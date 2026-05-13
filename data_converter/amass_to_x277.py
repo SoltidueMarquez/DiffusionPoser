@@ -93,6 +93,37 @@ SMPLH_TO_SMPL_JOINT_INDICES = np.array(
 )
 SMPLH_LEFT_HAND_START = 22
 SMPLH_RIGHT_HAND_START = 37
+MIRROR_DIR_NAME = "M"
+
+# 与 StableMotion/data_loaders/amasstools/smpl_mirroring.py 保持一致：
+# 镜像时先交换 SMPL body 的左右关节，再对 axis-angle 的 y/z 分量取负。
+SMPL_BODY_JOINTS_FLIP_PERM = np.array(
+    [
+        0,
+        2,
+        1,
+        3,
+        5,
+        4,
+        6,
+        8,
+        7,
+        9,
+        11,
+        10,
+        12,
+        14,
+        13,
+        15,
+        17,
+        16,
+        19,
+        18,
+        21,
+        20,
+    ],
+    dtype=np.int64,
+)
 
 # 如果 smplx 模型对象没有暴露 parents，则使用标准 SMPL 24 关节父子关系。
 DEFAULT_SMPL_PARENTS = np.array(
@@ -133,6 +164,8 @@ class MotionSource:
     betas: np.ndarray
     gender: str
     source_fps: float
+    is_mirrored: bool = False
+    original_relative_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +217,19 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--limit", default=0, type=int, help="Convert at most this many valid AMASS motion files.")
     group.add_argument("--overwrite", action="store_true", help="Overwrite existing converted npz files.")
     group.add_argument("--skip_existing", action="store_true", help="Skip output files that already exist.")
+    group.add_argument(
+        "--mirror",
+        dest="mirror",
+        action="store_true",
+        default=True,
+        help="同时生成 StableMotion 风格的 M/ 镜像样本，默认开启。",
+    )
+    group.add_argument(
+        "--no_mirror",
+        dest="mirror",
+        action="store_false",
+        help="只转换原始动作，不生成 M/ 镜像样本。",
+    )
 
     group = parser.add_argument_group("visualization")
     group.add_argument(
@@ -244,7 +290,17 @@ def validate_args(args: argparse.Namespace) -> None:
 def iter_amass_motion_files(amass_dir: Path) -> list[Path]:
     """收集真正包含 motion 的 AMASS 文件，跳过 DFaust 等只有 shape/betas 的 npz。"""
 
-    return sorted(path for path in amass_dir.rglob("*.npz") if path.name != "shape.npz")
+    return sorted(
+        path
+        for path in amass_dir.rglob("*.npz")
+        if path.name != "shape.npz" and not is_mirror_relative_path(path.relative_to(amass_dir))
+    )
+
+
+def is_mirror_relative_path(relative_path: Path) -> bool:
+    """StableMotion 把镜像数据放在 M/ 下；这里避免把镜像样本再次镜像。"""
+
+    return bool(relative_path.parts) and relative_path.parts[0] == MIRROR_DIR_NAME
 
 
 def load_motion_source(path: Path, amass_dir: Path, target_fps: float) -> MotionSource:
@@ -284,7 +340,71 @@ def load_motion_source(path: Path, amass_dir: Path, target_fps: float) -> Motion
         betas=betas,
         gender=gender,
         source_fps=source_fps,
+        original_relative_path=path.relative_to(amass_dir),
     )
+
+
+def mirror_motion_source(source: MotionSource) -> MotionSource:
+    """
+    生成 StableMotion 风格的镜像动作，不写回 AMASS 原始文件。
+
+    输出相对路径加上 `M/` 前缀，和 StableMotion split.txt 中的镜像命名保持一致：
+    `BMLmovi/a/b.npy` -> `M/BMLmovi/a/b.npz`。
+    """
+
+    return MotionSource(
+        path=source.path,
+        relative_path=Path(MIRROR_DIR_NAME) / source.relative_path,
+        poses=mirror_axis_angle_poses(source.poses),
+        trans=mirror_translations(source.trans),
+        betas=source.betas.copy(),
+        gender=source.gender,
+        source_fps=source.source_fps,
+        is_mirrored=True,
+        original_relative_path=source.original_relative_path or source.relative_path,
+    )
+
+
+def build_pose_flip_permutation(joint_count: int) -> np.ndarray:
+    if joint_count < SOURCE_BODY_JOINT_COUNT:
+        raise ValueError(f"镜像 pose 至少需要 {SOURCE_BODY_JOINT_COUNT} 个 joint，实际为 {joint_count}")
+
+    joint_permutation = list(SMPL_BODY_JOINTS_FLIP_PERM)
+    if joint_count >= SMPLH_JOINT_COUNT:
+        # SMPL-H 的手部顺序为 left hand 15 joints 后接 right hand 15 joints；
+        # 镜像时左右手整体交换，手内部的 MANO joint 顺序保持不变。
+        joint_permutation.extend(range(SMPLH_RIGHT_HAND_START, SMPLH_JOINT_COUNT))
+        joint_permutation.extend(range(SMPLH_LEFT_HAND_START, SMPLH_RIGHT_HAND_START))
+        joint_permutation.extend(range(SMPLH_JOINT_COUNT, joint_count))
+    else:
+        joint_permutation.extend(range(SOURCE_BODY_JOINT_COUNT, joint_count))
+
+    pose_permutation: list[int] = []
+    for joint_index in joint_permutation:
+        pose_permutation.extend([3 * joint_index, 3 * joint_index + 1, 3 * joint_index + 2])
+    return np.asarray(pose_permutation, dtype=np.int64)
+
+
+def mirror_axis_angle_poses(poses: np.ndarray) -> np.ndarray:
+    """
+    镜像 AMASS/SMPL-H axis-angle pose。
+
+    这里复用 StableMotion 的核心数学约定：先按左右关节 permutation 重排，再把每个
+    axis-angle 的 y/z 分量取负。这个操作对应 AMASS 右手 Z-up 中绕 yz 平面的左右镜像。
+    """
+
+    joint_count = poses.shape[-1] // 3
+    pose_permutation = build_pose_flip_permutation(joint_count)
+    mirrored = poses[..., pose_permutation].copy()
+    mirrored[..., 1::3] *= -1.0
+    mirrored[..., 2::3] *= -1.0
+    return mirrored
+
+
+def mirror_translations(trans: np.ndarray) -> np.ndarray:
+    mirrored = trans.copy()
+    mirrored[..., 0] *= -1.0
+    return mirrored
 
 
 def normalize_gender(value: Any) -> str:
@@ -847,6 +967,9 @@ def save_converted_motion(
     metadata = {
         "source_path": str(source.path),
         "source_relative_path": str(source.relative_path),
+        "original_source_relative_path": str(source.original_relative_path or source.relative_path),
+        "is_mirrored": source.is_mirrored,
+        "stablemotion_split_key": str(source.relative_path.with_suffix(".npy")).replace("\\", "/"),
         "source_fps": source.source_fps,
         "target_fps": target_fps,
         "feature_dim": FEATURE_DIM,
@@ -1196,8 +1319,11 @@ def convert_one_motion(
     args: argparse.Namespace,
     model_cache: SmplModelCache,
     enable_visualization: bool,
+    mirror_variant: bool = False,
 ) -> dict[str, Any]:
     source = load_motion_source(path=path, amass_dir=args.amass_dir, target_fps=args.target_fps)
+    if mirror_variant:
+        source = mirror_motion_source(source)
     output_path = output_path_for(source, args.output_dir)
     smpl_motion: SmplMotion | None = None
     x: np.ndarray | None = None
@@ -1229,6 +1355,10 @@ def convert_one_motion(
     record = {
         "status": status,
         "source_path": str(path),
+        "source_relative_path": str(source.relative_path),
+        "original_source_relative_path": str(source.original_relative_path or source.relative_path),
+        "is_mirrored": source.is_mirrored,
+        "stablemotion_split_key": str(source.relative_path.with_suffix(".npy")).replace("\\", "/"),
         "output_path": str(output_path),
         "visualization_attempted": bool(enable_visualization),
         "visualized": False,
@@ -1277,33 +1407,42 @@ def main() -> None:
     visualized = 0
 
     for path in tqdm(motion_files, desc="Converting AMASS to X277"):
-        enable_visualization = should_visualize(args=args, attempted_count=visualization_attempted)
-        try:
-            record = convert_one_motion(
-                path=path,
-                args=args,
-                model_cache=model_cache,
-                enable_visualization=enable_visualization,
-            )
-        except Exception as exc:
-            failed += 1
-            record = {
-                "status": "failed",
-                "source_path": str(path),
-                "error": repr(exc),
-                "visualization_attempted": False,
-                "visualized": False,
-            }
-        else:
-            if record["status"] == "converted":
-                converted += 1
+        mirror_variants = (False, True) if args.mirror else (False,)
+        for mirror_variant in mirror_variants:
+            enable_visualization = should_visualize(args=args, attempted_count=visualization_attempted)
+            try:
+                record = convert_one_motion(
+                    path=path,
+                    args=args,
+                    model_cache=model_cache,
+                    enable_visualization=enable_visualization,
+                    mirror_variant=mirror_variant,
+                )
+            except Exception as exc:
+                failed += 1
+                source_relative_path = path.relative_to(args.amass_dir)
+                if mirror_variant:
+                    source_relative_path = Path(MIRROR_DIR_NAME) / source_relative_path
+                record = {
+                    "status": "failed",
+                    "source_path": str(path),
+                    "source_relative_path": str(source_relative_path),
+                    "is_mirrored": mirror_variant,
+                    "stablemotion_split_key": str(source_relative_path.with_suffix(".npy")).replace("\\", "/"),
+                    "error": repr(exc),
+                    "visualization_attempted": False,
+                    "visualized": False,
+                }
             else:
-                skipped += 1
-            if record.get("visualization_attempted"):
-                visualization_attempted += 1
-            if record.get("visualized"):
-                visualized += 1
-        write_manifest_record(manifest_path, record)
+                if record["status"] == "converted":
+                    converted += 1
+                else:
+                    skipped += 1
+                if record.get("visualization_attempted"):
+                    visualization_attempted += 1
+                if record.get("visualized"):
+                    visualized += 1
+            write_manifest_record(manifest_path, record)
 
     print(
         f"完成 AMASS -> X277 转换：converted={converted}, skipped={skipped}, failed={failed}, "
