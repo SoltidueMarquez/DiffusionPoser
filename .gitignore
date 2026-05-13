@@ -1,0 +1,40 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.conda_pkgs/
+
+# Training artifacts
+dataset/
+data/
+save/
+output/
+outputs/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# Papers and large media references
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
