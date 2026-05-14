@@ -21,11 +21,11 @@ def add_base_options(parser: ArgumentParser):
 
 def add_data_options(parser: ArgumentParser):
     group = parser.add_argument_group("dataset")
-    group.add_argument("--data_dir", default="", type=str, help="预处理后的 DiffusionPoser 数据目录。")
+    group.add_argument("--data_dir", required=True, type=str, help="离线生成的 X277 传感器缺失任务目录。")
     group.add_argument("--data_split", default="train", type=str, help="Dataset split name.")
-    group.add_argument("--input_feats", default=190, type=int, help="每一帧的动作特征维度，DiffusionPoser 默认 190。")
-    group.add_argument("--seq_len", default=60, type=int, help="Smoke dataset 的序列长度；真实数据接入后由数据集决定。")
-    group.add_argument("--smoke_num_batches", default=2, type=int, help="未提供 data_dir 时用于 smoke training 的 batch 数。")
+    group.add_argument("--input_feats", default=283, type=int, help="X277 特征 277 维 + 6 维传感器缺失标签。")
+    group.add_argument("--seq_len", default=100, type=int, help="训练序列固定裁剪/padding 后的帧数。")
+    group.add_argument("--num_workers", default=0, type=int, help="DataLoader worker 数量。")
 
 
 def add_model_options(parser: ArgumentParser):
@@ -66,7 +66,6 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--gradient_clip", action="store_true")
     group.add_argument("--snr_gamma", default=0.0, type=float)
     group.add_argument("--l1_loss", action="store_true")
-    group.add_argument("--mask_ratio", default=0.6, type=float, help="随机训练时每个有效帧中待补全特征比例。")
     group.add_argument("--model_ema", action="store_true")
     group.add_argument("--model_ema_steps", type=int, default=10)
     group.add_argument("--model_ema_decay", type=float, default=0.995)

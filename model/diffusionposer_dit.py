@@ -37,14 +37,14 @@ class DiffusionPoserDiT(nn.Module):
     面向 DiffusionPoser 稀疏传感器重建的轻量 DiT 骨架。
 
     输入和输出都使用 `[B, C, T]`：
-    - `C` 是动作特征维度，默认 190；
+    - `C` 是动作特征维度，默认 283，即 X277 + 6 维传感器缺失标签；
     - `T` 是时间长度；
     - `inpaint_cond` 使用同形状布尔张量标记待补全位置，模型会把它作为显式条件通道拼接进去。
     """
 
     def __init__(
         self,
-        input_feats: int = 190,
+        input_feats: int = 283,
         latent_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,

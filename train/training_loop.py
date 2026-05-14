@@ -109,24 +109,26 @@ class TrainLoop:
 
     def mask_manager(self, batch, sample):
         batch_size, channels, seq_len = sample.shape
-        valid_frame_mask = batch.get("valid_frame_mask")
+        valid_frame_mask = batch.get("valid_frame_mask", batch.get("attention_mask"))
         if valid_frame_mask is None:
             valid_frame_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=sample.device)
         valid_frame_mask = valid_frame_mask.bool()
 
-        sensor_mask = batch.get("sensor_mask")
-        if sensor_mask is None:
-            sensor_mask = torch.rand_like(sample) > self.args.mask_ratio
-        sensor_mask = sensor_mask.bool()
+        inpaint_mask = batch.get("inpaint_mask")
+        if inpaint_mask is None:
+            raise ValueError("训练 batch 缺少 inpaint_mask，请先用 generate_x277_missing_tasks 生成离线缺失任务。")
 
-        # inpaint_mask=True 表示该位置是缺失区域，需要扩散模型补全并计算损失。
-        inpaint_mask = (~sensor_mask) & valid_frame_mask.unsqueeze(1)
+        # 真实 X277 数据已经离线生成了精确 mask；这里只叠加有效帧，避免 padding 进入 loss。
+        inpaint_mask = inpaint_mask.bool() & valid_frame_mask.unsqueeze(1)
+        if inpaint_mask.shape != sample.shape:
+            raise ValueError(f"inpaint_mask 应为 {tuple(sample.shape)}，实际为 {tuple(inpaint_mask.shape)}")
         if not inpaint_mask.any():
-            inpaint_mask[:, 0, 0] = True
+            raise ValueError("batch 中的 inpaint_mask 没有任何待补全位置，请检查离线任务生成。")
 
         return {
             "inpaint_cond": inpaint_mask,
             "valid_frame_mask": valid_frame_mask,
+            "attention_mask": valid_frame_mask,
             "y": {
                 "mask": inpaint_mask,
                 "inpainted_motion": sample,

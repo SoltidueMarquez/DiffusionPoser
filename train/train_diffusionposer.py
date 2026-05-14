@@ -32,9 +32,9 @@ def main():
         batch_size=args.batch_size,
         input_feats=args.input_feats,
         seq_len=args.seq_len,
-        mask_ratio=args.mask_ratio,
-        num_batches=args.smoke_num_batches,
         split=args.data_split,
+        num_workers=args.num_workers,
+        pin_memory=args.cuda,
     )
 
     model, diffusion = create_model_and_diffusion(args)
