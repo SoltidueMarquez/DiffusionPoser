@@ -19,13 +19,13 @@ pip install -r requirements.txt
 先把 `dataset/AMASS_x277_60hz` 中的 `x: [T, 277]` 转成固定长度缺失任务。默认每个源文件生成 4 条任务，序列长度为 100：
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --splits train test --seq_len 100 --samples_per_file 4 --seed 10 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 100 --samples_per_file 4 --seed 10 --overwrite
 ```
 
-如果要按 StableMotion 风格 split 过滤样本，额外传入 split 目录：
+`data_loaders/splits/train.txt` 和 `data_loaders/splits/test.txt` 已经从 StableMotion 参考项目复制到本项目，可直接用于 `stablemotion_split_key` 过滤。
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir D:\Desktop\动画项目\StableMotion-改进模型训练\data_loaders\splits --splits train test --seq_len 100 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 100 --overwrite
 ```
 
 生成目录形如 `dataset/AMASS_x277_60hz_missing_tasks/train/manifest.jsonl` 和 `tasks/*.npz`。训练时直接把根目录传给 `--data_dir`：

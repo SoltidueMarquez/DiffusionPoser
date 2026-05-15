@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
     MODEL_INPUT_DIM,
@@ -53,6 +54,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     group = parser.add_argument_group("runtime")
     group.add_argument("--seed", default=10, type=int, help="固定随机种子，保证离线任务可复现。")
+    group.add_argument(
+        "--compress_tasks",
+        action="store_true",
+        help="使用 np.savez_compressed 保存任务文件；文件更小但生成速度明显更慢。",
+    )
+    group.add_argument("--manifest_flush_interval", default=100, type=int, help="每写入多少条 manifest 后 flush 一次。")
     group.add_argument("--overwrite", action="store_true", help="允许覆盖已有输出目录。")
     return parser
 
@@ -72,8 +79,15 @@ def read_source_entries(source_dir: Path) -> list[dict]:
 
 def read_manifest_entries(source_dir: Path, manifest_path: Path) -> list[dict]:
     entries = []
+    total_lines = count_text_lines(manifest_path)
     with manifest_path.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
+        iterator = tqdm(
+            enumerate(file, start=1),
+            total=total_lines,
+            desc="读取 X277 manifest",
+            unit="条",
+        )
+        for line_number, line in iterator:
             if not line.strip():
                 continue
             raw_entry = json.loads(line)
@@ -116,7 +130,8 @@ def resolve_manifest_output_path(source_dir: Path, entry: dict) -> Path:
 
 def glob_source_entries(source_dir: Path) -> list[dict]:
     entries = []
-    for source_path in sorted(source_dir.rglob("*.npz")):
+    source_paths = sorted(source_dir.rglob("*.npz"))
+    for source_path in tqdm(source_paths, desc="扫描 X277 npz", unit="个"):
         if "missing_tasks" in source_path.parts:
             continue
         entries.append(
@@ -144,8 +159,9 @@ def read_split_keys(split_dir: Path | None, split: str) -> set[str] | None:
         raise FileNotFoundError(f"指定了 split_dir，但找不到 split 文件：{split_path}")
 
     keys = set()
+    total_lines = count_text_lines(split_path)
     with split_path.open("r", encoding="utf-8") as file:
-        for line in file:
+        for line in tqdm(file, total=total_lines, desc=f"读取 split={split}", unit="条"):
             key = normalize_split_key(line)
             if key:
                 keys.add(key)
@@ -155,7 +171,11 @@ def read_split_keys(split_dir: Path | None, split: str) -> set[str] | None:
 def filter_entries_by_split(entries: list[dict], split_keys: set[str] | None) -> list[dict]:
     if split_keys is None:
         return entries
-    return [entry for entry in entries if normalize_split_key(entry["stablemotion_split_key"]) in split_keys]
+    filtered = []
+    for entry in tqdm(entries, desc="匹配 split 与 X277 样本", unit="条"):
+        if normalize_split_key(entry["stablemotion_split_key"]) in split_keys:
+            filtered.append(entry)
+    return filtered
 
 
 def normalize_split_key(raw_key: str) -> str:
@@ -173,6 +193,13 @@ def normalize_split_key(raw_key: str) -> str:
 
 def normalize_slashes(path: str) -> str:
     return path.replace("\\", "/")
+
+
+def count_text_lines(path: Path) -> int:
+    """给 tqdm 提供总量；只读文本行数，不解析内容。"""
+
+    with path.open("r", encoding="utf-8") as file:
+        return sum(1 for _ in file)
 
 
 # endregion
@@ -195,6 +222,7 @@ def generate_missing_tasks(args: argparse.Namespace) -> dict[str, int]:
     source_entries = read_source_entries(source_dir=source_dir)
     if not source_entries:
         raise RuntimeError(f"未在 {source_dir} 中找到可用 X277 `.npz` 文件。")
+    print(f"[generate_x277_missing_tasks] 可用 X277 源样本数：{len(source_entries)}")
 
     counts = {}
     for split_index, split in enumerate(args.splits):
@@ -202,6 +230,11 @@ def generate_missing_tasks(args: argparse.Namespace) -> dict[str, int]:
         split_entries = filter_entries_by_split(entries=source_entries, split_keys=split_keys)
         if not split_entries:
             raise RuntimeError(f"split={split} 没有匹配到任何 X277 样本，请检查 split 文件或源 manifest。")
+        total_tasks = len(split_entries) * args.samples_per_file
+        print(
+            f"[generate_x277_missing_tasks] split={split} 匹配源样本={len(split_entries)}，"
+            f"预计生成任务={total_tasks}"
+        )
 
         rng = np.random.default_rng(args.seed + split_index)
         counts[split] = generate_split_tasks(
@@ -229,6 +262,11 @@ def generate_split_tasks(
     max_missing_length = args.max_missing_length if args.max_missing_length > 0 else None
     written = 0
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        progress = tqdm(
+            total=len(entries) * args.samples_per_file,
+            desc=f"生成 split={split} 缺失任务",
+            unit="条",
+        )
         for entry in entries:
             source_path = Path(entry["source_path"])
             source_frames, feature_dim = inspect_x277_file(source_path=source_path, fallback_frames=entry.get("frames", 0))
@@ -260,8 +298,9 @@ def generate_split_tasks(
                 )
                 task_rel_path = Path("tasks") / f"{task_id}.npz"
                 task_path = split_dir / task_rel_path
-                np.savez_compressed(
-                    task_path,
+                save_task_npz(
+                    task_path=task_path,
+                    compress=args.compress_tasks,
                     sensor_missing_labels=sensor_missing_labels,
                     inpaint_mask=inpaint_mask,
                     start_frame=np.int64(start_frame),
@@ -287,7 +326,31 @@ def generate_split_tasks(
                 }
                 manifest_file.write(json.dumps(manifest_entry, ensure_ascii=False, sort_keys=True) + "\n")
                 written += 1
+                if args.manifest_flush_interval > 0 and written % args.manifest_flush_interval == 0:
+                    manifest_file.flush()
+                progress.update(1)
+        progress.close()
     return written
+
+
+def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
+    """
+    保存单条缺失任务。
+
+    默认使用 `np.savez`，因为训练任务文件数量很多，压缩每个小文件会带来明显 CPU 开销。
+    如果更在意磁盘占用，可以通过 `--compress_tasks` 切回压缩保存。
+    """
+
+    temp_path = task_path.with_name(task_path.name + ".tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    with temp_path.open("wb") as file:
+        if compress:
+            np.savez_compressed(file, **arrays)
+        else:
+            np.savez(file, **arrays)
+    temp_path.replace(task_path)
 
 
 def inspect_x277_file(source_path: Path, fallback_frames: int = 0) -> tuple[int, int]:
