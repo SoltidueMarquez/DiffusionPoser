@@ -220,4 +220,60 @@ def apply_sensor_missing_interval(
     inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
 
 
+def build_inpaint_mask_from_sensor_missing_labels(
+    sensor_missing_labels: np.ndarray,
+    valid_frame_mask: np.ndarray,
+    feature_dim: int = MODEL_INPUT_DIM,
+) -> np.ndarray:
+    """
+    根据 `[T, 6]` 的传感器损坏标签重建 `[T, 283]` inpainting mask。
+
+    当输入是 `[B, T, 6]` 时，会返回 `[B, T, feature_dim]`。
+    `True` 表示对应位置需要被扩散补全；标签通道始终保持 `False`。
+    """
+
+    if feature_dim < MODEL_INPUT_DIM:
+        raise ValueError(f"feature_dim 至少应为 {MODEL_INPUT_DIM}，实际为 {feature_dim}")
+
+    labels = np.asarray(sensor_missing_labels, dtype=bool)
+    valid_mask = np.asarray(valid_frame_mask, dtype=bool)
+
+    if labels.ndim == 2:
+        if labels.shape[1] != SENSOR_LABEL_DIM:
+            raise ValueError(f"sensor_missing_labels 应为 [T, {SENSOR_LABEL_DIM}]，实际为 {labels.shape}")
+        if valid_mask.ndim != 1 or valid_mask.shape[0] != labels.shape[0]:
+            raise ValueError(f"valid_frame_mask 应为 [T]，实际为 {valid_mask.shape}")
+
+        mask = np.zeros((labels.shape[0], feature_dim), dtype=bool)
+        for sensor_index in range(SENSOR_LABEL_DIM):
+            sensor_mask = labels[:, sensor_index]
+            if not sensor_mask.any():
+                continue
+            pos_slice, rot_slice = sensor_feature_slices(sensor_index)
+            mask[sensor_mask, pos_slice] = True
+            mask[sensor_mask, rot_slice] = True
+        mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
+        mask[~valid_mask, :] = False
+        return mask
+
+    if labels.ndim == 3:
+        if labels.shape[2] != SENSOR_LABEL_DIM:
+            raise ValueError(f"sensor_missing_labels 应为 [B, T, {SENSOR_LABEL_DIM}]，实际为 {labels.shape}")
+        if valid_mask.ndim != 2 or valid_mask.shape[:2] != labels.shape[:2]:
+            raise ValueError(f"valid_frame_mask 应为 [B, T]，实际为 {valid_mask.shape}")
+        return np.stack(
+            [
+                build_inpaint_mask_from_sensor_missing_labels(
+                    sensor_missing_labels=labels[index],
+                    valid_frame_mask=valid_mask[index],
+                    feature_dim=feature_dim,
+                )
+                for index in range(labels.shape[0])
+            ],
+            axis=0,
+        )
+
+    raise ValueError(f"sensor_missing_labels 只能是 [T, 6] 或 [B, T, 6]，实际为 {labels.shape}")
+
+
 # endregion

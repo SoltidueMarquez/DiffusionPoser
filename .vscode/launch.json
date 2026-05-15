@@ -47,9 +47,9 @@
                 // 默认同时生成 train/test；如果只想快速重建训练集，可删除 "test"。
                 "--splits", "train", "test",
                 // 训练窗口长度，必须和训练配置中的 --seq_len 一致。
-                "--seq_len", "60",
+                "--seq_len", "150",
                 // 每个源动作生成多少条随机缺失任务；增大可提升缺失组合多样性。
-                "--samples_per_file", "2",
+                "--samples_per_file", "1",
                 // 每条任务内随机生成几个连续缺失区间。
                 "--num_intervals", "1",
                 // 每个缺失区间最短帧数。
@@ -115,7 +115,7 @@
                 // StableMotion 风格常用 batch size；显存不足时改 128/64。
                 "--batch_size", "256",
                 // 训练窗口长度，必须匹配 materialized task 的 seq_len。
-                "--seq_len", "60",
+                "--seq_len", "150",
                 // 模型输入通道数：X277 277 维 + 6 维传感器缺失标签。
                 "--input_feats", "283",
                 // DiT Transformer block 数量。
@@ -171,12 +171,12 @@
                 "--normalize_input", "true",
                 "--preload_data", "false",
                 // 指向要恢复的 model checkpoint；训练 loop 会自动尝试加载同 step 的 opt/ema。
-                "--resume_checkpoint", "${workspaceFolder}/save/diffusionposer_x277/model000000000.pt",
+                "--resume_checkpoint", "${workspaceFolder}/save/diffusionposer_x277/model000012000.pt",
                 // 允许写入已有 save_dir。
                 "--overwrite",
                 "--cuda", "true",
                 "--batch_size", "256",
-                "--seq_len", "60",
+                "--seq_len", "150",
                 "--input_feats", "283",
                 "--layers", "8",
                 "--heads", "8",
@@ -193,7 +193,57 @@
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
-                "--num_workers", "2"
+                "--num_workers", "0"
+            ]
+        },
+        {
+            "name": "测试 DiffusionPoser X277 fix-only",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sample.fix_test",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "args": [
+                // 运行层参数，方便在不同机器 / 不同解释器里快速复现。
+                "--seed", "10",
+                "--device", "0",
+                "--cuda", "true",
+                "--batch_size", "32",
+                // 如果不手写这个参数，sample.fix_test 会自动根据 checkpoint 名称推导默认输出目录。
+                "--output_dir", "${workspaceFolder}/output/diffusionposer_x277/Diffusionposer_x277+6_000012000_seed10",
+
+                // 固定使用仓库里已有的 checkpoint；换轮次时改这里即可。
+                "--model_path", "${workspaceFolder}/save/diffusionposer_x277/model000012000.pt",
+
+                // 修复测试使用离线生成的 materialized X277 缺失任务。
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz_missing_tasks",
+                "--data_split", "test",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_x277_60hz",
+                "--normalize_input", "true",
+                "--preload_data", "false",
+                "--seq_len", "150",
+                "--input_feats", "283",
+
+                // 这些参数和训练时的模型结构、扩散采样配置保持一致。
+                // sample.fix_test 会优先从 checkpoint 同目录的 args.json 回填默认值，但显式写出来更直观。
+                // "--layers", "8",
+                // "--heads", "8",
+                // "--latent_dim", "512",
+                // "--dropout", "0.0",
+                // "--noise_schedule", "cosine",
+                // "--diffusion_steps", "50",
+                // "--sigma_small", "true",
+                // "--predict_xstart", "1",
+                // "--ts_respace", "",
+
+                // 可视化控制项。
+                "--visualize_num", "5",
+                "--visualize_fps", "60",
+                "--x277_fps", "60",
+                "--use_ema", "true",
+                "--num_workers", "0"
             ]
         }
     ]

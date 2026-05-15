@@ -7,21 +7,21 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from data_loaders.manifest_utils import filter_entries_by_folder_path, normalize_folder_token
 from data_loaders.sensor_masking import MODEL_INPUT_DIM, SENSOR_LABEL_DIM, X277_FEATURE_DIM
 from utils.normalizer import X277Normalizer
 
 
 class X277MissingTaskDataset(Dataset):
     """
-    读取离线生成的 materialized X277 传感器缺失任务。
+    读取离线生成的 X277 缺失任务。
 
-    每个 task `.npz` 必须包含：
-    - `x277: [T, 277]`：已经从原始动作文件裁剪/padding 好的固定窗口。
-    - `sensor_missing_labels: [T, 6]`：6 个传感器在每帧是否缺失。
-    - `inpaint_mask: [T, 283]`：扩散训练中哪些位置需要补全并参与 loss。
+    每个 task `.npz` 至少包含：
+    - `x277: [T, 277]`
+    - `sensor_missing_labels: [T, 6]`
+    - `inpaint_mask: [T, 283]`
 
-    Dataset 返回 `[C, T]` 张量，DataLoader 默认 collate 后得到 `[B, C, T]`。
-    训练阶段不再读取原始 `AMASS_x277_60hz`，避免每条样本同时解压 task 和源 npz。
+    Dataset 返回的是 `[C, T]` 布局，便于后面的 DataLoader 自动拼成 `[B, C, T]`。
     """
 
     def __init__(
@@ -32,6 +32,7 @@ class X277MissingTaskDataset(Dataset):
         normalizer_dir: str | Path | None = None,
         normalize_input: bool = True,
         preload_data: bool = False,
+        folder_path: str | Path | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
@@ -40,24 +41,32 @@ class X277MissingTaskDataset(Dataset):
         self.preload_data = bool(preload_data)
         self.normalizer = create_normalizer(normalizer_dir=normalizer_dir, normalize_input=self.normalize_input)
 
+        # 先找到当前 split 对应的 manifest，再从 manifest 里读取任务条目。
         self.manifest_path = find_manifest_path(data_dir=self.data_dir, split=split)
         self.manifest_dir = self.manifest_path.parent
         self.entries = read_task_manifest(self.manifest_path)
 
+        # folder_path 只是“额外筛选条件”，不会替代 split。
+        if folder_path:
+            self.entries = filter_entries_by_folder_path(self.entries, folder_path=folder_path)
+
         if not self.entries:
             raise RuntimeError(f"{self.manifest_path} 中没有可用任务。")
+
+        # 这个数据集只接受固定 seq_len 的 materialized task，
+        # 这样后续 sampling / 可视化 的时间维就不会出现动态分支。
         for entry in self.entries:
             entry_seq_len = int(entry.get("seq_len", self.seq_len))
             if entry_seq_len != self.seq_len:
                 raise ValueError(
                     f"任务 {entry.get('task_id')} 的 seq_len={entry_seq_len}，"
-                    f"但当前 DataLoader 请求 seq_len={self.seq_len}。"
+                    f"但当前 DataLoader 期望 seq_len={self.seq_len}。"
                 )
 
         self.task_cache = None
         if self.preload_data:
-            # 只预加载 materialized task 本身；normalizer 仍在 __getitem__ 中动态执行，
-            # 这样切换 mean/std 或关闭标准化时不需要重新生成任务数据。
+            # 预加载只缓存原始 npz 内容，不提前做 normalizer 变换。
+            # 这样同一份缓存既能复用，也不会把训练/测试阶段的归一化策略锁死。
             self.task_cache = [
                 load_materialized_task_npz(manifest_dir=self.manifest_dir, task_path=entry["task_path"])
                 for entry in self.entries
@@ -79,11 +88,13 @@ class X277MissingTaskDataset(Dataset):
             shape=(self.seq_len, X277_FEATURE_DIM),
             name="x277",
         ).astype(np.float32, copy=True)
-        # 物化任务理论上已经把 padding 写成 0；这里再清一次，避免异常文件把 padding 噪声带入模型。
+
+        # materialized task 已经把整段序列裁成固定窗口，
+        # 这里再把超出有效长度的部分清零，保证 padding 不会混进模型输入。
         clip[valid_length:] = 0.0
 
         if self.normalizer is not None:
-            # 只标准化真实有效帧。padding 保持 0，便于模型和 mask 一起识别无效区域。
+            # 只对真实有效帧做归一化，padding 仍保持 0。
             clip[:valid_length] = self.normalizer.normalize(clip[:valid_length])
 
         valid_frame_mask = np.zeros(self.seq_len, dtype=bool)
@@ -100,11 +111,13 @@ class X277MissingTaskDataset(Dataset):
             name="inpaint_mask",
         ).astype(bool)
 
-        # padding 和 6 维缺失标签只作为条件上下文，不参与扩散补全 loss。
+        # padding 帧不参与任何补全、监督或评估。
         sensor_missing_labels[~valid_frame_mask] = False
         inpaint_mask[~valid_frame_mask] = False
-        inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
 
+        # 6 维缺失标签只作为条件通道输入，不作为重建目标；
+        # 283 维里的 label 部分也要始终保持 False，避免把标签通道误纳入 inpainting。
+        inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
         label_channels = encode_sensor_labels(
             sensor_missing_labels=sensor_missing_labels,
             valid_frame_mask=valid_frame_mask,
@@ -124,12 +137,12 @@ class X277MissingTaskDataset(Dataset):
         }
 
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:
+        # 如果开启了 preload，就直接复用缓存；否则按需读盘。
         if self.task_cache is not None:
             return self.task_cache[index]
         return load_materialized_task_npz(manifest_dir=self.manifest_dir, task_path=entry["task_path"])
 
 
-# region normalizer 与标签编码
 def create_normalizer(normalizer_dir: str | Path | None, normalize_input: bool) -> X277Normalizer | None:
     if not normalize_input:
         return None
@@ -144,10 +157,10 @@ def encode_sensor_labels(
     normalize_input: bool,
 ) -> np.ndarray:
     """
-    将 `[T, 6]` bool 缺失标签编码为模型输入通道。
+    把 `[T, 6]` 的传感器缺失标签编码成模型输入通道。
 
-    未归一化模式保留旧行为：False/True -> 0/1。
-    归一化模式使用 StableMotion 风格条件尺度：False/True -> -1/+1，padding 仍为 0。
+    - 未归一化模式：直接保留 0/1
+    - 归一化模式：转成 -1/+1，并把 padding 帧重新置回 0
     """
 
     label_channels = sensor_missing_labels.astype(np.float32)
@@ -157,11 +170,8 @@ def encode_sensor_labels(
     return label_channels
 
 
-# endregion
-
-
-# region manifest 与任务读取
 def find_manifest_path(data_dir: Path, split: str) -> Path:
+    # 优先找 `data_dir/split/manifest.jsonl`，找不到再回退到 `data_dir/manifest.jsonl`。
     candidates = [
         data_dir / split / "manifest.jsonl",
         data_dir / "manifest.jsonl",
@@ -220,6 +230,3 @@ def validate_task_array(array: np.ndarray, shape: tuple[int, int], name: str) ->
     if tuple(array.shape) != shape:
         raise ValueError(f"{name} 应为 {shape}，实际为 {tuple(array.shape)}")
     return array
-
-
-# endregion

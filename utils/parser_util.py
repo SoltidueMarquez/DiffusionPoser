@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+import json
 from argparse import ArgumentParser
+from pathlib import Path
 
 
 def train_args():
@@ -20,6 +24,35 @@ def str2bool(value):
     if value in {"no", "false", "f", "0", "n"}:
         return False
     raise ValueError(f"无法解析布尔参数：{value}")
+
+
+def parse_and_load_from_model(
+    parser: ArgumentParser,
+    argv: list[str] | None = None,
+    ignore_keys: set[str] | None = None,
+):
+    """先解析命令行，再用 checkpoint 同目录的 `args.json` 补齐默认值。"""
+
+    args = parser.parse_args(argv)
+    model_path = getattr(args, "model_path", "")
+    if not model_path:
+        return args
+
+    checkpoint_args = load_args_json(Path(model_path))
+    if not checkpoint_args:
+        return args
+
+    ignore_keys = set(ignore_keys or set())
+    for key, value in checkpoint_args.items():
+        if key in ignore_keys or not hasattr(args, key):
+            continue
+        try:
+            default_value = parser.get_default(key)
+        except Exception:
+            default_value = None
+        if getattr(args, key) == default_value:
+            setattr(args, key, value)
+    return args
 
 
 def add_base_options(parser: ArgumentParser):
@@ -70,6 +103,47 @@ def add_data_options(parser: ArgumentParser):
         help="训练序列固定裁剪/padding 后的帧数。",
     )
     group.add_argument("--num_workers", default=0, type=int, help="DataLoader worker 数量。")
+
+
+def add_sampling_options(parser: ArgumentParser):
+    group = parser.add_argument_group("sampling")
+    group.add_argument("--model_path", required=True, type=str, help="Path to model#########.pt.")
+    group.add_argument(
+        "--output_dir",
+        default="",
+        type=str,
+        help="测试结果输出目录；留空时根据 checkpoint 目录自动派生。",
+    )
+    group.add_argument(
+        "--folder_path",
+        default="",
+        type=str,
+        help="可选：只遍历测试集中某个子目录，用于缩小测试范围。",
+    )
+    group.add_argument(
+        "--visualize_num",
+        default=0,
+        type=int,
+        help="要可视化的样本数；0 表示不输出可视化，<0 表示全部样本。",
+    )
+    group.add_argument(
+        "--visualize_fps",
+        default=20.0,
+        type=float,
+        help="可视化视频帧率。",
+    )
+    group.add_argument(
+        "--x277_fps",
+        default=60.0,
+        type=float,
+        help="X277 特征解码时使用的原始运动帧率；visualize_fps 只控制导出视频帧率。",
+    )
+    group.add_argument(
+        "--use_ema",
+        default=True,
+        type=str2bool,
+        help="若 checkpoint 同目录存在 EMA 权重，则优先加载。",
+    )
 
 
 def add_model_options(parser: ArgumentParser):
@@ -123,3 +197,13 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--model_ema_decay", type=float, default=0.995, help="EMA decay.")
     group.add_argument("--model_ema_update_after", type=int, default=5000, help="Start EMA updates after N steps.")
     group.add_argument("--eval_during_training", action="store_true", help="Run evaluation while training.")
+
+
+def load_args_json(model_path: Path) -> dict:
+    """读取 checkpoint 同目录下的 `args.json`。"""
+
+    args_path = model_path.with_name("args.json")
+    if not args_path.exists():
+        return {}
+    with args_path.open("r", encoding="utf-8") as file:
+        return json.load(file)

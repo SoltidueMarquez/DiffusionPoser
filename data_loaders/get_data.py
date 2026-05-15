@@ -14,13 +14,13 @@ def get_dataset_loader(
     preload_data: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
+    folder_path: str | None = None,
 ):
     """
-    返回训练 DataLoader。
+    返回训练 / 测试 DataLoader。
 
-    当前训练入口只接收离线生成的 X277 缺失任务，避免误用随机数据完成“假训练”。
-    真实数据 batch 字段约定为：
-    `x: [B, 283, T]`、`valid_frame_mask: [B, T]`、`inpaint_mask: [B, 283, T]`。
+    当前入口只接受离线生成的 X277 缺失任务，不再混用原始数据或在线随机遮挡，
+    这样测试阶段看到的输入就和训练时的任务格式完全一致。
     """
 
     if not data_dir:
@@ -35,6 +35,7 @@ def get_dataset_loader(
         normalizer_dir=normalizer_dir,
         normalize_input=normalize_input,
         preload_data=preload_data,
+        folder_path=folder_path,
     )
     loader_kwargs = {
         "batch_size": batch_size,
@@ -44,7 +45,7 @@ def get_dataset_loader(
         "pin_memory": pin_memory,
     }
     if num_workers > 0:
-        # Windows 下 worker 启动成本较高，持久化 worker 可以避免每个 epoch 反复 spawn。
+        # Windows 下 worker 频繁重启的开销比较大；开启 persistent_workers 可以明显减少 epoch 间抖动。
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
