@@ -51,6 +51,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     group.add_argument("--min_missing_sensors", default=1, type=int, help="每个区间最少缺失传感器数量。")
     group.add_argument("--max_missing_sensors", default=4, type=int, help="每个区间最多缺失传感器数量。")
     group.add_argument("--min_observed_sensors", default=2, type=int, help="每个区间至少保留的未缺失传感器数量。")
+    group.add_argument("--limit", default=0, type=int, help="每个 split 最多使用多少个源样本；0 表示不限制。")
 
     group = parser.add_argument_group("runtime")
     group.add_argument("--seed", default=10, type=int, help="固定随机种子，保证离线任务可复现。")
@@ -228,6 +229,8 @@ def generate_missing_tasks(args: argparse.Namespace) -> dict[str, int]:
     for split_index, split in enumerate(args.splits):
         split_keys = read_split_keys(split_dir=split_dir, split=split)
         split_entries = filter_entries_by_split(entries=source_entries, split_keys=split_keys)
+        if args.limit > 0:
+            split_entries = split_entries[: args.limit]
         if not split_entries:
             raise RuntimeError(f"split={split} 没有匹配到任何 X277 样本，请检查 split 文件或源 manifest。")
         total_tasks = len(split_entries) * args.samples_per_file
@@ -269,7 +272,8 @@ def generate_split_tasks(
         )
         for entry in entries:
             source_path = Path(entry["source_path"])
-            source_frames, feature_dim = inspect_x277_file(source_path=source_path, fallback_frames=entry.get("frames", 0))
+            source_x277 = load_x277_array(source_path=source_path, fallback_frames=entry.get("frames", 0))
+            source_frames, feature_dim = source_x277.shape
             if feature_dim != X277_FEATURE_DIM:
                 raise ValueError(f"{source_path} 的 x 特征维应为 277，实际为 {feature_dim}")
 
@@ -298,9 +302,16 @@ def generate_split_tasks(
                 )
                 task_rel_path = Path("tasks") / f"{task_id}.npz"
                 task_path = split_dir / task_rel_path
+                x277_clip = create_x277_clip(
+                    source_x277=source_x277,
+                    start_frame=start_frame,
+                    valid_length=valid_length,
+                    seq_len=args.seq_len,
+                )
                 save_task_npz(
                     task_path=task_path,
                     compress=args.compress_tasks,
+                    x277=x277_clip,
                     sensor_missing_labels=sensor_missing_labels,
                     inpaint_mask=inpaint_mask,
                     start_frame=np.int64(start_frame),
@@ -321,6 +332,7 @@ def generate_split_tasks(
                     "source_frames": source_frames,
                     "seq_len": args.seq_len,
                     "feature_dim": MODEL_INPUT_DIM,
+                    "task_format": "materialized_x277_v1",
                     "missing_intervals": [interval.to_dict() for interval in intervals],
                     "is_mirrored": bool(entry.get("is_mirrored", False)),
                 }
@@ -353,17 +365,37 @@ def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
     temp_path.replace(task_path)
 
 
-def inspect_x277_file(source_path: Path, fallback_frames: int = 0) -> tuple[int, int]:
+def load_x277_array(source_path: Path, fallback_frames: int = 0) -> np.ndarray:
     with np.load(source_path, allow_pickle=False) as data:
         if "x" not in data:
             raise KeyError(f"{source_path} 缺少字段 `x`。")
-        x_shape = data["x"].shape
-    if len(x_shape) != 2:
-        raise ValueError(f"{source_path} 的 x 应为 [T, 277]，实际为 {x_shape}")
-    frames, feature_dim = int(x_shape[0]), int(x_shape[1])
+        x277 = data["x"].astype(np.float32, copy=True)
+    if x277.ndim != 2:
+        raise ValueError(f"{source_path} 的 x 应为 [T, 277]，实际为 {x277.shape}")
+    frames, feature_dim = int(x277.shape[0]), int(x277.shape[1])
     if fallback_frames and fallback_frames != frames:
         raise ValueError(f"{source_path} manifest frames={fallback_frames}，实际 x 帧数={frames}")
-    return frames, feature_dim
+    if feature_dim != X277_FEATURE_DIM:
+        raise ValueError(f"{source_path} 的 x 特征维应为 {X277_FEATURE_DIM}，实际为 {feature_dim}")
+    return x277
+
+
+def inspect_x277_file(source_path: Path, fallback_frames: int = 0) -> tuple[int, int]:
+    x277 = load_x277_array(source_path=source_path, fallback_frames=fallback_frames)
+    return int(x277.shape[0]), int(x277.shape[1])
+
+
+def create_x277_clip(source_x277: np.ndarray, start_frame: int, valid_length: int, seq_len: int) -> np.ndarray:
+    """把源 X277 序列物化成固定长度训练窗口，padding 帧保持 0。"""
+
+    end_frame = start_frame + valid_length
+    if start_frame < 0 or valid_length <= 0 or end_frame > source_x277.shape[0]:
+        raise ValueError(
+            f"X277 clip 越界：start={start_frame}, valid_length={valid_length}, source_frames={source_x277.shape[0]}"
+        )
+    clip = np.zeros((seq_len, X277_FEATURE_DIM), dtype=np.float32)
+    clip[:valid_length] = source_x277[start_frame:end_frame]
+    return clip
 
 
 def sample_window(rng: np.random.Generator, source_frames: int, seq_len: int) -> tuple[int, int]:

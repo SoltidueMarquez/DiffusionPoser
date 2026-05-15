@@ -52,6 +52,12 @@ def add_data_options(parser: ArgumentParser):
         help="是否使用 normalizer_dir/mean.pt 和 std.pt 标准化 X277 输入特征。",
     )
     group.add_argument(
+        "--preload_data",
+        default=False,
+        type=str2bool,
+        help="是否在 Dataset 初始化时把所有 task npz 解压到内存；正式训练默认关闭。",
+    )
+    group.add_argument(
         "--input_feats",
         default=283,
         type=int,

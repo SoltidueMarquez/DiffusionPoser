@@ -3,7 +3,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "转换数据：AMASS 转 X277 并可视化",
+            "name": "转换数据：AMASS -> X277 并可视化",
             "type": "debugpy",
             "request": "launch",
             "module": "data_converter.amass_to_x277",
@@ -12,18 +12,24 @@
             "justMyCode": false,
             "subProcess": false,
             "args": [
+                // 原始 AMASS 数据目录。
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
+                // X277 原始特征输出目录；这里保存的是每个动作完整序列，不直接用于训练读取。
                 "--output_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz",
+                // SMPL/SMPLH body model 目录。
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
+                // 生成镜像数据，使数据量翻倍，并保持 StableMotion 风格命名。
                 "--mirror",
+                // 随机导出少量可视化结果，便于快速检查转换是否异常。
                 "--visualize_num", "5",
                 "--visualize_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz/visualizations",
                 "--visualize_fps", "60",
+                // 已存在的转换结果跳过，适合断点续跑。
                 "--skip_existing"
             ]
         },
         {
-            "name": "生成数据：按 train/test split 生成 X277 缺失任务",
+            "name": "生成数据：materialized X277 缺失任务",
             "type": "debugpy",
             "request": "launch",
             "module": "data_loaders.generate_x277_missing_tasks",
@@ -32,13 +38,33 @@
             "justMyCode": false,
             "subProcess": false,
             "args": [
+                // X277 源数据目录；生成阶段会从这里裁剪 clip。
                 "--source_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz",
+                // 训练实际读取的缺失任务目录；每个 task npz 必须包含 x277。
                 "--output_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz_missing_tasks",
+                // 复用 StableMotion 风格 split.txt。
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
-                "--splits", "train", // 如需同时生成测试集，可在这里追加 "test"。
+                // 默认同时生成 train/test；如果只想快速重建训练集，可删除 "test"。
+                "--splits", "train", "test",
+                // 训练窗口长度，必须和训练配置中的 --seq_len 一致。
                 "--seq_len", "60",
+                // 每个源动作生成多少条随机缺失任务；增大可提升缺失组合多样性。
                 "--samples_per_file", "2",
+                // 每条任务内随机生成几个连续缺失区间。
+                "--num_intervals", "1",
+                // 每个缺失区间最短帧数。
+                "--min_missing_length", "10",
+                // 0 表示上限由 seq_len/valid_length 自动决定。
+                "--max_missing_length", "0",
+                // 每个缺失区间至少丢失几个传感器。
+                "--min_missing_sensors", "1",
+                // 每个缺失区间最多丢失几个传感器；6 个传感器中至少保留 2 个。
+                "--max_missing_sensors", "3",
+                // 至少保留几个可观测传感器，避免条件过少。
+                "--min_observed_sensors", "3",
+                // 固定随机种子，保证任务可复现。
                 "--seed", "10",
+                // 覆盖旧 task。当前 Dataset 不再兼容缺少 x277 的旧格式，所以重生成时需要打开。
                 "--overwrite"
             ]
         },
@@ -52,11 +78,11 @@
             "justMyCode": false,
             "subProcess": false,
             "args": [
-                // X277 源数据目录：统计 raw x: [T, 277]，不是统计 missing_tasks。
+                // 归一化统计仍基于完整 X277 源序列，而不是 missing_tasks。
                 "--source_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz",
-                // meta 输出目录：保存 mean.pt、std.pt 和 normalizer_meta.json。
+                // 保存 mean.pt、std.pt 和 normalizer_meta.json。
                 "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_x277_60hz",
-                // split 目录：默认使用 train.txt，避免 test 信息泄漏。
+                // 只使用 train split 统计，避免 test 信息泄漏。
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--split", "train",
                 "--overwrite"
@@ -72,23 +98,25 @@
             "justMyCode": false,
             "subProcess": false,
             "args": [
-                // 输出目录：保存训练参数、日志和 checkpoint。
+                // 输出目录：保存 args.json、日志和 checkpoint。
                 "--save_dir", "${workspaceFolder}/save/diffusionposer_x277",
-                // 缺失任务数据目录：训练样本已经包含 x、valid_frame_mask、sensor_missing_labels、inpaint_mask。
+                // 训练只读取 materialized task；不会再读取 AMASS_x277_60hz 源 npz。
                 "--data_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz_missing_tasks",
                 // 使用 train split 训练。
                 "--data_split", "train",
-                // meta 目录：normalize_input 读取 mean.pt/std.pt；weighted_loss 读取 feature_w.pt。
+                // normalize_input 读取 mean.pt/std.pt；weighted_loss 读取 feature_w.pt。
                 "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_x277_60hz",
-                // 标准化 X277 原始 277 维；6 维缺失标签会映射为 -1/+1，padding 仍为 0。
+                // 标准化前 277 维 X277；6 维缺失标签映射为 -1/+1，padding 仍为 0。
                 "--normalize_input", "true",
+                // 正式训练默认 false；小数据调试且内存充足时可改 true。
+                "--preload_data", "false",
                 // 使用 GPU 训练。
                 "--cuda", "true",
-                // batch size：StableMotion 风格常用 256；显存不足时可降低。
+                // StableMotion 风格常用 batch size；显存不足时改 128/64。
                 "--batch_size", "256",
-                // 训练窗口长度：必须匹配缺失任务 manifest 中的 seq_len。
+                // 训练窗口长度，必须匹配 materialized task 的 seq_len。
                 "--seq_len", "60",
-                // 模型输入通道数，固定为 X277 + 6 维缺失标签。
+                // 模型输入通道数：X277 277 维 + 6 维传感器缺失标签。
                 "--input_feats", "283",
                 // DiT Transformer block 数量。
                 "--layers", "8",
@@ -96,19 +124,19 @@
                 "--heads", "8",
                 // Transformer 隐层宽度。
                 "--latent_dim", "512",
-                // 扩散训练步数 T；与 StableMotion 默认保持一致。
+                // 扩散训练步数 T。
                 "--diffusion_steps", "50",
-                // 噪声日程：cosine 通常比 linear 更适合少步数扩散。
+                // 噪声日程；cosine 通常更适合少步数扩散。
                 "--noise_schedule", "cosine",
-                // 1 表示模型预测 x0；0 表示预测 epsilon。
+                // 1 表示预测 x0；0 表示预测 epsilon。
                 "--predict_xstart", "1",
                 // 使用 L1 masked reconstruction loss。
                 "--l1_loss",
-                // 保存 EMA 权重，采样/推理时通常更平滑。
+                // 保存 EMA 权重，后续采样/推理通常更平滑。
                 "--model_ema",
                 // 梯度范数裁剪到 1.0。
                 "--gradient_clip",
-                // 学习率；这里对齐 StableMotion-FSQ 风格训练配置。
+                // 学习率。
                 "--lr", "5e-5",
                 // 总训练 step。
                 "--num_steps", "2000000",
@@ -120,8 +148,8 @@
                 "--checkpoint_max_keep", "3",
                 // 写 TensorBoard 日志到 save_dir。
                 "--train_platform_type", "TensorboardPlatform",
-                // Windows 下先用 0；需要提升加载速度时再尝试 2/4。
-                "--num_workers", "2"
+                // Windows 下调试可用 0；正式训练可尝试 2/4，配合 materialized task 降低 I/O 开销。
+                "--num_workers", "0",
             ]
         },
         {
@@ -136,17 +164,18 @@
             "args": [
                 // 恢复训练仍写回同一个实验目录。
                 "--save_dir", "${workspaceFolder}/save/diffusionposer_x277",
-                // 数据目录必须和原训练保持一致。
+                // 必须使用重新生成后的 materialized task 数据目录。
                 "--data_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz_missing_tasks",
                 "--data_split", "train",
                 "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_x277_60hz",
                 "--normalize_input", "true",
-                // 指向要恢复的 model checkpoint；训练 loop 会自动找同 step 的 opt/ema。
+                "--preload_data", "false",
+                // 指向要恢复的 model checkpoint；训练 loop 会自动尝试加载同 step 的 opt/ema。
                 "--resume_checkpoint", "${workspaceFolder}/save/diffusionposer_x277/model000000000.pt",
                 // 允许写入已有 save_dir。
                 "--overwrite",
                 "--cuda", "true",
-                "--batch_size", "64",
+                "--batch_size", "256",
                 "--seq_len", "60",
                 "--input_feats", "283",
                 "--layers", "8",
@@ -164,7 +193,7 @@
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
-                "--num_workers", "0"
+                "--num_workers", "2"
             ]
         }
     ]

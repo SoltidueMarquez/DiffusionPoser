@@ -11,6 +11,7 @@ def get_dataset_loader(
     split: str = "train",
     normalizer_dir: str | None = None,
     normalize_input: bool = True,
+    preload_data: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
 ):
@@ -33,6 +34,7 @@ def get_dataset_loader(
         seq_len=seq_len,
         normalizer_dir=normalizer_dir,
         normalize_input=normalize_input,
+        preload_data=preload_data,
     )
     loader_kwargs = {
         "batch_size": batch_size,

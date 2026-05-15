@@ -97,6 +97,13 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             manifest_path = output_dir / "train" / "manifest.jsonl"
             manifest_lines = manifest_path.read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(manifest_lines), 2)
+            first_entry = json.loads(manifest_lines[0])
+            first_task_path = output_dir / "train" / first_entry["task_path"]
+            with np.load(first_task_path, allow_pickle=False) as task_data:
+                self.assertIn("x277", task_data.files)
+                self.assertEqual(tuple(task_data["x277"].shape), (100, X277_FEATURE_DIM))
+                np.testing.assert_array_equal(task_data["x277"][:35], x277)
+                self.assertTrue((task_data["x277"][35:] == 0).all())
 
             dataset = X277MissingTaskDataset(data_dir=output_dir, split="train", seq_len=100, normalize_input=False)
             self.assertEqual(len(dataset), 2)
@@ -162,6 +169,34 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             )
             self.assertTrue(torch.all(normalized_item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM, 35:] == 0))
             np.testing.assert_array_equal(normalized_item["inpaint_mask"].numpy(), item["inpaint_mask"].numpy())
+
+            # 新训练路径只支持 materialized task；缺少 x277 时应尽早报错，而不是回退读取源数据。
+            legacy_task_path = output_dir / "train" / "tasks" / "legacy_without_x277.npz"
+            with np.load(first_task_path, allow_pickle=False) as task_data:
+                legacy_task = {key: task_data[key].copy() for key in task_data.files if key != "x277"}
+            np.savez(legacy_task_path, **legacy_task)
+            legacy_manifest = output_dir / "legacy" / "manifest.jsonl"
+            legacy_manifest.parent.mkdir()
+            legacy_manifest.write_text(
+                json.dumps(
+                    {
+                        "task_id": "legacy_without_x277",
+                        "task_path": "../train/tasks/legacy_without_x277.npz",
+                        "seq_len": 100,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            legacy_dataset = X277MissingTaskDataset(
+                data_dir=output_dir,
+                split="legacy",
+                seq_len=100,
+                normalize_input=False,
+            )
+            with self.assertRaises(KeyError):
+                _ = legacy_dataset[0]
 
 
 class X277NormalizerComputationTest(unittest.TestCase):
