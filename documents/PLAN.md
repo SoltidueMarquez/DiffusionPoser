@@ -25,7 +25,7 @@ X277 维度定义如下：
 [234:270)  tracker_rot_root_fwd_up_now      6 x 6
 [270:272)  waist_delta_xz                   2
 [272:273)  waist_yaw_delta_degree           1
-[273:277)  contact_prev                     4
+[273:277)  contact_cur                      4
 ```
 
 6 个传感器顺序固定为：
@@ -56,7 +56,7 @@ position: [219:222)
 rotation: [240:246)
 ```
 
-注意：`body_rot_root_fwd_up_prev`、`body_vel_root_prev`、`waist_delta_xz`、`waist_yaw_delta_degree`、`contact_prev` 暂时不因为传感器丢失而遮盖。它们可以作为动作上下文继续保留。后续如果实验发现需要让模型同时重建身体状态，再单独扩展 body 维度的 mask 策略。
+注意：`body_rot_root_fwd_up_prev`、`body_vel_root_prev`、`waist_delta_xz`、`waist_yaw_delta_degree`、`contact_cur` 暂时不因为传感器丢失而遮盖。它们可以作为动作上下文继续保留。后续如果实验发现需要让模型同时重建身体状态，再单独扩展 body 维度的 mask 策略。
 
 ## 训练数据生成
 

@@ -7,7 +7,7 @@ import torch
 from data_loaders.get_data import get_dataset_loader
 from diffusion import logger
 from train.train_platforms import NoPlatform, TensorboardPlatform
-from train.training_loop import TrainLoop
+from train.training_loop import TrainLoop, find_resume_checkpoint
 from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
@@ -23,6 +23,11 @@ TRAIN_PLATFORMS = {
 def main():
     args = train_args()
     fixseed(args.seed)
+    if args.resume_checkpoint:
+        args.resume_checkpoint = find_resume_checkpoint(
+            save_dir=args.save_dir,
+            requested_checkpoint=args.resume_checkpoint,
+        )
     prepare_save_dir(args)
     dist_util.setup_dist(args.device if args.cuda else -1)
     logger.configure(dir=args.save_dir)
@@ -52,7 +57,7 @@ def main():
         model.to(dist_util.dev())
         print(f"Total params: {model.num_parameters() / 1_000_000.0:.2f}M")
 
-        print("training DiffusionPoser fix-only model...")
+        print(f"training DiffusionPoser model, task_mode={args.task_mode}...")
         TrainLoop(args, train_platform, model, diffusion, data).run_loop()
     finally:
         train_platform.close()
@@ -60,8 +65,12 @@ def main():
 
 def prepare_save_dir(args):
     save_dir = Path(args.save_dir)
-    if save_dir.exists() and not args.overwrite:
-        raise FileExistsError(f"save_dir [{save_dir}] already exists. Use --overwrite to reuse it.")
+    if save_dir.exists() and not args.overwrite and not args.resume_checkpoint:
+        raise FileExistsError(
+            f"save_dir [{save_dir}] already exists. "
+            "For a fresh run, choose a new --save_dir or pass --overwrite to reuse it. "
+            "To continue training, pass --resume_checkpoint latest."
+        )
     save_dir.mkdir(parents=True, exist_ok=True)
 
 

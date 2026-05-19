@@ -134,6 +134,8 @@ class X277MissingTaskDataset(Dataset):
             "length": valid_length,
             "keyid": entry.get("task_id", ""),
             "source_path": entry.get("source_path", ""),
+            "task_mode": entry.get("task_mode", ""),
+            "schema_name": entry.get("schema_name", ""),
         }
 
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:

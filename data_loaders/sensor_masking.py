@@ -10,10 +10,32 @@ X277_FEATURE_DIM = 277
 SENSOR_LABEL_DIM = 6
 MODEL_INPUT_DIM = X277_FEATURE_DIM + SENSOR_LABEL_DIM
 
+CURRENT277_SCHEMA_NAME = "current277_v1"
+TASK_MODE_FULL_RECONSTRUCTION_CURRENT = "full_reconstruction_current"
+TASK_MODES = (TASK_MODE_FULL_RECONSTRUCTION_CURRENT,)
+
+BODY_ROT_START = 0
+BODY_ROT_DIM = 144
+BODY_VEL_START = 144
+BODY_VEL_DIM = 72
 TRACKER_POS_START = 216
 TRACKER_POS_DIM = 3
 TRACKER_ROT_START = 234
 TRACKER_ROT_DIM = 6
+ROOT_DELTA_START = 270
+ROOT_DELTA_DIM = 2
+ROOT_YAW_START = 272
+ROOT_YAW_DIM = 1
+CONTACT_START = 273
+CONTACT_DIM = 4
+
+FULL_RECONSTRUCTION_TARGET_SLICES = (
+    slice(BODY_ROT_START, BODY_ROT_START + BODY_ROT_DIM),
+    slice(BODY_VEL_START, BODY_VEL_START + BODY_VEL_DIM),
+    slice(ROOT_DELTA_START, ROOT_DELTA_START + ROOT_DELTA_DIM),
+    slice(ROOT_YAW_START, ROOT_YAW_START + ROOT_YAW_DIM),
+    slice(CONTACT_START, CONTACT_START + CONTACT_DIM),
+)
 
 SENSOR_NAMES = (
     "head",
@@ -60,25 +82,6 @@ def sensor_feature_slices(sensor_index: int) -> tuple[slice, slice]:
     )
 
 
-def tracker_feature_mask(sensor_indices: Iterable[int], feature_dim: int = MODEL_INPUT_DIM) -> np.ndarray:
-    """
-    将传感器编号转换成一维特征 mask。
-
-    返回值形状为 `[feature_dim]`，其中 True 只出现在 X277 的 tracker position/rotation 维度。
-    追加的 6 维缺失标签永远不作为重建目标，因此即使 `feature_dim=283` 也保持 False。
-    """
-
-    if feature_dim < MODEL_INPUT_DIM:
-        raise ValueError(f"feature_dim 至少应为 {MODEL_INPUT_DIM}，实际为 {feature_dim}")
-
-    mask = np.zeros(feature_dim, dtype=bool)
-    for sensor_index in sensor_indices:
-        pos_slice, rot_slice = sensor_feature_slices(int(sensor_index))
-        mask[pos_slice] = True
-        mask[rot_slice] = True
-    return mask
-
-
 # endregion
 
 
@@ -104,25 +107,39 @@ def sample_missing_sensors(
     return tuple(sorted(int(index) for index in sensor_indices))
 
 
-def sample_frame_interval(
+def sample_frame_interval_in_range(
     rng: np.random.Generator,
-    valid_length: int,
+    start_frame: int,
+    end_frame: int,
     min_missing_length: int = 10,
     max_missing_length: int | None = None,
 ) -> tuple[int, int]:
-    """在有效帧范围内采样连续缺失区间，返回 `[start, length]`。"""
+    """Sample a contiguous interval inside ``[start_frame, end_frame)``."""
 
-    if valid_length <= 0:
-        raise ValueError("valid_length 必须大于 0，才能生成缺失区间。")
-
-    upper = valid_length if max_missing_length is None else min(max_missing_length, valid_length)
+    if start_frame < 0 or end_frame <= start_frame:
+        raise ValueError(f"invalid frame range: start={start_frame}, end={end_frame}")
+    span = end_frame - start_frame
+    upper = span if max_missing_length is None else min(max_missing_length, span)
     lower = min(max(1, min_missing_length), upper)
     length = int(rng.integers(lower, upper + 1))
-    start = int(rng.integers(0, valid_length - length + 1))
+    start = int(rng.integers(start_frame, end_frame - length + 1))
     return start, length
 
 
-def create_sensor_missing_task(
+def mark_current_reconstruction_targets(inpaint_mask: np.ndarray, start: int, length: int) -> None:
+    """Mark body/root/contact channels as reconstruction targets for a current277 window."""
+
+    if inpaint_mask.ndim != 2 or inpaint_mask.shape[1] < MODEL_INPUT_DIM:
+        raise ValueError("inpaint_mask must be [T, 283] or wider.")
+    end = start + length
+    if start < 0 or length <= 0 or end > inpaint_mask.shape[0]:
+        raise ValueError(f"target range out of bounds: start={start}, length={length}, T={inpaint_mask.shape[0]}")
+    for target_slice in FULL_RECONSTRUCTION_TARGET_SLICES:
+        inpaint_mask[start:end, target_slice] = True
+    inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
+
+
+def create_full_reconstruction_task(
     seq_len: int,
     valid_length: int,
     rng: np.random.Generator,
@@ -132,35 +149,73 @@ def create_sensor_missing_task(
     min_missing_sensors: int = 1,
     max_missing_sensors: int = 4,
     min_observed_sensors: int = 2,
-) -> tuple[np.ndarray, np.ndarray, list[MissingInterval]]:
+    min_history_frames: int = 10,
+    min_target_frames: int = 1,
+    max_target_frames: int | None = None,
+    all_sensor_dropout_prob: float = 0.10,
+    target_start: int | None = None,
+    target_length: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[MissingInterval], int, int]:
     """
-    生成单条固定长度训练样本的缺失标签和 inpainting mask。
+    Create a current277 full reconstruction task.
 
-    `sensor_missing_labels` 形状为 `[T, 6]`，只表达某个传感器在某帧是否缺失。
-    `inpaint_mask` 形状为 `[T, 283]`，True 表示该位置参与扩散加噪和 masked loss。
-    padding 帧不生成缺失，标签通道 `[277:283]` 也始终不参与 loss。
+    The target suffix predicts body rotation, body velocity, root delta, yaw delta,
+    contact labels, and tracker pos/rot only when that tracker is offline. The
+    prefix before ``target_start`` remains condition context.
     """
 
     if seq_len <= 0:
-        raise ValueError("seq_len 必须大于 0。")
+        raise ValueError("seq_len must be positive.")
     if valid_length <= 0 or valid_length > seq_len:
-        raise ValueError(f"valid_length 必须位于 [1, seq_len]，实际为 {valid_length} / {seq_len}")
+        raise ValueError(f"valid_length must be in [1, seq_len], got {valid_length} / {seq_len}")
     if num_intervals <= 0:
-        raise ValueError("num_intervals 必须大于 0。")
+        raise ValueError("num_intervals must be positive.")
+    if not 0.0 <= all_sensor_dropout_prob <= 1.0:
+        raise ValueError("all_sensor_dropout_prob must be in [0, 1].")
+
+    if target_start is None:
+        target_start_upper = max(valid_length - max(1, min_target_frames), 0)
+        target_start_lower = min(max(0, min_history_frames), target_start_upper)
+        target_start = int(rng.integers(target_start_lower, target_start_upper + 1))
+    else:
+        target_start = int(target_start)
+    if target_start < 0 or target_start >= valid_length:
+        raise ValueError(f"target_start out of valid range: {target_start}, valid_length={valid_length}")
+
+    max_available_target = valid_length - target_start
+    if target_length is None:
+        target_upper = max_available_target if max_target_frames is None else min(max_target_frames, max_available_target)
+        target_lower = min(max(1, min_target_frames), target_upper)
+        target_length = int(rng.integers(target_lower, target_upper + 1))
+    else:
+        target_length = int(target_length)
+    if target_length <= 0 or target_start + target_length > valid_length:
+        raise ValueError(
+            f"target range out of valid frames: start={target_start}, length={target_length}, valid={valid_length}"
+        )
 
     sensor_missing_labels = np.zeros((seq_len, SENSOR_LABEL_DIM), dtype=bool)
     inpaint_mask = np.zeros((seq_len, MODEL_INPUT_DIM), dtype=bool)
     intervals: list[MissingInterval] = []
-    max_missing_per_frame = SENSOR_LABEL_DIM - min_observed_sensors
 
+    mark_current_reconstruction_targets(
+        inpaint_mask=inpaint_mask,
+        start=target_start,
+        length=target_length,
+    )
+
+    target_end = target_start + target_length
     for _ in range(num_intervals):
-        for _attempt in range(100):
-            start, length = sample_frame_interval(
-                rng=rng,
-                valid_length=valid_length,
-                min_missing_length=min_missing_length,
-                max_missing_length=max_missing_length,
-            )
+        start, length = sample_frame_interval_in_range(
+            rng=rng,
+            start_frame=target_start,
+            end_frame=target_end,
+            min_missing_length=min_missing_length,
+            max_missing_length=max_missing_length,
+        )
+        if rng.random() < all_sensor_dropout_prob:
+            sensor_indices = tuple(range(SENSOR_LABEL_DIM))
+        else:
             sensor_indices = sample_missing_sensors(
                 rng=rng,
                 min_missing_sensors=min_missing_sensors,
@@ -168,28 +223,19 @@ def create_sensor_missing_task(
                 min_observed_sensors=min_observed_sensors,
             )
 
-            candidate_labels = sensor_missing_labels.copy()
-            candidate_inpaint_mask = inpaint_mask.copy()
-            apply_sensor_missing_interval(
-                sensor_missing_labels=candidate_labels,
-                inpaint_mask=candidate_inpaint_mask,
-                start=start,
-                length=length,
-                sensor_indices=sensor_indices,
-            )
-            if candidate_labels.sum(axis=1).max() <= max_missing_per_frame:
-                sensor_missing_labels = candidate_labels
-                inpaint_mask = candidate_inpaint_mask
-                intervals.append(MissingInterval(start=start, length=length, sensor_indices=sensor_indices))
-                break
-        else:
-            raise RuntimeError("无法在 100 次尝试内采样到满足可见传感器约束的缺失区间。")
+        apply_sensor_missing_interval(
+            sensor_missing_labels=sensor_missing_labels,
+            inpaint_mask=inpaint_mask,
+            start=start,
+            length=length,
+            sensor_indices=sensor_indices,
+        )
+        intervals.append(MissingInterval(start=start, length=length, sensor_indices=tuple(sensor_indices)))
 
-    # 这两行是训练语义的保险丝：标签只是条件，不应被扩散模型预测；padding 也不应有监督。
     inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
     inpaint_mask[valid_length:, :] = False
     sensor_missing_labels[valid_length:, :] = False
-    return sensor_missing_labels, inpaint_mask, intervals
+    return sensor_missing_labels, inpaint_mask, intervals, target_start, target_length
 
 
 def apply_sensor_missing_interval(
@@ -219,61 +265,6 @@ def apply_sensor_missing_interval(
 
     inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
 
-
-def build_inpaint_mask_from_sensor_missing_labels(
-    sensor_missing_labels: np.ndarray,
-    valid_frame_mask: np.ndarray,
-    feature_dim: int = MODEL_INPUT_DIM,
-) -> np.ndarray:
-    """
-    根据 `[T, 6]` 的传感器损坏标签重建 `[T, 283]` inpainting mask。
-
-    当输入是 `[B, T, 6]` 时，会返回 `[B, T, feature_dim]`。
-    `True` 表示对应位置需要被扩散补全；标签通道始终保持 `False`。
-    """
-
-    if feature_dim < MODEL_INPUT_DIM:
-        raise ValueError(f"feature_dim 至少应为 {MODEL_INPUT_DIM}，实际为 {feature_dim}")
-
-    labels = np.asarray(sensor_missing_labels, dtype=bool)
-    valid_mask = np.asarray(valid_frame_mask, dtype=bool)
-
-    if labels.ndim == 2:
-        if labels.shape[1] != SENSOR_LABEL_DIM:
-            raise ValueError(f"sensor_missing_labels 应为 [T, {SENSOR_LABEL_DIM}]，实际为 {labels.shape}")
-        if valid_mask.ndim != 1 or valid_mask.shape[0] != labels.shape[0]:
-            raise ValueError(f"valid_frame_mask 应为 [T]，实际为 {valid_mask.shape}")
-
-        mask = np.zeros((labels.shape[0], feature_dim), dtype=bool)
-        for sensor_index in range(SENSOR_LABEL_DIM):
-            sensor_mask = labels[:, sensor_index]
-            if not sensor_mask.any():
-                continue
-            pos_slice, rot_slice = sensor_feature_slices(sensor_index)
-            mask[sensor_mask, pos_slice] = True
-            mask[sensor_mask, rot_slice] = True
-        mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
-        mask[~valid_mask, :] = False
-        return mask
-
-    if labels.ndim == 3:
-        if labels.shape[2] != SENSOR_LABEL_DIM:
-            raise ValueError(f"sensor_missing_labels 应为 [B, T, {SENSOR_LABEL_DIM}]，实际为 {labels.shape}")
-        if valid_mask.ndim != 2 or valid_mask.shape[:2] != labels.shape[:2]:
-            raise ValueError(f"valid_frame_mask 应为 [B, T]，实际为 {valid_mask.shape}")
-        return np.stack(
-            [
-                build_inpaint_mask_from_sensor_missing_labels(
-                    sensor_missing_labels=labels[index],
-                    valid_frame_mask=valid_mask[index],
-                    feature_dim=feature_dim,
-                )
-                for index in range(labels.shape[0])
-            ],
-            axis=0,
-        )
-
-    raise ValueError(f"sensor_missing_labels 只能是 [T, 6] 或 [B, T, 6]，实际为 {labels.shape}")
 
 
 # endregion

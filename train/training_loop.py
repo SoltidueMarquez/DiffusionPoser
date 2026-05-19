@@ -8,13 +8,13 @@ from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
 from diffusion import logger
-from data_loaders.sensor_masking import MODEL_INPUT_DIM, X277_FEATURE_DIM
+from data_loaders.sensor_masking import MODEL_INPUT_DIM, TASK_MODE_FULL_RECONSTRUCTION_CURRENT, X277_FEATURE_DIM
 from utils import dist_util
 
 
 class TrainLoop:
     """
-    DiffusionPoser 的 fix-only 扩散训练循环。
+    DiffusionPoser 的 current277 扩散训练循环。
 
     本文件沿用 StableMotion 的训练骨架：run_loop -> run_step ->
     forward_backward -> mask_manager -> save/log_step。与 StableMotion 不同的是，
@@ -40,6 +40,7 @@ class TrainLoop:
         self.gradient_clip = args.gradient_clip
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
+        self.task_mode = getattr(args, "task_mode", TASK_MODE_FULL_RECONSTRUCTION_CURRENT)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
 
         self.save_dir = Path(args.save_dir)
@@ -49,7 +50,9 @@ class TrainLoop:
         self.num_steps = args.num_steps
         self.num_epochs = self.num_steps // max(1, len(self.data)) + 1
         self.device = dist_util.dev()
+        self._eval_skip_logged = False
         logger.log(f"training device: {self.device}")
+        logger.log(f"task mode: {self.task_mode}")
         if self.device.type == "cuda":
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
 
@@ -88,19 +91,28 @@ class TrainLoop:
         return feature_w
 
     def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        resume_checkpoint = find_resume_checkpoint(
+            save_dir=self.save_dir,
+            requested_checkpoint=self.resume_checkpoint,
+        )
         if not resume_checkpoint:
             return
 
+        self.resume_checkpoint = resume_checkpoint
         self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
         logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-        self.model.load_state_dict(
-            dist_util.load_state_dict(resume_checkpoint, map_location=self.device),
-            strict=False,
-        )
+        state_dict = dist_util.load_state_dict(resume_checkpoint, map_location=self.device)
+        incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
+        missing_keys = list(incompatible_keys.missing_keys)
+        unexpected_keys = list(incompatible_keys.unexpected_keys)
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "恢复训练 checkpoint 与当前模型结构不匹配，已停止以避免继续训练错误实验。"
+                f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+            )
 
     def _load_optimizer_state(self):
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        main_checkpoint = self.resume_checkpoint
         opt_checkpoint = Path(main_checkpoint).with_name(f"opt{self.resume_step:09d}.pt")
         if not opt_checkpoint.exists():
             logger.log(f"optimizer checkpoint not found, skip: {opt_checkpoint}")
@@ -125,7 +137,7 @@ class TrainLoop:
         )
 
     def _load_ema_state(self):
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        main_checkpoint = self.resume_checkpoint
         ema_checkpoint = Path(main_checkpoint).with_name(f"ema{self.resume_step:09d}.pt")
         if not ema_checkpoint.exists():
             logger.log(f"ema checkpoint not found, skip: {ema_checkpoint}")
@@ -140,6 +152,12 @@ class TrainLoop:
     # region 训练循环
     def run_loop(self):
         self.model.train()
+        if self._should_stop():
+            logger.log(
+                f"resume step {self.resume_step} has already reached num_steps={self.num_steps}; skip training."
+            )
+            return
+
         last_step_end = time.perf_counter()
         for _epoch in range(self.num_epochs):
             for batch in self.data:
@@ -147,35 +165,38 @@ class TrainLoop:
                 batch = move_batch_to_device(batch, self.device)
                 train_start_time = time.perf_counter()
                 self.run_step(batch)
+                self.step += 1
                 train_end_time = time.perf_counter()
+                global_step = self.step + self.resume_step
                 print(
-                    f"step[{self.step + self.resume_step}] "
+                    f"step[{global_step}] "
                     f"data={batch_ready_time - last_step_end:.3f}s "
                     f"train={train_end_time - train_start_time:.3f}s",
                     flush=True,
                 )
                 last_step_end = train_end_time
 
-                if self.step % self.log_interval == 0:
+                self.log_step()
+                if self.log_interval > 0 and global_step % self.log_interval == 0:
                     self.report_metrics()
 
-                if self.step % self.save_interval == 0:
+                if self.save_interval > 0 and global_step % self.save_interval == 0:
                     self.save()
                     self.model.eval()
                     self.evaluate()
                     self.model.train()
 
-                    if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                    if os.environ.get("DIFFUSION_TRAINING_TEST", ""):
                         return
 
-                self.step += 1
                 if self._should_stop():
                     break
 
             if self._should_stop():
                 break
 
-        if (self.step - 1) % self.save_interval != 0:
+        global_step = self.step + self.resume_step
+        if self.step > 0 and (self.save_interval <= 0 or global_step % self.save_interval != 0):
             self.save()
             self.evaluate()
 
@@ -188,7 +209,9 @@ class TrainLoop:
     def evaluate(self):
         if not self.args.eval_during_training:
             return
-        raise NotImplementedError("训练期评估尚未实现；请先关闭 --eval_during_training。")
+        if not self._eval_skip_logged:
+            logger.log("训练期评估入口尚未接入采样评估流程，本次训练将跳过 --eval_during_training。")
+            self._eval_skip_logged = True
 
     def run_step(self, batch):
         self.forward_backward(batch)
@@ -202,8 +225,6 @@ class TrainLoop:
 
         if self.ema_model is not None:
             self.ema_model.update()
-
-        self.log_step()
 
     def forward_backward(self, batch):
         self.opt.zero_grad(set_to_none=True)
@@ -248,7 +269,7 @@ class TrainLoop:
 
     def mask_manager(self, batch, sample):
         """
-        构建 fix-only 的扩散条件。
+        根据 task_mode 生成扩散条件与 loss mask。
 
         `inpaint_mask=True` 表示该位置需要加噪、预测并参与 loss；False 表示该位置是观测条件。
         其中 `[277:283)` 的 6 维传感器缺失标签必须一直是条件，不允许被模型预测。
@@ -288,8 +309,9 @@ class TrainLoop:
 
     # region 日志与 checkpoint
     def log_step(self):
-        logger.logkv("step", self.step + self.resume_step)
-        logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
+        global_step = self.step + self.resume_step
+        logger.logkv("step", global_step)
+        logger.logkv("samples", global_step * self.global_batch)
 
     def report_metrics(self):
         current = logger.get_current().name2val
@@ -372,8 +394,63 @@ def parse_resume_step_from_filename(filename):
     return int(match.group(1))
 
 
-def find_resume_checkpoint():
-    return None
+def find_resume_checkpoint(save_dir: str | Path, requested_checkpoint: str | Path | None = "") -> str:
+    """
+    解析恢复训练用的主模型 checkpoint。
+
+    - `requested_checkpoint` 为空：表示用户明确要从头训练，不自动恢复。
+    - `requested_checkpoint` 为 `latest`/`auto`：从 `save_dir` 扫描最新的 `model*.pt`。
+    - `requested_checkpoint` 是具体路径但文件不存在：回退到 `save_dir` 中最新的 checkpoint，
+      这样 VSCode 配置里写死的旧 checkpoint 被清理后仍然能继续训练。
+    """
+
+    requested_text = "" if requested_checkpoint is None else str(requested_checkpoint).strip()
+    if not requested_text:
+        return ""
+
+    latest_checkpoint = find_latest_model_checkpoint(save_dir)
+    if requested_text.lower() in {"latest", "auto"}:
+        if latest_checkpoint is None:
+            raise FileNotFoundError(f"save_dir 中没有可恢复的 model*.pt checkpoint：{Path(save_dir)}")
+        logger.log(f"auto resume from latest checkpoint: {latest_checkpoint}")
+        return str(latest_checkpoint)
+
+    requested_path = Path(requested_text).expanduser()
+    if requested_path.exists():
+        return str(requested_path)
+
+    if latest_checkpoint is not None:
+        logger.log(
+            f"requested resume checkpoint not found: {requested_path}; "
+            f"fallback to latest checkpoint: {latest_checkpoint}"
+        )
+        return str(latest_checkpoint)
+
+    raise FileNotFoundError(
+        f"--resume_checkpoint 指向的文件不存在：{requested_path}；"
+        f"并且 save_dir 中也没有可恢复的 model*.pt checkpoint：{Path(save_dir)}"
+    )
+
+
+def find_latest_model_checkpoint(save_dir: str | Path) -> Path | None:
+    """在实验目录中查找 step 最大的 `model*.pt`。"""
+
+    save_dir = Path(save_dir)
+    if not save_dir.exists():
+        return None
+
+    candidates: list[tuple[int, Path]] = []
+    for path in save_dir.iterdir():
+        if not path.is_file():
+            continue
+        match = re.fullmatch(r"model(\d+)\.pt", path.name)
+        if match is None:
+            continue
+        candidates.append((int(match.group(1)), path))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def log_loss_dict(diffusion, timesteps, losses):

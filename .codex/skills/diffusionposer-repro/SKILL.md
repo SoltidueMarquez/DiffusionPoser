@@ -9,6 +9,11 @@ description: Coding rules and project style guide for the DiffusionPoser Python 
 
 This skill records coding conventions for the DiffusionPoser reproduction project. It is not a task plan. Use it as the local style and engineering contract when writing Python code for the project.
 
+## Environment
+
+- For this project, default to the Anaconda environment `diffusionposer5070` before running Python, pip, tests, training, sampling, export, or evaluation commands.
+- On Windows PowerShell, prefer `conda activate diffusionposer5070` for an interactive shell. For one-off commands where activation state is uncertain, prefer `conda run -n diffusionposer5070 <command>`.
+
 ## Communication
 
 - 使用中文回答与解释，除非用户明确要求使用其他语言。

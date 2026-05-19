@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 
 FEATURE_DIM = 277
+SCHEMA_NAME = "current277_v1"
 SMPL_JOINT_COUNT = 24
 SOURCE_BODY_JOINT_COUNT = 22
 SMPLH_JOINT_COUNT = 52
@@ -132,12 +133,12 @@ DEFAULT_SMPL_PARENTS = np.array(
 )
 
 FEATURE_SLICES = {
-    "body_rot_root_fwd_up_prev": [0, 144],
-    "body_vel_root_prev": [144, 216],
+    "body_rot_root_now": [0, 144],
+    "body_vel_root_now": [144, 216],
     "tracker_pos_root_now": [216, 234],
-    "tracker_rot_root_fwd_up_now": [234, 270],
-    "waist_delta_xz": [270, 272],
-    "waist_yaw_delta_degree": [272, 273],
+    "tracker_rot_root_now": [234, 270],
+    "root_delta_xz": [270, 272],
+    "root_yaw_delta_degree": [272, 273],
     "contact_cur": [273, 277],
 }
 
@@ -194,13 +195,13 @@ class RootFrames:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to DiffusionPoser X277 files.")
+    parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to DiffusionPoser current277 files.")
 
     group = parser.add_argument_group("paths")
     group.add_argument("--amass_dir", default="dataset/AMASS", type=Path, help="AMASS npz root directory.")
     group.add_argument(
         "--output_dir",
-        default="dataset/processed/amass_x277_60hz",
+        default="dataset/AMASS_current277_60hz",
         type=Path,
         help="Directory that mirrors AMASS relative paths and stores converted npz files.",
     )
@@ -873,10 +874,10 @@ def build_x277_features(
     speed_threshold: float,
 ) -> np.ndarray:
     """
-    组装 X277 特征，返回 `[T-2,277]`。
+    组装 current277_v1 特征，返回 `[T-1,277]`。
 
-    第 0 行对应原目标序列的 t=2：body_rot/body_vel 使用 t-1，tracker/contact 使用 t。
-    这样速度 `(t-1)-(t-2)` 有定义，也避免第一帧缺少历史状态。
+    第 0 行对应原目标序列的 t=1。除速度/root delta 依赖上一帧外，
+    body、tracker、root delta、contact 都严格使用当前帧 t。
     """
 
     joint_positions = smpl_motion.joint_positions
@@ -897,20 +898,18 @@ def build_x277_features(
     )
 
     rows: list[np.ndarray] = []
-    for current_index in range(2, joint_positions.shape[0]):
+    for current_index in range(1, joint_positions.shape[0]):
         prev_index = current_index - 1
-        prev_prev_index = current_index - 2
         row = np.empty(FEATURE_DIM, dtype=np.float64)
 
-        prev_root_rot_inv = root_frames.rotations[prev_index].T
         current_root_rot_inv = root_frames.rotations[current_index].T
 
-        body_rot_root_prev = prev_root_rot_inv[None] @ joint_rotations[prev_index]
-        row[0:144] = rotation_6d_forward_up(body_rot_root_prev[None]).reshape(-1)
+        body_rot_root_now = current_root_rot_inv[None] @ joint_rotations[current_index]
+        row[0:144] = rotation_6d_forward_up(body_rot_root_now[None]).reshape(-1)
 
-        joint_vel_world_prev = (joint_positions[prev_index] - joint_positions[prev_prev_index]) * target_fps
-        joint_vel_root_prev = joint_vel_world_prev @ root_frames.rotations[prev_index]
-        row[144:216] = joint_vel_root_prev.reshape(-1)
+        joint_vel_world_now = (joint_positions[current_index] - joint_positions[prev_index]) * target_fps
+        joint_vel_root_now = joint_vel_world_now @ root_frames.rotations[current_index]
+        row[144:216] = joint_vel_root_now.reshape(-1)
 
         tracker_pos_root_now = (tracker_positions[current_index] - root_frames.positions[current_index]) @ root_frames.rotations[
             current_index
@@ -973,6 +972,7 @@ def save_converted_motion(
         "source_fps": source.source_fps,
         "target_fps": target_fps,
         "feature_dim": FEATURE_DIM,
+        "schema_name": SCHEMA_NAME,
         "feature_slices": FEATURE_SLICES,
         "tracker_order": TRACKER_NAMES,
         "contact_order": CONTACT_NAMES,
@@ -1050,18 +1050,17 @@ def decode_x277_joint_positions(
     decoded_frames: list[np.ndarray] = []
 
     for row in x:
-        root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
-        joint_vel_root_prev = row[144:216].reshape(SMPL_JOINT_COUNT, 3).astype(np.float64)
-        joint_vel_world_prev = joint_vel_root_prev @ root_rotation.T
-        joint_positions = joint_positions + joint_vel_world_prev / target_fps
-        decoded_frames.append(joint_positions.copy())
-
-        # Root delta 记录的是 waist/pelvis 从上一帧到当前帧在上一帧 root 下的 XZ 位移。
-        # 对下一行速度解码来说，root_yaw/root_position 必须先沿这一行推进一帧。
+        prev_root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
         delta_xz = row[270:272].astype(np.float64)
-        delta_world = np.asarray([delta_xz[0], 0.0, delta_xz[1]], dtype=np.float64) @ root_rotation.T
+        delta_world = np.asarray([delta_xz[0], 0.0, delta_xz[1]], dtype=np.float64) @ prev_root_rotation.T
         root_position = root_position + delta_world
         root_yaw = root_yaw + math.radians(float(row[272]))
+        current_root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
+
+        joint_vel_root_now = row[144:216].reshape(SMPL_JOINT_COUNT, 3).astype(np.float64)
+        joint_vel_world_now = joint_vel_root_now @ current_root_rotation.T
+        joint_positions = joint_positions + joint_vel_world_now / target_fps
+        decoded_frames.append(joint_positions.copy())
 
     return np.stack(decoded_frames, axis=0)
 
@@ -1075,8 +1074,8 @@ def build_visualization_tracks(
     decoded_unity = decode_x277_joint_positions(
         x=x,
         seed_joint_positions=smpl_motion.joint_positions[0],
-        seed_root_position=root_frames.positions[1],
-        seed_root_yaw=float(root_frames.yaws[1]),
+        seed_root_position=root_frames.positions[0],
+        seed_root_yaw=float(root_frames.yaws[0]),
         target_fps=target_fps,
     )
 

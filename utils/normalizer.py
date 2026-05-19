@@ -34,8 +34,8 @@ class X277Normalizer:
             raise FileNotFoundError(
                 "找不到 X277 normalizer 文件，请先运行："
                 "python -m data_loaders.compute_x277_normalizer "
-                "--source_dir dataset/AMASS_x277_60hz "
-                "--output_dir dataset/meta_AMASS_x277_60hz "
+                "--source_dir dataset/AMASS_current277_60hz "
+                "--output_dir dataset/meta_AMASS_current277_60hz "
                 "--split_dir data_loaders/splits --split train --overwrite"
             )
 

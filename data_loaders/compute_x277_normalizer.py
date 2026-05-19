@@ -18,13 +18,13 @@ from utils.normalizer import X277Normalizer
 
 # region 参数解析
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute X277 mean/std normalizer from converted AMASS data.")
+    parser = argparse.ArgumentParser(description="Compute current277 mean/std normalizer from converted AMASS data.")
 
     group = parser.add_argument_group("paths")
-    group.add_argument("--source_dir", default="dataset/AMASS_x277_60hz", type=str, help="X277 源数据目录。")
+    group.add_argument("--source_dir", default="dataset/AMASS_current277_60hz", type=str, help="current277 源数据目录。")
     group.add_argument(
         "--output_dir",
-        default="dataset/meta_AMASS_x277_60hz",
+        default="dataset/meta_AMASS_current277_60hz",
         type=str,
         help="保存 mean.pt、std.pt 和 normalizer_meta.json 的目录。",
     )

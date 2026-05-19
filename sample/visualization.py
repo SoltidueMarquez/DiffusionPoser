@@ -9,7 +9,15 @@ from typing import Any
 import numpy as np
 from tqdm.auto import tqdm
 
-from data_loaders.sensor_masking import SENSOR_NAMES, TRACKER_POS_DIM, TRACKER_POS_START
+from data_loaders.sensor_masking import (
+    BODY_VEL_DIM,
+    BODY_VEL_START,
+    MODEL_INPUT_DIM,
+    SENSOR_NAMES,
+    TRACKER_POS_DIM,
+    TRACKER_POS_START,
+    X277_FEATURE_DIM,
+)
 
 try:
     import matplotlib
@@ -77,9 +85,9 @@ TRACKER_JOINT_INDICES = np.array(
     ],
     dtype=np.int64,
 )
-VISUALIZATION_LIMITATION_NOTE = (
-    "Approximate X277 skeleton: body pose is scaffolded from six tracker points; "
-    "damaged/repaired trackers are overlaid as markers."
+FULL_RECONSTRUCTION_VISUALIZATION_NOTE = (
+    "Approximate full reconstruction: 24 joints are decoded from X277 body velocity/root delta; "
+    "offline trackers are shown as overlaid markers."
 )
 KINEMATIC_CHAINS = (
     (0, 3, 6, 9, 12, 15),
@@ -235,34 +243,6 @@ def extract_tracker_positions(features: np.ndarray) -> np.ndarray:
     raise ValueError(f"features 只能是 `[T, 277]` 或 `[B, T, 277]`，实际为 {array.shape}")
 
 
-def decode_x277_joint_positions(
-    features: np.ndarray,
-    target_fps: float = 60.0,
-    seed_joint_positions: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    从 X277 近似解码 `[T, 24, 3]` 的 Unity 世界空间人体骨架。
-
-    转换器的 overlay 可以拿到真实 SMPL joints，所以蓝色 decoded X277 看起来很稳。
-    测试任务只有 X277 特征，缺少那个 seed；这里改用 6 个 tracker 点搭一个
-    SMPL 拓扑脚手架，优先保证“看起来是人”，再把损坏/修复 tracker 作为点叠加。
-    """
-
-    x277 = np.asarray(features, dtype=np.float64)
-    if x277.ndim != 2 or x277.shape[1] < 277:
-        raise ValueError(f"features 应为 `[T, 277]`，实际为 {x277.shape}")
-    if target_fps <= 0:
-        raise ValueError("target_fps 必须为正数。")
-    if seed_joint_positions is not None:
-        seed = np.asarray(seed_joint_positions, dtype=np.float64)
-        if seed.shape != (SMPL_JOINT_COUNT, 3):
-            raise ValueError(f"seed_joint_positions 应为 [24, 3]，实际为 {seed.shape}")
-
-    tracker_positions = decode_x277_tracker_positions(x277)
-    decoded_frames = [build_smpl_like_joints_from_tracker_points(frame_trackers) for frame_trackers in tracker_positions]
-    return np.stack(decoded_frames, axis=0).astype(np.float32)
-
-
 def decode_x277_tracker_positions(features: np.ndarray) -> np.ndarray:
     """
     把 X277 的 6 个 tracker root-local 位置转成 Unity 世界空间 `[T,6,3]`。
@@ -291,17 +271,78 @@ def decode_x277_tracker_positions(features: np.ndarray) -> np.ndarray:
     return np.stack(tracker_frames, axis=0).astype(np.float32)
 
 
+def decode_x277_joint_positions_from_body_velocity(
+    features: np.ndarray,
+    target_fps: float = 60.0,
+    seed_joint_positions: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    用 X277 的 body velocity 和 root delta 近似恢复完整 24 关节轨迹。
+
+    full_reconstruction_current 会补全 body rotation、body velocity、root delta、yaw、contact，
+    以及断线 tracker 的 pos/rot。测试 task 里没有保存原始 SMPL joints，所以这里不能做精确 FK；
+    采用第一帧 tracker 搭出的近似骨架作为 seed，然后沿时间积分 body velocity，并用 root delta
+    约束 pelvis 的水平轨迹。这样视频里看到的是“完整补全后的身体运动”，而不是只看 6 个 tracker 点。
+    """
+
+    x277 = np.asarray(features, dtype=np.float64)
+    if x277.ndim != 2 or x277.shape[1] < X277_FEATURE_DIM:
+        raise ValueError(f"features 应为 `[T, 277]`，实际为 {x277.shape}")
+    if target_fps <= 0:
+        raise ValueError("target_fps 必须为正数。")
+    if x277.shape[0] == 0:
+        raise ValueError("features 至少需要 1 帧。")
+
+    if seed_joint_positions is None:
+        tracker_positions = decode_x277_tracker_positions(x277)
+        joint_positions = build_smpl_like_joints_from_tracker_points(tracker_positions[0]).astype(np.float64)
+    else:
+        seed = np.asarray(seed_joint_positions, dtype=np.float64)
+        if seed.shape != (SMPL_JOINT_COUNT, 3):
+            raise ValueError(f"seed_joint_positions 应为 [24, 3]，实际为 {seed.shape}")
+        joint_positions = seed.copy()
+
+    decoded_frames = [joint_positions.copy()]
+    root_position = joint_positions[JOINT_INDEX["pelvis"]].copy()
+    root_yaw = math.radians(float(x277[0, 272]))
+
+    for frame_index in range(1, x277.shape[0]):
+        row = x277[frame_index]
+        prev_root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
+        delta_xz = row[270:272].astype(np.float64)
+        delta_world = np.asarray([delta_xz[0], 0.0, delta_xz[1]], dtype=np.float64) @ prev_root_rotation.T
+        root_position = root_position + delta_world
+        root_yaw = root_yaw + math.radians(float(row[272]))
+
+        current_root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
+        joint_vel_root_now = row[BODY_VEL_START : BODY_VEL_START + BODY_VEL_DIM].reshape(SMPL_JOINT_COUNT, 3)
+        joint_vel_world_now = joint_vel_root_now @ current_root_rotation.T
+        joint_positions = joint_positions + joint_vel_world_now / float(target_fps)
+
+        # body velocity 控制垂直和局部姿态变化，root delta 控制水平位移；二者同时使用能减少长期漂移。
+        pelvis = joint_positions[JOINT_INDEX["pelvis"]]
+        horizontal_correction = np.asarray(
+            [root_position[0] - pelvis[0], 0.0, root_position[2] - pelvis[2]],
+            dtype=np.float64,
+        )
+        joint_positions = joint_positions + horizontal_correction[None]
+        decoded_frames.append(joint_positions.copy())
+
+    return np.stack(decoded_frames, axis=0).astype(np.float32)
+
+
 # endregion
 
 
 # region 渲染
 
-def render_fix_visualization(
+def render_full_reconstruction_visualization(
     *,
     reference_motion: np.ndarray,
-    corrupted_motion: np.ndarray,
-    repaired_motion: np.ndarray,
+    conditioned_motion: np.ndarray,
+    reconstructed_motion: np.ndarray,
     sensor_missing_labels: np.ndarray,
+    inpaint_mask: np.ndarray,
     output_path: Path,
     fps: float,
     title: str,
@@ -309,10 +350,10 @@ def render_fix_visualization(
     x277_fps: float = 60.0,
 ) -> dict:
     """
-    生成修复结果视频，三栏对比损坏输入、修复输出和 GT。
+    生成 current277 完整补全视频，对比条件输入、模型补全和 GT。
 
-    视频强调的是损坏 tracker 在近似人体骨架端点上的变化；它不是正式评估指标，
-    后续如果要做定量结果，仍应直接基于 X277 或反解后的 SMPL 数据计算。
+    这里主体骨架来自 body velocity/root delta 的近似解码，
+    因此可以观察 body/root/contact 这类完整补全目标造成的整体姿态和轨迹变化。
     """
 
     if not HAS_VISUALIZATION_BACKEND:
@@ -320,27 +361,47 @@ def render_fix_visualization(
     if fps <= 0:
         raise ValueError("fps 必须为正数。")
 
-    ref_joints = decode_x277_joint_positions(reference_motion, target_fps=x277_fps)
-    # 人体骨架只作为姿态上下文：fix-only 任务真正被改写的是 tracker position/rotation。
-    # 如果对 corrupted input 也用被清零的 tracker 重搭骨架，骨架会被缺失值拉塌，反而掩盖修复效果。
-    # 因此三栏共用 GT/reference 的人体脚手架，各自只叠加自己的 tracker 点。
-    corrupted_joints = ref_joints.copy()
-    repaired_joints = ref_joints.copy()
-    ref_trackers = decode_x277_tracker_positions(reference_motion)
-    corrupted_trackers = decode_x277_tracker_positions(corrupted_motion)
-    repaired_trackers = decode_x277_tracker_positions(repaired_motion)
     labels = np.asarray(sensor_missing_labels, dtype=bool)
     if labels.ndim != 2 or labels.shape[1] != len(SENSOR_NAMES):
         raise ValueError(f"sensor_missing_labels 应为 [T, 6]，实际为 {labels.shape}")
 
+    mask = np.asarray(inpaint_mask, dtype=bool)
+    if mask.ndim != 2 or mask.shape[1] not in {X277_FEATURE_DIM, MODEL_INPUT_DIM}:
+        raise ValueError(f"inpaint_mask 应为 [T, 277] 或 [T, 283]，实际为 {mask.shape}")
+    target_frame_mask = mask[:, :X277_FEATURE_DIM].any(axis=1)
+
+    # 三条轨迹共享同一个 seed，避免条件输入里目标帧被清零后导致第一帧骨架塌缩，影响横向比较。
+    seed_trackers = decode_x277_tracker_positions(reference_motion)
+    seed_joints = build_smpl_like_joints_from_tracker_points(seed_trackers[0])
+    reference_joints = decode_x277_joint_positions_from_body_velocity(
+        reference_motion,
+        target_fps=x277_fps,
+        seed_joint_positions=seed_joints,
+    )
+    conditioned_joints = decode_x277_joint_positions_from_body_velocity(
+        conditioned_motion,
+        target_fps=x277_fps,
+        seed_joint_positions=seed_joints,
+    )
+    reconstructed_joints = decode_x277_joint_positions_from_body_velocity(
+        reconstructed_motion,
+        target_fps=x277_fps,
+        seed_joint_positions=seed_joints,
+    )
+
+    reference_trackers = decode_x277_tracker_positions(reference_motion)
+    conditioned_trackers = decode_x277_tracker_positions(conditioned_motion)
+    reconstructed_trackers = decode_x277_tracker_positions(reconstructed_motion)
+
     frame_count = min(
-        ref_joints.shape[0],
-        corrupted_joints.shape[0],
-        repaired_joints.shape[0],
-        ref_trackers.shape[0],
-        corrupted_trackers.shape[0],
-        repaired_trackers.shape[0],
+        reference_joints.shape[0],
+        conditioned_joints.shape[0],
+        reconstructed_joints.shape[0],
+        reference_trackers.shape[0],
+        conditioned_trackers.shape[0],
+        reconstructed_trackers.shape[0],
         labels.shape[0],
+        target_frame_mask.shape[0],
     )
     if valid_length is not None:
         frame_count = min(frame_count, int(valid_length))
@@ -348,17 +409,16 @@ def render_fix_visualization(
         raise ValueError("没有可视化帧。")
 
     tracks = [
-        unity_to_z_up_display(corrupted_joints[:frame_count]).copy(),
-        unity_to_z_up_display(repaired_joints[:frame_count]).copy(),
-        unity_to_z_up_display(ref_joints[:frame_count]).copy(),
+        unity_to_z_up_display(conditioned_joints[:frame_count]).copy(),
+        unity_to_z_up_display(reconstructed_joints[:frame_count]).copy(),
+        unity_to_z_up_display(reference_joints[:frame_count]).copy(),
     ]
     tracker_tracks = [
-        unity_to_z_up_display(corrupted_trackers[:frame_count]).copy(),
-        unity_to_z_up_display(repaired_trackers[:frame_count]).copy(),
-        unity_to_z_up_display(ref_trackers[:frame_count]).copy(),
+        unity_to_z_up_display(conditioned_trackers[:frame_count]).copy(),
+        unity_to_z_up_display(reconstructed_trackers[:frame_count]).copy(),
+        unity_to_z_up_display(reference_trackers[:frame_count]).copy(),
     ]
 
-    # 和转换器保持一致：三条轨迹使用同一块地面和同一套空间尺度，避免视觉比较被坐标轴缩放误导。
     min_z = min(
         min(float(track[:, :, 2].min()) for track in tracks),
         min(float(track[:, :, 2].min()) for track in tracker_tracks),
@@ -380,7 +440,14 @@ def render_fix_visualization(
         frame_labels = labels[frame_index]
         missing_sensor_indices = np.flatnonzero(frame_labels).tolist()
         missing_sensor_names = [SENSOR_NAMES[index] for index in missing_sensor_indices]
-        highlighted_joints = TRACKER_JOINT_INDICES[missing_sensor_indices] if missing_sensor_indices else np.asarray([], dtype=np.int64)
+        is_target_frame = bool(target_frame_mask[frame_index])
+        highlighted_joints = (
+            np.arange(SMPL_JOINT_COUNT, dtype=np.int64)
+            if is_target_frame
+            else TRACKER_JOINT_INDICES[missing_sensor_indices]
+            if missing_sensor_indices
+            else np.asarray([], dtype=np.int64)
+        )
 
         fig.clf()
         axes = [
@@ -389,18 +456,18 @@ def render_fix_visualization(
             fig.add_subplot(1, 3, 3, projection="3d"),
         ]
         panel_specs = [
-            ("Corrupted input", tracks[0], tracker_tracks[0], "#6B7280", "#F97316"),
-            ("Repaired output", tracks[1], tracker_tracks[1], "#2563EB", "#22D3EE"),
+            ("Conditioned input", tracks[0], tracker_tracks[0], "#6B7280", "#F97316"),
+            ("Reconstructed output", tracks[1], tracker_tracks[1], "#2563EB", "#22D3EE"),
             ("Ground truth", tracks[2], tracker_tracks[2], "#059669", "#059669"),
         ]
-        for ax, (panel_title, track, tracker_track, color, damaged_color) in zip(axes, panel_specs):
+        for ax, (panel_title, track, tracker_track, color, target_color) in zip(axes, panel_specs):
             configure_visualization_axis(ax=ax, center_xy=center_xy, radius=radius, z_max=z_max, title=panel_title)
             draw_ground_grid(ax=ax, center_xy=center_xy, radius=radius)
             draw_skeleton(
                 ax=ax,
                 joints=track[frame_index],
                 color=color,
-                damaged_color=damaged_color,
+                damaged_color=target_color,
                 highlighted_joint_indices=highlighted_joints,
                 alpha=0.72,
                 linewidth=2.8,
@@ -409,18 +476,23 @@ def render_fix_visualization(
                 ax=ax,
                 tracker_points=tracker_track[frame_index],
                 color=color,
-                damaged_color=damaged_color,
+                damaged_color=target_color,
                 damaged_sensor_indices=missing_sensor_indices,
             )
 
-        headline = f"{title}\nFrame {frame_index + 1}/{frame_count} | Damaged sensors: {', '.join(missing_sensor_names) if missing_sensor_names else 'none'}"
+        target_text = "yes" if is_target_frame else "no"
+        missing_text = ", ".join(missing_sensor_names) if missing_sensor_names else "none"
+        headline = (
+            f"{title}\nFrame {frame_index + 1}/{frame_count} | "
+            f"Full reconstruction target: {target_text} | Offline sensors: {missing_text}"
+        )
         fig.text(0.02, 0.97, headline, va="top", ha="left", fontsize=10, color="black")
-        fig.text(0.02, 0.025, VISUALIZATION_LIMITATION_NOTE, va="bottom", ha="left", fontsize=8, color="#4B5563")
+        fig.text(0.02, 0.025, FULL_RECONSTRUCTION_VISUALIZATION_NOTE, va="bottom", ha="left", fontsize=8, color="#4B5563")
         legend_handles = [
-            Line2D([0], [0], color="#6B7280", lw=4, alpha=0.8, label="Corrupted"),
-            Line2D([0], [0], color="#2563EB", lw=4, alpha=0.8, label="Repaired"),
+            Line2D([0], [0], color="#6B7280", lw=4, alpha=0.8, label="Conditioned"),
+            Line2D([0], [0], color="#2563EB", lw=4, alpha=0.8, label="Reconstructed"),
             Line2D([0], [0], color="#059669", lw=4, alpha=0.8, label="Ground truth"),
-            Line2D([0], [0], color="#F97316", lw=4, alpha=0.9, label="Damaged part"),
+            Line2D([0], [0], color="#F97316", lw=4, alpha=0.9, label="Target / offline"),
         ]
         axes[1].legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 1.12), ncol=4, frameon=False)
         draw_timeline(fig=fig, frame_index=frame_index, frame_count=frame_count)
@@ -431,6 +503,7 @@ def render_fix_visualization(
         frame_meta.append(
             {
                 "frame_index": frame_index,
+                "is_reconstruction_target": is_target_frame,
                 "missing_sensor_indices": missing_sensor_indices,
                 "missing_sensor_names": missing_sensor_names,
             }
@@ -444,8 +517,8 @@ def render_fix_visualization(
         "x277_fps": float(x277_fps),
         "frame_count": frame_count,
         "frames": frame_meta,
-        "visualization": "x277_smpl_skeleton",
-        "note": VISUALIZATION_LIMITATION_NOTE,
+        "visualization": "current277_full_reconstruction",
+        "note": FULL_RECONSTRUCTION_VISUALIZATION_NOTE,
     }
 
 

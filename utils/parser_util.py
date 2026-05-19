@@ -4,9 +4,11 @@ import json
 from argparse import ArgumentParser
 from pathlib import Path
 
+from data_loaders.sensor_masking import TASK_MODE_FULL_RECONSTRUCTION_CURRENT, TASK_MODES
+
 
 def train_args():
-    parser = ArgumentParser(description="Train a DiffusionPoser fix-only diffusion reconstruction model.")
+    parser = ArgumentParser(description="Train a DiffusionPoser current277 diffusion reconstruction model.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -66,6 +68,13 @@ def add_base_options(parser: ArgumentParser):
 def add_data_options(parser: ArgumentParser):
     group = parser.add_argument_group("dataset")
     group.add_argument(
+        "--task_mode",
+        default=TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+        choices=TASK_MODES,
+        type=str,
+        help="训练/采样任务语义。",
+    )
+    group.add_argument(
         "--data_dir",
         required=True,
         type=str,
@@ -74,7 +83,7 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--data_split", default="train", type=str, help="Dataset split name.")
     group.add_argument(
         "--normalizer_dir",
-        default="dataset/meta_AMASS_x277_60hz",
+        default="dataset/meta_AMASS_current277_60hz",
         type=str,
         help="X277 normalizer/meta 目录；normalize_input 读取 mean.pt/std.pt，weighted_loss 读取 feature_w.pt。",
     )
@@ -186,7 +195,12 @@ def add_training_options(parser: ArgumentParser):
         help="最多保留最近 N 组 model/opt/ema checkpoint；0 表示不清理。",
     )
     group.add_argument("--num_steps", default=1_000_000, type=int, help="Total training steps.")
-    group.add_argument("--resume_checkpoint", default="", type=str, help="Path to model#########.pt.")
+    group.add_argument(
+        "--resume_checkpoint",
+        default="",
+        type=str,
+        help="Path to model#########.pt, or latest/auto to resume from the newest model*.pt in save_dir.",
+    )
     group.add_argument("--gradient_clip", action="store_true", help="Clip grad-norm at 1.0.")
     group.add_argument("--weighted_loss", action="store_true", help="从 normalizer_dir/feature_w_file 读取逐维 loss 权重。")
     group.add_argument("--feature_w_file", default="feature_w.pt", type=str, help="Feature weight file name.")
@@ -196,7 +210,11 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--model_ema_steps", type=int, default=10, help="How often to update EMA.")
     group.add_argument("--model_ema_decay", type=float, default=0.995, help="EMA decay.")
     group.add_argument("--model_ema_update_after", type=int, default=5000, help="Start EMA updates after N steps.")
-    group.add_argument("--eval_during_training", action="store_true", help="Run evaluation while training.")
+    group.add_argument(
+        "--eval_during_training",
+        action="store_true",
+        help="Reserved flag; current training loop logs a warning and skips in-loop evaluation.",
+    )
 
 
 def load_args_json(model_path: Path) -> dict:

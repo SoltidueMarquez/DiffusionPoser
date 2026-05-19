@@ -1,21 +1,13 @@
 {
-    "version": "0.2.0",
-    "configurations": [
+    "version": "2.0.0",
+    "tasks": [
         {
-            "name": "current277 | 1 转换 AMASS -> current277",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "data_converter.amass_to_x277",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 1 convert AMASS",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "data_converter.amass_to_x277",
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
                 "--output_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz",
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
@@ -26,45 +18,45 @@
                 "--visualize_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz/visualizations",
                 "--visualize_fps", "60",
                 "--skip_existing"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 2 统计 normalizer",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "data_loaders.compute_x277_normalizer",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 2 compute normalizer",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "data_loaders.compute_x277_normalizer",
                 "--source_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz",
                 "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_current277_60hz",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--split", "train",
                 "--overwrite"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 3 生成 full reconstruction 任务",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "data_loaders.generate_x277_missing_tasks",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 3 generate full reconstruction tasks",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "data_loaders.generate_x277_missing_tasks",
                 "--source_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz",
                 "--output_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz_missing_tasks",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
@@ -84,23 +76,23 @@
                 "--all_sensor_dropout_prob", "0.10",
                 "--seed", "10",
                 "--overwrite"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 4 训练 full reconstruction",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "train.train_diffusionposer",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 4 train",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "train.train_diffusionposer",
                 "--save_dir", "${workspaceFolder}/save/diffusionposer_current277",
                 "--data_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz_missing_tasks",
                 "--data_split", "train",
@@ -128,23 +120,23 @@
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
                 "--num_workers", "0"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 4b 恢复训练 latest",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "train.train_diffusionposer",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 4b resume latest",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "train.train_diffusionposer",
                 "--save_dir", "${workspaceFolder}/save/diffusionposer_current277",
                 "--data_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz_missing_tasks",
                 "--data_split", "train",
@@ -174,23 +166,23 @@
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
                 "--num_workers", "0"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 5 离线流式重建 test",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "sample.reconstruct_stream",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 5 stream reconstruct",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "sample.reconstruct_stream",
                 "--model_path", "${input:current277ModelPath}",
                 "--output_dir", "${workspaceFolder}/output/current277_stream",
                 "--data_dir", "${workspaceFolder}/dataset/AMASS_current277_60hz_missing_tasks",
@@ -206,80 +198,56 @@
                 "--visualize_num", "0",
                 "--use_ema", "true",
                 "--num_workers", "0"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 6 评估流式输出",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "eval.evaluate_current277",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: 6 evaluate stream outputs",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "eval.evaluate_current277",
                 "--input_dir", "${workspaceFolder}/output/current277_stream",
                 "--output_json", "${workspaceFolder}/output/current277_stream/current277_eval_summary.json"
-            ]
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
         },
         {
-            "name": "current277 | 测试 unittest",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "unittest",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
+            "label": "current277: tests",
+            "type": "shell",
+            "command": "conda",
             "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "unittest",
                 "tests.test_x277_data",
                 "tests.test_current277_schema",
                 "tests.test_fix_test",
                 "tests.test_resume_checkpoint"
-            ]
-        },
-        {
-            "name": "legacy | fix_tracker 测试入口",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "sample.fix_test",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
+            ],
+            "group": "test",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
             },
-            "args": [
-                "--model_path", "${input:legacyModelPath}",
-                "--output_dir", "${workspaceFolder}/output/legacy_fix_tracker",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_x277_60hz_missing_tasks",
-                "--data_split", "test",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_x277_60hz",
-                "--task_mode", "fix_tracker",
-                "--normalize_input", "true",
-                "--preload_data", "false",
-                "--cuda", "true",
-                "--batch_size", "32",
-                "--seq_len", "150",
-                "--input_feats", "283",
-                "--visualize_num", "5",
-                "--visualize_fps", "60",
-                "--x277_fps", "60",
-                "--use_ema", "true",
-                "--num_workers", "0"
-            ]
+            "problemMatcher": []
         }
     ],
     "inputs": [
@@ -288,12 +256,6 @@
             "type": "promptString",
             "description": "current277 checkpoint path",
             "default": "${workspaceFolder}/save/diffusionposer_current277/model000002000.pt"
-        },
-        {
-            "id": "legacyModelPath",
-            "type": "promptString",
-            "description": "legacy fix_tracker checkpoint path",
-            "default": "${workspaceFolder}/save/diffusionposer_x277/model000012000.pt"
         }
     ]
 }

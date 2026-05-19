@@ -11,9 +11,12 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
+    CURRENT277_SCHEMA_NAME,
     MODEL_INPUT_DIM,
+    TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+    TASK_MODES,
     X277_FEATURE_DIM,
-    create_sensor_missing_task,
+    create_full_reconstruction_task,
 )
 
 
@@ -22,10 +25,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate fixed X277 sensor-missing tasks for DiffusionPoser.")
 
     group = parser.add_argument_group("paths")
-    group.add_argument("--source_dir", default="dataset/AMASS_x277_60hz", type=str, help="X277 源数据目录。")
+    group.add_argument("--source_dir", default="dataset/AMASS_current277_60hz", type=str, help="current277 源数据目录。")
     group.add_argument(
         "--output_dir",
-        default="dataset/AMASS_x277_60hz_missing_tasks",
+        default="dataset/AMASS_current277_60hz_missing_tasks",
         type=str,
         help="生成的缺失任务数据目录。",
     )
@@ -37,6 +40,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     group = parser.add_argument_group("task")
+    group.add_argument(
+        "--task_mode",
+        default=TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+        choices=TASK_MODES,
+        type=str,
+        help="任务语义：current277 全身重建。",
+    )
     group.add_argument("--splits", nargs="+", default=["train"], type=str, help="要生成的 split 名称列表。")
     group.add_argument("--seq_len", default=100, type=int, help="每条训练任务的固定帧长。")
     group.add_argument("--samples_per_file", default=4, type=int, help="每个源动作文件生成多少个固定窗口任务。")
@@ -51,6 +61,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
     group.add_argument("--min_missing_sensors", default=1, type=int, help="每个区间最少缺失传感器数量。")
     group.add_argument("--max_missing_sensors", default=4, type=int, help="每个区间最多缺失传感器数量。")
     group.add_argument("--min_observed_sensors", default=2, type=int, help="每个区间至少保留的未缺失传感器数量。")
+    group.add_argument(
+        "--min_history_frames",
+        default=10,
+        type=int,
+        help="full_reconstruction_current 的历史条件帧数下限。",
+    )
+    group.add_argument(
+        "--min_target_frames",
+        default=1,
+        type=int,
+        help="full_reconstruction_current 的目标帧数下限。",
+    )
+    group.add_argument(
+        "--max_target_frames",
+        default=0,
+        type=int,
+        help="full_reconstruction_current 的目标帧数上限；0 表示不限制。",
+    )
+    group.add_argument(
+        "--all_sensor_dropout_prob",
+        default=0.10,
+        type=float,
+        help="full_reconstruction_current 中生成全 6 tracker 断线区间的概率。",
+    )
     group.add_argument("--limit", default=0, type=int, help="每个 split 最多使用多少个源样本；0 表示不限制。")
 
     group = parser.add_argument_group("runtime")
@@ -99,14 +133,20 @@ def read_manifest_entries(source_dir: Path, manifest_path: Path) -> list[dict]:
             if not source_path.exists():
                 raise FileNotFoundError(f"manifest 第 {line_number} 行指向的 X277 文件不存在：{source_path}")
 
+            source_relative_path = manifest_source_relative_path(
+                source_dir=source_dir,
+                source_path=source_path,
+                entry=raw_entry,
+            )
+
             stablemotion_split_key = raw_entry.get("stablemotion_split_key")
             if not stablemotion_split_key:
-                stablemotion_split_key = source_path_to_split_key(source_dir=source_dir, source_path=source_path)
+                stablemotion_split_key = str(Path(source_relative_path).with_suffix(".npy")).replace("\\", "/")
 
             entries.append(
                 {
                     "source_path": str(source_path),
-                    "source_relative_path": source_path.relative_to(source_dir).as_posix(),
+                    "source_relative_path": source_relative_path,
                     "stablemotion_split_key": normalize_slashes(stablemotion_split_key),
                     "frames": int(raw_entry.get("frames", 0)),
                     "feature_dim": int(raw_entry.get("feature_dim", X277_FEATURE_DIM)),
@@ -127,6 +167,16 @@ def resolve_manifest_output_path(source_dir: Path, entry: dict) -> Path:
     if relative_path:
         return source_dir / normalize_slashes(relative_path)
     raise KeyError("manifest entry 缺少 output_path/source_relative_path，无法定位 X277 文件。")
+
+
+def manifest_source_relative_path(source_dir: Path, source_path: Path, entry: dict) -> str:
+    try:
+        return source_path.relative_to(source_dir).as_posix()
+    except ValueError:
+        relative_path = entry.get("source_relative_path") or entry.get("original_source_relative_path")
+        if relative_path:
+            return normalize_slashes(relative_path)
+        return normalize_slashes(source_path.name)
 
 
 def glob_source_entries(source_dir: Path) -> list[dict]:
@@ -283,7 +333,14 @@ def generate_split_tasks(
                     source_frames=source_frames,
                     seq_len=args.seq_len,
                 )
-                sensor_missing_labels, inpaint_mask, intervals = create_sensor_missing_task(
+                max_target_frames = args.max_target_frames if args.max_target_frames > 0 else None
+                (
+                    sensor_missing_labels,
+                    inpaint_mask,
+                    intervals,
+                    target_start,
+                    target_length,
+                ) = create_full_reconstruction_task(
                     seq_len=args.seq_len,
                     valid_length=valid_length,
                     rng=rng,
@@ -293,12 +350,23 @@ def generate_split_tasks(
                     min_missing_sensors=args.min_missing_sensors,
                     max_missing_sensors=args.max_missing_sensors,
                     min_observed_sensors=args.min_observed_sensors,
+                    min_history_frames=args.min_history_frames,
+                    min_target_frames=args.min_target_frames,
+                    max_target_frames=max_target_frames,
+                    all_sensor_dropout_prob=args.all_sensor_dropout_prob,
                 )
+                task_extra = {
+                    "target_start": int(target_start),
+                    "target_length": int(target_length),
+                }
+                task_format = "materialized_current277_full_reconstruction_v1"
+                schema_name = CURRENT277_SCHEMA_NAME
 
                 task_id = make_task_id(
                     split=split,
                     stablemotion_split_key=entry["stablemotion_split_key"],
                     sample_index=sample_index,
+                    task_mode=args.task_mode,
                 )
                 task_rel_path = Path("tasks") / f"{task_id}.npz"
                 task_path = split_dir / task_rel_path
@@ -332,10 +400,13 @@ def generate_split_tasks(
                     "source_frames": source_frames,
                     "seq_len": args.seq_len,
                     "feature_dim": MODEL_INPUT_DIM,
-                    "task_format": "materialized_x277_v1",
+                    "task_format": task_format,
+                    "schema_name": schema_name,
+                    "task_mode": args.task_mode,
                     "missing_intervals": [interval.to_dict() for interval in intervals],
                     "is_mirrored": bool(entry.get("is_mirrored", False)),
                 }
+                manifest_entry.update(task_extra)
                 manifest_file.write(json.dumps(manifest_entry, ensure_ascii=False, sort_keys=True) + "\n")
                 written += 1
                 if args.manifest_flush_interval > 0 and written % args.manifest_flush_interval == 0:
@@ -409,10 +480,15 @@ def sample_window(rng: np.random.Generator, source_frames: int, seq_len: int) ->
     return start_frame, seq_len
 
 
-def make_task_id(split: str, stablemotion_split_key: str, sample_index: int) -> str:
+def make_task_id(
+    split: str,
+    stablemotion_split_key: str,
+    sample_index: int,
+    task_mode: str = TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+) -> str:
     key = normalize_slashes(stablemotion_split_key)
     stem = re.sub(r"[^A-Za-z0-9_]+", "_", Path(key).with_suffix("").as_posix()).strip("_")
-    digest = hashlib.sha1(f"{split}:{key}:{sample_index}".encode("utf-8")).hexdigest()[:8]
+    digest = hashlib.sha1(f"{split}:{key}:{sample_index}:{task_mode}".encode("utf-8")).hexdigest()[:8]
     return f"{stem}_s{sample_index:04d}_{digest}"
 
 

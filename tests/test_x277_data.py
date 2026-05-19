@@ -10,12 +10,16 @@ from torch.utils.data import DataLoader
 from data_loaders.compute_x277_normalizer import main as compute_x277_normalizer_main
 from data_loaders.generate_x277_missing_tasks import main as generate_missing_tasks_main
 from data_loaders.sensor_masking import (
+    CONTACT_START,
     MODEL_INPUT_DIM,
+    ROOT_DELTA_START,
+    ROOT_YAW_START,
     SENSOR_LABEL_DIM,
+    TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
     X277_FEATURE_DIM,
     apply_sensor_missing_interval,
+    create_full_reconstruction_task,
     sensor_feature_slices,
-    tracker_feature_mask,
 )
 from data_loaders.x277_dataset import X277MissingTaskDataset
 from utils.normalizer import X277Normalizer
@@ -46,12 +50,127 @@ class SensorMaskingTest(unittest.TestCase):
             self.assertFalse(sensor_missing_labels[:2, sensor_index].any())
             self.assertFalse(sensor_missing_labels[5:, sensor_index].any())
 
+    def test_full_reconstruction_masks_body_root_contact_and_offline_trackers(self):
+        rng = np.random.default_rng(7)
+        sensor_missing_labels, inpaint_mask, intervals, target_start, target_length = create_full_reconstruction_task(
+            seq_len=12,
+            valid_length=10,
+            rng=rng,
+            num_intervals=1,
+            min_missing_length=4,
+            max_missing_length=4,
+            all_sensor_dropout_prob=1.0,
+            target_start=3,
+            target_length=4,
+        )
+
+        self.assertEqual(target_start, 3)
+        self.assertEqual(target_length, 4)
+        self.assertEqual(len(intervals), 1)
+
+        target = slice(3, 7)
+        self.assertTrue(inpaint_mask[target, 0:216].all())
+        self.assertTrue(inpaint_mask[target, ROOT_DELTA_START : ROOT_DELTA_START + 2].all())
+        self.assertTrue(inpaint_mask[target, ROOT_YAW_START : ROOT_YAW_START + 1].all())
+        self.assertTrue(inpaint_mask[target, CONTACT_START : CONTACT_START + 4].all())
+        self.assertFalse(inpaint_mask[:3].any())
+        self.assertFalse(inpaint_mask[10:].any())
+        self.assertFalse(inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
+
+        self.assertTrue(sensor_missing_labels[target].all())
+        self.assertFalse(sensor_missing_labels[:3].any())
+        self.assertFalse(sensor_missing_labels[10:].any())
+        for sensor_index in range(SENSOR_LABEL_DIM):
+            pos_slice, rot_slice = sensor_feature_slices(sensor_index)
+            self.assertTrue(inpaint_mask[target, pos_slice].all())
+            self.assertTrue(inpaint_mask[target, rot_slice].all())
+
 
 class X277MissingTaskDatasetTest(unittest.TestCase):
+    def test_generator_creates_full_reconstruction_current_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            source_dir = tmp_path / "AMASS_current277_60hz"
+            source_file = source_dir / "CMU" / "142" / "sample_poses.npz"
+            source_file.parent.mkdir(parents=True)
+
+            x277 = np.arange(20 * X277_FEATURE_DIM, dtype=np.float32).reshape(20, X277_FEATURE_DIM)
+            np.savez(source_file, x=x277)
+            with (source_dir / "manifest.jsonl").open("w", encoding="utf-8") as file:
+                file.write(
+                    json.dumps(
+                        {
+                            "status": "converted",
+                            "feature_dim": X277_FEATURE_DIM,
+                            "frames": 20,
+                            "output_path": str(source_file),
+                            "source_relative_path": "CMU/142/sample_poses.npz",
+                            "stablemotion_split_key": "CMU/142/sample_poses.npy",
+                            "is_mirrored": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            split_dir = tmp_path / "splits"
+            split_dir.mkdir()
+            (split_dir / "train.txt").write_text("CMU/142/sample_poses.npy\n", encoding="utf-8")
+            output_dir = tmp_path / "full_tasks"
+            generate_missing_tasks_main(
+                [
+                    "--source_dir",
+                    str(source_dir),
+                    "--output_dir",
+                    str(output_dir),
+                    "--split_dir",
+                    str(split_dir),
+                    "--splits",
+                    "train",
+                    "--task_mode",
+                    TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+                    "--seq_len",
+                    "20",
+                    "--samples_per_file",
+                    "1",
+                    "--min_history_frames",
+                    "5",
+                    "--min_target_frames",
+                    "5",
+                    "--max_target_frames",
+                    "5",
+                    "--min_missing_length",
+                    "5",
+                    "--max_missing_length",
+                    "5",
+                    "--all_sensor_dropout_prob",
+                    "1.0",
+                    "--seed",
+                    "123",
+                ]
+            )
+
+            manifest_entry = json.loads((output_dir / "train" / "manifest.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(manifest_entry["task_mode"], TASK_MODE_FULL_RECONSTRUCTION_CURRENT)
+            self.assertEqual(manifest_entry["schema_name"], "current277_v1")
+            target_start = int(manifest_entry["target_start"])
+            target_length = int(manifest_entry["target_length"])
+            target = slice(target_start, target_start + target_length)
+            self.assertEqual(target_length, 5)
+
+            with np.load(output_dir / "train" / manifest_entry["task_path"], allow_pickle=False) as task_data:
+                inpaint_mask = task_data["inpaint_mask"].astype(bool)
+                sensor_missing_labels = task_data["sensor_missing_labels"].astype(bool)
+            self.assertTrue(inpaint_mask[target, 0:216].all())
+            self.assertTrue(inpaint_mask[target, ROOT_DELTA_START : ROOT_DELTA_START + 2].all())
+            self.assertTrue(inpaint_mask[target, CONTACT_START : CONTACT_START + 4].all())
+            self.assertFalse(inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
+            self.assertTrue(sensor_missing_labels[target].all())
+
     def test_generator_and_dataset_create_fixed_length_training_batch(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            source_dir = tmp_path / "AMASS_x277_60hz"
+            source_dir = tmp_path / "AMASS_current277_60hz"
             source_file = source_dir / "CMU" / "142" / "sample_poses.npz"
             source_file.parent.mkdir(parents=True)
 
@@ -89,6 +208,8 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
                     "100",
                     "--samples_per_file",
                     "2",
+                    "--all_sensor_dropout_prob",
+                    "0.0",
                     "--seed",
                     "123",
                 ]
@@ -124,14 +245,12 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             labels = item["sensor_missing_labels"].numpy()
             np.testing.assert_array_equal(item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM].numpy().astype(bool), labels)
 
-            missing_sensor_count = int(labels.any(axis=1).sum())
-            self.assertGreaterEqual(missing_sensor_count, 1)
-            self.assertLessEqual(missing_sensor_count, 4)
-            self.assertGreaterEqual(SENSOR_LABEL_DIM - missing_sensor_count, 2)
-
             mask = item["inpaint_mask"].numpy()
-            allowed_features = tracker_feature_mask(range(SENSOR_LABEL_DIM))
-            self.assertFalse(mask[~allowed_features].any())
+            self.assertTrue(labels.any())
+            self.assertTrue(mask[:216].any())
+            self.assertTrue(mask[ROOT_DELTA_START : ROOT_DELTA_START + 2].any())
+            self.assertTrue(mask[ROOT_YAW_START : ROOT_YAW_START + 1].any())
+            self.assertTrue(mask[CONTACT_START : CONTACT_START + 4].any())
 
             loader = DataLoader(dataset, batch_size=2, shuffle=False)
             batch = next(iter(loader))
