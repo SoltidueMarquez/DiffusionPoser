@@ -7,8 +7,16 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from data_loaders.manifest_utils import filter_entries_by_folder_path, normalize_folder_token
-from data_loaders.sensor_masking import MODEL_INPUT_DIM, SENSOR_LABEL_DIM, X277_FEATURE_DIM
+from data_loaders.manifest_utils import filter_entries_by_folder_path
+from data_loaders.sensor_masking import (
+    LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
+    MODEL_INPUT_DIM,
+    SENSOR_LABEL_DIM,
+    X277_FEATURE_DIM,
+    enforce_last_frame_reconstruction_task,
+    validate_last_frame_seq_len,
+    validate_last_frame_window,
+)
 from utils.normalizer import X277Normalizer
 
 
@@ -28,7 +36,7 @@ class X277MissingTaskDataset(Dataset):
         self,
         data_dir: str | Path,
         split: str = "train",
-        seq_len: int = 100,
+        seq_len: int = LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
         normalizer_dir: str | Path | None = None,
         normalize_input: bool = True,
         preload_data: bool = False,
@@ -37,6 +45,7 @@ class X277MissingTaskDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.split = split
         self.seq_len = int(seq_len)
+        validate_last_frame_seq_len(self.seq_len)
         self.normalize_input = bool(normalize_input)
         self.preload_data = bool(preload_data)
         self.normalizer = create_normalizer(normalizer_dir=normalizer_dir, normalize_input=self.normalize_input)
@@ -53,14 +62,15 @@ class X277MissingTaskDataset(Dataset):
         if not self.entries:
             raise RuntimeError(f"{self.manifest_path} 中没有可用任务。")
 
-        # 这个数据集只接受固定 seq_len 的 materialized task，
-        # 这样后续 sampling / 可视化 的时间维就不会出现动态分支。
+        # 数据入口只接受原生 11 帧 materialized task，不在读取阶段裁剪旧长窗口。
         for entry in self.entries:
-            entry_seq_len = int(entry.get("seq_len", self.seq_len))
+            if "seq_len" not in entry:
+                raise KeyError(f"任务 {entry.get('task_id')} 缺少 manifest 字段 `seq_len`。")
+            entry_seq_len = int(entry["seq_len"])
             if entry_seq_len != self.seq_len:
                 raise ValueError(
                     f"任务 {entry.get('task_id')} 的 seq_len={entry_seq_len}，"
-                    f"但当前 DataLoader 期望 seq_len={self.seq_len}。"
+                    f"当前数据集只接受原生 {self.seq_len} 帧在线补全窗口。"
                 )
 
         self.task_cache = None
@@ -79,45 +89,24 @@ class X277MissingTaskDataset(Dataset):
         entry = self.entries[index]
         task = self.load_task(index=index, entry=entry)
 
-        valid_length = validate_scalar_int(task=task, name="valid_length")
-        if valid_length <= 0 or valid_length > self.seq_len:
-            raise ValueError(f"valid_length 应位于 [1, {self.seq_len}]，实际为 {valid_length}")
-
-        clip = validate_task_array(
-            array=task["x277"],
-            shape=(self.seq_len, X277_FEATURE_DIM),
-            name="x277",
-        ).astype(np.float32, copy=True)
-
-        # materialized task 已经把整段序列裁成固定窗口，
-        # 这里再把超出有效长度的部分清零，保证 padding 不会混进模型输入。
-        clip[valid_length:] = 0.0
+        clip, sensor_missing_labels, inpaint_mask, valid_length = load_last_frame_task_arrays(
+            task=task,
+            seq_len=self.seq_len,
+        )
 
         if self.normalizer is not None:
-            # 只对真实有效帧做归一化，padding 仍保持 0。
-            clip[:valid_length] = self.normalizer.normalize(clip[:valid_length])
+            # 11 帧全部是有效窗口；归一化只作用在 X277 物理特征上。
+            clip = self.normalizer.normalize(clip)
 
-        valid_frame_mask = np.zeros(self.seq_len, dtype=bool)
-        valid_frame_mask[:valid_length] = True
+        valid_frame_mask = np.ones(self.seq_len, dtype=bool)
 
-        sensor_missing_labels = validate_task_array(
-            array=task["sensor_missing_labels"],
-            shape=(self.seq_len, SENSOR_LABEL_DIM),
-            name="sensor_missing_labels",
-        ).astype(bool)
-        inpaint_mask = validate_task_array(
-            array=task["inpaint_mask"],
-            shape=(self.seq_len, MODEL_INPUT_DIM),
-            name="inpaint_mask",
-        ).astype(bool)
+        target_start, target_length = enforce_last_frame_reconstruction_task(
+            sensor_missing_labels=sensor_missing_labels,
+            inpaint_mask=inpaint_mask,
+            valid_length=valid_length,
+        )
 
-        # padding 帧不参与任何补全、监督或评估。
-        sensor_missing_labels[~valid_frame_mask] = False
-        inpaint_mask[~valid_frame_mask] = False
-
-        # 6 维缺失标签只作为条件通道输入，不作为重建目标；
-        # 283 维里的 label 部分也要始终保持 False，避免把标签通道误纳入 inpainting。
-        inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
+        # 6 维缺失标签只作为条件通道输入，不作为重建目标。
         label_channels = encode_sensor_labels(
             sensor_missing_labels=sensor_missing_labels,
             valid_frame_mask=valid_frame_mask,
@@ -136,6 +125,8 @@ class X277MissingTaskDataset(Dataset):
             "source_path": entry.get("source_path", ""),
             "task_mode": entry.get("task_mode", ""),
             "schema_name": entry.get("schema_name", ""),
+            "target_start": target_start,
+            "target_length": target_length,
         }
 
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:
@@ -217,6 +208,32 @@ def load_materialized_task_npz(manifest_dir: Path, task_path: str) -> dict[str, 
             "请使用 `python -m data_loaders.generate_x277_missing_tasks --overwrite ...` 重新生成任务数据。"
         )
     return task
+
+
+def load_last_frame_task_arrays(
+    task: dict[str, np.ndarray],
+    seq_len: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """读取并校验原生 10 帧历史 + 第 11 帧补全任务，不做旧窗口裁剪。"""
+
+    validate_last_frame_seq_len(seq_len)
+    task_seq_len = validate_scalar_int(task=task, name="seq_len")
+    validate_last_frame_seq_len(task_seq_len)
+    valid_length = validate_scalar_int(task=task, name="valid_length")
+    validate_last_frame_window(valid_length)
+
+    clip = validate_task_array(task["x277"], shape=(seq_len, X277_FEATURE_DIM), name="x277").astype(
+        np.float32,
+        copy=True,
+    )
+    sensor_missing_labels = validate_task_array(
+        task["sensor_missing_labels"], shape=(seq_len, SENSOR_LABEL_DIM), name="sensor_missing_labels"
+    ).astype(bool)
+    inpaint_mask = validate_task_array(
+        task["inpaint_mask"], shape=(seq_len, MODEL_INPUT_DIM), name="inpaint_mask"
+    ).astype(bool)
+
+    return clip, sensor_missing_labels, inpaint_mask, valid_length
 
 
 def validate_scalar_int(task: dict[str, np.ndarray], name: str) -> int:

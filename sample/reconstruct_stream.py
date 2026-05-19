@@ -55,6 +55,19 @@ def get_batch_string_item(batch: dict, key: str, index: int) -> str:
     return str(value)
 
 
+def get_batch_int_item(batch: dict, key: str, index: int, default: int) -> int:
+    value = batch.get(key)
+    if value is None:
+        return int(default)
+    if isinstance(value, (list, tuple)):
+        return int(value[index])
+    if isinstance(value, np.ndarray):
+        return int(value[index])
+    if torch.is_tensor(value):
+        return int(value[index].item())
+    return int(value)
+
+
 def denormalize_x277_sequence(sequence_x: torch.Tensor, normalizer) -> np.ndarray:
     """Convert one normalized `[283, T]` tensor into denormalized `[T, 277]`."""
 
@@ -81,6 +94,36 @@ def build_model_kwargs(
     }
 
 
+def seed_missing_features_from_previous_frame(
+    *,
+    current_frame: torch.Tensor,
+    current_inpaint_mask: torch.Tensor,
+    previous_frame: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    用上一帧重建结果初始化当前帧待补全维度。
+
+    DiffusionPoser 的自回归 inpainting 推理不是把未知维度置零，而是让未知
+    body/root/contact 和离线 tracker 从上一帧的合理动作状态开始去噪。mask 仍然为
+    True，表示这些位置不会被当作观测条件强制保留。
+    """
+
+    if current_frame.shape != current_inpaint_mask.shape:
+        raise ValueError(
+            f"current_frame 和 current_inpaint_mask 形状必须一致，实际为 "
+            f"{tuple(current_frame.shape)} vs {tuple(current_inpaint_mask.shape)}"
+        )
+    if previous_frame is None:
+        # 第一帧没有历史重建值；保持冷启动零初始化，避免使用当前帧 GT 泄漏未知信息。
+        previous_frame = torch.zeros_like(current_frame)
+    elif previous_frame.shape != current_frame.shape:
+        raise ValueError(
+            f"previous_frame 应与 current_frame 同形，实际为 "
+            f"{tuple(previous_frame.shape)} vs {tuple(current_frame.shape)}"
+        )
+    return torch.where(current_inpaint_mask, previous_frame, current_frame)
+
+
 def build_stream_window(
     *,
     reference: torch.Tensor,
@@ -94,13 +137,24 @@ def build_stream_window(
     Build a left-padded sliding window ending at ``frame_index``.
 
     History frames come from ``reconstructed`` and are always hard conditions.
-    The current frame uses the dataset inpaint mask, so online trackers remain
-    observed while body/root/contact and offline trackers are sampled.
+    The current observed trackers remain hard conditions, while current unknown
+    body/root/contact and offline trackers are initialized from the previous
+    reconstructed frame before diffusion sampling.
     """
 
     channels, total_frames = reference.shape
     if channels != MODEL_INPUT_DIM:
         raise ValueError(f"reference must be [283, T], got {tuple(reference.shape)}")
+    if reconstructed.shape != reference.shape:
+        raise ValueError(f"reconstructed must match reference, got {tuple(reconstructed.shape)}")
+    if task_inpaint_mask.shape != reference.shape:
+        raise ValueError(f"task_inpaint_mask must match reference, got {tuple(task_inpaint_mask.shape)}")
+    if valid_frame_mask.shape != (total_frames,):
+        raise ValueError(f"valid_frame_mask must be [T], got {tuple(valid_frame_mask.shape)}")
+    if frame_index < 0 or frame_index >= total_frames:
+        raise ValueError(f"frame_index out of range: {frame_index}, T={total_frames}")
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
 
     source_start = max(0, frame_index - seq_len + 1)
     source_end = frame_index + 1
@@ -117,11 +171,56 @@ def build_stream_window(
         conditioned[0, :, history_dest] = reconstructed[:, history_slice]
 
     current_dest = offset + window_length - 1
-    conditioned[0, :, current_dest] = reference[:, frame_index]
-    inpaint_mask[0, :, current_dest] = task_inpaint_mask[:, frame_index]
-    conditioned = torch.where(inpaint_mask, torch.zeros_like(conditioned), conditioned)
+    current_mask = task_inpaint_mask[:, frame_index]
+    previous_frame = reconstructed[:, frame_index - 1] if frame_index > 0 else None
+    conditioned[0, :, current_dest] = seed_missing_features_from_previous_frame(
+        current_frame=reference[:, frame_index],
+        current_inpaint_mask=current_mask,
+        previous_frame=previous_frame,
+    )
+    inpaint_mask[0, :, current_dest] = current_mask
     window_valid[0, offset : offset + window_length] = valid_frame_mask[source_start:source_end]
     return conditioned, inpaint_mask, window_valid, current_dest
+
+
+def build_previous_frame_conditioned_sequence(
+    *,
+    reference: torch.Tensor,
+    reconstructed: torch.Tensor,
+    task_inpaint_mask: torch.Tensor,
+    valid_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    构造与流式推理一致的条件轨迹，主要用于保存和可视化。
+
+    `reference` 和 `reconstructed` 都是 `[283, T]`。待补全维度记录上一帧重建值，
+    当前真实可观测 tracker 和 6 维缺失标签仍然来自 `reference`。
+    """
+
+    if reconstructed.shape != reference.shape:
+        raise ValueError(f"reconstructed must match reference, got {tuple(reconstructed.shape)}")
+    if task_inpaint_mask.shape != reference.shape:
+        raise ValueError(f"task_inpaint_mask must match reference, got {tuple(task_inpaint_mask.shape)}")
+    total_frames = reference.shape[1]
+    if valid_frame_mask.shape != (total_frames,):
+        raise ValueError(f"valid_frame_mask must be [T], got {tuple(valid_frame_mask.shape)}")
+
+    conditioned = reference.clone()
+    valid_length = int(valid_frame_mask.sum().item())
+    if valid_length <= 0:
+        raise ValueError("valid_frame_mask 没有有效帧，无法构造当前帧条件。")
+    frame_index = valid_length - 1
+    frame_mask = task_inpaint_mask[:, frame_index]
+    if not frame_mask.any():
+        raise ValueError("当前窗口最后一帧没有任何待补全维度，请检查 inpaint_mask。")
+    previous_frame = reconstructed[:, frame_index - 1] if frame_index > 0 else None
+    conditioned[:, frame_index] = seed_missing_features_from_previous_frame(
+        current_frame=reference[:, frame_index],
+        current_inpaint_mask=frame_mask,
+        previous_frame=previous_frame,
+    )
+    conditioned[:, valid_length:] = 0.0
+    return conditioned
 
 
 def sample_streaming_sequence(
@@ -136,40 +235,42 @@ def sample_streaming_sequence(
     reconstructed = reference.clone()
     sample_fn = choose_sampler(diffusion, bool(args.ts_respace))
     valid_length = int(valid_frame_mask.sum().item())
+    if valid_length <= 0:
+        raise ValueError("valid_frame_mask 没有有效帧，无法执行流式重建。")
 
-    for frame_index in range(valid_length):
-        frame_mask = task_inpaint_mask[:, frame_index]
-        if not frame_mask.any():
-            continue
+    frame_index = valid_length - 1
+    frame_mask = task_inpaint_mask[:, frame_index]
+    if not frame_mask.any():
+        raise ValueError("当前窗口最后一帧没有任何待补全维度，请检查 inpaint_mask。")
 
-        conditioned, inpaint_mask, window_valid, current_dest = build_stream_window(
-            reference=reference,
-            reconstructed=reconstructed,
-            task_inpaint_mask=task_inpaint_mask,
-            valid_frame_mask=valid_frame_mask,
-            frame_index=frame_index,
-            seq_len=int(args.seq_len),
-        )
-        model_kwargs = build_model_kwargs(
-            conditioned_motion=conditioned,
-            inpaint_mask=inpaint_mask,
-            valid_frame_mask=window_valid,
-        )
-        sampled_window = sample_fn(
-            model,
-            tuple(conditioned.shape),
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            skip_timesteps=0,
-            init_image=conditioned,
-            progress=False,
-            dump_steps=None,
-            noise=None,
-            const_noise=False,
-        )
-        sampled_frame = sampled_window[0, :, current_dest]
-        conditioned_frame = conditioned[0, :, current_dest]
-        reconstructed[:, frame_index] = torch.where(frame_mask, sampled_frame, conditioned_frame)
+    conditioned, inpaint_mask, window_valid, current_dest = build_stream_window(
+        reference=reference,
+        reconstructed=reconstructed,
+        task_inpaint_mask=task_inpaint_mask,
+        valid_frame_mask=valid_frame_mask,
+        frame_index=frame_index,
+        seq_len=int(args.seq_len),
+    )
+    model_kwargs = build_model_kwargs(
+        conditioned_motion=conditioned,
+        inpaint_mask=inpaint_mask,
+        valid_frame_mask=window_valid,
+    )
+    sampled_window = sample_fn(
+        model,
+        tuple(conditioned.shape),
+        clip_denoised=False,
+        model_kwargs=model_kwargs,
+        skip_timesteps=0,
+        init_image=conditioned,
+        progress=False,
+        dump_steps=None,
+        noise=None,
+        const_noise=False,
+    )
+    sampled_frame = sampled_window[0, :, current_dest]
+    conditioned_frame = conditioned[0, :, current_dest]
+    reconstructed[:, frame_index] = torch.where(frame_mask, sampled_frame, conditioned_frame)
 
     reconstructed[:, valid_length:] = 0.0
     return reconstructed
@@ -202,7 +303,7 @@ def save_stream_artifacts(
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_argument_parser()
-    args = parse_and_load_from_model(parser, argv=argv, ignore_keys={"batch_size", "data_split"})
+    args = parse_and_load_from_model(parser, argv=argv, ignore_keys={"batch_size", "data_split", "seq_len"})
     if int(args.batch_size) != 1:
         raise ValueError("reconstruct_stream 当前按单样本自回归运行，请使用 --batch_size 1。")
 
@@ -269,13 +370,18 @@ def main(argv: list[str] | None = None) -> None:
         task_inpaint_mask = batch["inpaint_mask"][0].bool()
         valid_frame_mask = batch["valid_frame_mask"][0].bool()
 
-        conditioned_reference = torch.where(task_inpaint_mask, torch.zeros_like(reference), reference)
         with torch.no_grad():
             reconstructed = sample_streaming_sequence(
                 model=model,
                 diffusion=diffusion,
                 args=args,
                 reference=reference,
+                task_inpaint_mask=task_inpaint_mask,
+                valid_frame_mask=valid_frame_mask,
+            )
+            conditioned_reference = build_previous_frame_conditioned_sequence(
+                reference=reference,
+                reconstructed=reconstructed,
                 task_inpaint_mask=task_inpaint_mask,
                 valid_frame_mask=valid_frame_mask,
             )
@@ -290,6 +396,9 @@ def main(argv: list[str] | None = None) -> None:
         sensor_missing_labels = batch["sensor_missing_labels"][0].transpose(0, 1).cpu().numpy()
         inpaint_mask = task_inpaint_mask.transpose(0, 1).cpu().numpy()
         valid_frame_mask_np = valid_frame_mask.cpu().numpy()
+        valid_length = int(valid_frame_mask.sum().item())
+        target_start = get_batch_int_item(batch, "target_start", 0, valid_length - 1)
+        target_length = get_batch_int_item(batch, "target_length", 0, 1)
 
         render_meta = None
         rendered = False
@@ -323,7 +432,9 @@ def main(argv: list[str] | None = None) -> None:
             "source_path": get_batch_string_item(batch, "source_path", 0),
             "task_mode": get_batch_string_item(batch, "task_mode", 0),
             "schema_name": get_batch_string_item(batch, "schema_name", 0),
-            "valid_length": int(valid_frame_mask.sum().item()),
+            "valid_length": valid_length,
+            "target_start": target_start,
+            "target_length": target_length,
             "model_path": str(args.model_path),
             "model_source": model_source,
             "output_dir": str(sample_dir),

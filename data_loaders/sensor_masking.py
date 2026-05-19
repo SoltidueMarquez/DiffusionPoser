@@ -13,6 +13,8 @@ MODEL_INPUT_DIM = X277_FEATURE_DIM + SENSOR_LABEL_DIM
 CURRENT277_SCHEMA_NAME = "current277_v1"
 TASK_MODE_FULL_RECONSTRUCTION_CURRENT = "full_reconstruction_current"
 TASK_MODES = (TASK_MODE_FULL_RECONSTRUCTION_CURRENT,)
+HISTORY_CONTEXT_FRAMES = 10
+LAST_FRAME_RECONSTRUCTION_SEQ_LEN = HISTORY_CONTEXT_FRAMES + 1
 
 BODY_ROT_START = 0
 BODY_ROT_DIM = 144
@@ -107,25 +109,6 @@ def sample_missing_sensors(
     return tuple(sorted(int(index) for index in sensor_indices))
 
 
-def sample_frame_interval_in_range(
-    rng: np.random.Generator,
-    start_frame: int,
-    end_frame: int,
-    min_missing_length: int = 10,
-    max_missing_length: int | None = None,
-) -> tuple[int, int]:
-    """Sample a contiguous interval inside ``[start_frame, end_frame)``."""
-
-    if start_frame < 0 or end_frame <= start_frame:
-        raise ValueError(f"invalid frame range: start={start_frame}, end={end_frame}")
-    span = end_frame - start_frame
-    upper = span if max_missing_length is None else min(max_missing_length, span)
-    lower = min(max(1, min_missing_length), upper)
-    length = int(rng.integers(lower, upper + 1))
-    start = int(rng.integers(start_frame, end_frame - length + 1))
-    return start, length
-
-
 def mark_current_reconstruction_targets(inpaint_mask: np.ndarray, start: int, length: int) -> None:
     """Mark body/root/contact channels as reconstruction targets for a current277 window."""
 
@@ -139,19 +122,103 @@ def mark_current_reconstruction_targets(inpaint_mask: np.ndarray, start: int, le
     inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
 
 
+def validate_last_frame_seq_len(seq_len: int) -> None:
+    """
+    校验 current277 在线补全任务的物化窗口长度。
+
+    当前需求不保留长窗口兼容：任务文件、训练、采样和导出都必须直接使用
+    11 帧窗口，其中前 10 帧是历史条件，第 11 帧是唯一补全目标。
+    """
+
+    if int(seq_len) != LAST_FRAME_RECONSTRUCTION_SEQ_LEN:
+        raise ValueError(
+            "full_reconstruction_current 固定为 10 帧历史 + 第 11 帧补全，"
+            f"seq_len 应为 {LAST_FRAME_RECONSTRUCTION_SEQ_LEN}，实际为 {seq_len}"
+        )
+
+
+def validate_last_frame_window(valid_length: int) -> None:
+    """
+    校验 current277 在线补全窗口长度。
+
+    本任务固定读取 10 帧历史上下文，并补全第 11 帧；因此有效窗口长度必须
+    正好是 11。这样训练、采样和评估里的 target 帧位置都保持一致。
+    """
+
+    if int(valid_length) != LAST_FRAME_RECONSTRUCTION_SEQ_LEN:
+        raise ValueError(
+            "full_reconstruction_current 固定为 10 帧历史 + 第 11 帧补全，"
+            f"valid_length 应为 {LAST_FRAME_RECONSTRUCTION_SEQ_LEN}，实际为 {valid_length}"
+        )
+
+
+def current_reconstruction_target_frame(valid_length: int) -> int:
+    """返回当前窗口唯一需要补全的帧索引，也就是第 11 帧。"""
+
+    validate_last_frame_window(valid_length)
+    return HISTORY_CONTEXT_FRAMES
+
+
+def enforce_last_frame_reconstruction_task(
+    sensor_missing_labels: np.ndarray,
+    inpaint_mask: np.ndarray,
+    valid_length: int,
+) -> tuple[int, int]:
+    """
+    严格校验任务已经是 DiffusionPoser 风格的“只补当前帧”窗口。
+
+    输入数组形状分别为 `[T, 6]` 和 `[T, 283]`。函数不再重写旧的长区间
+    target；如果 mask 不是“前 10 帧全条件、第 11 帧补全”的原生任务，
+    直接报错，要求重新生成 materialized task。
+    """
+
+    if sensor_missing_labels.ndim != 2 or sensor_missing_labels.shape[1] != SENSOR_LABEL_DIM:
+        raise ValueError("sensor_missing_labels must be [T, 6].")
+    if inpaint_mask.ndim != 2 or inpaint_mask.shape[1] < MODEL_INPUT_DIM:
+        raise ValueError("inpaint_mask must be [T, 283] or wider.")
+    if sensor_missing_labels.shape[0] != inpaint_mask.shape[0]:
+        raise ValueError(
+            f"sensor_missing_labels and inpaint_mask frame counts differ: "
+            f"{sensor_missing_labels.shape[0]} vs {inpaint_mask.shape[0]}"
+        )
+    validate_last_frame_window(valid_length)
+    if valid_length > inpaint_mask.shape[0]:
+        raise ValueError(f"valid_length={valid_length} exceeds task length={inpaint_mask.shape[0]}")
+
+    target_start = current_reconstruction_target_frame(valid_length)
+    target_length = 1
+    if sensor_missing_labels[:target_start].any() or sensor_missing_labels[target_start + 1 : valid_length].any():
+        raise ValueError("sensor_missing_labels 只能在第 11 帧标记缺失传感器。")
+
+    expected_mask = np.zeros_like(inpaint_mask, dtype=bool)
+    mark_current_reconstruction_targets(
+        inpaint_mask=expected_mask,
+        start=target_start,
+        length=target_length,
+    )
+    missing_sensors = np.flatnonzero(sensor_missing_labels[target_start])
+    if missing_sensors.size:
+        apply_sensor_missing_interval(
+            sensor_missing_labels=np.zeros_like(sensor_missing_labels, dtype=bool),
+            inpaint_mask=expected_mask,
+            start=target_start,
+            length=target_length,
+            sensor_indices=missing_sensors,
+        )
+
+    if not np.array_equal(inpaint_mask.astype(bool), expected_mask):
+        raise ValueError("inpaint_mask 必须只在第 11 帧标记 body/root/contact 和当前缺失 tracker。")
+    return target_start, target_length
+
+
 def create_full_reconstruction_task(
     seq_len: int,
     valid_length: int,
     rng: np.random.Generator,
     num_intervals: int = 1,
-    min_missing_length: int = 10,
-    max_missing_length: int | None = None,
     min_missing_sensors: int = 1,
     max_missing_sensors: int = 4,
     min_observed_sensors: int = 2,
-    min_history_frames: int = 10,
-    min_target_frames: int = 1,
-    max_target_frames: int | None = None,
     all_sensor_dropout_prob: float = 0.10,
     target_start: int | None = None,
     target_length: int | None = None,
@@ -159,40 +226,38 @@ def create_full_reconstruction_task(
     """
     Create a current277 full reconstruction task.
 
-    The target suffix predicts body rotation, body velocity, root delta, yaw delta,
-    contact labels, and tracker pos/rot only when that tracker is offline. The
-    prefix before ``target_start`` remains condition context.
+    每个固定窗口只预测最后一个有效帧。历史帧全部作为条件，最后一帧预测
+    body rotation、body velocity、root delta、yaw delta、contact，以及当前
+    离线 tracker 的 position/rotation。这和 DiffusionPoser 的实时自回归
+    inpainting 对齐：一个窗口对应“历史 + 当前观测”，输出当前帧。
     """
 
-    if seq_len <= 0:
-        raise ValueError("seq_len must be positive.")
-    if valid_length <= 0 or valid_length > seq_len:
-        raise ValueError(f"valid_length must be in [1, seq_len], got {valid_length} / {seq_len}")
+    validate_last_frame_seq_len(seq_len)
+    validate_last_frame_window(valid_length)
     if num_intervals <= 0:
         raise ValueError("num_intervals must be positive.")
     if not 0.0 <= all_sensor_dropout_prob <= 1.0:
         raise ValueError("all_sensor_dropout_prob must be in [0, 1].")
 
+    expected_target_start = current_reconstruction_target_frame(valid_length)
     if target_start is None:
-        target_start_upper = max(valid_length - max(1, min_target_frames), 0)
-        target_start_lower = min(max(0, min_history_frames), target_start_upper)
-        target_start = int(rng.integers(target_start_lower, target_start_upper + 1))
+        target_start = expected_target_start
     else:
         target_start = int(target_start)
-    if target_start < 0 or target_start >= valid_length:
-        raise ValueError(f"target_start out of valid range: {target_start}, valid_length={valid_length}")
-
-    max_available_target = valid_length - target_start
+        if target_start != expected_target_start:
+            raise ValueError(
+                "full_reconstruction_current 固定补第 11 帧："
+                f"target_start 应为 {expected_target_start}，实际为 {target_start}"
+            )
     if target_length is None:
-        target_upper = max_available_target if max_target_frames is None else min(max_target_frames, max_available_target)
-        target_lower = min(max(1, min_target_frames), target_upper)
-        target_length = int(rng.integers(target_lower, target_upper + 1))
+        target_length = 1
     else:
         target_length = int(target_length)
-    if target_length <= 0 or target_start + target_length > valid_length:
-        raise ValueError(
-            f"target range out of valid frames: start={target_start}, length={target_length}, valid={valid_length}"
-        )
+        if target_length != 1:
+            raise ValueError(
+                "full_reconstruction_current 只补窗口最后一帧："
+                f"target_length 应为 1，实际为 {target_length}"
+            )
 
     sensor_missing_labels = np.zeros((seq_len, SENSOR_LABEL_DIM), dtype=bool)
     inpaint_mask = np.zeros((seq_len, MODEL_INPUT_DIM), dtype=bool)
@@ -204,15 +269,9 @@ def create_full_reconstruction_task(
         length=target_length,
     )
 
-    target_end = target_start + target_length
     for _ in range(num_intervals):
-        start, length = sample_frame_interval_in_range(
-            rng=rng,
-            start_frame=target_start,
-            end_frame=target_end,
-            min_missing_length=min_missing_length,
-            max_missing_length=max_missing_length,
-        )
+        # 任务目标固定为当前窗口最后一帧；多次采样会把多个缺失传感器集合并到这一帧。
+        start, length = target_start, target_length
         if rng.random() < all_sensor_dropout_prob:
             sensor_indices = tuple(range(SENSOR_LABEL_DIM))
         else:

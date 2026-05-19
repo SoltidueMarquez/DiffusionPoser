@@ -20,7 +20,9 @@ from sample.visualization import (
     HAS_VISUALIZATION_BACKEND,
     SMPL_JOINT_COUNT,
     decode_x277_joint_positions_from_body_velocity,
+    decode_x277_tracker_positions,
     render_full_reconstruction_visualization,
+    restore_missing_tracker_positions_for_visualization,
 )
 
 
@@ -32,6 +34,31 @@ class Current277FullVisualizationTest(unittest.TestCase):
 
         self.assertEqual(decoded.shape, (5, SMPL_JOINT_COUNT, 3))
         self.assertTrue(np.isfinite(decoded).all())
+
+    def test_missing_tracker_visualization_uses_reference_position(self):
+        reference_motion = build_toy_current277_motion(frame_count=5)
+        conditioned_motion = reference_motion.copy()
+        missing_sensor_indices = (1, 4)
+        for sensor_index in missing_sensor_indices:
+            pos_start = TRACKER_POS_START + sensor_index * TRACKER_POS_DIM
+            conditioned_motion[2, pos_start : pos_start + TRACKER_POS_DIM] = 0.0
+
+        sensor_missing_labels = np.zeros((5, SENSOR_LABEL_DIM), dtype=bool)
+        sensor_missing_labels[2, list(missing_sensor_indices)] = True
+
+        reference_trackers = decode_x277_tracker_positions(reference_motion)
+        conditioned_trackers = decode_x277_tracker_positions(conditioned_motion)
+        restored_trackers = restore_missing_tracker_positions_for_visualization(
+            conditioned_trackers=conditioned_trackers,
+            reference_trackers=reference_trackers,
+            sensor_missing_labels=sensor_missing_labels,
+        )
+
+        self.assertFalse(np.allclose(conditioned_trackers[2, 1], reference_trackers[2, 1]))
+        self.assertFalse(np.allclose(conditioned_trackers[2, 4], reference_trackers[2, 4]))
+        np.testing.assert_allclose(restored_trackers[2, 1], reference_trackers[2, 1], atol=1e-6)
+        np.testing.assert_allclose(restored_trackers[2, 4], reference_trackers[2, 4], atol=1e-6)
+        np.testing.assert_allclose(restored_trackers[2, 0], conditioned_trackers[2, 0], atol=1e-6)
 
     @unittest.skipUnless(HAS_VISUALIZATION_BACKEND, "缺少可视化后端，跳过完整补全 mp4 smoke test。")
     def test_render_full_reconstruction_visualization_writes_mp4(self):

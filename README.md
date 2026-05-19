@@ -16,19 +16,21 @@ pip install -r requirements.txt
 
 ### X277 缺失任务生成
 
-先把 `dataset/AMASS_x277_60hz` 中的 `x: [T, 277]` 转成固定长度缺失任务。默认每个源文件生成 4 条任务，序列长度为 100：
+先把 `dataset/AMASS_x277_60hz` 中的 `x: [T, 277]` 转成固定长度缺失任务。默认每个源文件生成 4 条任务，序列长度为 11：
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 100 --samples_per_file 4 --seed 10 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --samples_per_file 4 --seed 10 --overwrite
 ```
 
 `data_loaders/splits/train.txt` 和 `data_loaders/splits/test.txt` 已经从 StableMotion 参考项目复制到本项目，可直接用于 `stablemotion_split_key` 过滤。
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 100 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --overwrite
 ```
 
 生成目录形如 `dataset/AMASS_x277_60hz_missing_tasks/train/manifest.jsonl` 和 `tasks/*.npz`。训练时直接把根目录传给 `--data_dir`：
+
+当前 `full_reconstruction_current` 任务固定为 DiffusionPoser 风格的单帧在线补全：每条固定窗口固定 11 帧，前 10 帧作为历史条件，第 11 帧标记为重建目标。第 11 帧会补全 body/root/contact，以及该帧离线 tracker 的 position/rotation。
 
 ```powershell
 python -m train.train_diffusionposer --data_dir dataset/AMASS_x277_60hz_missing_tasks --data_split train --save_dir runs/x277_train --overwrite
@@ -106,7 +108,7 @@ DiffusionPoser/
 | `sensor_missing_labels` | `[B, 6, T]` | 6 个 tracker 在每帧是否缺失。 |
 | `inpaint_mask` | `[B, 283, T]` | `True` 表示该位置需要扩散补全并参与 loss。 |
 
-`TrainLoop.mask_manager()` 使用离线生成的 `inpaint_mask`，缺少该字段会直接报错，避免误跑随机或无监督 mask。
+`TrainLoop.mask_manager()` 使用离线生成的 `inpaint_mask`，缺少该字段会直接报错，避免误跑随机或无监督 mask。`X277MissingTaskDataset` 只接受原生 11 帧 materialized task：前 10 帧是历史条件，第 11 帧是唯一补全目标。已有 100/150 帧旧任务不会被自动裁剪，必须用当前生成脚本重新生成。
 
 ## 常用参数
 
@@ -118,7 +120,7 @@ DiffusionPoser/
 | `--device` | `0` | CUDA 设备编号。 |
 | `--batch_size` | `8` | batch size。 |
 | `--input_feats` | `283` | 训练输入特征维度。 |
-| `--seq_len` | `100` | 固定裁剪/padding 后的训练帧数。 |
+| `--seq_len` | `11` | 固定训练帧数；10 帧历史 + 第 11 帧补全。 |
 | `--num_workers` | `0` | DataLoader worker 数量。 |
 | `--layers` | `8` | Transformer 层数。 |
 | `--heads` | `8` | attention heads。 |

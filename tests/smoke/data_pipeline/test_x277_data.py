@@ -53,33 +53,27 @@ class SensorMaskingTest(unittest.TestCase):
     def test_full_reconstruction_masks_body_root_contact_and_offline_trackers(self):
         rng = np.random.default_rng(7)
         sensor_missing_labels, inpaint_mask, intervals, target_start, target_length = create_full_reconstruction_task(
-            seq_len=12,
-            valid_length=10,
+            seq_len=11,
+            valid_length=11,
             rng=rng,
             num_intervals=1,
-            min_missing_length=4,
-            max_missing_length=4,
             all_sensor_dropout_prob=1.0,
-            target_start=3,
-            target_length=4,
         )
 
-        self.assertEqual(target_start, 3)
-        self.assertEqual(target_length, 4)
+        self.assertEqual(target_start, 10)
+        self.assertEqual(target_length, 1)
         self.assertEqual(len(intervals), 1)
 
-        target = slice(3, 7)
+        target = target_start
         self.assertTrue(inpaint_mask[target, 0:216].all())
         self.assertTrue(inpaint_mask[target, ROOT_DELTA_START : ROOT_DELTA_START + 2].all())
         self.assertTrue(inpaint_mask[target, ROOT_YAW_START : ROOT_YAW_START + 1].all())
         self.assertTrue(inpaint_mask[target, CONTACT_START : CONTACT_START + 4].all())
-        self.assertFalse(inpaint_mask[:3].any())
-        self.assertFalse(inpaint_mask[10:].any())
+        self.assertFalse(inpaint_mask[:target_start].any())
         self.assertFalse(inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
 
         self.assertTrue(sensor_missing_labels[target].all())
-        self.assertFalse(sensor_missing_labels[:3].any())
-        self.assertFalse(sensor_missing_labels[10:].any())
+        self.assertFalse(sensor_missing_labels[:target_start].any())
         for sensor_index in range(SENSOR_LABEL_DIM):
             pos_slice, rot_slice = sensor_feature_slices(sensor_index)
             self.assertTrue(inpaint_mask[target, pos_slice].all())
@@ -130,19 +124,9 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
                     "--task_mode",
                     TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
                     "--seq_len",
-                    "20",
+                    "11",
                     "--samples_per_file",
                     "1",
-                    "--min_history_frames",
-                    "5",
-                    "--min_target_frames",
-                    "5",
-                    "--max_target_frames",
-                    "5",
-                    "--min_missing_length",
-                    "5",
-                    "--max_missing_length",
-                    "5",
                     "--all_sensor_dropout_prob",
                     "1.0",
                     "--seed",
@@ -155,8 +139,10 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             self.assertEqual(manifest_entry["schema_name"], "current277_v1")
             target_start = int(manifest_entry["target_start"])
             target_length = int(manifest_entry["target_length"])
-            target = slice(target_start, target_start + target_length)
-            self.assertEqual(target_length, 5)
+            target = target_start
+            self.assertEqual(target_start, 10)
+            self.assertEqual(target_length, 1)
+            self.assertEqual(manifest_entry["task_format"], "materialized_current277_last_frame_reconstruction_v1")
 
             with np.load(output_dir / "train" / manifest_entry["task_path"], allow_pickle=False) as task_data:
                 inpaint_mask = task_data["inpaint_mask"].astype(bool)
@@ -164,8 +150,10 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             self.assertTrue(inpaint_mask[target, 0:216].all())
             self.assertTrue(inpaint_mask[target, ROOT_DELTA_START : ROOT_DELTA_START + 2].all())
             self.assertTrue(inpaint_mask[target, CONTACT_START : CONTACT_START + 4].all())
+            self.assertFalse(inpaint_mask[:target_start].any())
             self.assertFalse(inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
             self.assertTrue(sensor_missing_labels[target].all())
+            self.assertFalse(sensor_missing_labels[:target_start].any())
 
     def test_generator_and_dataset_create_fixed_length_training_batch(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -174,13 +162,13 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             source_file = source_dir / "CMU" / "142" / "sample_poses.npz"
             source_file.parent.mkdir(parents=True)
 
-            x277 = np.arange(35 * X277_FEATURE_DIM, dtype=np.float32).reshape(35, X277_FEATURE_DIM)
+            x277 = np.arange(11 * X277_FEATURE_DIM, dtype=np.float32).reshape(11, X277_FEATURE_DIM)
             np.savez(source_file, x=x277)
 
             manifest_entry = {
                 "status": "converted",
                 "feature_dim": X277_FEATURE_DIM,
-                "frames": 35,
+                "frames": 11,
                 "output_path": str(source_file),
                 "source_relative_path": "CMU/142/sample_poses.npz",
                 "stablemotion_split_key": "CMU/142/sample_poses.npy",
@@ -205,7 +193,7 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
                     "--splits",
                     "train",
                     "--seq_len",
-                    "100",
+                    "11",
                     "--samples_per_file",
                     "2",
                     "--all_sensor_dropout_prob",
@@ -222,24 +210,20 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             first_task_path = output_dir / "train" / first_entry["task_path"]
             with np.load(first_task_path, allow_pickle=False) as task_data:
                 self.assertIn("x277", task_data.files)
-                self.assertEqual(tuple(task_data["x277"].shape), (100, X277_FEATURE_DIM))
-                np.testing.assert_array_equal(task_data["x277"][:35], x277)
-                self.assertTrue((task_data["x277"][35:] == 0).all())
+                self.assertEqual(tuple(task_data["x277"].shape), (11, X277_FEATURE_DIM))
+                np.testing.assert_array_equal(task_data["x277"], x277)
 
-            dataset = X277MissingTaskDataset(data_dir=output_dir, split="train", seq_len=100, normalize_input=False)
+            dataset = X277MissingTaskDataset(data_dir=output_dir, split="train", seq_len=11, normalize_input=False)
             self.assertEqual(len(dataset), 2)
 
             item = dataset[0]
-            self.assertEqual(tuple(item["x"].shape), (MODEL_INPUT_DIM, 100))
-            self.assertEqual(tuple(item["valid_frame_mask"].shape), (100,))
-            self.assertEqual(tuple(item["attention_mask"].shape), (100,))
-            self.assertEqual(tuple(item["sensor_missing_labels"].shape), (SENSOR_LABEL_DIM, 100))
-            self.assertEqual(tuple(item["inpaint_mask"].shape), (MODEL_INPUT_DIM, 100))
-            self.assertEqual(int(item["valid_frame_mask"].sum().item()), 35)
+            self.assertEqual(tuple(item["x"].shape), (MODEL_INPUT_DIM, 11))
+            self.assertEqual(tuple(item["valid_frame_mask"].shape), (11,))
+            self.assertEqual(tuple(item["attention_mask"].shape), (11,))
+            self.assertEqual(tuple(item["sensor_missing_labels"].shape), (SENSOR_LABEL_DIM, 11))
+            self.assertEqual(tuple(item["inpaint_mask"].shape), (MODEL_INPUT_DIM, 11))
+            self.assertEqual(int(item["valid_frame_mask"].sum().item()), 11)
 
-            self.assertTrue(torch.all(item["x"][:, 35:] == 0))
-            self.assertFalse(item["valid_frame_mask"][35:].any())
-            self.assertFalse(item["inpaint_mask"][:, 35:].any())
             self.assertFalse(item["inpaint_mask"][X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
 
             labels = item["sensor_missing_labels"].numpy()
@@ -247,6 +231,13 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
 
             mask = item["inpaint_mask"].numpy()
             self.assertTrue(labels.any())
+            target_frame = int(item["target_start"])
+            self.assertEqual(target_frame, 10)
+            self.assertEqual(int(item["target_length"]), 1)
+            self.assertTrue(mask[:, :target_frame].sum() == 0)
+            self.assertTrue(mask[:, target_frame + 1 :].sum() == 0)
+            self.assertTrue(labels[:, :target_frame].sum() == 0)
+            self.assertTrue(labels[:, target_frame + 1 :].sum() == 0)
             self.assertTrue(mask[:216].any())
             self.assertTrue(mask[ROOT_DELTA_START : ROOT_DELTA_START + 2].any())
             self.assertTrue(mask[ROOT_YAW_START : ROOT_YAW_START + 1].any())
@@ -254,9 +245,9 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
 
             loader = DataLoader(dataset, batch_size=2, shuffle=False)
             batch = next(iter(loader))
-            self.assertEqual(tuple(batch["x"].shape), (2, MODEL_INPUT_DIM, 100))
-            self.assertEqual(tuple(batch["valid_frame_mask"].shape), (2, 100))
-            self.assertEqual(tuple(batch["inpaint_mask"].shape), (2, MODEL_INPUT_DIM, 100))
+            self.assertEqual(tuple(batch["x"].shape), (2, MODEL_INPUT_DIM, 11))
+            self.assertEqual(tuple(batch["valid_frame_mask"].shape), (2, 11))
+            self.assertEqual(tuple(batch["inpaint_mask"].shape), (2, MODEL_INPUT_DIM, 11))
 
             normalizer_dir = tmp_path / "meta"
             mean = np.arange(X277_FEATURE_DIM, dtype=np.float32)
@@ -266,27 +257,25 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             normalized_dataset = X277MissingTaskDataset(
                 data_dir=output_dir,
                 split="train",
-                seq_len=100,
+                seq_len=11,
                 normalizer_dir=normalizer_dir,
                 normalize_input=True,
             )
             normalized_item = normalized_dataset[0]
-            expected_x277 = (x277[:35] - mean) / std
+            expected_x277 = (x277 - mean) / std
             np.testing.assert_allclose(
-                normalized_item["x"][:X277_FEATURE_DIM, :35].T.numpy(),
+                normalized_item["x"][:X277_FEATURE_DIM, :11].T.numpy(),
                 expected_x277,
                 rtol=1e-6,
                 atol=1e-6,
             )
-            self.assertTrue(torch.all(normalized_item["x"][:, 35:] == 0))
 
             normalized_labels = normalized_item["sensor_missing_labels"].numpy()
-            expected_label_channels = np.where(normalized_labels[:, :35], 1.0, -1.0)
+            expected_label_channels = np.where(normalized_labels[:, :11], 1.0, -1.0)
             np.testing.assert_array_equal(
-                normalized_item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM, :35].numpy(),
+                normalized_item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM, :11].numpy(),
                 expected_label_channels,
             )
-            self.assertTrue(torch.all(normalized_item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM, 35:] == 0))
             np.testing.assert_array_equal(normalized_item["inpaint_mask"].numpy(), item["inpaint_mask"].numpy())
 
             # 新训练路径只支持 materialized task；缺少 x277 时应尽早报错，而不是回退读取源数据。
@@ -301,7 +290,7 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
                     {
                         "task_id": "legacy_without_x277",
                         "task_path": "../train/tasks/legacy_without_x277.npz",
-                        "seq_len": 100,
+                        "seq_len": 11,
                     },
                     ensure_ascii=False,
                 )
@@ -311,11 +300,45 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             legacy_dataset = X277MissingTaskDataset(
                 data_dir=output_dir,
                 split="legacy",
-                seq_len=100,
+                seq_len=11,
                 normalize_input=False,
             )
             with self.assertRaises(KeyError):
                 _ = legacy_dataset[0]
+
+            # 旧长窗口任务必须重新生成；Dataset 不再把 100/150 帧任务裁成 10+1。
+            legacy_long_task_path = output_dir / "train" / "tasks" / "legacy_long_window.npz"
+            np.savez(
+                legacy_long_task_path,
+                x277=np.zeros((150, X277_FEATURE_DIM), dtype=np.float32),
+                sensor_missing_labels=np.zeros((150, SENSOR_LABEL_DIM), dtype=bool),
+                inpaint_mask=np.zeros((150, MODEL_INPUT_DIM), dtype=bool),
+                start_frame=np.int64(0),
+                valid_length=np.int64(150),
+                source_frames=np.int64(150),
+                seq_len=np.int64(150),
+            )
+            legacy_long_manifest = output_dir / "legacy_long" / "manifest.jsonl"
+            legacy_long_manifest.parent.mkdir()
+            legacy_long_manifest.write_text(
+                json.dumps(
+                    {
+                        "task_id": "legacy_long_window",
+                        "task_path": "../train/tasks/legacy_long_window.npz",
+                        "seq_len": 150,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                X277MissingTaskDataset(
+                    data_dir=output_dir,
+                    split="legacy_long",
+                    seq_len=11,
+                    normalize_input=False,
+                )
 
 
 class X277NormalizerComputationTest(unittest.TestCase):

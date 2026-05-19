@@ -20,6 +20,7 @@ if str(EXPORT_DIR) not in sys.path:
     sys.path.insert(0, str(EXPORT_DIR))
 
 
+from data_loaders.sensor_masking import LAST_FRAME_RECONSTRUCTION_SEQ_LEN, validate_last_frame_seq_len  # noqa: E402
 from utils.model_util import create_model_and_diffusion  # noqa: E402
 from write_unity_runtime_assets import (  # noqa: E402
     default_unity_model_dir,
@@ -30,7 +31,7 @@ from write_unity_runtime_assets import (  # noqa: E402
 
 DEFAULT_MODEL_CONFIG = {
     "input_feats": expected_x277_model_input_dim(),
-    "seq_len": 150,
+    "seq_len": LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
     "layers": 8,
     "heads": 8,
     "latent_dim": 512,
@@ -115,12 +116,19 @@ def load_checkpoint_args(model_path: Path) -> dict[str, Any]:
 
 def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:
     config = dict(DEFAULT_MODEL_CONFIG)
-    config.update({key: value for key, value in load_checkpoint_args(Path(cli_args.model_path)).items() if key in config})
+    config.update(
+        {
+            key: value
+            for key, value in load_checkpoint_args(Path(cli_args.model_path)).items()
+            if key in config and key != "seq_len"
+        }
+    )
     for key in DEFAULT_MODEL_CONFIG:
         value = getattr(cli_args, key)
         if value is not None:
             config[key] = value
 
+    validate_last_frame_seq_len(config["seq_len"])
     config["predict_xstart"] = int(config["predict_xstart"])
     if not bool(config["predict_xstart"]):
         raise ValueError("Unity Sentis export requires predict_xstart=true. Epsilon-prediction checkpoints are rejected.")

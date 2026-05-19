@@ -14,6 +14,9 @@ if str(DIFFUSIONPOSER_ROOT) not in sys.path:
     sys.path.insert(0, str(DIFFUSIONPOSER_ROOT))
 
 
+from data_loaders.sensor_masking import LAST_FRAME_RECONSTRUCTION_SEQ_LEN, validate_last_frame_seq_len  # noqa: E402
+
+
 SMPL24_BONE_NAMES = [
     "Pelvis",
     "L_Hip",
@@ -100,6 +103,7 @@ def build_current277_feature_schema(
     sequence_length: int,
     bone_names: list[str] | None = None,
 ) -> dict[str, Any]:
+    validate_last_frame_seq_len(sequence_length)
     bone_names = list(bone_names or SMPL24_BONE_NAMES)
     bone_count = len(bone_names)
     if feature_dim < X277_MODEL_INPUT_DIM:
@@ -193,8 +197,6 @@ def build_normalizer(
         if strict:
             raise FileNotFoundError(f"Missing normalizer tensors: {mean_path}, {std_path}")
         return disabled_normalizer(feature_dim, epsilon)
-
-    import torch
 
     mean = torch_load(mean_path).float().flatten().cpu().numpy()
     std = torch_load(std_path).float().flatten().cpu().numpy()
@@ -299,7 +301,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default=str(default_unity_model_dir()), type=str)
     parser.add_argument("--schema", default="current277", choices=["current277", "x277", "full_body"])
     parser.add_argument("--feature_dim", default=expected_x277_model_input_dim(), type=int)
-    parser.add_argument("--seq_len", default=150, type=int)
+    parser.add_argument("--seq_len", default=LAST_FRAME_RECONSTRUCTION_SEQ_LEN, type=int)
     parser.add_argument("--diffusion_steps", default=50, type=int)
     parser.add_argument("--noise_schedule", default="cosine", choices=["linear", "cosine"])
     parser.add_argument("--normalizer_dir", default="", type=str)
@@ -310,6 +312,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
     args = build_arg_parser().parse_args(argv)
+    validate_last_frame_seq_len(args.seq_len)
     normalizer_dir = Path(args.normalizer_dir).resolve() if args.normalizer_dir else None
     assets = write_runtime_assets(
         output_dir=Path(args.output_dir).resolve(),

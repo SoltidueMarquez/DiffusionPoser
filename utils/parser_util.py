@@ -4,7 +4,11 @@ import json
 from argparse import ArgumentParser
 from pathlib import Path
 
-from data_loaders.sensor_masking import TASK_MODE_FULL_RECONSTRUCTION_CURRENT, TASK_MODES
+from data_loaders.sensor_masking import (
+    LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
+    TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+    TASK_MODES,
+)
 
 
 def train_args():
@@ -107,9 +111,9 @@ def add_data_options(parser: ArgumentParser):
     )
     group.add_argument(
         "--seq_len",
-        default=100,
+        default=LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
         type=int,
-        help="训练序列固定裁剪/padding 后的帧数。",
+        help="训练/采样窗口帧数；当前任务固定为 11，即 10 帧历史 + 第 11 帧补全。",
     )
     group.add_argument("--num_workers", default=0, type=int, help="DataLoader worker 数量。")
 

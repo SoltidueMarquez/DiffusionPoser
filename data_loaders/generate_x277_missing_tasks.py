@@ -12,11 +12,14 @@ from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
     CURRENT277_SCHEMA_NAME,
+    LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
     MODEL_INPUT_DIM,
     TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
     TASK_MODES,
     X277_FEATURE_DIM,
     create_full_reconstruction_task,
+    validate_last_frame_seq_len,
+    validate_last_frame_window,
 )
 
 
@@ -48,42 +51,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="任务语义：current277 全身重建。",
     )
     group.add_argument("--splits", nargs="+", default=["train"], type=str, help="要生成的 split 名称列表。")
-    group.add_argument("--seq_len", default=100, type=int, help="每条训练任务的固定帧长。")
+    group.add_argument(
+        "--seq_len",
+        default=LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
+        type=int,
+        help="每条任务的固定帧长；默认 11，即 10 帧历史 + 第 11 帧补全。",
+    )
     group.add_argument("--samples_per_file", default=4, type=int, help="每个源动作文件生成多少个固定窗口任务。")
-    group.add_argument("--num_intervals", default=1, type=int, help="每条任务内连续缺失区间数量。")
-    group.add_argument("--min_missing_length", default=10, type=int, help="每个缺失区间的最短帧数。")
-    group.add_argument(
-        "--max_missing_length",
-        default=0,
-        type=int,
-        help="每个缺失区间的最长帧数；0 表示不超过 seq_len/有效长度。",
-    )
-    group.add_argument("--min_missing_sensors", default=1, type=int, help="每个区间最少缺失传感器数量。")
-    group.add_argument("--max_missing_sensors", default=4, type=int, help="每个区间最多缺失传感器数量。")
-    group.add_argument("--min_observed_sensors", default=2, type=int, help="每个区间至少保留的未缺失传感器数量。")
-    group.add_argument(
-        "--min_history_frames",
-        default=10,
-        type=int,
-        help="full_reconstruction_current 的历史条件帧数下限。",
-    )
-    group.add_argument(
-        "--min_target_frames",
-        default=1,
-        type=int,
-        help="full_reconstruction_current 的目标帧数下限。",
-    )
-    group.add_argument(
-        "--max_target_frames",
-        default=0,
-        type=int,
-        help="full_reconstruction_current 的目标帧数上限；0 表示不限制。",
-    )
+    group.add_argument("--num_intervals", default=1, type=int, help="第 11 帧缺失传感器集合的采样次数。")
+    group.add_argument("--min_missing_sensors", default=1, type=int, help="第 11 帧最少缺失传感器数量。")
+    group.add_argument("--max_missing_sensors", default=4, type=int, help="第 11 帧最多缺失传感器数量。")
+    group.add_argument("--min_observed_sensors", default=2, type=int, help="第 11 帧至少保留的未缺失传感器数量。")
     group.add_argument(
         "--all_sensor_dropout_prob",
         default=0.10,
         type=float,
-        help="full_reconstruction_current 中生成全 6 tracker 断线区间的概率。",
+        help="full_reconstruction_current 中第 11 帧全 6 tracker 断线的概率。",
     )
     group.add_argument("--limit", default=0, type=int, help="每个 split 最多使用多少个源样本；0 表示不限制。")
 
@@ -312,7 +295,6 @@ def generate_split_tasks(
     task_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = split_dir / "manifest.jsonl"
 
-    max_missing_length = args.max_missing_length if args.max_missing_length > 0 else None
     written = 0
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         progress = tqdm(
@@ -333,7 +315,6 @@ def generate_split_tasks(
                     source_frames=source_frames,
                     seq_len=args.seq_len,
                 )
-                max_target_frames = args.max_target_frames if args.max_target_frames > 0 else None
                 (
                     sensor_missing_labels,
                     inpaint_mask,
@@ -345,21 +326,16 @@ def generate_split_tasks(
                     valid_length=valid_length,
                     rng=rng,
                     num_intervals=args.num_intervals,
-                    min_missing_length=args.min_missing_length,
-                    max_missing_length=max_missing_length,
                     min_missing_sensors=args.min_missing_sensors,
                     max_missing_sensors=args.max_missing_sensors,
                     min_observed_sensors=args.min_observed_sensors,
-                    min_history_frames=args.min_history_frames,
-                    min_target_frames=args.min_target_frames,
-                    max_target_frames=max_target_frames,
                     all_sensor_dropout_prob=args.all_sensor_dropout_prob,
                 )
                 task_extra = {
                     "target_start": int(target_start),
                     "target_length": int(target_length),
                 }
-                task_format = "materialized_current277_full_reconstruction_v1"
+                task_format = "materialized_current277_last_frame_reconstruction_v1"
                 schema_name = CURRENT277_SCHEMA_NAME
 
                 task_id = make_task_id(
@@ -457,8 +433,10 @@ def inspect_x277_file(source_path: Path, fallback_frames: int = 0) -> tuple[int,
 
 
 def create_x277_clip(source_x277: np.ndarray, start_frame: int, valid_length: int, seq_len: int) -> np.ndarray:
-    """把源 X277 序列物化成固定长度训练窗口，padding 帧保持 0。"""
+    """把源 X277 序列物化成固定 11 帧训练窗口。"""
 
+    validate_last_frame_seq_len(seq_len)
+    validate_last_frame_window(valid_length)
     end_frame = start_frame + valid_length
     if start_frame < 0 or valid_length <= 0 or end_frame > source_x277.shape[0]:
         raise ValueError(
@@ -472,12 +450,14 @@ def create_x277_clip(source_x277: np.ndarray, start_frame: int, valid_length: in
 def sample_window(rng: np.random.Generator, source_frames: int, seq_len: int) -> tuple[int, int]:
     if source_frames <= 0:
         raise ValueError("源序列帧数必须大于 0。")
-    if seq_len <= 0:
-        raise ValueError("seq_len 必须大于 0。")
-    if source_frames <= seq_len:
-        return 0, source_frames
-    start_frame = int(rng.integers(0, source_frames - seq_len + 1))
-    return start_frame, seq_len
+    validate_last_frame_seq_len(seq_len)
+    if source_frames < LAST_FRAME_RECONSTRUCTION_SEQ_LEN:
+        raise ValueError(
+            f"源序列至少需要 {LAST_FRAME_RECONSTRUCTION_SEQ_LEN} 帧，"
+            f"用于 10 帧历史 + 第 11 帧补全，实际为 {source_frames}"
+        )
+    start_frame = int(rng.integers(0, source_frames - LAST_FRAME_RECONSTRUCTION_SEQ_LEN + 1))
+    return start_frame, LAST_FRAME_RECONSTRUCTION_SEQ_LEN
 
 
 def make_task_id(

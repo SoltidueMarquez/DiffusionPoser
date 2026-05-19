@@ -87,7 +87,7 @@ TRACKER_JOINT_INDICES = np.array(
 )
 FULL_RECONSTRUCTION_VISUALIZATION_NOTE = (
     "Approximate full reconstruction: 24 joints are decoded from X277 body velocity/root delta; "
-    "offline trackers are shown as overlaid markers."
+    "offline trackers are shown at their reference positions with target colors."
 )
 KINEMATIC_CHAINS = (
     (0, 3, 6, 9, 12, 15),
@@ -331,6 +331,35 @@ def decode_x277_joint_positions_from_body_velocity(
     return np.stack(decoded_frames, axis=0).astype(np.float32)
 
 
+def restore_missing_tracker_positions_for_visualization(
+    conditioned_trackers: np.ndarray,
+    reference_trackers: np.ndarray,
+    sensor_missing_labels: np.ndarray,
+) -> np.ndarray:
+    """
+    Render offline tracker points at their original reference positions.
+
+    The model still receives masked tracker features. This helper is only for
+    visualization: a missing sensor should remain visible at the real location,
+    while color/marker style communicates that it was unavailable as input.
+    """
+
+    conditioned = np.asarray(conditioned_trackers, dtype=np.float64).copy()
+    reference = np.asarray(reference_trackers, dtype=np.float64)
+    labels = np.asarray(sensor_missing_labels, dtype=bool)
+
+    expected_tail_shape = (len(SENSOR_NAMES), 3)
+    if conditioned.ndim != 3 or conditioned.shape[1:] != expected_tail_shape:
+        raise ValueError(f"conditioned_trackers 应为 [T, 6, 3]，实际为 {conditioned.shape}")
+    if reference.shape != conditioned.shape:
+        raise ValueError(f"reference_trackers 应与 conditioned_trackers 同形，实际为 {reference.shape}")
+    if labels.shape != conditioned.shape[:2]:
+        raise ValueError(f"sensor_missing_labels 应为 [T, 6]，实际为 {labels.shape}")
+
+    conditioned[labels] = reference[labels]
+    return conditioned.astype(np.float32)
+
+
 # endregion
 
 
@@ -408,13 +437,18 @@ def render_full_reconstruction_visualization(
     if frame_count <= 0:
         raise ValueError("没有可视化帧。")
 
+    conditioned_trackers_for_display = restore_missing_tracker_positions_for_visualization(
+        conditioned_trackers=conditioned_trackers[:frame_count],
+        reference_trackers=reference_trackers[:frame_count],
+        sensor_missing_labels=labels[:frame_count],
+    )
     tracks = [
         unity_to_z_up_display(conditioned_joints[:frame_count]).copy(),
         unity_to_z_up_display(reconstructed_joints[:frame_count]).copy(),
         unity_to_z_up_display(reference_joints[:frame_count]).copy(),
     ]
     tracker_tracks = [
-        unity_to_z_up_display(conditioned_trackers[:frame_count]).copy(),
+        unity_to_z_up_display(conditioned_trackers_for_display).copy(),
         unity_to_z_up_display(reconstructed_trackers[:frame_count]).copy(),
         unity_to_z_up_display(reference_trackers[:frame_count]).copy(),
     ]
@@ -519,6 +553,7 @@ def render_full_reconstruction_visualization(
         "frames": frame_meta,
         "visualization": "current277_full_reconstruction",
         "note": FULL_RECONSTRUCTION_VISUALIZATION_NOTE,
+        "conditioned_missing_trackers": "reference_position_target_color",
     }
 
 
