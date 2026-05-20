@@ -16,6 +16,11 @@ from data_loaders.sensor_masking import (
     ROOT_YAW_START,
     SENSOR_LABEL_DIM,
     TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+    TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2,
+    TRACKER_POS_DIM,
+    TRACKER_POS_START,
+    TRACKER_ROT_DIM,
+    TRACKER_ROT_START,
     X277_FEATURE_DIM,
     apply_sensor_missing_interval,
     create_full_reconstruction_task,
@@ -26,7 +31,7 @@ from utils.normalizer import X277Normalizer
 
 
 class SensorMaskingTest(unittest.TestCase):
-    def test_sensor_index_only_targets_tracker_position_and_rotation(self):
+    def test_sensor_missing_interval_only_sets_missing_label(self):
         seq_len = 8
         for sensor_index in range(SENSOR_LABEL_DIM):
             sensor_missing_labels = np.zeros((seq_len, SENSOR_LABEL_DIM), dtype=bool)
@@ -40,17 +45,12 @@ class SensorMaskingTest(unittest.TestCase):
                 sensor_indices=[sensor_index],
             )
 
-            expected = np.zeros_like(inpaint_mask)
-            pos_slice, rot_slice = sensor_feature_slices(sensor_index)
-            expected[2:5, pos_slice] = True
-            expected[2:5, rot_slice] = True
-
-            np.testing.assert_array_equal(inpaint_mask, expected)
+            np.testing.assert_array_equal(inpaint_mask, np.zeros_like(inpaint_mask))
             self.assertTrue(sensor_missing_labels[2:5, sensor_index].all())
             self.assertFalse(sensor_missing_labels[:2, sensor_index].any())
             self.assertFalse(sensor_missing_labels[5:, sensor_index].any())
 
-    def test_full_reconstruction_masks_body_root_contact_and_offline_trackers(self):
+    def test_full_reconstruction_masks_body_root_contact_without_tracker_targets(self):
         rng = np.random.default_rng(7)
         sensor_missing_labels, inpaint_mask, intervals, target_start, target_length = create_full_reconstruction_task(
             seq_len=11,
@@ -76,8 +76,8 @@ class SensorMaskingTest(unittest.TestCase):
         self.assertFalse(sensor_missing_labels[:target_start].any())
         for sensor_index in range(SENSOR_LABEL_DIM):
             pos_slice, rot_slice = sensor_feature_slices(sensor_index)
-            self.assertTrue(inpaint_mask[target, pos_slice].all())
-            self.assertTrue(inpaint_mask[target, rot_slice].all())
+            self.assertFalse(inpaint_mask[target, pos_slice].any())
+            self.assertFalse(inpaint_mask[target, rot_slice].any())
 
 
 class X277MissingTaskDatasetTest(unittest.TestCase):
@@ -142,7 +142,9 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             target = target_start
             self.assertEqual(target_start, 10)
             self.assertEqual(target_length, 1)
-            self.assertEqual(manifest_entry["task_format"], "materialized_current277_last_frame_reconstruction_v1")
+            self.assertEqual(manifest_entry["task_format"], TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2)
+            self.assertEqual(manifest_entry["tracker_target_mode"], "derived_from_body")
+            self.assertEqual(manifest_entry["missing_tracker_condition"], "zero")
 
             with np.load(output_dir / "train" / manifest_entry["task_path"], allow_pickle=False) as task_data:
                 inpaint_mask = task_data["inpaint_mask"].astype(bool)
@@ -152,6 +154,10 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             self.assertTrue(inpaint_mask[target, CONTACT_START : CONTACT_START + 4].all())
             self.assertFalse(inpaint_mask[:target_start].any())
             self.assertFalse(inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM].any())
+            for sensor_index in range(SENSOR_LABEL_DIM):
+                pos_slice, rot_slice = sensor_feature_slices(sensor_index)
+                self.assertFalse(inpaint_mask[target, pos_slice].any())
+                self.assertFalse(inpaint_mask[target, rot_slice].any())
             self.assertTrue(sensor_missing_labels[target].all())
             self.assertFalse(sensor_missing_labels[:target_start].any())
 
@@ -218,6 +224,7 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
 
             item = dataset[0]
             self.assertEqual(tuple(item["x"].shape), (MODEL_INPUT_DIM, 11))
+            self.assertEqual(tuple(item["conditioned_x"].shape), (MODEL_INPUT_DIM, 11))
             self.assertEqual(tuple(item["valid_frame_mask"].shape), (11,))
             self.assertEqual(tuple(item["attention_mask"].shape), (11,))
             self.assertEqual(tuple(item["sensor_missing_labels"].shape), (SENSOR_LABEL_DIM, 11))
@@ -242,10 +249,22 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
             self.assertTrue(mask[ROOT_DELTA_START : ROOT_DELTA_START + 2].any())
             self.assertTrue(mask[ROOT_YAW_START : ROOT_YAW_START + 1].any())
             self.assertTrue(mask[CONTACT_START : CONTACT_START + 4].any())
+            self.assertFalse(mask[TRACKER_POS_START : TRACKER_POS_START + SENSOR_LABEL_DIM * TRACKER_POS_DIM].any())
+            self.assertFalse(mask[TRACKER_ROT_START : TRACKER_ROT_START + SENSOR_LABEL_DIM * TRACKER_ROT_DIM].any())
+
+            conditioned_x = item["conditioned_x"].numpy()
+            full_x = item["x"].numpy()
+            for sensor_index in np.flatnonzero(labels[:, target_frame]):
+                pos_slice, rot_slice = sensor_feature_slices(int(sensor_index))
+                self.assertTrue(np.all(conditioned_x[pos_slice, target_frame] == 0.0))
+                self.assertTrue(np.all(conditioned_x[rot_slice, target_frame] == 0.0))
+                self.assertFalse(np.all(full_x[pos_slice, target_frame] == 0.0))
+                self.assertFalse(np.all(full_x[rot_slice, target_frame] == 0.0))
 
             loader = DataLoader(dataset, batch_size=2, shuffle=False)
             batch = next(iter(loader))
             self.assertEqual(tuple(batch["x"].shape), (2, MODEL_INPUT_DIM, 11))
+            self.assertEqual(tuple(batch["conditioned_x"].shape), (2, MODEL_INPUT_DIM, 11))
             self.assertEqual(tuple(batch["valid_frame_mask"].shape), (2, 11))
             self.assertEqual(tuple(batch["inpaint_mask"].shape), (2, MODEL_INPUT_DIM, 11))
 
@@ -276,6 +295,13 @@ class X277MissingTaskDatasetTest(unittest.TestCase):
                 normalized_item["x"][X277_FEATURE_DIM:MODEL_INPUT_DIM, :11].numpy(),
                 expected_label_channels,
             )
+            normalized_conditioned_x = normalized_item["conditioned_x"].numpy()
+            normalized_labels = normalized_item["sensor_missing_labels"].numpy()
+            normalized_target = int(normalized_item["target_start"])
+            for sensor_index in np.flatnonzero(normalized_labels[:, normalized_target]):
+                pos_slice, rot_slice = sensor_feature_slices(int(sensor_index))
+                self.assertTrue(np.all(normalized_conditioned_x[pos_slice, normalized_target] == 0.0))
+                self.assertTrue(np.all(normalized_conditioned_x[rot_slice, normalized_target] == 0.0))
             np.testing.assert_array_equal(normalized_item["inpaint_mask"].numpy(), item["inpaint_mask"].numpy())
 
             # 新训练路径只支持 materialized task；缺少 x277 时应尽早报错，而不是回退读取源数据。

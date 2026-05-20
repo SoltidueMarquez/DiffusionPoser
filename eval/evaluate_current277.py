@@ -12,8 +12,6 @@ from data_loaders.sensor_masking import MODEL_INPUT_DIM, SENSOR_LABEL_DIM, X277_
 FEATURE_GROUPS = {
     "body_rot_l2": (slice(0, 144), 24, 6, "l2"),
     "body_vel_l2": (slice(144, 216), 24, 3, "l2"),
-    "tracker_pos_l2": (slice(216, 234), 6, 3, "l2"),
-    "tracker_rot_l2": (slice(234, 270), 6, 6, "l2"),
     "root_delta_l2": (slice(270, 272), 1, 2, "l2"),
     "root_yaw_abs_degree": (slice(272, 273), 1, 1, "abs"),
     "contact_l1": (slice(273, 277), 4, 1, "abs"),

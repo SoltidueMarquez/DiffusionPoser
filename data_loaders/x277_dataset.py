@@ -12,8 +12,10 @@ from data_loaders.sensor_masking import (
     LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
     MODEL_INPUT_DIM,
     SENSOR_LABEL_DIM,
+    TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2,
     X277_FEATURE_DIM,
     enforce_last_frame_reconstruction_task,
+    sensor_feature_slices,
     validate_last_frame_seq_len,
     validate_last_frame_window,
 )
@@ -64,6 +66,12 @@ class X277MissingTaskDataset(Dataset):
 
         # 数据入口只接受原生 11 帧 materialized task，不在读取阶段裁剪旧长窗口。
         for entry in self.entries:
+            task_format = str(entry.get("task_format", "")).strip()
+            if task_format and task_format != TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2:
+                raise ValueError(
+                    f"任务 {entry.get('task_id')} 的 task_format={task_format}，"
+                    f"当前只接受 {TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2}。请重新生成 materialized task。"
+                )
             if "seq_len" not in entry:
                 raise KeyError(f"任务 {entry.get('task_id')} 缺少 manifest 字段 `seq_len`。")
             entry_seq_len = int(entry["seq_len"])
@@ -113,9 +121,15 @@ class X277MissingTaskDataset(Dataset):
             normalize_input=self.normalize_input,
         )
         x = np.concatenate([clip, label_channels], axis=1)
+        conditioned_clip = build_tracker_zero_conditioned_clip(
+            clip=clip,
+            sensor_missing_labels=sensor_missing_labels,
+        )
+        conditioned_x = np.concatenate([conditioned_clip, label_channels], axis=1)
 
         return {
             "x": torch.from_numpy(x.T).float(),
+            "conditioned_x": torch.from_numpy(conditioned_x.T).float(),
             "valid_frame_mask": torch.from_numpy(valid_frame_mask).bool(),
             "attention_mask": torch.from_numpy(valid_frame_mask).bool(),
             "sensor_missing_labels": torch.from_numpy(sensor_missing_labels.T).bool(),
@@ -161,6 +175,35 @@ def encode_sensor_labels(
         label_channels = label_channels * 2.0 - 1.0
         label_channels[~valid_frame_mask] = 0.0
     return label_channels
+
+
+def build_tracker_zero_conditioned_clip(
+    clip: np.ndarray,
+    sensor_missing_labels: np.ndarray,
+) -> np.ndarray:
+    """
+    构造模型实际看到的 X277 条件特征。
+
+    缺失 tracker 的真实 pos/rot 仍保留在 `x` 里作为 GT 和导出参考；但训练/采样时这些通道
+    不能泄漏给模型，所以在 `conditioned_x` 中按缺失标签置为 0。这里在归一化之后执行，
+    保证“零条件”就是模型输入空间里的 0。
+    """
+
+    conditioned = np.asarray(clip, dtype=np.float32).copy()
+    labels = np.asarray(sensor_missing_labels, dtype=bool)
+    if conditioned.ndim != 2 or conditioned.shape[1] < X277_FEATURE_DIM:
+        raise ValueError(f"clip 应为 [T, 277]，实际为 {conditioned.shape}")
+    if labels.shape != (conditioned.shape[0], SENSOR_LABEL_DIM):
+        raise ValueError(f"sensor_missing_labels 应为 [T, 6]，实际为 {labels.shape}")
+
+    for sensor_index in range(SENSOR_LABEL_DIM):
+        missing_frames = labels[:, sensor_index]
+        if not missing_frames.any():
+            continue
+        pos_slice, rot_slice = sensor_feature_slices(sensor_index)
+        conditioned[missing_frames, pos_slice] = 0.0
+        conditioned[missing_frames, rot_slice] = 0.0
+    return conditioned
 
 
 def find_manifest_path(data_dir: Path, split: str) -> Path:

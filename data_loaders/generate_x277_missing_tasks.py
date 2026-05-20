@@ -13,9 +13,12 @@ from tqdm.auto import tqdm
 from data_loaders.sensor_masking import (
     CURRENT277_SCHEMA_NAME,
     LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
+    MISSING_TRACKER_CONDITION_ZERO,
     MODEL_INPUT_DIM,
     TASK_MODE_FULL_RECONSTRUCTION_CURRENT,
+    TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2,
     TASK_MODES,
+    TRACKER_TARGET_MODE_DERIVED_FROM_BODY,
     X277_FEATURE_DIM,
     create_full_reconstruction_task,
     validate_last_frame_seq_len,
@@ -335,7 +338,7 @@ def generate_split_tasks(
                     "target_start": int(target_start),
                     "target_length": int(target_length),
                 }
-                task_format = "materialized_current277_last_frame_reconstruction_v1"
+                task_format = TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2
                 schema_name = CURRENT277_SCHEMA_NAME
 
                 task_id = make_task_id(
@@ -378,6 +381,8 @@ def generate_split_tasks(
                     "feature_dim": MODEL_INPUT_DIM,
                     "task_format": task_format,
                     "schema_name": schema_name,
+                    "tracker_target_mode": TRACKER_TARGET_MODE_DERIVED_FROM_BODY,
+                    "missing_tracker_condition": MISSING_TRACKER_CONDITION_ZERO,
                     "task_mode": args.task_mode,
                     "missing_intervals": [interval.to_dict() for interval in intervals],
                     "is_mirrored": bool(entry.get("is_mirrored", False)),

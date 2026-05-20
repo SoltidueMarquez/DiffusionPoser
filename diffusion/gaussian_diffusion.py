@@ -1338,17 +1338,22 @@ class GaussianDiffusion:
         # - y["mask"] 表示扩散损失需要监督的位置，形状为 [B, C, T]；
         # - inpaint_cond 表示前向加噪的位置，True 代表待补全，False 代表已知条件。
         # 这个约定让同一套扩散过程可以复用到不同特征维度的稀疏传感器重建任务。
-        mask = model_kwargs['y']['mask']
-        inpaint_cond = model_kwargs['inpaint_cond']  # [B, C, T]
-
         if model_kwargs is None:             # 若未传额外条件参数，则用空字典占位
             model_kwargs = {}
+        mask = model_kwargs['y']['mask']
+        inpaint_cond = model_kwargs['inpaint_cond']  # [B, C, T]
+        conditioning_motion = model_kwargs.get("y", {}).get("inpainted_motion", x_start)
+        if conditioning_motion.shape != x_start.shape:
+            raise ValueError(
+                f"inpainted_motion shape must match x_start: {tuple(conditioning_motion.shape)} vs {tuple(x_start.shape)}"
+            )
         if noise is None:                    # 若未指定噪声，按 x_start 形状采样标准高斯噪声
             noise = th.randn_like(x_start)
         
-        # 只在待补全部分加噪；已观测条件保持 x_start，避免模型在条件区域学习无意义的重建误差。
+        # 只在待补全部分加噪；条件区使用 conditioned_x，而不是 GT x_start。
+        # 缺失 tracker 的 pos/rot 在 conditioned_x 中为 0，避免把真实绑点泄漏给模型。
         x_t = self.q_sample(x_start, t, noise=noise)
-        x_t = torch.where(inpaint_cond, x_t, x_start)
+        x_t = torch.where(inpaint_cond, x_t, conditioning_motion)
 
         terms = {}
 

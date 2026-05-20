@@ -42,6 +42,8 @@ class Current277EvaluationTest(unittest.TestCase):
         normal_online = result["scenarios"]["normal_online"]
         self.assertEqual(normal_online["frames"], 1)
         self.assertEqual(normal_online["root_yaw_abs_degree"], 5.0)
+        self.assertNotIn("tracker_pos_l2", normal_online)
+        self.assertNotIn("tracker_rot_l2", normal_online)
 
 
 if __name__ == "__main__":

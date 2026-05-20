@@ -12,7 +12,11 @@ from data_loaders.get_data import get_dataset_loader
 from data_loaders.sensor_masking import MODEL_INPUT_DIM, X277_FEATURE_DIM
 from diffusion import logger
 from sample.utils import build_output_dir, choose_sampler, load_checkpoint_model, sanitize_path_token
-from sample.visualization import HAS_VISUALIZATION_BACKEND, render_full_reconstruction_visualization
+from sample.visualization import (
+    HAS_VISUALIZATION_BACKEND,
+    derive_tracker_features_from_body,
+    render_full_reconstruction_visualization,
+)
 from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
@@ -127,6 +131,7 @@ def seed_missing_features_from_previous_frame(
 def build_stream_window(
     *,
     reference: torch.Tensor,
+    conditioned_reference: torch.Tensor | None = None,
     reconstructed: torch.Tensor,
     task_inpaint_mask: torch.Tensor,
     valid_frame_mask: torch.Tensor,
@@ -145,6 +150,9 @@ def build_stream_window(
     channels, total_frames = reference.shape
     if channels != MODEL_INPUT_DIM:
         raise ValueError(f"reference must be [283, T], got {tuple(reference.shape)}")
+    condition_source = reference if conditioned_reference is None else conditioned_reference
+    if condition_source.shape != reference.shape:
+        raise ValueError(f"conditioned_reference must match reference, got {tuple(condition_source.shape)}")
     if reconstructed.shape != reference.shape:
         raise ValueError(f"reconstructed must match reference, got {tuple(reconstructed.shape)}")
     if task_inpaint_mask.shape != reference.shape:
@@ -174,7 +182,7 @@ def build_stream_window(
     current_mask = task_inpaint_mask[:, frame_index]
     previous_frame = reconstructed[:, frame_index - 1] if frame_index > 0 else None
     conditioned[0, :, current_dest] = seed_missing_features_from_previous_frame(
-        current_frame=reference[:, frame_index],
+        current_frame=condition_source[:, frame_index],
         current_inpaint_mask=current_mask,
         previous_frame=previous_frame,
     )
@@ -186,6 +194,7 @@ def build_stream_window(
 def build_previous_frame_conditioned_sequence(
     *,
     reference: torch.Tensor,
+    conditioned_reference: torch.Tensor | None = None,
     reconstructed: torch.Tensor,
     task_inpaint_mask: torch.Tensor,
     valid_frame_mask: torch.Tensor,
@@ -199,13 +208,16 @@ def build_previous_frame_conditioned_sequence(
 
     if reconstructed.shape != reference.shape:
         raise ValueError(f"reconstructed must match reference, got {tuple(reconstructed.shape)}")
+    condition_source = reference if conditioned_reference is None else conditioned_reference
+    if condition_source.shape != reference.shape:
+        raise ValueError(f"conditioned_reference must match reference, got {tuple(condition_source.shape)}")
     if task_inpaint_mask.shape != reference.shape:
         raise ValueError(f"task_inpaint_mask must match reference, got {tuple(task_inpaint_mask.shape)}")
     total_frames = reference.shape[1]
     if valid_frame_mask.shape != (total_frames,):
         raise ValueError(f"valid_frame_mask must be [T], got {tuple(valid_frame_mask.shape)}")
 
-    conditioned = reference.clone()
+    conditioned = condition_source.clone()
     valid_length = int(valid_frame_mask.sum().item())
     if valid_length <= 0:
         raise ValueError("valid_frame_mask 没有有效帧，无法构造当前帧条件。")
@@ -215,7 +227,7 @@ def build_previous_frame_conditioned_sequence(
         raise ValueError("当前窗口最后一帧没有任何待补全维度，请检查 inpaint_mask。")
     previous_frame = reconstructed[:, frame_index - 1] if frame_index > 0 else None
     conditioned[:, frame_index] = seed_missing_features_from_previous_frame(
-        current_frame=reference[:, frame_index],
+        current_frame=condition_source[:, frame_index],
         current_inpaint_mask=frame_mask,
         previous_frame=previous_frame,
     )
@@ -229,6 +241,7 @@ def sample_streaming_sequence(
     diffusion,
     args,
     reference: torch.Tensor,
+    conditioned_reference: torch.Tensor | None = None,
     task_inpaint_mask: torch.Tensor,
     valid_frame_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -245,6 +258,7 @@ def sample_streaming_sequence(
 
     conditioned, inpaint_mask, window_valid, current_dest = build_stream_window(
         reference=reference,
+        conditioned_reference=conditioned_reference,
         reconstructed=reconstructed,
         task_inpaint_mask=task_inpaint_mask,
         valid_frame_mask=valid_frame_mask,
@@ -367,6 +381,7 @@ def main(argv: list[str] | None = None) -> None:
     for batch_index, raw_batch in enumerate(tqdm(data, desc="Stream reconstruct", unit="sample")):
         batch = move_batch_to_device(raw_batch, device)
         reference = batch["x"][0]
+        conditioned_input = batch.get("conditioned_x", batch["x"])[0]
         task_inpaint_mask = batch["inpaint_mask"][0].bool()
         valid_frame_mask = batch["valid_frame_mask"][0].bool()
 
@@ -376,11 +391,13 @@ def main(argv: list[str] | None = None) -> None:
                 diffusion=diffusion,
                 args=args,
                 reference=reference,
+                conditioned_reference=conditioned_input,
                 task_inpaint_mask=task_inpaint_mask,
                 valid_frame_mask=valid_frame_mask,
             )
             conditioned_reference = build_previous_frame_conditioned_sequence(
                 reference=reference,
+                conditioned_reference=conditioned_input,
                 reconstructed=reconstructed,
                 task_inpaint_mask=task_inpaint_mask,
                 valid_frame_mask=valid_frame_mask,
@@ -393,6 +410,10 @@ def main(argv: list[str] | None = None) -> None:
         reference_motion = denormalize_x277_sequence(reference, motion_normalizer)
         conditioned_motion = denormalize_x277_sequence(conditioned_reference, motion_normalizer)
         reconstructed_motion = denormalize_x277_sequence(reconstructed, motion_normalizer)
+        reconstructed_motion = derive_tracker_features_from_body(
+            reconstructed_motion,
+            target_fps=float(args.x277_fps),
+        )
         sensor_missing_labels = batch["sensor_missing_labels"][0].transpose(0, 1).cpu().numpy()
         inpaint_mask = task_inpaint_mask.transpose(0, 1).cpu().numpy()
         valid_frame_mask_np = valid_frame_mask.cpu().numpy()
@@ -444,6 +465,7 @@ def main(argv: list[str] | None = None) -> None:
             "visualize_num": int(args.visualize_num),
             "fps": float(args.visualize_fps),
             "x277_fps": float(args.x277_fps),
+            "tracker_target_mode": "derived_from_body",
         }
         save_stream_artifacts(
             sample_dir=sample_dir,

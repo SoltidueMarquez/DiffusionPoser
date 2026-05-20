@@ -1,0 +1,57 @@
+{
+  "schema_name": "x277_motion_studio_ai_index_v1",
+  "purpose": "Local AMASS/X277/task/repair result 3D viewer, compare player, root/tracker edit project, and current277-compatible task exporter.",
+  "entrypoints": {
+    "one_click_root": "start_visual_editor.cmd",
+    "one_click_web": "start_visual_editor_web.cmd",
+    "bootstrap": "powershell -ExecutionPolicy Bypass -File visual_editor/scripts/bootstrap.ps1",
+    "start_script": "powershell -ExecutionPolicy Bypass -File visual_editor/scripts/start.ps1",
+    "api": "visual_editor/.venv/Scripts/python -m visual_editor.server --amass_dir <amass> --source_dir <x277_sources> --data_dir <tasks> --result_dir <repair_outputs> --output_dir <exports> --smpl_model_dir dataset/body_models",
+    "frontend_dev": "npm.cmd --prefix visual_editor run viewer:dev",
+    "frontend_build": "npm.cmd --prefix visual_editor run viewer:build",
+    "electron_dev": "npm.cmd --prefix visual_editor run electron:dev"
+  },
+  "local_environment": {
+    "python_venv": "visual_editor/.venv",
+    "node_modules": "visual_editor/node_modules",
+    "cache": "visual_editor/.cache",
+    "runtime": "visual_editor/.runtime",
+    "library_cache": "visual_editor/.runtime/library_cache.json",
+    "frame_cache": "visual_editor/.runtime/frame_cache",
+    "exports": "visual_editor/.runtime/exports"
+  },
+  "backend_modules": {
+    "visual_editor.models": "Dataclasses for StudioConfig, MotionAsset, MotionTrack, compare panes, and edit schema constants.",
+    "visual_editor.library": "Indexes AMASS, converted X277, materialized task, and repair stream outputs.",
+    "visual_editor.decoder": "Lazily decodes tracks into a shared frame payload and optional mesh payload.",
+    "visual_editor.services": "Compare, edit, export, and top-level MotionStudioService orchestration.",
+    "visual_editor.x277": "X277 decoding, root/tracker keyframe application helpers, and current277 task export.",
+    "visual_editor.server": "FastAPI REST API and CLI entrypoint."
+  },
+  "rest_api": [
+    "GET /api/library",
+    "POST /api/library/refresh",
+    "GET /api/assets/{asset_id}",
+    "GET /api/assets/{asset_id}/frames?track_id=&start=&count=&frame_offset=",
+    "POST /api/compare/frames",
+    "GET /api/assets/{asset_id}/mesh?track_id=&frame=",
+    "POST /api/edit/projects",
+    "PATCH /api/edit/projects/{project_id}/keyframes",
+    "POST /api/edit/projects/{project_id}/preview",
+    "POST /api/edit/projects/{project_id}/export",
+    "GET /api/ai-index"
+  ],
+  "data_contracts": {
+    "amass_raw": "Raw AMASS npz contains poses, trans, betas, gender, and mocap_framerate. Direct rendering needs local SMPL/SMPL-H assets.",
+    "x277_source": "Converted X277 npz contains x: [T, 277].",
+    "materialized_task": "Task npz contains x277, sensor_missing_labels, inpaint_mask, start_frame, valid_length, source_frames, and seq_len.",
+    "repair_result": "stream_outputs.npz contains reference_motion, conditioned_motion, reconstructed_motion, sensor_missing_labels, inpaint_mask, and valid_frame_mask.",
+    "exported_dataset": "Export directory contains <split>/manifest.jsonl, <split>/tasks/*.npz, edit_log.json, and dataset_index.json."
+  },
+  "maintenance_notes": [
+    "Do not auto-download SMPL/AMASS licensed assets; default local model lookup is dataset/body_models.",
+    "Do not overwrite original datasets or training outputs.",
+    "Editor dependencies, caches, runtime files, frame cache, and exports stay inside visual_editor/.",
+    "The old /api/samples routes and old SampleRecord UI model were intentionally removed in v0.2."
+  ]
+}

@@ -16,24 +16,24 @@ pip install -r requirements.txt
 
 ### X277 缺失任务生成
 
-先把 `dataset/AMASS_x277_60hz` 中的 `x: [T, 277]` 转成固定长度缺失任务。默认每个源文件生成 4 条任务，序列长度为 11：
+先把 `dataset/AMASS_current277_60hz` 中的 `x: [T, 277]` 转成固定长度缺失任务。默认每个源文件生成 4 条任务，序列长度为 11：
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --samples_per_file 4 --seed 10 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_current277_60hz --output_dir dataset/AMASS_current277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --samples_per_file 4 --seed 10 --overwrite
 ```
 
 `data_loaders/splits/train.txt` 和 `data_loaders/splits/test.txt` 已经从 StableMotion 参考项目复制到本项目，可直接用于 `stablemotion_split_key` 过滤。
 
 ```powershell
-python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_x277_60hz --output_dir dataset/AMASS_x277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --overwrite
+python -m data_loaders.generate_x277_missing_tasks --source_dir dataset/AMASS_current277_60hz --output_dir dataset/AMASS_current277_60hz_missing_tasks --split_dir data_loaders/splits --splits train test --seq_len 11 --overwrite
 ```
 
-生成目录形如 `dataset/AMASS_x277_60hz_missing_tasks/train/manifest.jsonl` 和 `tasks/*.npz`。训练时直接把根目录传给 `--data_dir`：
+生成目录形如 `dataset/AMASS_current277_60hz_missing_tasks/train/manifest.jsonl` 和 `tasks/*.npz`。训练时直接把根目录传给 `--data_dir`：
 
 当前 `full_reconstruction_current` 任务固定为 DiffusionPoser 风格的单帧在线补全：每条固定窗口固定 11 帧，前 10 帧作为历史条件，第 11 帧标记为重建目标。第 11 帧会补全 body/root/contact，以及该帧离线 tracker 的 position/rotation。
 
 ```powershell
-python -m train.train_diffusionposer --data_dir dataset/AMASS_x277_60hz_missing_tasks --data_split train --save_dir runs/x277_train --overwrite
+python -m train.train_diffusionposer --data_dir dataset/AMASS_current277_60hz_missing_tasks --data_split train --save_dir runs/x277_train --overwrite
 ```
 
 ### AMASS 转换脚本
@@ -103,12 +103,13 @@ DiffusionPoser/
 | 字段 | 形状 | 含义 |
 | --- | --- | --- |
 | `x` | `[B, 283, T]` | 前 277 维为 X277，后 6 维为传感器缺失标签。 |
+| `conditioned_x` | `[B, 283, T]` | 模型实际看到的条件输入；缺失 tracker 的 pos/rot 在模型输入空间置 0，GT 仍保留在 `x`。 |
 | `valid_frame_mask` | `[B, T]` | 有效帧标记。 |
 | `attention_mask` | `[B, T]` | 与 `valid_frame_mask` 同义，提供给模型忽略 padding 帧。 |
 | `sensor_missing_labels` | `[B, 6, T]` | 6 个 tracker 在每帧是否缺失。 |
 | `inpaint_mask` | `[B, 283, T]` | `True` 表示该位置需要扩散补全并参与 loss。 |
 
-`TrainLoop.mask_manager()` 使用离线生成的 `inpaint_mask`，缺少该字段会直接报错，避免误跑随机或无监督 mask。`X277MissingTaskDataset` 只接受原生 11 帧 materialized task：前 10 帧是历史条件，第 11 帧是唯一补全目标。已有 100/150 帧旧任务不会被自动裁剪，必须用当前生成脚本重新生成。
+`TrainLoop.mask_manager()` 使用离线生成的 `inpaint_mask`，缺少该字段会直接报错，避免误跑随机或无监督 mask。`X277MissingTaskDataset` 只接受原生 11 帧 materialized task：前 10 帧是历史条件，第 11 帧是唯一补全目标。当前任务格式为 `materialized_current277_body_reconstruction_v2`：模型只重建 body rotation、body velocity、root delta/yaw 和 contact；缺失 tracker 的 pos/rot 不参与 loss，采样或 Unity 推理后由重建出的身体骨骼绑定点派生。已有 100/150 帧旧任务不会被自动裁剪，旧 v1 tracker-target 任务也不会兼容，必须用当前生成脚本重新生成。
 
 ## 常用参数
 

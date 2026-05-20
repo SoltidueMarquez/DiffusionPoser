@@ -10,12 +10,16 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
+    BODY_ROT_DIM,
+    BODY_ROT_START,
     BODY_VEL_DIM,
     BODY_VEL_START,
     MODEL_INPUT_DIM,
     SENSOR_NAMES,
     TRACKER_POS_DIM,
     TRACKER_POS_START,
+    TRACKER_ROT_DIM,
+    TRACKER_ROT_START,
     X277_FEATURE_DIM,
 )
 
@@ -87,7 +91,7 @@ TRACKER_JOINT_INDICES = np.array(
 )
 FULL_RECONSTRUCTION_VISUALIZATION_NOTE = (
     "Approximate full reconstruction: 24 joints are decoded from X277 body velocity/root delta; "
-    "offline trackers are shown at their reference positions with target colors."
+    "reconstructed trackers are derived from reconstructed body joints."
 )
 KINEMATIC_CHAINS = (
     (0, 3, 6, 9, 12, 15),
@@ -329,6 +333,53 @@ def decode_x277_joint_positions_from_body_velocity(
         decoded_frames.append(joint_positions.copy())
 
     return np.stack(decoded_frames, axis=0).astype(np.float32)
+
+
+def derive_tracker_features_from_body(
+    features: np.ndarray,
+    target_fps: float = 60.0,
+    seed_joint_positions: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    从重建后的身体动作自动推出 6 个 tracker 通道。
+
+    v2 训练契约里 tracker pos/rot 不再由 diffusion 直接补全。这里把 Head/LWrist/RWrist/Waist/LFoot/RFoot
+    绑定到对应 SMPL24 关节：位置来自近似解码出的关节中心，旋转直接取对应关节的 root-local 6D rotation。
+    """
+
+    x277 = np.asarray(features, dtype=np.float32)
+    if x277.ndim != 2 or x277.shape[1] < X277_FEATURE_DIM:
+        raise ValueError(f"features 应为 `[T, 277]`，实际为 {x277.shape}")
+
+    derived = x277.copy()
+    joints_world = decode_x277_joint_positions_from_body_velocity(
+        x277,
+        target_fps=target_fps,
+        seed_joint_positions=seed_joint_positions,
+    ).astype(np.float64)
+
+    root_yaw = 0.0
+    for frame_index, row in enumerate(x277.astype(np.float64)):
+        root_yaw += math.radians(float(row[272]))
+        root_rotation = make_yaw_rotation(np.asarray([root_yaw], dtype=np.float64))[0]
+        root_position = joints_world[frame_index, JOINT_INDEX["pelvis"]]
+        tracker_world = joints_world[frame_index, TRACKER_JOINT_INDICES]
+        tracker_root = (tracker_world - root_position[None]) @ root_rotation
+        derived[
+            frame_index,
+            TRACKER_POS_START : TRACKER_POS_START + len(SENSOR_NAMES) * TRACKER_POS_DIM,
+        ] = tracker_root.reshape(-1).astype(np.float32)
+
+    body_rot = x277[:, BODY_ROT_START : BODY_ROT_START + BODY_ROT_DIM].reshape(
+        x277.shape[0],
+        SMPL_JOINT_COUNT,
+        6,
+    )
+    derived[
+        :,
+        TRACKER_ROT_START : TRACKER_ROT_START + len(SENSOR_NAMES) * TRACKER_ROT_DIM,
+    ] = body_rot[:, TRACKER_JOINT_INDICES, :].reshape(x277.shape[0], -1)
+    return derived.astype(np.float32)
 
 
 def restore_missing_tracker_positions_for_visualization(

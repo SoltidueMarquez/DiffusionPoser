@@ -11,6 +11,9 @@ SENSOR_LABEL_DIM = 6
 MODEL_INPUT_DIM = X277_FEATURE_DIM + SENSOR_LABEL_DIM
 
 CURRENT277_SCHEMA_NAME = "current277_v1"
+TASK_FORMAT_CURRENT277_BODY_RECONSTRUCTION_V2 = "materialized_current277_body_reconstruction_v2"
+TRACKER_TARGET_MODE_DERIVED_FROM_BODY = "derived_from_body"
+MISSING_TRACKER_CONDITION_ZERO = "zero"
 TASK_MODE_FULL_RECONSTRUCTION_CURRENT = "full_reconstruction_current"
 TASK_MODES = (TASK_MODE_FULL_RECONSTRUCTION_CURRENT,)
 HISTORY_CONTEXT_FRAMES = 10
@@ -196,16 +199,6 @@ def enforce_last_frame_reconstruction_task(
         start=target_start,
         length=target_length,
     )
-    missing_sensors = np.flatnonzero(sensor_missing_labels[target_start])
-    if missing_sensors.size:
-        apply_sensor_missing_interval(
-            sensor_missing_labels=np.zeros_like(sensor_missing_labels, dtype=bool),
-            inpaint_mask=expected_mask,
-            start=target_start,
-            length=target_length,
-            sensor_indices=missing_sensors,
-        )
-
     if not np.array_equal(inpaint_mask.astype(bool), expected_mask):
         raise ValueError("inpaint_mask 必须只在第 11 帧标记 body/root/contact 和当前缺失 tracker。")
     return target_start, target_length
@@ -318,9 +311,6 @@ def apply_sensor_missing_interval(
     for sensor_index in sensor_indices:
         validate_sensor_index(int(sensor_index))
         sensor_missing_labels[start:end, int(sensor_index)] = True
-        pos_slice, rot_slice = sensor_feature_slices(int(sensor_index))
-        inpaint_mask[start:end, pos_slice] = True
-        inpaint_mask[start:end, rot_slice] = True
 
     inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM] = False
 

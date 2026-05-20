@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
 from data_loaders.sensor_masking import (
@@ -180,7 +180,12 @@ def add_diffusion_options(parser: ArgumentParser):
 def add_training_options(parser: ArgumentParser):
     group = parser.add_argument_group("training")
     group.add_argument("--save_dir", required=True, type=str, help="Directory to save checkpoints and args.json.")
-    group.add_argument("--overwrite", action="store_true", help="Allow writing into an existing save_dir.")
+    group.add_argument(
+        "--overwrite",
+        default=True,
+        action=BooleanOptionalAction,
+        help="默认允许写入已有 save_dir；如需保护已有目录，请传 --no-overwrite。",
+    )
     group.add_argument(
         "--train_platform_type",
         default="NoPlatform",

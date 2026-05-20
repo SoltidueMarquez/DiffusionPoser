@@ -1,0 +1,31 @@
+{
+  "name": "x277-amass-motion-studio",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "viewer:dev": "vite --host 127.0.0.1 --port 5177",
+    "viewer:build": "tsc -b && vite build",
+    "electron:dev": "electron electron/main.cjs",
+    "lint": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.122.0",
+    "@react-three/fiber": "^8.17.10",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.171.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@types/three": "^0.171.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^42.1.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}

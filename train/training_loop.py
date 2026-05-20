@@ -295,13 +295,19 @@ class TrainLoop:
         if not inpaint_mask.any():
             raise ValueError("当前 batch 的 inpaint_mask 没有待补全位置，请检查离线任务生成结果。")
 
+        conditioned_sample = batch.get("conditioned_x", sample)
+        if conditioned_sample.shape != sample.shape:
+            raise ValueError(
+                f"conditioned_x 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}"
+            )
+
         return {
             "inpaint_cond": inpaint_mask,
             "valid_frame_mask": valid_frame_mask,
             "attention_mask": valid_frame_mask,
             "y": {
                 "mask": inpaint_mask,
-                "inpainted_motion": sample,
+                "inpainted_motion": conditioned_sample,
             },
         }
 

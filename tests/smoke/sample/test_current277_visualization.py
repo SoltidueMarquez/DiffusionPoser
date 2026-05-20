@@ -21,6 +21,7 @@ from sample.visualization import (
     SMPL_JOINT_COUNT,
     decode_x277_joint_positions_from_body_velocity,
     decode_x277_tracker_positions,
+    derive_tracker_features_from_body,
     render_full_reconstruction_visualization,
     restore_missing_tracker_positions_for_visualization,
 )
@@ -59,6 +60,21 @@ class Current277FullVisualizationTest(unittest.TestCase):
         np.testing.assert_allclose(restored_trackers[2, 1], reference_trackers[2, 1], atol=1e-6)
         np.testing.assert_allclose(restored_trackers[2, 4], reference_trackers[2, 4], atol=1e-6)
         np.testing.assert_allclose(restored_trackers[2, 0], conditioned_trackers[2, 0], atol=1e-6)
+
+    def test_derive_tracker_features_from_body_overwrites_tracker_channels(self):
+        motion = build_toy_current277_motion(frame_count=5)
+        motion[:, TRACKER_POS_START : TRACKER_POS_START + SENSOR_LABEL_DIM * TRACKER_POS_DIM] = 123.0
+
+        derived = derive_tracker_features_from_body(motion, target_fps=60.0)
+
+        self.assertEqual(derived.shape, motion.shape)
+        self.assertTrue(np.isfinite(derived).all())
+        self.assertFalse(
+            np.allclose(
+                derived[:, TRACKER_POS_START : TRACKER_POS_START + SENSOR_LABEL_DIM * TRACKER_POS_DIM],
+                123.0,
+            )
+        )
 
     @unittest.skipUnless(HAS_VISUALIZATION_BACKEND, "缺少可视化后端，跳过完整补全 mp4 smoke test。")
     def test_render_full_reconstruction_visualization_writes_mp4(self):
