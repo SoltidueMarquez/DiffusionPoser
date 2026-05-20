@@ -64,6 +64,27 @@ def test_save_reconstruction_writes_raw_and_normalized_features(tmp_path):
     with np.load(path, allow_pickle=False) as data:
         assert "reference_features_raw" in data.files
         assert "reference_features_normalized" in data.files
+        assert data["input_feature_space"].item() == "normalized"
         np.testing.assert_allclose(data["reference_features_normalized"], 0.0)
         np.testing.assert_allclose(data["reference_features_raw"], 10.0)
         np.testing.assert_allclose(data["reference_features"], data["reference_features_raw"])
+
+
+def test_save_reconstruction_without_normalizer_does_not_write_normalized_fields(tmp_path):
+    reference = torch.zeros((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
+    inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
+    path = tmp_path / "raw_result.npz"
+
+    save_reconstruction(
+        path=path,
+        reference=reference,
+        conditioned=reference,
+        reconstructed=reference,
+        inpaint_mask=inpaint_mask,
+        normalizer=None,
+    )
+
+    with np.load(path, allow_pickle=False) as data:
+        assert data["input_feature_space"].item() == "raw"
+        assert "reference_features_raw" in data.files
+        assert "reference_features_normalized" not in data.files

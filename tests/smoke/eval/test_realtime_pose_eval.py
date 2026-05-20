@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START
-from eval.evaluate_realtime_pose import evaluate_file
+from eval.evaluate_realtime_pose import evaluate_file, summarize
 from sample.reconstruct_stream import build_realtime_inpaint_mask, save_reconstruction
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
@@ -65,3 +66,13 @@ def test_realtime_pose_eval_prefers_raw_features_when_available(tmp_path):
     metrics = evaluate_file(path)
     assert metrics["feature_space"] == "raw"
     assert metrics["pose_mse"] > 0.0
+
+
+def test_realtime_pose_eval_rejects_mixed_feature_spaces():
+    with pytest.raises(ValueError, match="feature_space"):
+        summarize(
+            [
+                {"feature_space": "raw", "pose_mse": 1.0, "yaw_cos_loss": 0.1, "target_mae": 0.5},
+                {"feature_space": "normalized", "pose_mse": 2.0, "yaw_cos_loss": 0.2, "target_mae": 0.6},
+            ]
+        )

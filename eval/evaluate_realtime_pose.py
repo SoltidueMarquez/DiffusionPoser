@@ -123,10 +123,12 @@ def summarize(results: list[dict[str, float | int | str]]) -> dict[str, float | 
     if not results:
         raise RuntimeError("没有可评估的 realtime_pose_v1 结果文件。")
     feature_spaces = sorted({str(item.get("feature_space", "unknown")) for item in results})
+    if len(feature_spaces) != 1:
+        raise ValueError(f"不能混合评估不同 feature_space: {feature_spaces}")
     return {
         "schema_name": REALTIME_POSE_SCHEMA_NAME,
         "file_count": len(results),
-        "feature_space": feature_spaces[0] if len(feature_spaces) == 1 else "mixed",
+        "feature_space": feature_spaces[0],
         "pose_mse": float(np.mean([float(item["pose_mse"]) for item in results])),
         "yaw_cos_loss": float(np.mean([float(item["yaw_cos_loss"]) for item in results])),
         "target_mae": float(np.mean([float(item["target_mae"]) for item in results])),

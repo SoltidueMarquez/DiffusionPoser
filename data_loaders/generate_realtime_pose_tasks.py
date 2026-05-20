@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,21 @@ SOURCE_KEYS = {
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
 
 
+@dataclass(frozen=True)
+class SplitTaskPlan:
+    split: str
+    entries: list[dict]
+    seed: int
+
+
+@dataclass(frozen=True)
+class TaskGenerationPlan:
+    source_dir: Path
+    output_dir: Path
+    split_dir: Path | None
+    split_plans: list[SplitTaskPlan]
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose_v1 materialized tasks.")
     paths = parser.add_argument_group("paths")
@@ -83,6 +99,17 @@ def str2bool(value):
 
 
 def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
+    plan = plan_realtime_pose_task_generation(args)
+    return execute_realtime_pose_task_generation(plan=plan, args=args)
+
+
+def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerationPlan:
+    """
+    先完成所有不会改文件系统的校验。
+
+    这样 split 配错、source 不存在或没有匹配样本时，不会留下空 output_dir 或 marker。
+    """
+
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose_v1 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
@@ -93,18 +120,12 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     if not source_dir.exists():
         raise FileNotFoundError(f"realtime_pose_v1 源目录不存在：{source_dir}")
-    prepare_task_output_dir(
-        source_dir=source_dir,
-        output_dir=output_dir,
-        overwrite=bool(args.overwrite),
-        split_dir=split_dir,
-    )
 
     source_entries = read_source_entries(source_dir)
     if not source_entries:
         raise RuntimeError(f"{source_dir} 中没有 realtime_pose_v1 源数据。")
 
-    counts = {}
+    split_plans: list[SplitTaskPlan] = []
     for split_index, split in enumerate(args.splits):
         split_keys = read_split_keys(split_dir, split)
         split_entries = filter_entries_by_split(source_entries, split_keys)
@@ -112,14 +133,45 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
             split_entries = split_entries[: args.limit]
         if not split_entries:
             raise RuntimeError(f"split={split} 没有匹配 realtime_pose_v1 源数据。")
-        rng = np.random.default_rng(int(args.seed) + split_index)
-        counts[split] = generate_split_tasks(
-            entries=split_entries,
-            output_dir=output_dir,
-            split=split,
+        split_plans.append(
+            SplitTaskPlan(
+                split=split,
+                entries=split_entries,
+                seed=int(args.seed) + split_index,
+            )
+        )
+
+    validate_task_output_dir_available(
+        source_dir=source_dir,
+        output_dir=output_dir,
+        overwrite=bool(args.overwrite),
+    )
+    return TaskGenerationPlan(
+        source_dir=source_dir,
+        output_dir=output_dir,
+        split_dir=split_dir,
+        split_plans=split_plans,
+    )
+
+
+def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argparse.Namespace) -> dict[str, int]:
+    prepare_task_output_dir(
+        source_dir=plan.source_dir,
+        output_dir=plan.output_dir,
+        overwrite=bool(args.overwrite),
+        split_dir=plan.split_dir,
+    )
+
+    counts = {}
+    for split_plan in plan.split_plans:
+        rng = np.random.default_rng(split_plan.seed)
+        counts[split_plan.split] = generate_split_tasks(
+            entries=split_plan.entries,
+            output_dir=plan.output_dir,
+            split=split_plan.split,
             rng=rng,
             args=args,
-            source_split_dir=split_dir,
+            source_split_dir=plan.split_dir,
         )
     return counts
 
@@ -127,13 +179,21 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
 def prepare_task_output_dir(source_dir: Path, output_dir: Path, overwrite: bool, split_dir: Path | None) -> None:
     """准备 task 输出目录，并在覆盖已有目录前做路径安全检查。"""
 
+    validate_task_output_dir_available(source_dir=source_dir, output_dir=output_dir, overwrite=overwrite)
     if output_dir.exists():
-        if not overwrite:
-            raise FileExistsError(f"输出目录已存在：{output_dir}，如需重建请添加 --overwrite")
-        validate_task_output_dir_for_overwrite(source_dir=source_dir, output_dir=output_dir)
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_task_output_marker(source_dir=source_dir, output_dir=output_dir, split_dir=split_dir)
+
+
+def validate_task_output_dir_available(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
+    """只校验 output_dir 是否可用，不创建或删除任何文件。"""
+
+    if not output_dir.exists():
+        return
+    if not overwrite:
+        raise FileExistsError(f"输出目录已存在：{output_dir}，如需重建请添加 --overwrite")
+    validate_task_output_dir_for_overwrite(source_dir=source_dir, output_dir=output_dir)
 
 
 def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -> None:

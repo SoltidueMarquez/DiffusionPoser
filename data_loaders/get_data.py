@@ -61,6 +61,8 @@ def get_dataset_loader(
         "pin_memory": pin_memory,
     }
     if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
+        # Dataset.set_epoch 会在每个 epoch 更新动态遮盖/增强种子；不常驻 worker，
+        # 让下一轮 DataLoader 迭代重新接收主进程里的 epoch 状态。
+        loader_kwargs["persistent_workers"] = False
         loader_kwargs["prefetch_factor"] = 2
     return DataLoader(dataset, **loader_kwargs)

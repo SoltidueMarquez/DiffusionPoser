@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -112,6 +111,7 @@ def test_task_generator_default_split_filter_rejects_unmatched_source(tmp_path):
                 "--overwrite",
             ]
         )
+    assert not output_dir.exists()
 
 
 def test_task_generator_overwrite_rejects_unsafe_directories(tmp_path):
@@ -441,7 +441,6 @@ def test_converter_fails_on_partial_conversion_by_default(monkeypatch, tmp_path)
     bad_path.parent.mkdir(parents=True)
     bad_path.write_bytes(b"not a real motion")
 
-    monkeypatch.setattr(sys, "argv", ["prog", "--amass_dir", str(amass_dir), "--output_dir", str(output_dir)])
     monkeypatch.setattr(amass_converter, "validate_shared_args", lambda args: None)
     monkeypatch.setattr(amass_converter, "iter_amass_motion_files", lambda amass_path: [bad_path])
     monkeypatch.setattr(amass_converter, "SmplModelCache", lambda model_dir: object())
@@ -451,7 +450,7 @@ def test_converter_fails_on_partial_conversion_by_default(monkeypatch, tmp_path)
 
     monkeypatch.setattr(amass_converter, "convert_one_motion", fail_convert)
     with pytest.raises(RuntimeError, match="allow_partial"):
-        amass_converter.main()
+        amass_converter.main(["--amass_dir", str(amass_dir), "--output_dir", str(output_dir)])
 
     manifest_path = output_dir / "manifest.jsonl"
     entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]

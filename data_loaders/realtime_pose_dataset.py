@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,13 @@ from data_loaders.sensor_masking import (
 from utils.normalizer import RealtimePoseNormalizer
 
 
+@dataclass(frozen=True)
+class RandomContext:
+    worker_id: int
+    access_index: int
+    epoch: int = 0
+
+
 class RealtimePoseTaskDataset(Dataset):
     """读取 `realtime_pose_v1` materialized task 并输出 `[C,T]` 训练样本。"""
 
@@ -93,7 +101,8 @@ class RealtimePoseTaskDataset(Dataset):
         if self.tracker_mask_fill not in TRACKER_MASK_FILL_MODES:
             raise ValueError(f"tracker_mask_fill 目前只支持 {TRACKER_MASK_FILL_MODES}，实际为 {tracker_mask_fill}")
         self.tracker_mask_categories = normalize_tracker_pattern_categories(tracker_mask_categories)
-        self.dynamic_access_index = 0
+        self.epoch = 0
+        self.access_index = 0
         self.normalizer = create_normalizer(normalizer_dir=normalizer_dir, normalize_input=self.normalize_input)
 
         self.manifest_path = find_manifest_path(data_dir=self.data_dir, split=split)
@@ -125,17 +134,21 @@ class RealtimePoseTaskDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         entry = self.entries[index]
-        access_state = self.next_access_state()
+        random_context = self.next_random_context()
         task = self.load_task(index=index, entry=entry)
         arrays = load_realtime_task_arrays(task=task, seq_len=self.seq_len)
         arrays, applied_tracker_pattern = self.apply_tracker_mask_policy(
             arrays=arrays,
             entry=entry,
             index=index,
-            access_state=access_state,
+            random_context=random_context,
         )
         if self.is_train_split:
-            rng = self.stable_rng(entry=entry, index=index, salt=f"augment:{access_state[0]}:{access_state[1]}")
+            rng = self.stable_rng(
+                entry=entry,
+                index=index,
+                salt=f"augment:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
+            )
             arrays = augment_realtime_arrays(
                 arrays=arrays,
                 rng=rng,
@@ -187,9 +200,15 @@ class RealtimePoseTaskDataset(Dataset):
             return self.task_cache[index]
         return load_materialized_task_npz(manifest_dir=self.manifest_dir, task_path=entry["task_path"])
 
-    def next_access_state(self) -> tuple[int, int]:
+    def set_epoch(self, epoch: int) -> None:
+        """训练循环在 epoch 开头调用，使动态 mask 和增强能随 epoch 可复现地变化。"""
+
+        self.epoch = int(epoch)
+        self.access_index = 0
+
+    def next_random_context(self) -> RandomContext:
         """
-        返回当前 Dataset 实例内的访问状态 `(worker_id, access_index)`。
+        返回当前 Dataset 实例内的随机上下文。
 
         DataLoader 多 worker 会复制 Dataset 实例，因此把 worker_id 放进随机种子里，
         可以避免每个 worker 生成完全相同的动态遮盖和增强序列。
@@ -197,9 +216,9 @@ class RealtimePoseTaskDataset(Dataset):
 
         worker_info = torch.utils.data.get_worker_info()
         worker_id = int(worker_info.id) if worker_info is not None else 0
-        access_index = self.dynamic_access_index
-        self.dynamic_access_index += 1
-        return worker_id, access_index
+        access_index = self.access_index
+        self.access_index += 1
+        return RandomContext(worker_id=worker_id, access_index=access_index, epoch=self.epoch)
 
     def resolve_tracker_mask_policy(self, policy: str) -> str:
         policy = str(policy or TRACKER_MASK_POLICY_AUTO)
@@ -214,18 +233,21 @@ class RealtimePoseTaskDataset(Dataset):
         arrays: dict[str, np.ndarray],
         entry: dict,
         index: int,
-        access_state: tuple[int, int],
+        random_context: RandomContext,
     ) -> tuple[dict[str, np.ndarray], str]:
         if self.tracker_mask_policy == TRACKER_MASK_POLICY_TASK:
             return arrays, str(entry.get("tracker_pattern", "task"))
 
         result = {key: value.copy() for key, value in arrays.items()}
         if self.tracker_mask_policy == TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES:
-            category = self.dynamic_mask_category(entry=entry, index=index, access_state=access_state)
+            category = self.dynamic_mask_category(entry=entry, index=index, random_context=random_context)
             rng = self.stable_rng(
                 entry=entry,
                 index=index,
-                salt=f"dynamic_pattern:{category}:{access_state[0]}:{access_state[1]}",
+                salt=(
+                    f"dynamic_pattern:{category}:e{random_context.epoch}:"
+                    f"w{random_context.worker_id}:a{random_context.access_index}"
+                ),
             )
         elif self.tracker_mask_policy == TRACKER_MASK_POLICY_FIXED_CATEGORIES:
             category = self.fixed_mask_category(entry=entry, index=index)
@@ -237,16 +259,15 @@ class RealtimePoseTaskDataset(Dataset):
         result["sensor_valid"] = repeat_pattern_sensor_valid(pattern, seq_len=self.seq_len)
         return result, pattern.category
 
-    def dynamic_mask_category(self, entry: dict, index: int, access_state: tuple[int, int]) -> str:
+    def dynamic_mask_category(self, entry: dict, index: int, random_context: RandomContext) -> str:
         # 动态遮盖按“洗牌后的类别轮转”采样，既覆盖所有类别，又能由 seed 复现实验。
         categories = np.asarray(self.tracker_mask_categories, dtype=object)
-        worker_id, access_index = access_state
-        cycle_index = access_index // len(categories)
-        position = access_index % len(categories)
+        cycle_index = random_context.access_index // len(categories)
+        position = random_context.access_index % len(categories)
         rng = self.stable_rng(
             entry=entry,
             index=index,
-            salt=f"dynamic_category:{worker_id}:{cycle_index}",
+            salt=f"dynamic_category:e{random_context.epoch}:w{random_context.worker_id}:c{cycle_index}",
         )
         rng.shuffle(categories)
         return str(categories[position])

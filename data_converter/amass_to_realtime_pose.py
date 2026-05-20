@@ -39,7 +39,7 @@ from data_loaders.realtime_pose_kinematics import (
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose_v1 files.")
     parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize_limit", default=0, type=int)
     parser.add_argument("--visualize_dir", default=Path("output/realtime_pose_visualization"), type=Path)
     parser.add_argument("--visualize_fps", default=20.0, type=float)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def output_path_for(source: MotionSource, output_dir: Path) -> Path:
@@ -160,8 +160,8 @@ def convert_one_motion(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> dict[str, int]:
+    args = parse_args(argv)
     validate_shared_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "manifest.jsonl"
@@ -215,6 +215,7 @@ def main() -> None:
             f"AMASS 转换存在 {len(failed_records)} 个失败样本，默认停止以避免下游使用部分数据。"
             f"示例：{preview}。如确认可接受部分数据，请添加 --allow_partial。"
         )
+    return {"converted": converted, "skipped": skipped, "failed": failed}
 
 
 if __name__ == "__main__":

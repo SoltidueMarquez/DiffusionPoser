@@ -89,27 +89,33 @@ def save_reconstruction(
     normalizer=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    reference_normalized = tensor_bct_to_numpy_btc(reference)
-    conditioned_normalized = tensor_bct_to_numpy_btc(conditioned)
-    reconstructed_normalized = tensor_bct_to_numpy_btc(reconstructed)
-    reference_raw = inverse_normalized_features(reference_normalized, normalizer=normalizer)
-    conditioned_raw = inverse_normalized_features(conditioned_normalized, normalizer=normalizer)
-    reconstructed_raw = inverse_normalized_features(reconstructed_normalized, normalizer=normalizer)
-    np.savez(
-        path,
-        schema_name=np.asarray(REALTIME_POSE_SCHEMA_NAME),
+    has_normalizer = normalizer is not None
+    reference_input = tensor_bct_to_numpy_btc(reference)
+    conditioned_input = tensor_bct_to_numpy_btc(conditioned)
+    reconstructed_input = tensor_bct_to_numpy_btc(reconstructed)
+    reference_raw = inverse_normalized_features(reference_input, normalizer=normalizer)
+    conditioned_raw = inverse_normalized_features(conditioned_input, normalizer=normalizer)
+    reconstructed_raw = inverse_normalized_features(reconstructed_input, normalizer=normalizer)
+    payload = {
+        "schema_name": np.asarray(REALTIME_POSE_SCHEMA_NAME),
+        "feature_space": np.asarray("raw"),
+        "input_feature_space": np.asarray("normalized" if has_normalizer else "raw"),
         # 旧字段继续保留，但现在明确写 raw，避免评估默认落在归一化空间。
-        reference_features=reference_raw,
-        conditioned_features=conditioned_raw,
-        reconstructed_features=reconstructed_raw,
-        reference_features_raw=reference_raw,
-        conditioned_features_raw=conditioned_raw,
-        reconstructed_features_raw=reconstructed_raw,
-        reference_features_normalized=reference_normalized,
-        conditioned_features_normalized=conditioned_normalized,
-        reconstructed_features_normalized=reconstructed_normalized,
-        inpaint_mask=inpaint_mask.detach().cpu().numpy().transpose(0, 2, 1),
-    )
+        "reference_features": reference_raw,
+        "conditioned_features": conditioned_raw,
+        "reconstructed_features": reconstructed_raw,
+        "reference_features_raw": reference_raw,
+        "conditioned_features_raw": conditioned_raw,
+        "reconstructed_features_raw": reconstructed_raw,
+        "inpaint_mask": inpaint_mask.detach().cpu().numpy().transpose(0, 2, 1),
+    }
+    if has_normalizer:
+        payload.update(
+            reference_features_normalized=reference_input,
+            conditioned_features_normalized=conditioned_input,
+            reconstructed_features_normalized=reconstructed_input,
+        )
+    np.savez(path, **payload)
 
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:

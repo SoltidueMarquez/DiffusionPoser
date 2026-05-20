@@ -168,7 +168,10 @@ class TrainLoop:
             return
 
         last_step_end = time.perf_counter()
-        for _epoch in range(self.num_epochs):
+        for epoch in range(self.num_epochs):
+            dataset = getattr(self.data, "dataset", None)
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
             for batch in self.data:
                 batch_ready_time = time.perf_counter()
                 batch = move_batch_to_device(batch, self.device)
