@@ -76,6 +76,8 @@ select {
 
 .library-panel {
   border-right: 1px solid #263244;
+  display: flex;
+  flex-direction: column;
 }
 
 .control-panel {
@@ -103,17 +105,103 @@ select {
   border-bottom: 1px solid #263244;
 }
 
+.asset-kind-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #263244;
+}
+
+.kind-chip {
+  flex: 1 1 84px;
+  height: 30px;
+  min-width: 0;
+  padding: 0 7px;
+  font-size: 11px;
+  color: #b9c7d8;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.kind-chip:first-child {
+  flex: 0 0 48px;
+}
+
+.kind-chip span {
+  color: #91a4bd;
+  font-size: 10px;
+}
+
+.kind-chip.active {
+  border-color: #60a5fa;
+  background: #1d314b;
+  color: #e5edf7;
+}
+
+.kind-chip.active span {
+  color: #c7d9ee;
+}
+
 .asset-groups {
-  height: calc(100vh - 105px);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 8px;
 }
 
-.asset-groups h2,
 .panel h2 {
   font-size: 13px;
   margin: 10px 0 8px;
   color: #b9c7d8;
+}
+
+.asset-group {
+  margin-bottom: 8px;
+}
+
+.asset-group-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.asset-group-toggle {
+  min-width: 0;
+  height: 32px;
+  justify-content: flex-start;
+  padding: 0 8px;
+}
+
+.asset-group-toggle span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #b9c7d8;
+  font-size: 12px;
+}
+
+.asset-group-toggle strong {
+  color: #e5edf7;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.asset-group-only {
+  height: 32px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.asset-group.collapsed {
+  margin-bottom: 6px;
+}
+
+.asset-group-body {
+  min-width: 0;
 }
 
 .asset-row {

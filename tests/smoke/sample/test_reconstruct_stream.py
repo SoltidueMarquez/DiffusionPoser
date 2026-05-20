@@ -1,100 +1,69 @@
 from __future__ import annotations
 
-import unittest
-
+import numpy as np
 import torch
 
-from data_loaders.sensor_masking import MODEL_INPUT_DIM, TRACKER_POS_START
-from sample.reconstruct_stream import build_previous_frame_conditioned_sequence, build_stream_window
+from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN, REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START
+from sample.reconstruct_stream import reconstruct_batch, save_reconstruction
 
 
-def make_reference(seq_len: int) -> torch.Tensor:
-    values = torch.arange(MODEL_INPUT_DIM * seq_len, dtype=torch.float32)
-    return values.reshape(MODEL_INPUT_DIM, seq_len)
+class RecordingDiffusion:
+    def __init__(self):
+        self.noise = "unset"
+
+    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs):
+        del model, clip_denoised, model_kwargs
+        self.noise = noise
+        return torch.ones(shape)
 
 
-class ReconstructStreamWindowTest(unittest.TestCase):
-    def test_current_unknown_features_are_seeded_from_previous_reconstruction(self):
-        reference = make_reference(seq_len=4)
-        conditioned_reference = reference.clone()
-        conditioned_reference[TRACKER_POS_START, 2] = 0.0
-        reconstructed = reference + 10_000.0
-        task_inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
-        task_inpaint_mask[[0, 272], 2] = True
-        valid_frame_mask = torch.ones(4, dtype=torch.bool)
+def test_reconstruct_batch_starts_from_sampler_noise_and_keeps_conditions():
+    conditioned = torch.full((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), 2.0)
+    batch = {
+        "conditioned_x": conditioned,
+        "valid_frame_mask": torch.ones(1, REALTIME_POSE_SEQ_LEN, dtype=torch.bool),
+    }
+    diffusion = RecordingDiffusion()
 
-        conditioned, inpaint_mask, window_valid, current_dest = build_stream_window(
-            reference=reference,
-            conditioned_reference=conditioned_reference,
-            reconstructed=reconstructed,
-            task_inpaint_mask=task_inpaint_mask,
-            valid_frame_mask=valid_frame_mask,
-            frame_index=2,
-            seq_len=3,
-        )
+    reconstructed = reconstruct_batch(
+        model=object(),
+        diffusion=diffusion,
+        batch=batch,
+        device=torch.device("cpu"),
+        use_ddim=False,
+    )
 
-        self.assertEqual(current_dest, 2)
-        torch.testing.assert_close(conditioned[0, :, 0], reconstructed[:, 0])
-        torch.testing.assert_close(conditioned[0, :, 1], reconstructed[:, 1])
-
-        expected_current = conditioned_reference[:, 2].clone()
-        frame_mask = task_inpaint_mask[:, 2]
-        expected_current[frame_mask] = reconstructed[:, 1][frame_mask]
-        torch.testing.assert_close(conditioned[0, :, current_dest], expected_current)
-        self.assertTrue(torch.equal(inpaint_mask[0, :, current_dest], frame_mask))
-        self.assertFalse(inpaint_mask[0, :, :current_dest].any())
-        self.assertTrue(torch.equal(window_valid, torch.ones((1, 3), dtype=torch.bool)))
-
-    def test_first_frame_unknown_features_use_zero_cold_start(self):
-        reference = make_reference(seq_len=3)
-        conditioned_reference = reference.clone()
-        conditioned_reference[TRACKER_POS_START, 0] = 0.0
-        reconstructed = reference + 10_000.0
-        task_inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
-        task_inpaint_mask[[0], 0] = True
-        valid_frame_mask = torch.ones(3, dtype=torch.bool)
-
-        conditioned, inpaint_mask, window_valid, current_dest = build_stream_window(
-            reference=reference,
-            conditioned_reference=conditioned_reference,
-            reconstructed=reconstructed,
-            task_inpaint_mask=task_inpaint_mask,
-            valid_frame_mask=valid_frame_mask,
-            frame_index=0,
-            seq_len=3,
-        )
-
-        expected_current = conditioned_reference[:, 0].clone()
-        frame_mask = task_inpaint_mask[:, 0]
-        expected_current[frame_mask] = 0.0
-        self.assertEqual(current_dest, 2)
-        torch.testing.assert_close(conditioned[0, :, current_dest], expected_current)
-        self.assertTrue(torch.equal(inpaint_mask[0, :, current_dest], frame_mask))
-        self.assertTrue(torch.equal(window_valid, torch.tensor([[False, False, True]])))
-
-    def test_saved_conditioned_sequence_matches_streaming_previous_frame_seed(self):
-        reference = make_reference(seq_len=4)
-        conditioned_reference = reference.clone()
-        conditioned_reference[TRACKER_POS_START, 2] = 0.0
-        reconstructed = reference + 10_000.0
-        task_inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
-        task_inpaint_mask[[10, 272], 2] = True
-        valid_frame_mask = torch.tensor([True, True, True, False])
-
-        conditioned = build_previous_frame_conditioned_sequence(
-            reference=reference,
-            conditioned_reference=conditioned_reference,
-            reconstructed=reconstructed,
-            task_inpaint_mask=task_inpaint_mask,
-            valid_frame_mask=valid_frame_mask,
-        )
-
-        expected = conditioned_reference.clone()
-        # 保存/可视化条件只反映当前窗口最后一帧的推理输入。
-        expected[task_inpaint_mask[:, 2], 2] = reconstructed[task_inpaint_mask[:, 2], 1]
-        expected[:, 3] = 0.0
-        torch.testing.assert_close(conditioned, expected)
+    assert diffusion.noise is None
+    assert torch.all(reconstructed[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] == 1.0)
+    condition_mask = torch.ones_like(conditioned, dtype=torch.bool)
+    condition_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = False
+    assert torch.all(reconstructed[condition_mask] == conditioned[condition_mask])
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_save_reconstruction_writes_raw_and_normalized_features(tmp_path):
+    class OffsetNormalizer:
+        def inverse(self, features):
+            return features + 10.0
+
+    reference = torch.zeros((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
+    reconstructed = reference.clone()
+    reconstructed[:, 0, REALTIME_POSE_TARGET_START] = 1.0
+    inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
+    inpaint_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = True
+    path = tmp_path / "result.npz"
+
+    save_reconstruction(
+        path=path,
+        reference=reference,
+        conditioned=reference,
+        reconstructed=reconstructed,
+        inpaint_mask=inpaint_mask,
+        normalizer=OffsetNormalizer(),
+    )
+
+    with np.load(path, allow_pickle=False) as data:
+        assert "reference_features_raw" in data.files
+        assert "reference_features_normalized" in data.files
+        np.testing.assert_allclose(data["reference_features_normalized"], 0.0)
+        np.testing.assert_allclose(data["reference_features_raw"], 10.0)
+        np.testing.assert_allclose(data["reference_features"], data["reference_features_raw"])

@@ -19,8 +19,8 @@ $DefaultDataDir = Join-Path $RuntimeDir "missing_tasks"
 $DefaultSourceDir = Join-Path $RuntimeDir "sources"
 $DefaultOutputDir = Join-Path $RuntimeDir "exports"
 $PreferredAmassDir = Join-Path $RepoRoot "dataset\AMASS"
-$PreferredDataDir = Join-Path $RepoRoot "dataset\AMASS_current277_60hz_missing_tasks"
-$PreferredSourceDir = Join-Path $RepoRoot "dataset\AMASS_current277_60hz"
+$PreferredDataDir = Join-Path $RepoRoot "dataset\AMASS_realtime_pose_60hz_tasks"
+$PreferredSourceDir = Join-Path $RepoRoot "dataset\AMASS_realtime_pose_60hz"
 $PreferredResultDir = Join-Path $RepoRoot "output"
 $PreferredSmplModelDir = Join-Path $RepoRoot "dataset\body_models"
 $VenvPython = Join-Path $EditorRoot ".venv\Scripts\python.exe"
@@ -112,39 +112,39 @@ if ((-not $SkipBuild) -and $NeedsBuild) {
 }
 
 $env:PYTHONPATH = [string]$RepoRoot
-$env:X277_EDITOR_AMASS_DIR = [string](Resolve-Path -LiteralPath $AmassDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_AMASS_DIR) {
-    $env:X277_EDITOR_AMASS_DIR = [string]$AmassDir
+$env:REALTIME_POSE_EDITOR_AMASS_DIR = [string](Resolve-Path -LiteralPath $AmassDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_AMASS_DIR) {
+    $env:REALTIME_POSE_EDITOR_AMASS_DIR = [string]$AmassDir
 }
-$env:X277_EDITOR_DATA_DIR = [string](Resolve-Path -LiteralPath $DataDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_DATA_DIR) {
-    $env:X277_EDITOR_DATA_DIR = [string]$DataDir
+$env:REALTIME_POSE_EDITOR_DATA_DIR = [string](Resolve-Path -LiteralPath $DataDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_DATA_DIR) {
+    $env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
 }
-$env:X277_EDITOR_SOURCE_DIR = [string](Resolve-Path -LiteralPath $SourceDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_SOURCE_DIR) {
-    $env:X277_EDITOR_SOURCE_DIR = [string]$SourceDir
+$env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string](Resolve-Path -LiteralPath $SourceDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_SOURCE_DIR) {
+    $env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
 }
-$env:X277_EDITOR_RESULT_DIR = [string](Resolve-Path -LiteralPath $ResultDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_RESULT_DIR) {
-    $env:X277_EDITOR_RESULT_DIR = [string]$ResultDir
+$env:REALTIME_POSE_EDITOR_RESULT_DIR = [string](Resolve-Path -LiteralPath $ResultDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_RESULT_DIR) {
+    $env:REALTIME_POSE_EDITOR_RESULT_DIR = [string]$ResultDir
 }
-$env:X277_EDITOR_OUTPUT_DIR = [string](Resolve-Path -LiteralPath $OutputDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_OUTPUT_DIR) {
-    $env:X277_EDITOR_OUTPUT_DIR = [string]$OutputDir
+$env:REALTIME_POSE_EDITOR_OUTPUT_DIR = [string](Resolve-Path -LiteralPath $OutputDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_OUTPUT_DIR) {
+    $env:REALTIME_POSE_EDITOR_OUTPUT_DIR = [string]$OutputDir
 }
-$env:X277_EDITOR_RUNTIME_DIR = [string]$RuntimeDir
-$env:X277_EDITOR_SMPL_MODEL_DIR = [string](Resolve-Path -LiteralPath $SmplModelDir -ErrorAction SilentlyContinue)
-if (-not $env:X277_EDITOR_SMPL_MODEL_DIR) {
-    $env:X277_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
+$env:REALTIME_POSE_EDITOR_RUNTIME_DIR = [string]$RuntimeDir
+$env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR = [string](Resolve-Path -LiteralPath $SmplModelDir -ErrorAction SilentlyContinue)
+if (-not $env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR) {
+    $env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
 }
 
-Write-Host "[visual_editor] Starting X277 Visual Editor..."
-Write-Host "[visual_editor] amass_dir=$env:X277_EDITOR_AMASS_DIR"
-Write-Host "[visual_editor] data_dir=$env:X277_EDITOR_DATA_DIR"
-Write-Host "[visual_editor] source_dir=$env:X277_EDITOR_SOURCE_DIR"
-Write-Host "[visual_editor] result_dir=$env:X277_EDITOR_RESULT_DIR"
-Write-Host "[visual_editor] output_dir=$env:X277_EDITOR_OUTPUT_DIR"
-Write-Host "[visual_editor] smpl_model_dir=$env:X277_EDITOR_SMPL_MODEL_DIR"
+Write-Host "[visual_editor] Starting RealtimePose Studio..."
+Write-Host "[visual_editor] amass_dir=$env:REALTIME_POSE_EDITOR_AMASS_DIR"
+Write-Host "[visual_editor] data_dir=$env:REALTIME_POSE_EDITOR_DATA_DIR"
+Write-Host "[visual_editor] source_dir=$env:REALTIME_POSE_EDITOR_SOURCE_DIR"
+Write-Host "[visual_editor] result_dir=$env:REALTIME_POSE_EDITOR_RESULT_DIR"
+Write-Host "[visual_editor] output_dir=$env:REALTIME_POSE_EDITOR_OUTPUT_DIR"
+Write-Host "[visual_editor] smpl_model_dir=$env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR"
 if ($PrepareOnly) {
     Write-Host "[visual_editor] PrepareOnly completed. Electron was not started."
     exit 0

@@ -6,7 +6,7 @@ import torch.nn as nn
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
-    """把扩散时间步编码成连续向量，供每一层 Transformer 作为去噪强度条件。"""
+    """把扩散时间步编码成连续向量，表示当前样本的噪声强度。"""
 
     def __init__(self, embedding_dim: int, max_period: int = 10_000):
         super().__init__()
@@ -34,45 +34,45 @@ class SinusoidalTimestepEmbedding(nn.Module):
 
 class DiffusionPoserDiT(nn.Module):
     """
-    面向 DiffusionPoser 稀疏传感器重建的轻量 DiT 骨架。
+    realtime_pose_v1 条件扩散去噪网络。
 
-    输入和输出都使用 `[B, C, T]`：
-    - `C` 是动作特征维度，默认 283，即 X277 + 6 维传感器缺失标签；
-    - `T` 是时间长度；
-    - `inpaint_cond` 使用同形状布尔张量标记待补全位置，模型会把它作为显式条件通道拼接进去。
+    输入和输出均为 `[B, C, T]`，默认 `C=206, T<=61`。`inpaint_cond=True`
+    的位置由扩散生成，False 的位置保持为观测条件。frame positional embedding
+    用来告诉 Transformer token 在 61 帧窗口中的位置。
     """
 
     def __init__(
         self,
-        input_feats: int = 283,
+        input_feats: int = 206,
         latent_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,
         dropout: float = 0.0,
         zero_init: bool = False,
+        max_seq_len: int = 61,
     ):
         super().__init__()
-        self.input_feats = input_feats
-        self.output_feats = input_feats
-        self.latent_dim = latent_dim
+        self.input_feats = int(input_feats)
+        self.output_feats = int(input_feats)
+        self.latent_dim = int(latent_dim)
+        self.max_seq_len = int(max_seq_len)
 
-        # 把“当前 noisy motion”和“哪些位置需要补全”一起投影成 token。
-        self.input_proj = nn.Linear(input_feats * 2, latent_dim)
-        self.time_embed = SinusoidalTimestepEmbedding(latent_dim)
+        self.input_proj = nn.Linear(self.input_feats * 2, self.latent_dim)
+        self.time_embed = SinusoidalTimestepEmbedding(self.latent_dim)
+        self.frame_pos_embed = nn.Parameter(torch.zeros(1, self.max_seq_len, self.latent_dim))
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=latent_dim,
+            d_model=self.latent_dim,
             nhead=num_heads,
-            dim_feedforward=latent_dim * 4,
+            dim_feedforward=self.latent_dim * 4,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output_proj = nn.Linear(latent_dim, input_feats)
+        self.output_proj = nn.Linear(self.latent_dim, self.input_feats)
 
         if zero_init:
-            # 复现早期训练时更稳定：初始模型近似输出 0，逐步学习 x0 或 epsilon。
             nn.init.zeros_(self.output_proj.weight)
             nn.init.zeros_(self.output_proj.bias)
 
@@ -89,10 +89,12 @@ class DiffusionPoserDiT(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if hidden_states.dim() != 3:
-            raise ValueError(f"hidden_states 应为 [B, C, T]，实际得到 {tuple(hidden_states.shape)}")
+            raise ValueError(f"hidden_states 应为 [B, C, T]，实际为 {tuple(hidden_states.shape)}")
         batch_size, channels, seq_len = hidden_states.shape
         if channels != self.input_feats:
-            raise ValueError(f"输入特征维度应为 {self.input_feats}，实际得到 {channels}")
+            raise ValueError(f"输入特征维应为 {self.input_feats}，实际为 {channels}")
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
 
         if inpaint_cond is None:
             inpaint_cond = torch.ones_like(hidden_states, dtype=torch.bool)
@@ -105,18 +107,16 @@ class DiffusionPoserDiT(nn.Module):
             valid_frame_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=hidden_states.device)
         valid_frame_mask = valid_frame_mask.bool()
         if valid_frame_mask.shape != (batch_size, seq_len):
-            raise ValueError("valid_frame_mask 必须为 [B, T]")
+            raise ValueError(f"valid_frame_mask 应为 [B, T]，实际为 {tuple(valid_frame_mask.shape)}")
 
-        # Transformer 使用 [B, T, C]；mask 通道保留为 0/1，让模型知道哪些 token/特征是待生成目标。
         motion_tokens = hidden_states.transpose(1, 2)
         mask_tokens = inpaint_cond.float().transpose(1, 2)
         tokens = torch.cat([motion_tokens, mask_tokens], dim=-1)
 
         hidden = self.input_proj(tokens)
         hidden = hidden + self.time_embed(timestep).unsqueeze(1)
+        hidden = hidden + self.frame_pos_embed[:, :seq_len]
 
-        # PyTorch 的 src_key_padding_mask 中 True 表示忽略该 token，因此这里取反。
         key_padding_mask = ~valid_frame_mask
         hidden = self.transformer(hidden, src_key_padding_mask=key_padding_mask)
-        output = self.output_proj(hidden).transpose(1, 2)
-        return output
+        return self.output_proj(hidden).transpose(1, 2)

@@ -11,6 +11,7 @@ def create_model_and_diffusion(args):
         num_heads=args.heads,
         dropout=args.dropout,
         zero_init=args.zero_init,
+        max_seq_len=args.max_seq_len,
     )
     diffusion = create_gaussian_diffusion(args)
     return model, diffusion

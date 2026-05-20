@@ -1,84 +1,17 @@
-# X277/AMASS Motion Studio
+# RealtimePose Studio
 
-`visual_editor/` is a local 3D viewer/editor for AMASS, converted X277, materialized current277 tasks, and streaming repair outputs.
+`visual_editor/` 是本地 realtime_pose_v1 查看和 task 导出工具。
 
-## Environment
-
-All editor dependencies and runtime files stay under this directory:
-
-- Python: `visual_editor/.venv/`
-- Node: `visual_editor/node_modules/`
-- Caches: `visual_editor/.cache/`
-- Runtime/index/frame caches: `visual_editor/.runtime/`
-- Edited exports: `visual_editor/.runtime/exports/`
-
-Bootstrap:
+## 启动 API
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File visual_editor/scripts/bootstrap.ps1
+conda run -n diffusionposer5070 python -m visual_editor.server --source_dir dataset/AMASS_realtime_pose_60hz --data_dir dataset/AMASS_realtime_pose_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports
 ```
 
-## Launch
+## 数据
 
-One-click Electron shell:
+- Source：`realtime_pose_v1` `.npz`，包含 `body_pose_parent_6d/root_pos_world/root_yaw/tracker_pos_world/joints_world` 等源数组。
+- Task：`materialized_realtime_pose_v1` `.npz`，包含 source 数组、`sensor_valid`、`inpaint_mask` 和 61 帧窗口元数据。
+- Result：采样结果 `.npz`，建议包含 `reference_features`、`conditioned_features`、`reconstructed_features`。
 
-```powershell
-start_visual_editor.cmd
-```
-
-Web safe mode:
-
-```powershell
-start_visual_editor_web.cmd
-```
-
-By default the launcher uses `dataset/body_models` as `smpl_model_dir`, so raw AMASS rendering is enabled automatically when the model files exist.
-
-Explicit paths:
-
-```powershell
-start_visual_editor.cmd -AmassDir dataset/AMASS -SourceDir dataset/AMASS_current277_60hz -DataDir dataset/AMASS_current277_60hz_missing_tasks -ResultDir output -OutputDir visual_editor/.runtime/exports -SmplModelDir dataset/body_models
-```
-
-API only:
-
-```powershell
-visual_editor/.venv/Scripts/python -m visual_editor.server --amass_dir dataset/AMASS --source_dir dataset/AMASS_current277_60hz --data_dir dataset/AMASS_current277_60hz_missing_tasks --result_dir output --output_dir visual_editor/.runtime/exports --smpl_model_dir dataset/body_models
-```
-
-Frontend development:
-
-```powershell
-npm.cmd --prefix visual_editor run viewer:dev
-```
-
-## Data Sources
-
-- AMASS raw: `poses/trans/betas/gender/mocap_framerate`; direct rendering needs local `smpl_model_dir`.
-- Converted X277: `.npz` with `x: [T, 277]`.
-- Task windows: `.npz` with `x277`, masks, and current277 metadata.
-- Repair outputs: `stream_outputs.npz` with `reference_motion`, `conditioned_motion`, and `reconstructed_motion`.
-
-The library index is cached in `visual_editor/.runtime/library_cache.json`. SMPL frame results are cached in `visual_editor/.runtime/frame_cache/`.
-
-## Optional SMPL
-
-SMPL/SMPL-H assets are not downloaded automatically. The default local model directory is `dataset/body_models`. To enable raw AMASS rendering or mesh preview, install optional dependencies:
-
-```powershell
-visual_editor/.venv/Scripts/python -m pip install -r visual_editor/requirements-smpl.txt --cache-dir visual_editor/.cache/pip
-start_visual_editor.cmd
-```
-
-## Current Interfaces
-
-- `GET /api/library`
-- `POST /api/library/refresh`
-- `GET /api/assets/{asset_id}/frames?track_id=&start=&count=&frame_offset=`
-- `POST /api/compare/frames`
-- `POST /api/edit/projects`
-- `PATCH /api/edit/projects/{project_id}/keyframes`
-- `POST /api/edit/projects/{project_id}/preview`
-- `POST /api/edit/projects/{project_id}/export`
-
-Exported edited datasets remain current277 loader-compatible: 10 history frames plus the 11th target frame.
+默认导出的 task 固定为 61 帧 full-tracker 窗口，`sensor_valid` 全 1。需要做评估或可视化对比时，可以在 exporter 中选择固定 tracker pattern；训练阶段的随机遮盖由 Dataset 动态完成，不需要从编辑器导出多份训练 mask。

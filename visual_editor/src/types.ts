@@ -7,7 +7,7 @@ export interface MotionTrack {
   frame_count: number;
   fps: number;
   source_path: string;
-  compatible_x277: boolean;
+  compatible_realtime_pose: boolean;
   available: boolean;
   unavailable_reason: string;
   frame_offset: number;
@@ -16,7 +16,7 @@ export interface MotionTrack {
 
 export interface MotionAsset {
   asset_id: string;
-  kind: "amass" | "x277" | "task" | "repair";
+  kind: "source" | "task" | "result";
   label: string;
   source_path: string;
   frame_count: number;
@@ -35,10 +35,10 @@ export interface ComparePreset {
 
 export interface LibraryPayload {
   schema_name: string;
-  config: Record<string, unknown>;
   index: Record<string, unknown>;
   assets: MotionAsset[];
-  presets: ComparePreset[];
+  stats: Record<string, number>;
+  compare_presets: ComparePreset[];
 }
 
 export interface FrameState {
@@ -51,8 +51,7 @@ export interface FrameState {
   root_yaw: number;
   trackers: Vec3[];
   joints: Vec3[];
-  contact: number[];
-  sensor_missing_labels: boolean[];
+  sensor_valid: boolean[];
   inpaint_target: boolean;
   valid: boolean;
 }
@@ -105,6 +104,8 @@ export interface ExportResult {
   task_count: number;
   tasks: Array<{ task_id: string; target_frame: number; task_path: string }>;
   project_id: string;
+  mask_policy: "full" | "fixed_patterns";
+  tracker_patterns: string[];
 }
 
 export interface MeshPayload {

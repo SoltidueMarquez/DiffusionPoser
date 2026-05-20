@@ -16,8 +16,8 @@ $RepoRoot = Resolve-Path (Join-Path $EditorRoot "..")
 $RuntimeDir = Join-Path $EditorRoot ".runtime"
 $DefaultOutputDir = Join-Path $RuntimeDir "exports"
 $PreferredAmassDir = Join-Path $RepoRoot "dataset\AMASS"
-$PreferredDataDir = Join-Path $RepoRoot "dataset\AMASS_current277_60hz_missing_tasks"
-$PreferredSourceDir = Join-Path $RepoRoot "dataset\AMASS_current277_60hz"
+$PreferredDataDir = Join-Path $RepoRoot "dataset\AMASS_realtime_pose_60hz_tasks"
+$PreferredSourceDir = Join-Path $RepoRoot "dataset\AMASS_realtime_pose_60hz"
 $PreferredResultDir = Join-Path $RepoRoot "output"
 $PreferredSmplModelDir = Join-Path $RepoRoot "dataset\body_models"
 $VenvPython = Join-Path $EditorRoot ".venv\Scripts\python.exe"
@@ -109,13 +109,13 @@ if ($Rebuild) {
 }
 
 $env:PYTHONPATH = [string]$RepoRoot
-$env:X277_EDITOR_AMASS_DIR = [string]$AmassDir
-$env:X277_EDITOR_DATA_DIR = [string]$DataDir
-$env:X277_EDITOR_SOURCE_DIR = [string]$SourceDir
-$env:X277_EDITOR_RESULT_DIR = [string]$ResultDir
-$env:X277_EDITOR_OUTPUT_DIR = [string]$OutputDir
-$env:X277_EDITOR_RUNTIME_DIR = [string]$RuntimeDir
-$env:X277_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
+$env:REALTIME_POSE_EDITOR_AMASS_DIR = [string]$AmassDir
+$env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
+$env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
+$env:REALTIME_POSE_EDITOR_RESULT_DIR = [string]$ResultDir
+$env:REALTIME_POSE_EDITOR_OUTPUT_DIR = [string]$OutputDir
+$env:REALTIME_POSE_EDITOR_RUNTIME_DIR = [string]$RuntimeDir
+$env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
 
 Write-Host "[visual_editor_web] data_dir=$DataDir"
 Write-Host "[visual_editor_web] amass_dir=$AmassDir"

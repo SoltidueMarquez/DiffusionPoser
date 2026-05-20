@@ -4,11 +4,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_X277_FPS = 60.0
-LIBRARY_CACHE_SCHEMA = "x277_motion_studio_library_cache_v1"
+DEFAULT_REALTIME_POSE_FPS = 60.0
+LIBRARY_CACHE_SCHEMA = "realtime_pose_studio_library_cache_v1"
 LIBRARY_CACHE_VERSION = 2
-EDIT_PROJECT_SCHEMA = "x277_motion_studio_edit_project_v1"
-EDITED_DATASET_SCHEMA = "x277_motion_studio_edited_dataset_v1"
+EDIT_PROJECT_SCHEMA = "realtime_pose_studio_edit_project_v1"
+EDITED_DATASET_SCHEMA = "realtime_pose_studio_edited_dataset_v1"
 
 
 @dataclass
@@ -20,7 +20,7 @@ class StudioConfig:
     output_dir: Path
     smpl_model_dir: Path | None = None
     runtime_dir: Path = Path("visual_editor/.runtime")
-    x277_fps: float = DEFAULT_X277_FPS
+    realtime_pose_fps: float = DEFAULT_REALTIME_POSE_FPS
 
     @classmethod
     def from_paths(
@@ -33,7 +33,7 @@ class StudioConfig:
         output_dir: str | Path,
         smpl_model_dir: str | Path | None = None,
         runtime_dir: str | Path = Path("visual_editor/.runtime"),
-        x277_fps: float = DEFAULT_X277_FPS,
+        realtime_pose_fps: float | None = None,
     ) -> "StudioConfig":
         smpl_path = Path(smpl_model_dir) if smpl_model_dir else None
         return cls(
@@ -44,7 +44,7 @@ class StudioConfig:
             output_dir=Path(output_dir),
             smpl_model_dir=smpl_path,
             runtime_dir=Path(runtime_dir),
-            x277_fps=float(x277_fps),
+            realtime_pose_fps=float(realtime_pose_fps if realtime_pose_fps is not None else DEFAULT_REALTIME_POSE_FPS),
         )
 
 
@@ -56,7 +56,7 @@ class MotionTrack:
     frame_count: int
     fps: float
     source_path: Path
-    compatible_x277: bool
+    compatible_realtime_pose: bool
     available: bool = True
     unavailable_reason: str = ""
     frame_offset: int = 0
@@ -70,7 +70,7 @@ class MotionTrack:
             "frame_count": int(self.frame_count),
             "fps": float(self.fps),
             "source_path": str(self.source_path),
-            "compatible_x277": bool(self.compatible_x277),
+            "compatible_realtime_pose": bool(self.compatible_realtime_pose),
             "available": bool(self.available),
             "unavailable_reason": self.unavailable_reason,
             "frame_offset": int(self.frame_offset),
@@ -86,7 +86,7 @@ class MotionTrack:
             frame_count=int(payload["frame_count"]),
             fps=float(payload["fps"]),
             source_path=Path(str(payload["source_path"])),
-            compatible_x277=bool(payload["compatible_x277"]),
+            compatible_realtime_pose=bool(payload.get("compatible_realtime_pose", False)),
             available=bool(payload.get("available", True)),
             unavailable_reason=str(payload.get("unavailable_reason", "")),
             frame_offset=int(payload.get("frame_offset", 0)),

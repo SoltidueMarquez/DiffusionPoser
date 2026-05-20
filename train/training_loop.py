@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import time
@@ -7,20 +9,19 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_TARGET_DIM,
+    SENSOR_VALID_START,
+    TASK_MODE_REALTIME_POSE,
+)
 from diffusion import logger
-from data_loaders.sensor_masking import MODEL_INPUT_DIM, TASK_MODE_FULL_RECONSTRUCTION_CURRENT, X277_FEATURE_DIM
 from utils import dist_util
 
 
 class TrainLoop:
-    """
-    DiffusionPoser 的 current277 扩散训练循环。
-
-    本文件沿用 StableMotion 的训练骨架：run_loop -> run_step ->
-    forward_backward -> mask_manager -> save/log_step。与 StableMotion 不同的是，
-    DiffusionPoser 不再训练 detection 模式，训练目标完全由离线生成的
-    `inpaint_mask: [B, 283, T]` 决定。
-    """
+    """realtime_pose_v1 扩散训练循环。"""
 
     def __init__(self, args, train_platform, model, diffusion, data):
         self.args = args
@@ -40,7 +41,7 @@ class TrainLoop:
         self.gradient_clip = args.gradient_clip
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
-        self.task_mode = getattr(args, "task_mode", TASK_MODE_FULL_RECONSTRUCTION_CURRENT)
+        self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
 
         self.save_dir = Path(args.save_dir)
@@ -51,12 +52,16 @@ class TrainLoop:
         self.num_epochs = self.num_steps // max(1, len(self.data)) + 1
         self.device = dist_util.dev()
         self._eval_skip_logged = False
+
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
+        if self.task_mode != TASK_MODE_REALTIME_POSE:
+            raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
         if self.device.type == "cuda":
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
 
         self.feature_w = self._load_feature_weights(args)
+        self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
 
         self.scaler = GradScaler("cuda", enabled=self.device.type == "cuda")
@@ -78,17 +83,23 @@ class TrainLoop:
         if not feature_w_path.exists():
             raise FileNotFoundError(f"开启 --weighted_loss 后找不到特征权重文件：{feature_w_path}")
 
-        feature_w = torch.load(feature_w_path, map_location="cpu", weights_only=True).float()
-        feature_w = feature_w.flatten()
-        if feature_w.numel() == X277_FEATURE_DIM:
-            # X277 权重只覆盖真实动作特征；6 维缺失标签只作为条件，补 1 只是为了形状对齐。
-            feature_w = torch.cat([feature_w, torch.ones(MODEL_INPUT_DIM - X277_FEATURE_DIM)])
-        if feature_w.numel() != MODEL_INPUT_DIM:
-            raise ValueError(
-                f"feature_w 应为 {X277_FEATURE_DIM} 或 {MODEL_INPUT_DIM} 维，实际为 {feature_w.numel()} 维"
-            )
+        feature_w = torch.load(feature_w_path, map_location="cpu", weights_only=True).float().flatten()
+        if feature_w.numel() != REALTIME_POSE_INPUT_DIM:
+            raise ValueError(f"feature_w 应为 {REALTIME_POSE_INPUT_DIM} 维，实际为 {feature_w.numel()} 维")
         feature_w.requires_grad_(False)
         return feature_w
+
+    @staticmethod
+    def _read_dataset_normalizer_stats(data):
+        dataset = getattr(data, "dataset", None)
+        normalizer = getattr(dataset, "normalizer", None)
+        if normalizer is None or getattr(normalizer, "disable", False):
+            return None, None
+        mean = getattr(normalizer, "mean", None)
+        std = getattr(normalizer, "std", None)
+        if mean is None or std is None:
+            return None, None
+        return mean.detach().float().clone(), std.detach().float().clone()
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint(
@@ -107,7 +118,7 @@ class TrainLoop:
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if missing_keys or unexpected_keys:
             raise RuntimeError(
-                "恢复训练 checkpoint 与当前模型结构不匹配，已停止以避免继续训练错误实验。"
+                "checkpoint 与当前 realtime_pose_v1 模型结构不匹配，已停止恢复。"
                 f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
             )
 
@@ -153,9 +164,7 @@ class TrainLoop:
     def run_loop(self):
         self.model.train()
         if self._should_stop():
-            logger.log(
-                f"resume step {self.resume_step} has already reached num_steps={self.num_steps}; skip training."
-            )
+            logger.log(f"resume step {self.resume_step} has already reached num_steps={self.num_steps}; skip training.")
             return
 
         last_step_end = time.perf_counter()
@@ -210,7 +219,7 @@ class TrainLoop:
         if not self.args.eval_during_training:
             return
         if not self._eval_skip_logged:
-            logger.log("训练期评估入口尚未接入采样评估流程，本次训练将跳过 --eval_during_training。")
+            logger.log("训练期评估入口尚未接入 realtime_pose_v1 采样评估，本次训练跳过 --eval_during_training。")
             self._eval_skip_logged = True
 
     def run_step(self, batch):
@@ -231,14 +240,14 @@ class TrainLoop:
 
         with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.device.type == "cuda"):
             for i in range(0, batch["x"].shape[0], self.microbatch):
-                # 目前保持 StableMotion 的整 batch 训练语义，先不引入 microbatch 梯度累积。
+                # 当前保持整 batch 训练，后续如果 batch 很大再引入 microbatch 梯度累积。
                 assert i == 0
                 assert self.microbatch == self.batch_size
 
-                sample = batch["x"]  # [B, 283, T]
+                sample = batch["x"]  # [B, 206, 61]
                 batch_size, channels, seq_len = sample.shape
-                if channels != MODEL_INPUT_DIM:
-                    raise ValueError(f"训练输入应为 [B, {MODEL_INPUT_DIM}, T]，实际为 {tuple(sample.shape)}")
+                if channels != REALTIME_POSE_INPUT_DIM:
+                    raise ValueError(f"训练输入应为 [B, {REALTIME_POSE_INPUT_DIM}, T]，实际为 {tuple(sample.shape)}")
 
                 feature_w = self._feature_weights_for_batch(batch_size, seq_len)
                 timesteps = torch.randint(
@@ -269,10 +278,8 @@ class TrainLoop:
 
     def mask_manager(self, batch, sample):
         """
-        根据 task_mode 生成扩散条件与 loss mask。
-
-        `inpaint_mask=True` 表示该位置需要加噪、预测并参与 loss；False 表示该位置是观测条件。
-        其中 `[277:283)` 的 6 维传感器缺失标签必须一直是条件，不允许被模型预测。
+        `inpaint_mask=True` 表示该位置需要加噪、预测并参与 denoise loss。
+        tracker 条件和 sensor_valid 永远作为观测条件，不参与 diffusion loss。
         """
 
         batch_size, channels, seq_len = sample.shape
@@ -285,30 +292,42 @@ class TrainLoop:
 
         inpaint_mask = batch.get("inpaint_mask")
         if inpaint_mask is None:
-            raise ValueError("训练 batch 缺少 inpaint_mask，请先生成 X277 传感器缺失任务。")
+            raise ValueError("训练 batch 缺少 inpaint_mask，请先生成 realtime_pose_v1 task。")
         inpaint_mask = inpaint_mask.bool()
         if inpaint_mask.shape != sample.shape:
             raise ValueError(f"inpaint_mask 应为 {tuple(sample.shape)}，实际为 {tuple(inpaint_mask.shape)}")
 
         inpaint_mask = inpaint_mask & valid_frame_mask.unsqueeze(1)
-        inpaint_mask[:, X277_FEATURE_DIM:MODEL_INPUT_DIM, :] = False
+        inpaint_mask[:, REALTIME_POSE_TARGET_DIM:REALTIME_POSE_INPUT_DIM, :] = False
+        if inpaint_mask[:, SENSOR_VALID_START:, :].any():
+            raise ValueError("sensor_valid 不能参与 diffusion loss，请检查 task 的 inpaint_mask。")
         if not inpaint_mask.any():
-            raise ValueError("当前 batch 的 inpaint_mask 没有待补全位置，请检查离线任务生成结果。")
+            raise ValueError("当前 batch 的 inpaint_mask 没有待补全部分，请检查离线任务生成结果。")
 
         conditioned_sample = batch.get("conditioned_x", sample)
         if conditioned_sample.shape != sample.shape:
-            raise ValueError(
-                f"conditioned_x 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}"
-            )
+            raise ValueError(f"conditioned_x 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}")
+
+        y = {
+            "mask": inpaint_mask,
+            "inpainted_motion": conditioned_sample,
+            "schema_name": REALTIME_POSE_SCHEMA_NAME,
+            "target_joints_world": batch["target_joints_world"],
+            "prev_joints_world": batch["prev_joints_world"],
+            "target_root_pos_world": batch["target_root_pos_world"],
+            "prev_root_yaw": batch["prev_root_yaw"],
+            "target_root_yaw": batch["target_root_yaw"],
+            "joint_offsets_parent": batch["joint_offsets_parent"],
+        }
+        if self.normalizer_mean is not None and self.normalizer_std is not None:
+            y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
+            y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)
 
         return {
             "inpaint_cond": inpaint_mask,
             "valid_frame_mask": valid_frame_mask,
             "attention_mask": valid_frame_mask,
-            "y": {
-                "mask": inpaint_mask,
-                "inpainted_motion": conditioned_sample,
-            },
+            "y": y,
         }
 
     # endregion
@@ -401,14 +420,7 @@ def parse_resume_step_from_filename(filename):
 
 
 def find_resume_checkpoint(save_dir: str | Path, requested_checkpoint: str | Path | None = "") -> str:
-    """
-    解析恢复训练用的主模型 checkpoint。
-
-    - `requested_checkpoint` 为空：表示用户明确要从头训练，不自动恢复。
-    - `requested_checkpoint` 为 `latest`/`auto`：从 `save_dir` 扫描最新的 `model*.pt`。
-    - `requested_checkpoint` 是具体路径但文件不存在：回退到 `save_dir` 中最新的 checkpoint，
-      这样 VSCode 配置里写死的旧 checkpoint 被清理后仍然能继续训练。
-    """
+    """解析恢复训练使用的主模型 checkpoint。"""
 
     requested_text = "" if requested_checkpoint is None else str(requested_checkpoint).strip()
     if not requested_text:
@@ -433,7 +445,7 @@ def find_resume_checkpoint(save_dir: str | Path, requested_checkpoint: str | Pat
         return str(latest_checkpoint)
 
     raise FileNotFoundError(
-        f"--resume_checkpoint 指向的文件不存在：{requested_path}；"
+        f"--resume_checkpoint 指向的文件不存在：{requested_path}，"
         f"并且 save_dir 中也没有可恢复的 model*.pt checkpoint：{Path(save_dir)}"
     )
 
@@ -461,7 +473,9 @@ def find_latest_model_checkpoint(save_dir: str | Path) -> Path | None:
 
 def log_loss_dict(diffusion, timesteps, losses):
     for key, values in losses.items():
+        if not torch.is_tensor(values):
+            continue
         logger.logkv_mean(key, values.mean().item())
         for timestep, loss in zip(timesteps.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * timestep / diffusion.num_timesteps)
-            logger.logkv_mean(f"{key}_q{quartile}", loss)
+            logger.logkv_mean(f"{key}_q{quartile}", float(loss))

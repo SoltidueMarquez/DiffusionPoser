@@ -16,6 +16,15 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
+from data_loaders.realtime_pose_kinematics import JOINT_INDEX, fk_parent_local_torch
+from data_loaders.sensor_masking import (
+    BODY_POSE_DIM,
+    BODY_POSE_START,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_TARGET_START,
+    ROOT_YAW_DELTA_DIM,
+    ROOT_YAW_DELTA_START,
+)
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -1321,6 +1330,88 @@ class GaussianDiffusion:
         x_t = x_start * negnoise_level_mask + x_t * (1 - negnoise_level_mask)
         return x_t
 
+    def _realtime_pose_slice_to_raw(self, values, y, start, end):
+        """把归一化后的 realtime 特征切片还原到物理尺度。"""
+
+        mean = y.get("normalizer_mean")
+        std = y.get("normalizer_std")
+        if mean is None or std is None:
+            return values
+        return values * std[start:end].view(1, -1) + mean[start:end].view(1, -1)
+
+    def _realtime_pose_aux_losses(self, pred_xstart, x_start, model_kwargs):
+        """计算 realtime_pose_v1 第 61 帧的 yaw/FK/velocity/foot-lock 辅助损失。"""
+
+        y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
+        if y.get("schema_name") != REALTIME_POSE_SCHEMA_NAME:
+            return {}
+
+        required = (
+            "target_joints_world",
+            "prev_joints_world",
+            "target_root_pos_world",
+            "prev_root_yaw",
+            "joint_offsets_parent",
+        )
+        missing = [name for name in required if name not in y]
+        if missing:
+            raise KeyError(f"realtime_pose_v1 auxiliary loss 缺少 batch 字段：{missing}")
+
+        frame = REALTIME_POSE_TARGET_START
+        pose_slice = slice(BODY_POSE_START, BODY_POSE_START + BODY_POSE_DIM)
+        yaw_slice = slice(ROOT_YAW_DELTA_START, ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM)
+
+        pred_pose = pred_xstart[:, pose_slice, frame]
+        pred_yaw_delta = pred_xstart[:, yaw_slice, frame]
+        gt_yaw_delta = x_start[:, yaw_slice, frame]
+        pred_pose = self._realtime_pose_slice_to_raw(pred_pose, y, pose_slice.start, pose_slice.stop)
+        pred_yaw_delta = self._realtime_pose_slice_to_raw(pred_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
+        gt_yaw_delta = self._realtime_pose_slice_to_raw(gt_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
+
+        pred_yaw_delta = torch.nn.functional.normalize(pred_yaw_delta, dim=-1, eps=1e-8)
+        gt_yaw_delta = torch.nn.functional.normalize(gt_yaw_delta, dim=-1, eps=1e-8)
+        yaw_loss = 1.0 - (pred_yaw_delta * gt_yaw_delta).sum(dim=-1)
+
+        prev_root_yaw = y["prev_root_yaw"].to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
+        yaw_delta_angle = torch.atan2(pred_yaw_delta[:, 0], pred_yaw_delta[:, 1])
+        pred_root_yaw = prev_root_yaw + yaw_delta_angle
+
+        target_root_pos = y["target_root_pos_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+        target_joints = y["target_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+        prev_joints = y["prev_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+        offsets = y["joint_offsets_parent"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+
+        pred_joints = fk_parent_local_torch(
+            body_pose_parent_6d=pred_pose,
+            root_pos_world=target_root_pos,
+            root_yaw=pred_root_yaw,
+            parent_offsets=offsets,
+        )
+
+        fk_loss = ((pred_joints - target_joints) ** 2).flatten(1).mean(dim=1)
+        pred_joint_vel = pred_joints - prev_joints
+        gt_joint_vel = target_joints - prev_joints
+        joint_vel_loss = torch.abs(pred_joint_vel - gt_joint_vel).flatten(1).mean(dim=1)
+
+        foot_indices = torch.tensor(
+            [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
+            device=pred_xstart.device,
+            dtype=torch.long,
+        )
+        gt_foot_delta_xz = target_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
+        contact_mask = torch.linalg.norm(gt_foot_delta_xz, dim=-1) < 0.03
+        pred_foot_delta_xz = pred_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
+        foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * contact_mask.float()
+        foot_lock_count = contact_mask.float().sum(dim=1).clamp_min(1.0)
+        foot_lock_loss = foot_lock_raw.sum(dim=1) / foot_lock_count
+
+        return {
+            "yaw_loss": yaw_loss,
+            "fk_loss": fk_loss,
+            "joint_vel_loss": joint_vel_loss,
+            "foot_lock_loss": foot_lock_loss,
+        }
+
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, feature_w=None, snr_gamma=5, use_l1=False):
         """
         计算单个时间步的训练损失。
@@ -1402,6 +1493,12 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
+            if self.model_mean_type == ModelMeanType.START_X:
+                pred_xstart = model_output
+            elif self.model_mean_type == ModelMeanType.EPSILON:
+                pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            else:
+                pred_xstart = None
 
             terms["simple_loss"] = self.masked_l2(target, model_output, mask, feature_w, use_l1) 
 
@@ -1417,6 +1514,18 @@ class GaussianDiffusion:
                 if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                     mse_loss_weights = mse_loss_weights / (snr + 1)
                 terms["loss"] *= mse_loss_weights
+
+            if pred_xstart is not None:
+                aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs)
+                if aux_terms:
+                    terms.update(aux_terms)
+                    terms["loss"] = (
+                        terms["loss"]
+                        + 10.0 * terms["yaw_loss"]
+                        + 2.0 * terms["fk_loss"]
+                        + 0.5 * terms["joint_vel_loss"]
+                        + 0.5 * terms["foot_lock_loss"]
+                    )
 
         else:
             raise NotImplementedError(self.loss_type)

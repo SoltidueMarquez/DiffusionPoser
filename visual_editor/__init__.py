@@ -1,4 +1,4 @@
-"""Local X277/AMASS Motion Studio package."""
+"""Local RealtimePose Studio package."""
 
 __all__ = ["__version__"]
 

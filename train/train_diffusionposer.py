@@ -50,6 +50,16 @@ def main():
             preload_data=args.preload_data,
             num_workers=args.num_workers,
             pin_memory=args.cuda,
+            tracker_pos_noise_std=args.tracker_pos_noise_std,
+            tracker_rot_noise_std=args.tracker_rot_noise_std,
+            non_hip_tracker_dropout_prob=args.non_hip_tracker_dropout_prob,
+            history_pose_noise_std=args.history_pose_noise_std,
+            history_yaw_noise_std=args.history_yaw_noise_std,
+            root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
+            tracker_mask_policy=args.tracker_mask_policy,
+            tracker_mask_seed=args.tracker_mask_seed,
+            tracker_mask_fill=args.tracker_mask_fill,
+            tracker_mask_categories=args.tracker_mask_categories,
         )
 
         print("creating model and diffusion...")

@@ -1,1 +1,1 @@
-"""Smoke tests for the local X277 visual editor."""
+"""Smoke tests for the local RealtimePose Studio."""

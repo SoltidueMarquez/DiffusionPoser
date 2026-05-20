@@ -12,7 +12,7 @@ app.commandLine.appendSwitch("disable-gpu-compositing");
 
 const editorRoot = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(editorRoot, "..");
-const apiPort = process.env.X277_EDITOR_PORT || "8765";
+const apiPort = process.env.REALTIME_POSE_EDITOR_PORT || "8765";
 let serverProcess = null;
 let shutdownTimer = null;
 
@@ -37,32 +37,32 @@ function startServer() {
     "--port",
     apiPort,
     "--runtime_dir",
-    envOrDefault("X277_EDITOR_RUNTIME_DIR", path.join(editorRoot, ".runtime")),
+    envOrDefault("REALTIME_POSE_EDITOR_RUNTIME_DIR", path.join(editorRoot, ".runtime")),
     "--amass_dir",
-    envOrDefault("X277_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
+    envOrDefault("REALTIME_POSE_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
     "--data_dir",
-    envOrDefault("X277_EDITOR_DATA_DIR", path.join(editorRoot, ".runtime", "missing_tasks")),
+    envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_60hz_tasks")),
     "--source_dir",
-    envOrDefault("X277_EDITOR_SOURCE_DIR", path.join(editorRoot, ".runtime", "sources")),
+    envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_60hz")),
     "--result_dir",
-    envOrDefault("X277_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
+    envOrDefault("REALTIME_POSE_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
     "--output_dir",
-    envOrDefault("X277_EDITOR_OUTPUT_DIR", path.join(editorRoot, ".runtime", "exports")),
+    envOrDefault("REALTIME_POSE_EDITOR_OUTPUT_DIR", path.join(editorRoot, ".runtime", "exports")),
   ];
-  if (process.env.X277_EDITOR_SMPL_MODEL_DIR) {
-    args.push("--smpl_model_dir", process.env.X277_EDITOR_SMPL_MODEL_DIR);
+  if (process.env.REALTIME_POSE_EDITOR_SMPL_MODEL_DIR) {
+    args.push("--smpl_model_dir", process.env.REALTIME_POSE_EDITOR_SMPL_MODEL_DIR);
   }
   serverProcess = spawn(pythonExecutable(), args, {
     cwd: repoRoot,
     env: {
       ...process.env,
       PYTHONPATH: repoRoot,
-      X277_EDITOR_RUNTIME_DIR: envOrDefault("X277_EDITOR_RUNTIME_DIR", path.join(editorRoot, ".runtime")),
-      X277_EDITOR_AMASS_DIR: envOrDefault("X277_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
-      X277_EDITOR_DATA_DIR: envOrDefault("X277_EDITOR_DATA_DIR", path.join(editorRoot, ".runtime", "missing_tasks")),
-      X277_EDITOR_SOURCE_DIR: envOrDefault("X277_EDITOR_SOURCE_DIR", path.join(editorRoot, ".runtime", "sources")),
-      X277_EDITOR_RESULT_DIR: envOrDefault("X277_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
-      X277_EDITOR_OUTPUT_DIR: envOrDefault("X277_EDITOR_OUTPUT_DIR", path.join(editorRoot, ".runtime", "exports")),
+      REALTIME_POSE_EDITOR_RUNTIME_DIR: envOrDefault("REALTIME_POSE_EDITOR_RUNTIME_DIR", path.join(editorRoot, ".runtime")),
+      REALTIME_POSE_EDITOR_AMASS_DIR: envOrDefault("REALTIME_POSE_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
+      REALTIME_POSE_EDITOR_DATA_DIR: envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_60hz_tasks")),
+      REALTIME_POSE_EDITOR_SOURCE_DIR: envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_60hz")),
+      REALTIME_POSE_EDITOR_RESULT_DIR: envOrDefault("REALTIME_POSE_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
+      REALTIME_POSE_EDITOR_OUTPUT_DIR: envOrDefault("REALTIME_POSE_EDITOR_OUTPUT_DIR", path.join(editorRoot, ".runtime", "exports")),
     },
     stdio: "inherit",
     windowsHide: true,

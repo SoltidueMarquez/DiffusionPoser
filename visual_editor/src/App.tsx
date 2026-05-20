@@ -1,12 +1,15 @@
 import { Canvas } from "@react-three/fiber";
 import { Grid, Html, Line, OrbitControls, PerspectiveCamera } from "@react-three/drei";
-import { Download, Pause, Play, Plus, RefreshCw, Save, SkipBack, SkipForward, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Pause, Play, Plus, RefreshCw, Save, SkipBack, SkipForward, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import type { CompareFramesPayload, EditProject, FrameState, LibraryPayload, MotionAsset, MotionTrack, PaneSelection, Vec3 } from "./types";
 
 const TRACKER_NAMES = ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"];
+const TRACKER_PATTERN_CATEGORIES = ["head-present", "hand-present", "foot-present", "upper-body", "lower-body", "mixed-sparse", "full-trackers"];
 const EDIT_TARGETS = ["root", ...TRACKER_NAMES];
+const ASSET_KINDS = ["source", "task", "result"] as const;
+type AssetKind = MotionAsset["kind"];
 
 interface ContextPreset {
   preset_id: string;
@@ -58,7 +61,7 @@ function makePaneFromTrack(asset: MotionAsset, trackId: string, label: string, f
 }
 
 function isSensorMissing(frame: FrameState | undefined, index: number): boolean {
-  return Boolean(frame?.sensor_missing_labels?.[index]);
+  return !Boolean(frame?.sensor_valid?.[index]);
 }
 
 function SkeletonView({ frame, jointChains }: { frame: FrameState | undefined; jointChains: number[][] }) {
@@ -115,13 +118,12 @@ function SkeletonView({ frame, jointChains }: { frame: FrameState | undefined; j
 }
 
 function SensorStatusStrip({ frame }: { frame: FrameState | undefined }) {
-  const hasLabels = Boolean(frame?.sensor_missing_labels?.length);
   return (
     <div className="sensor-status-strip">
       {TRACKER_NAMES.map((name, index) => {
         const missing = isSensorMissing(frame, index);
         return (
-          <span key={name} className={`sensor-status ${missing ? "missing" : ""} ${hasLabels ? "" : "unknown"}`} title={`${name}: ${missing ? "missing" : hasLabels ? "observed" : "unknown"}`}>
+          <span key={name} className={`sensor-status ${missing ? "missing" : ""}`} title={`${name}: ${missing ? "missing" : "observed"}`}>
             {name}
           </span>
         );
@@ -146,52 +148,23 @@ function buildAssetPresets(asset: MotionAsset | undefined): ContextPreset[] {
     }
   };
 
-  if (asset.kind === "repair") {
-    pushPreset(
-      "gt_repair",
-      "GT vs Repair",
-      "Compare reference motion with reconstructed result.",
-      [makePaneFromTrack(asset, "ground_truth", "Ground Truth"), makePaneFromTrack(asset, "reconstructed", "Repair")],
-    );
-    pushPreset(
-      "conditioned_repair",
-      "Conditioned vs Repair",
-      "Compare model condition with reconstructed result.",
-      [makePaneFromTrack(asset, "conditioned", "Conditioned"), makePaneFromTrack(asset, "reconstructed", "Repair")],
-    );
-    pushPreset(
-      "gt_conditioned_repair",
-      "GT / Conditioned / Repair",
-      "Show all repair result tracks for the selected sample.",
-      [
-        makePaneFromTrack(asset, "ground_truth", "Ground Truth"),
-        makePaneFromTrack(asset, "conditioned", "Conditioned"),
-        makePaneFromTrack(asset, "reconstructed", "Repair"),
-      ],
-    );
-    pushPreset("reconstructed", "Reconstructed", "Show reconstructed result only.", [makePaneFromTrack(asset, "reconstructed", "Repair")]);
-    return presets;
-  }
-
-  if (asset.kind === "amass") {
-    pushPreset(
-      "amass_x277",
-      "AMASS vs X277",
-      "Compare raw AMASS joints with this asset's converted X277 track.",
-      [makePaneFromTrack(asset, "amass_raw", "AMASS"), makePaneFromTrack(asset, "x277_converted", "X277")],
-    );
-    pushPreset("amass_raw", "AMASS Raw", "Show raw AMASS joints only.", [makePaneFromTrack(asset, "amass_raw", "AMASS")]);
-    pushPreset("x277_converted", "X277 Converted", "Show converted X277 motion only.", [makePaneFromTrack(asset, "x277_converted", "X277")]);
-    return presets;
-  }
-
-  if (asset.kind === "x277") {
-    pushPreset("x277_converted", "X277 Converted", "Show selected X277 motion.", [makePaneFromTrack(asset, "x277_converted", "X277")]);
+  if (asset.kind === "source") {
+    pushPreset("realtime_source", "Realtime Source", "Show realtime_pose_v1 converted source motion.", [makePaneFromTrack(asset, "realtime_source", "Source")]);
     return presets;
   }
 
   if (asset.kind === "task") {
-    pushPreset("task_reference", "Task Reference", "Show selected current277 materialized task.", [makePaneFromTrack(asset, "task_reference", "Task Reference")]);
+    pushPreset("task_reference", "Task Reference", "Show realtime_pose_v1 materialized task.", [makePaneFromTrack(asset, "task_reference", "Task Reference")]);
+    return presets;
+  }
+
+  if (asset.kind === "result") {
+    pushPreset(
+      "result_features",
+      "Result Features",
+      "Show available reconstruction feature tracks when joint arrays are present.",
+      [makePaneFromTrack(asset, "reference_features", "Reference"), makePaneFromTrack(asset, "reconstructed_features", "Reconstructed")],
+    );
     return presets;
   }
 
@@ -204,17 +177,16 @@ function defaultPresetForAsset(asset: MotionAsset | undefined): ContextPreset | 
     return undefined;
   }
   const preferredByKind: Record<string, string[]> = {
-    repair: ["gt_repair", "reconstructed", "conditioned_repair", "gt_conditioned_repair"],
-    amass: ["amass_x277", "x277_converted", "amass_raw"],
-    x277: ["x277_converted"],
+    source: ["realtime_source"],
     task: ["task_reference"],
+    result: ["result_features"],
   };
   const preferredIds = preferredByKind[asset.kind] ?? [];
   return preferredIds.map((presetId) => presets.find((preset) => preset.preset_id === presetId)).find(Boolean) ?? presets[0];
 }
 
 function selectDefaultAsset(assets: MotionAsset[]): MotionAsset | undefined {
-  const priority = ["repair", "amass", "x277", "task"];
+  const priority = ["source", "task", "result"];
   for (const kind of priority) {
     const asset = assets.find((candidate) => candidate.kind === kind && defaultPresetForAsset(candidate));
     if (asset) {
@@ -242,11 +214,16 @@ export function App() {
   const [editProject, setEditProject] = useState<EditProject | null>(null);
   const [editTarget, setEditTarget] = useState("root");
   const [positionText, setPositionText] = useState("0, 0, 0");
-  const [exportStart, setExportStart] = useState(10);
-  const [exportEnd, setExportEnd] = useState(10);
+  const [exportStart, setExportStart] = useState(60);
+  const [exportEnd, setExportEnd] = useState(60);
   const [exportStride, setExportStride] = useState(1);
-  const [missingSensors, setMissingSensors] = useState<string[]>([]);
+  const [trackerPatterns, setTrackerPatterns] = useState<string[]>(["full-trackers"]);
   const [log, setLog] = useState("Connecting local API...");
+  const [collapsedAssetKinds, setCollapsedAssetKinds] = useState<Record<AssetKind, boolean>>({
+    source: false,
+    task: false,
+    result: false,
+  });
 
   const jointChains = useMemo(
     () => [
@@ -269,12 +246,13 @@ export function App() {
     return assets.filter((asset) => `${asset.kind} ${asset.label} ${asset.group}`.toLowerCase().includes(value));
   }, [library, query]);
   const groupedAssets = useMemo(() => {
-    const groups: Record<string, MotionAsset[]> = { amass: [], x277: [], task: [], repair: [] };
+    const groups: Record<AssetKind, MotionAsset[]> = { source: [], task: [], result: [] };
     for (const asset of filteredAssets) {
-      groups[asset.kind]?.push(asset);
+      groups[asset.kind].push(asset);
     }
     return groups;
   }, [filteredAssets]);
+  const activeAssetKindCount = ASSET_KINDS.filter((kind) => !collapsedAssetKinds[kind]).length;
 
   const selectedAsset = assetsById.get(selectedAssetId);
   const contextPresets = useMemo(() => buildAssetPresets(selectedAsset), [selectedAsset]);
@@ -283,7 +261,6 @@ export function App() {
   const activeFrame = activePaneFrames?.frames[currentOffset];
   const activeAsset = assetsById.get(panes[activePane]?.asset_id);
   const activeTrack = trackById(activeAsset, panes[activePane]?.track_id ?? "");
-  const smplUnavailableReason = typeof library?.config.smpl_unavailable_reason === "string" ? library.config.smpl_unavailable_reason : "";
   const paneLengths = compare?.panes.map((pane) => pane.frames.length).filter((length) => length > 0) ?? [];
   const maxOffset = paneLengths.length ? Math.max(0, Math.min(...paneLengths) - 1) : 0;
 
@@ -334,8 +311,8 @@ export function App() {
         setIsCompareLoading(false);
         setCurrentOffset((current) => Math.min(current, Math.max(0, payload.panes[0]?.frames.length - 1)));
         const frameCount = payload.panes[0]?.frame_count ?? 0;
-        setExportStart(Math.min(10, Math.max(0, frameCount - 1)));
-        setExportEnd(Math.min(Math.max(10, frameCount - 1), frameCount - 1));
+        setExportStart(Math.min(60, Math.max(0, frameCount - 1)));
+        setExportEnd(Math.min(Math.max(60, frameCount - 1), frameCount - 1));
         setLog(payload.warnings.length ? payload.warnings.join("\n") : `Compare panes: ${payload.panes.length}`);
       })
       .catch((error) => {
@@ -385,6 +362,7 @@ export function App() {
 
   function chooseAsset(asset: MotionAsset) {
     const preset = defaultPresetForAsset(asset);
+    setCollapsedAssetKinds((current) => ({ ...current, [asset.kind]: false }));
     setSelectedAssetId(asset.asset_id);
     setSelectedPresetId(preset?.preset_id ?? "");
     setPanes(preset?.panes ?? []);
@@ -399,6 +377,23 @@ export function App() {
     } else {
       setLog(`${assetLabel(asset)} has no available presets`);
     }
+  }
+
+  function toggleAssetKind(kind: AssetKind) {
+    setCollapsedAssetKinds((current) => ({ ...current, [kind]: !current[kind] }));
+  }
+
+  function showOnlyAssetKind(kind: AssetKind) {
+    setCollapsedAssetKinds({
+      source: kind !== "source",
+      task: kind !== "task",
+      result: kind !== "result",
+    });
+    setLog(`Showing ${kind.toUpperCase()} assets`);
+  }
+
+  function expandAllAssetKinds() {
+    setCollapsedAssetKinds({ source: false, task: false, result: false });
   }
 
   async function refreshLibrary() {
@@ -445,8 +440,8 @@ export function App() {
     }
     try {
       const track = activeTrack;
-      if (!track?.compatible_x277) {
-        throw new Error("Active track is not X277-compatible");
+      if (!track?.compatible_realtime_pose) {
+        throw new Error("Active track is not realtime_pose_v1 exportable");
       }
       const position = positionText.split(",").map((part) => Number(part.trim()));
       if (position.length !== 3 || position.some((part) => !Number.isFinite(part))) {
@@ -492,9 +487,9 @@ export function App() {
         frame_end: exportEnd,
         stride: exportStride,
         split: "train",
-        missing_sensors: missingSensors,
+        tracker_patterns: trackerPatterns,
       });
-      setLog(`Exported ${result.task_count} tasks: ${result.export_dir}`);
+      setLog(`Exported ${result.task_count} ${result.mask_policy} tasks: ${result.export_dir}`);
     } catch (error) {
       setLog(`Export failed: ${(error as Error).message}`);
     }
@@ -509,28 +504,63 @@ export function App() {
           <button className="icon-button" onClick={refreshLibrary} title="Refresh library">
             <RefreshCw size={17} />
           </button>
-          <strong>Motion Studio</strong>
+          <strong>RealtimePose Studio</strong>
         </div>
         <div className="library-search">
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search assets" />
         </div>
-        <div className="asset-groups">
-          {(["repair", "amass", "x277", "task"] as const).map((kind) => (
-            <section key={kind}>
-              <h2>{kind.toUpperCase()} · {groupedAssets[kind].length}</h2>
-              {groupedAssets[kind].slice(0, 600).map((asset) => (
-                <button
-                  key={asset.asset_id}
-                  className={`asset-row ${asset.asset_id === selectedAssetId ? "active" : ""}`}
-                  onClick={() => chooseAsset(asset)}
-                  title={asset.label}
-                >
-                  <span>{asset.label}</span>
-                  <small>{asset.tracks.map((track) => track.track_id).join(" / ")}</small>
-                </button>
-              ))}
-            </section>
+        <div className="asset-kind-switcher">
+          <button className={activeAssetKindCount === ASSET_KINDS.length ? "kind-chip active" : "kind-chip"} onClick={expandAllAssetKinds}>
+            All
+          </button>
+          {ASSET_KINDS.map((kind) => (
+            <button
+              key={kind}
+              className={!collapsedAssetKinds[kind] && activeAssetKindCount === 1 ? "kind-chip active" : "kind-chip"}
+              onClick={() => showOnlyAssetKind(kind)}
+              title={`Show only ${kind.toUpperCase()} assets`}
+            >
+              {kind.toUpperCase()} <span>{groupedAssets[kind].length}</span>
+            </button>
           ))}
+        </div>
+        <div className="asset-groups">
+          {ASSET_KINDS.map((kind) => {
+            const isCollapsed = collapsedAssetKinds[kind];
+            return (
+              <section key={kind} className={isCollapsed ? "asset-group collapsed" : "asset-group"}>
+                <div className="asset-group-header">
+                  <button
+                    className="asset-group-toggle"
+                    onClick={() => toggleAssetKind(kind)}
+                    title={`${isCollapsed ? "Expand" : "Collapse"} ${kind.toUpperCase()} assets`}
+                  >
+                    {isCollapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                    <span>{kind.toUpperCase()}</span>
+                    <strong>{groupedAssets[kind].length}</strong>
+                  </button>
+                  <button className="asset-group-only" onClick={() => showOnlyAssetKind(kind)} title={`Show only ${kind.toUpperCase()} assets`}>
+                    Only
+                  </button>
+                </div>
+                {isCollapsed ? null : (
+                  <div className="asset-group-body">
+                    {groupedAssets[kind].slice(0, 600).map((asset) => (
+                      <button
+                        key={asset.asset_id}
+                        className={`asset-row ${asset.asset_id === selectedAssetId ? "active" : ""}`}
+                        onClick={() => chooseAsset(asset)}
+                        title={asset.label}
+                      >
+                        <span>{asset.label}</span>
+                        <small>{asset.tracks.map((track) => track.track_id).join(" / ")}</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            );
+          })}
         </div>
       </aside>
 
@@ -689,7 +719,7 @@ export function App() {
             <input value={positionText} onChange={(event) => setPositionText(event.target.value)} />
           </label>
           <div className="button-row">
-            <button onClick={upsertKeyframe} disabled={!activeTrack?.compatible_x277}>
+            <button onClick={upsertKeyframe} disabled={!activeTrack?.compatible_realtime_pose}>
               <Plus size={16} /> Save
             </button>
             <button onClick={deleteKeyframe} disabled={!editProject}>
@@ -699,7 +729,7 @@ export function App() {
               <Save size={16} /> Current
             </button>
           </div>
-          <div className="meta-line">{editProject ? editProject.project_id : activeTrack?.compatible_x277 ? "No edit project" : "Track is view-only"}</div>
+          <div className="meta-line">{editProject ? editProject.project_id : activeTrack?.compatible_realtime_pose ? "No edit project" : "Track is view-only"}</div>
         </section>
 
         <section className="panel">
@@ -707,11 +737,11 @@ export function App() {
           <div className="grid-form">
             <label>
               Start
-              <input type="number" value={exportStart} min={10} onChange={(event) => setExportStart(Number(event.target.value))} />
+              <input type="number" value={exportStart} min={60} onChange={(event) => setExportStart(Number(event.target.value))} />
             </label>
             <label>
               End
-              <input type="number" value={exportEnd} min={10} onChange={(event) => setExportEnd(Number(event.target.value))} />
+              <input type="number" value={exportEnd} min={60} onChange={(event) => setExportEnd(Number(event.target.value))} />
             </label>
             <label>
               Stride
@@ -719,29 +749,30 @@ export function App() {
             </label>
           </div>
           <div className="sensor-grid">
-            {TRACKER_NAMES.map((sensor) => (
-              <label key={sensor} className="check-row">
+            {TRACKER_PATTERN_CATEGORIES.map((pattern) => (
+              <label key={pattern} className="check-row">
                 <input
                   type="checkbox"
-                  checked={missingSensors.includes(sensor)}
+                  checked={trackerPatterns.includes(pattern)}
                   onChange={(event) =>
-                    setMissingSensors((current) => (event.target.checked ? [...current, sensor] : current.filter((item) => item !== sensor)))
+                    setTrackerPatterns((current) => {
+                      const next = event.target.checked ? [...current, pattern] : current.filter((item) => item !== pattern);
+                      return next.length ? next : ["full-trackers"];
+                    })
                   }
                 />
-                {sensor}
+                {pattern}
               </label>
             ))}
           </div>
-          <button className="primary" onClick={exportDataset} disabled={!activeTrack?.compatible_x277}>
+          <div className="meta-line">Training masks are sampled by Dataset; exports here are fixed evaluation/debug patterns.</div>
+          <button className="primary" onClick={exportDataset} disabled={!activeTrack?.compatible_realtime_pose}>
             <Download size={16} /> Export Tasks
           </button>
         </section>
 
         <section className="panel">
           <h2>Status</h2>
-          {library?.config.smpl_available === false && smplUnavailableReason ? (
-            <div className="meta-line warning">AMASS Raw: {smplUnavailableReason}</div>
-          ) : null}
           <pre className="log">{log}</pre>
         </section>
       </aside>

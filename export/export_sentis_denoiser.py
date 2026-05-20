@@ -20,18 +20,21 @@ if str(EXPORT_DIR) not in sys.path:
     sys.path.insert(0, str(EXPORT_DIR))
 
 
-from data_loaders.sensor_masking import LAST_FRAME_RECONSTRUCTION_SEQ_LEN, validate_last_frame_seq_len  # noqa: E402
-from utils.model_util import create_model_and_diffusion  # noqa: E402
-from write_unity_runtime_assets import (  # noqa: E402
-    default_unity_model_dir,
-    expected_x277_model_input_dim,
-    write_runtime_assets,
+from data_loaders.sensor_masking import (  # noqa: E402
+    REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_START,
 )
+from utils.model_util import create_model_and_diffusion  # noqa: E402
+from write_unity_runtime_assets import default_unity_model_dir, write_runtime_assets  # noqa: E402
 
 
 DEFAULT_MODEL_CONFIG = {
-    "input_feats": expected_x277_model_input_dim(),
-    "seq_len": LAST_FRAME_RECONSTRUCTION_SEQ_LEN,
+    "input_feats": REALTIME_POSE_INPUT_DIM,
+    "seq_len": REALTIME_POSE_SEQ_LEN,
+    "max_seq_len": REALTIME_POSE_SEQ_LEN,
     "layers": 8,
     "heads": 8,
     "latent_dim": 512,
@@ -46,7 +49,7 @@ DEFAULT_MODEL_CONFIG = {
 
 
 class SentisDenoiserWrapper(nn.Module):
-    """Fixed ONNX/Sentis contract wrapper for the realtime denoiser."""
+    """Unity Sentis 固定调用合约：输入 `[1,206,61]`，输出 `pred_x0`。"""
 
     def __init__(self, denoiser: nn.Module):
         super().__init__()
@@ -68,7 +71,7 @@ class SentisDenoiserWrapper(nn.Module):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export a DiffusionPoser denoiser for Unity Sentis.")
+    parser = argparse.ArgumentParser(description="Export a realtime_pose_v1 DiffusionPoser denoiser for Unity Sentis.")
     parser.add_argument("--model_path", required=True, type=str, help="Path to model*.pt checkpoint.")
     parser.add_argument("--output_dir", default=str(default_unity_model_dir()), type=str)
     parser.add_argument("--normalizer_dir", default="", type=str)
@@ -79,12 +82,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--opset", default=17, type=int)
     parser.add_argument("--onnx_check_tolerance", default=2e-4, type=float)
     parser.add_argument("--strict_onnx_check", action="store_true")
-    parser.add_argument("--allow_feature_dim_mismatch", action="store_true")
-    parser.add_argument(
-        "--skip_runtime_assets",
-        action="store_true",
-        help="Export only diffusionposer_denoiser.onnx. Use this for checkpoints whose feature schema is not RealtimePose current277 v1.",
-    )
 
     for key, value in DEFAULT_MODEL_CONFIG.items():
         arg_type = type(value)
@@ -116,32 +113,25 @@ def load_checkpoint_args(model_path: Path) -> dict[str, Any]:
 
 def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:
     config = dict(DEFAULT_MODEL_CONFIG)
-    config.update(
-        {
-            key: value
-            for key, value in load_checkpoint_args(Path(cli_args.model_path)).items()
-            if key in config and key != "seq_len"
-        }
-    )
+    config.update({key: value for key, value in load_checkpoint_args(Path(cli_args.model_path)).items() if key in config})
     for key in DEFAULT_MODEL_CONFIG:
         value = getattr(cli_args, key)
         if value is not None:
             config[key] = value
 
-    validate_last_frame_seq_len(config["seq_len"])
+    if int(config["input_feats"]) != REALTIME_POSE_INPUT_DIM:
+        raise ValueError(
+            f"{REALTIME_POSE_SCHEMA_NAME} 只支持 input_feats={REALTIME_POSE_INPUT_DIM}，"
+            f"checkpoint/CLI 给出 {config['input_feats']}。旧 X277 checkpoint 不能导出。"
+        )
+    if int(config["seq_len"]) != REALTIME_POSE_SEQ_LEN or int(config["max_seq_len"]) != REALTIME_POSE_SEQ_LEN:
+        raise ValueError(
+            f"{REALTIME_POSE_SCHEMA_NAME} 只支持 seq_len=max_seq_len={REALTIME_POSE_SEQ_LEN}，"
+            f"实际 seq_len={config['seq_len']}, max_seq_len={config['max_seq_len']}。"
+        )
     config["predict_xstart"] = int(config["predict_xstart"])
     if not bool(config["predict_xstart"]):
         raise ValueError("Unity Sentis export requires predict_xstart=true. Epsilon-prediction checkpoints are rejected.")
-
-    expected_dim = expected_x277_model_input_dim()
-    if int(config["input_feats"]) != expected_dim and not (
-        cli_args.allow_feature_dim_mismatch or cli_args.skip_runtime_assets
-    ):
-        raise ValueError(
-            f"Checkpoint input_feats={config['input_feats']} but RealtimePose X277 schema expects {expected_dim}. "
-            "Pass --allow_feature_dim_mismatch only if you also update feature_schema.json explicitly."
-        )
-
     return SimpleNamespace(**config)
 
 
@@ -166,7 +156,7 @@ def load_export_model(model: nn.Module, model_path: Path, device: torch.device, 
     missing = list(incompatible.missing_keys)
     unexpected = list(incompatible.unexpected_keys)
     if missing or unexpected:
-        raise RuntimeError(f"Checkpoint does not match model. missing={missing}, unexpected={unexpected}")
+        raise RuntimeError(f"Checkpoint does not match realtime_pose_v1 model. missing={missing}, unexpected={unexpected}")
     model.to(device)
     model.eval()
     return model, "model"
@@ -186,14 +176,25 @@ def unwrap_state_dict(payload: Any) -> dict[str, torch.Tensor]:
             if isinstance(value, dict):
                 payload = value
                 break
-
     if not isinstance(payload, dict):
         raise TypeError("Checkpoint payload is not a state_dict.")
-
     state_dict = dict(payload)
     if state_dict and all(str(key).startswith("module.") for key in state_dict):
         state_dict = {str(key)[len("module.") :]: value for key, value in state_dict.items()}
     return state_dict
+
+
+def build_dummy_inputs(
+    feature_dim: int,
+    sequence_length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_t = torch.randn(1, feature_dim, sequence_length, dtype=torch.float32, device=device)
+    timestep = torch.tensor([0.0], dtype=torch.float32, device=device)
+    inpaint_mask = torch.zeros(1, feature_dim, sequence_length, dtype=torch.float32, device=device)
+    inpaint_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = 1.0
+    valid_frame_mask = torch.ones(1, sequence_length, dtype=torch.float32, device=device)
+    return x_t, timestep, inpaint_mask, valid_frame_mask
 
 
 def export_onnx(
@@ -208,25 +209,21 @@ def export_onnx(
     if hasattr(torch.backends, "mha") and hasattr(torch.backends.mha, "set_fastpath_enabled"):
         torch.backends.mha.set_fastpath_enabled(False)
 
-    x_t = torch.randn(1, feature_dim, sequence_length, dtype=torch.float32, device=device)
-    timestep = torch.tensor([0.0], dtype=torch.float32, device=device)
-    inpaint_mask = torch.ones(1, feature_dim, sequence_length, dtype=torch.float32, device=device)
-    valid_frame_mask = torch.ones(1, sequence_length, dtype=torch.float32, device=device)
-
+    dummy_inputs = build_dummy_inputs(feature_dim, sequence_length, device)
     with torch.no_grad():
-        reference = wrapper(x_t, timestep, inpaint_mask, valid_frame_mask).detach().cpu()
+        reference = wrapper(*dummy_inputs).detach().cpu()
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         wrapper,
-        (x_t, timestep, inpaint_mask, valid_frame_mask),
+        dummy_inputs,
         str(onnx_path),
         input_names=["x_t", "timestep", "inpaint_mask", "valid_frame_mask"],
         output_names=["pred_x0"],
         opset_version=opset,
         do_constant_folding=True,
     )
-    return reference, (x_t.detach().cpu(), timestep.detach().cpu(), inpaint_mask.detach().cpu(), valid_frame_mask.detach().cpu())
+    return reference, tuple(value.detach().cpu() for value in dummy_inputs)
 
 
 def check_onnx_alignment(
@@ -284,8 +281,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     reference, onnx_inputs = export_onnx(
         wrapper=wrapper,
         onnx_path=staging_onnx_path,
-        feature_dim=int(model_config.input_feats),
-        sequence_length=int(model_config.seq_len),
+        feature_dim=REALTIME_POSE_INPUT_DIM,
+        sequence_length=REALTIME_POSE_SEQ_LEN,
         opset=int(cli_args.opset),
         device=device,
     )
@@ -303,33 +300,30 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         raise
     staging_onnx_path.replace(onnx_path)
 
-    if cli_args.skip_runtime_assets:
-        runtime_assets = {}
-    else:
-        runtime_assets = write_runtime_assets(
-            output_dir=output_dir,
-            feature_dim=int(model_config.input_feats),
-            sequence_length=int(model_config.seq_len),
-            diffusion_steps=int(model_config.diffusion_steps),
-            noise_schedule=str(model_config.noise_schedule),
-            predict_xstart=True,
-            normalizer_dir=normalizer_dir,
-            normalize_input=bool(cli_args.normalize_input),
-            strict_normalizer=bool(cli_args.strict_normalizer),
-            schema="current277",
-        )
+    runtime_assets = write_runtime_assets(
+        output_dir=output_dir,
+        feature_dim=REALTIME_POSE_INPUT_DIM,
+        sequence_length=REALTIME_POSE_SEQ_LEN,
+        diffusion_steps=int(model_config.diffusion_steps),
+        noise_schedule=str(model_config.noise_schedule),
+        predict_xstart=True,
+        normalizer_dir=normalizer_dir,
+        normalize_input=bool(cli_args.normalize_input),
+        strict_normalizer=bool(cli_args.strict_normalizer),
+    )
 
     result = {
         "onnx_path": onnx_path,
         "runtime_assets": runtime_assets,
         "model_source": model_source,
         "max_abs_error": max_abs_error,
-        "feature_dim": int(model_config.input_feats),
-        "sequence_length": int(model_config.seq_len),
+        "schema_name": REALTIME_POSE_SCHEMA_NAME,
+        "feature_dim": REALTIME_POSE_INPUT_DIM,
+        "sequence_length": REALTIME_POSE_SEQ_LEN,
     }
     print(f"[export_sentis_denoiser] ONNX: {onnx_path}")
     print(f"[export_sentis_denoiser] weights: {model_source}")
-    print(f"[export_sentis_denoiser] feature_dim={result['feature_dim']} seq_len={result['sequence_length']}")
+    print(f"[export_sentis_denoiser] schema={REALTIME_POSE_SCHEMA_NAME} feature_dim={REALTIME_POSE_INPUT_DIM} seq_len={REALTIME_POSE_SEQ_LEN}")
     if max_abs_error is not None:
         print(f"[export_sentis_denoiser] PyTorch/ONNXRuntime max_abs_error={max_abs_error:.6g}")
     for name, path in runtime_assets.items():

@@ -50,15 +50,18 @@ class ExportRequest(BaseModel):
     target_frames: list[int] | None = None
     split: str = "train"
     missing_sensors: list[int | str] = Field(default_factory=list)
+    tracker_pattern: str | None = None
+    tracker_patterns: list[str] | None = None
+    seed: int = 10
     export_name: str | None = None
     output_dir: str | None = None
 
 
 def build_app(service: MotionStudioService) -> FastAPI:
     app = FastAPI(
-        title="X277/AMASS Motion Studio API",
-        version="0.2.0",
-        description="Local multi-source AMASS/X277/repair visual compare and edit API.",
+        title="RealtimePose Studio API",
+        version="1.0.0",
+        description="Local realtime_pose_v1 source/task/result viewer and task export API.",
     )
     app.state.service = service
     app.add_middleware(
@@ -154,14 +157,14 @@ def build_app(service: MotionStudioService) -> FastAPI:
 
 def config_from_env() -> StudioConfig:
     return StudioConfig.from_paths(
-        amass_dir=os.environ.get("X277_EDITOR_AMASS_DIR", "dataset/AMASS"),
-        source_dir=os.environ.get("X277_EDITOR_SOURCE_DIR", "dataset/AMASS_current277_60hz"),
-        data_dir=os.environ.get("X277_EDITOR_DATA_DIR", "dataset/AMASS_current277_60hz_missing_tasks"),
-        result_dir=os.environ.get("X277_EDITOR_RESULT_DIR", "output"),
-        output_dir=os.environ.get("X277_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"),
-        smpl_model_dir=os.environ.get("X277_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"),
-        runtime_dir=os.environ.get("X277_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"),
-        x277_fps=float(os.environ.get("X277_EDITOR_X277_FPS", "60.0")),
+        amass_dir=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"),
+        source_dir=os.environ.get("REALTIME_POSE_EDITOR_SOURCE_DIR", "dataset/AMASS_realtime_pose_60hz"),
+        data_dir=os.environ.get("REALTIME_POSE_EDITOR_DATA_DIR", "dataset/AMASS_realtime_pose_60hz_tasks"),
+        result_dir=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"),
+        output_dir=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"),
+        smpl_model_dir=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"),
+        runtime_dir=os.environ.get("REALTIME_POSE_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"),
+        realtime_pose_fps=float(os.environ.get("REALTIME_POSE_EDITOR_FPS", "60.0")),
     )
 
 
@@ -169,15 +172,15 @@ app = build_app(MotionStudioService(config_from_env())) if __name__ != "__main__
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local X277/AMASS Motion Studio API server.")
-    parser.add_argument("--amass_dir", default=os.environ.get("X277_EDITOR_AMASS_DIR", "dataset/AMASS"))
-    parser.add_argument("--source_dir", default=os.environ.get("X277_EDITOR_SOURCE_DIR", "dataset/AMASS_current277_60hz"))
-    parser.add_argument("--data_dir", default=os.environ.get("X277_EDITOR_DATA_DIR", "dataset/AMASS_current277_60hz_missing_tasks"))
-    parser.add_argument("--result_dir", default=os.environ.get("X277_EDITOR_RESULT_DIR", "output"))
-    parser.add_argument("--output_dir", default=os.environ.get("X277_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"))
-    parser.add_argument("--smpl_model_dir", default=os.environ.get("X277_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"))
-    parser.add_argument("--runtime_dir", default=os.environ.get("X277_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"))
-    parser.add_argument("--x277_fps", default=60.0, type=float)
+    parser = argparse.ArgumentParser(description="Run the local RealtimePose Studio API server.")
+    parser.add_argument("--amass_dir", default=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"))
+    parser.add_argument("--source_dir", default=os.environ.get("REALTIME_POSE_EDITOR_SOURCE_DIR", "dataset/AMASS_realtime_pose_60hz"))
+    parser.add_argument("--data_dir", default=os.environ.get("REALTIME_POSE_EDITOR_DATA_DIR", "dataset/AMASS_realtime_pose_60hz_tasks"))
+    parser.add_argument("--result_dir", default=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"))
+    parser.add_argument("--output_dir", default=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"))
+    parser.add_argument("--smpl_model_dir", default=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"))
+    parser.add_argument("--runtime_dir", default=os.environ.get("REALTIME_POSE_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"))
+    parser.add_argument("--realtime_pose_fps", default=60.0, type=float)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--reload", action="store_true")
@@ -198,7 +201,7 @@ def main(argv: list[str] | None = None) -> None:
             output_dir=args.output_dir,
             smpl_model_dir=args.smpl_model_dir or None,
             runtime_dir=args.runtime_dir,
-            x277_fps=args.x277_fps,
+            realtime_pose_fps=args.realtime_pose_fps,
         )
     )
     uvicorn.run(build_app(service), host=args.host, port=args.port, reload=bool(args.reload))

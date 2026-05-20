@@ -49,7 +49,7 @@ export const api = {
       frame_end: number;
       stride: number;
       split: string;
-      missing_sensors: string[];
+      tracker_patterns: string[];
       export_name?: string;
     },
   ) =>

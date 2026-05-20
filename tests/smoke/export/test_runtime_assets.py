@@ -1,38 +1,41 @@
 from __future__ import annotations
 
-import tempfile
-import unittest
-from pathlib import Path
+import json
 
-import numpy as np
 import torch
 
-from export.write_unity_runtime_assets import X277_FEATURE_DIM, X277_MODEL_INPUT_DIM, build_normalizer
+from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN
+from export.write_unity_runtime_assets import build_normalizer, write_runtime_assets
 
 
-class RuntimeAssetsTest(unittest.TestCase):
-    def test_x277_normalizer_maps_runtime_sensor_labels_to_training_scale(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            normalizer_dir = Path(tmp_dir)
-            torch.save(torch.zeros(X277_FEATURE_DIM), normalizer_dir / "mean.pt")
-            torch.save(torch.ones(X277_FEATURE_DIM), normalizer_dir / "std.pt")
-
-            payload = build_normalizer(
-                feature_dim=X277_MODEL_INPUT_DIM,
-                normalizer_dir=normalizer_dir,
-                normalize_input=True,
-                strict=True,
-            )
-
-        label_mean = np.asarray(payload["mean"][X277_FEATURE_DIM:X277_MODEL_INPUT_DIM], dtype=np.float32)
-        label_std = np.asarray(payload["std"][X277_FEATURE_DIM:X277_MODEL_INPUT_DIM], dtype=np.float32)
-        np.testing.assert_allclose(label_mean, np.full(6, 0.5, dtype=np.float32))
-        np.testing.assert_allclose(label_std, np.full(6, 0.5, dtype=np.float32))
-
-        runtime_labels = np.asarray([0.0, 1.0], dtype=np.float32)
-        normalized = (runtime_labels - label_mean[:2]) / label_std[:2]
-        np.testing.assert_allclose(normalized, np.asarray([-1.0, 1.0], dtype=np.float32))
+def test_runtime_assets_are_realtime_pose_only(tmp_path):
+    assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False)
+    schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
+    assert schema["schemaName"] == REALTIME_POSE_SCHEMA_NAME
+    assert schema["featureDim"] == REALTIME_POSE_INPUT_DIM
+    assert schema["sequenceLength"] == REALTIME_POSE_SEQ_LEN
+    assert schema["targetStart"] == 60
+    assert schema["targetLength"] == 1
+    assert schema["targetFeatureLength"] == 146
+    assert schema["bodyPoseParent6d"] == {"name": "body_pose_parent_6d", "start": 0, "length": 144}
+    assert schema["rootYawDeltaSinCos"] == {"name": "root_yaw_delta_sincos", "start": 144, "length": 2}
+    assert schema["trackerPositionReference"] == {"name": "tracker_pos_ref", "start": 146, "length": 18}
+    assert schema["trackerRotation6dReference"] == {"name": "tracker_rot_ref_6d", "start": 164, "length": 36}
+    assert schema["sensorValid"] == {"name": "sensor_valid", "start": 200, "length": 6}
+    assert schema["runtimeRules"]["onnxDummyInputShape"] == [1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN]
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_realtime_normalizer_requires_206_dimensions(tmp_path):
+    normalizer_dir = tmp_path / "meta"
+    normalizer_dir.mkdir()
+    torch.save(torch.zeros(REALTIME_POSE_INPUT_DIM), normalizer_dir / "mean.pt")
+    torch.save(torch.ones(REALTIME_POSE_INPUT_DIM), normalizer_dir / "std.pt")
+    payload = build_normalizer(
+        feature_dim=REALTIME_POSE_INPUT_DIM,
+        normalizer_dir=normalizer_dir,
+        normalize_input=True,
+        strict=True,
+    )
+    assert payload["enabled"] is True
+    assert payload["featureDim"] == REALTIME_POSE_INPUT_DIM
+    assert len(payload["mean"]) == REALTIME_POSE_INPUT_DIM
