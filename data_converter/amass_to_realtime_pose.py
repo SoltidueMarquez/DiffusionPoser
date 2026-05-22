@@ -87,6 +87,7 @@ def build_realtime_pose_features(smpl_motion: SmplMotion) -> dict[str, np.ndarra
         joints_world=joints_world,
         body_pose_parent_6d=body_pose_parent_6d,
         root_yaws=root_yaw,
+        root_pos_world=root_pos_world,
     )
 
     return {

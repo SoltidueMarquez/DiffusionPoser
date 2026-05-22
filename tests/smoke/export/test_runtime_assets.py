@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN
+from export.export_sentis_denoiser import validate_normalizer_export_contract
 from export.write_unity_runtime_assets import build_normalizer, write_runtime_assets
 
 
@@ -39,3 +42,19 @@ def test_realtime_normalizer_requires_206_dimensions(tmp_path):
     assert payload["enabled"] is True
     assert payload["featureDim"] == REALTIME_POSE_INPUT_DIM
     assert len(payload["mean"]) == REALTIME_POSE_INPUT_DIM
+
+
+def test_normalized_runtime_asset_export_requires_normalizer_dir():
+    with pytest.raises(FileNotFoundError):
+        build_normalizer(
+            feature_dim=REALTIME_POSE_INPUT_DIM,
+            normalizer_dir=None,
+            normalize_input=True,
+            strict=False,
+        )
+
+
+def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():
+    args = SimpleNamespace(normalize_input=True, normalizer_dir="")
+    with pytest.raises(FileNotFoundError):
+        validate_normalizer_export_contract(args, {"normalize_input": True})

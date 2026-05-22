@@ -127,16 +127,12 @@ def build_normalizer(
     if not normalize_input:
         return disabled_normalizer(feature_dim, epsilon)
     if normalizer_dir is None:
-        if strict:
-            raise FileNotFoundError("normalizer_dir is required when strict normalizer export is enabled.")
-        return disabled_normalizer(feature_dim, epsilon)
+        raise FileNotFoundError("normalize_input=True 时必须提供 normalizer_dir，不能导出 disabled normalizer。")
 
     mean_path = normalizer_dir / "mean.pt"
     std_path = normalizer_dir / "std.pt"
     if not mean_path.exists() or not std_path.exists():
-        if strict:
-            raise FileNotFoundError(f"Missing normalizer tensors: {mean_path}, {std_path}")
-        return disabled_normalizer(feature_dim, epsilon)
+        raise FileNotFoundError(f"normalize_input=True 时缺少 normalizer tensors: {mean_path}, {std_path}")
 
     mean_tensor, std_tensor = enforce_realtime_pose_normalizer_contract(
         torch_load(mean_path).float().flatten(),
@@ -253,7 +249,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         predict_xstart=True,
         normalizer_dir=normalizer_dir,
         normalize_input=bool(args.normalize_input),
-        strict_normalizer=bool(args.strict_normalizer),
+        strict_normalizer=bool(args.strict_normalizer or args.normalize_input),
     )
     for name, path in assets.items():
         print(f"[write_unity_runtime_assets] {name}: {path}")

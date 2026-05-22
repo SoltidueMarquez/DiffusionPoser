@@ -111,6 +111,29 @@ def load_checkpoint_args(model_path: Path) -> dict[str, Any]:
         return json.load(file)
 
 
+def validate_normalizer_export_contract(cli_args: argparse.Namespace, checkpoint_args: dict[str, Any]) -> None:
+    checkpoint_normalize_input = bool(checkpoint_args.get("normalize_input", True))
+    export_normalize_input = bool(cli_args.normalize_input)
+    normalizer_dir = Path(cli_args.normalizer_dir).resolve() if cli_args.normalizer_dir else None
+
+    if checkpoint_normalize_input and not export_normalize_input:
+        raise ValueError(
+            "checkpoint args.json 显示 normalize_input=True，Sentis 导出不能关闭 normalize_input。"
+        )
+    if not export_normalize_input:
+        return
+    if normalizer_dir is None:
+        raise FileNotFoundError(
+            "导出 normalized checkpoint 时必须提供 --normalizer_dir，避免 Unity 端把 raw 特征喂给模型。"
+        )
+    missing = [path for path in (normalizer_dir / "mean.pt", normalizer_dir / "std.pt") if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "导出 normalized checkpoint 时缺少 normalizer 文件："
+            + ", ".join(str(path) for path in missing)
+        )
+
+
 def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:
     config = dict(DEFAULT_MODEL_CONFIG)
     config.update({key: value for key, value in load_checkpoint_args(Path(cli_args.model_path)).items() if key in config})
@@ -269,6 +292,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     model_path = Path(cli_args.model_path).resolve()
     output_dir = Path(cli_args.output_dir).resolve()
     normalizer_dir = Path(cli_args.normalizer_dir).resolve() if cli_args.normalizer_dir else None
+    checkpoint_args = load_checkpoint_args(model_path)
+    validate_normalizer_export_contract(cli_args=cli_args, checkpoint_args=checkpoint_args)
     device = torch.device(cli_args.device)
     model_config = build_model_config(cli_args)
 
@@ -309,7 +334,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         predict_xstart=True,
         normalizer_dir=normalizer_dir,
         normalize_input=bool(cli_args.normalize_input),
-        strict_normalizer=bool(cli_args.strict_normalizer),
+        strict_normalizer=bool(cli_args.strict_normalizer or cli_args.normalize_input),
     )
 
     result = {

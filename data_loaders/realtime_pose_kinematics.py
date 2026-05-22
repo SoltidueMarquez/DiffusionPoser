@@ -141,6 +141,7 @@ def estimate_parent_offsets(
     joints_world: np.ndarray,
     body_pose_parent_6d: np.ndarray,
     root_yaws: np.ndarray,
+    root_pos_world: np.ndarray | None = None,
     parents: np.ndarray = SMPL_PARENTS,
 ) -> np.ndarray:
     """用第一帧估计 parent-local 骨骼 offset，供轻量 FK loss 和可视化使用。"""
@@ -151,6 +152,11 @@ def estimate_parent_offsets(
     global_rot = np.empty((24, 3, 3), dtype=np.float64)
     global_rot[0] = root_rotation
     offsets = np.zeros((24, 3), dtype=np.float32)
+    if root_pos_world is not None:
+        root_pos = np.asarray(root_pos_world, dtype=np.float64)
+        root_offset_world = joints[0, 0] - root_pos[0]
+        root_yaw_rotation = make_yaw_rotation_np(np.asarray([root_yaws[0]], dtype=np.float64))[0]
+        offsets[0] = (root_yaw_rotation.T @ root_offset_world).astype(np.float32)
     for joint_index, parent_index in enumerate(parents):
         if parent_index < 0:
             continue
@@ -176,7 +182,8 @@ def fk_parent_local_torch(
     for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
         if parent_index < 0:
             joint_rot = yaw_rot @ local_rot[:, joint_index]
-            joint_pos = root_pos_world
+            root_offset = parent_offsets[:, joint_index]
+            joint_pos = root_pos_world + torch.einsum("bij,bj->bi", yaw_rot, root_offset)
         else:
             parent_rot = global_rot[parent_index]
             joint_rot = parent_rot @ local_rot[:, joint_index]

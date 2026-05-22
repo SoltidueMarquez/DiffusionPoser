@@ -5,11 +5,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_to_realtime_pose import build_realtime_pose_features
 from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
+from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     encode_realtime_pose_features,
@@ -53,6 +55,37 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     assert features["tracker_rot_world_6d"].shape == (4, 6, 6)
     assert features["joints_world"].shape == (4, 24, 3)
     assert "contact" not in features
+
+
+def test_fk_reconstructs_pelvis_from_ground_root_offset():
+    class SmplMotion:
+        pass
+
+    source = build_toy_realtime_source(frame_count=4)
+    source["joints_world"][:, 0, 1] = 0.92
+    motion = SmplMotion()
+    motion.joint_positions = source["joints_world"]
+    rotations = np.zeros((4, 24, 3, 3), dtype=np.float32)
+    rotations[..., 0, 0] = 1.0
+    rotations[..., 1, 1] = 1.0
+    rotations[..., 2, 2] = 1.0
+    motion.joint_rotations = rotations
+
+    features = build_realtime_pose_features(motion)
+    assert features["root_pos_world"][0, 1] == 0.0
+    np.testing.assert_allclose(features["joint_offsets_parent"][0], np.asarray([0.0, 0.92, 0.0], dtype=np.float32))
+
+    pred_joints = fk_parent_local_torch(
+        body_pose_parent_6d=torch.from_numpy(features["body_pose_parent_6d"][:1]).float(),
+        root_pos_world=torch.from_numpy(features["root_pos_world"][:1]).float(),
+        root_yaw=torch.from_numpy(features["root_yaw"][:1]).float(),
+        parent_offsets=torch.from_numpy(features["joint_offsets_parent"][None]).float(),
+    )
+    np.testing.assert_allclose(
+        pred_joints[0, 0].detach().numpy(),
+        source["joints_world"][0, 0],
+        atol=1e-6,
+    )
 
 
 def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
