@@ -12,19 +12,20 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     MIN_VALID_TRACKERS,
-    REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
-    TASK_FORMAT_REALTIME_POSE_V1,
     TASK_MASK_POLICIES,
     TASK_MASK_POLICY_FIXED_PATTERNS,
     TASK_MASK_POLICY_FULL,
     TASK_MODE_REALTIME_POSE,
     TRACKER_PATTERN_CATEGORIES,
     create_realtime_inpaint_mask,
+    get_schema_spec,
     make_tracker_pattern,
     make_window_patterns,
     normalize_tracker_pattern_categories,
@@ -44,6 +45,11 @@ SOURCE_KEYS = {
     "joint_offsets_parent",
 }
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
+USABLE_SOURCE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
+SHORT_SOURCE_POLICY_SKIP = "skip"
+SHORT_SOURCE_POLICY_ERROR = "error"
+SHORT_SOURCE_POLICIES = (SHORT_SOURCE_POLICY_SKIP, SHORT_SOURCE_POLICY_ERROR)
+SHORT_SOURCE_REPORT_NAME = "skipped_short_sources.jsonl"
 
 
 @dataclass(frozen=True)
@@ -62,7 +68,7 @@ class TaskGenerationPlan:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate realtime_pose_v1 materialized tasks.")
+    parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
     paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_60hz", type=str)
     paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_60hz_tasks", type=str)
@@ -71,12 +77,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     task = parser.add_argument_group("task")
     task.add_argument("--splits", nargs="+", default=["train"], type=str)
     task.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
+    task.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     task.add_argument("--samples_per_file", default=4, type=int)
     task.add_argument("--mask_policy", default=TASK_MASK_POLICY_FULL, choices=TASK_MASK_POLICIES, type=str)
     task.add_argument("--fixed_tracker_patterns", nargs="+", default=["all"], type=str)
     task.add_argument("--patterns_per_window", default=len(TRACKER_PATTERN_CATEGORIES), type=int)
     task.add_argument("--min_valid_trackers", default=MIN_VALID_TRACKERS, type=int)
     task.add_argument("--ensure_pattern_categories", default=True, type=str2bool)
+    task.add_argument("--short_source_policy", default=SHORT_SOURCE_POLICY_SKIP, choices=SHORT_SOURCE_POLICIES, type=str)
     task.add_argument("--limit", default=0, type=int)
 
     runtime = parser.add_argument_group("runtime")
@@ -111,7 +119,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     """
 
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"realtime_pose_v1 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
+        raise ValueError(f"realtime_pose 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
         raise ValueError(f"min_valid_trackers 至少为 {MIN_VALID_TRACKERS}")
 
@@ -119,11 +127,11 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     output_dir = Path(args.output_dir).resolve()
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     if not source_dir.exists():
-        raise FileNotFoundError(f"realtime_pose_v1 源目录不存在：{source_dir}")
+        raise FileNotFoundError(f"{args.schema} 源目录不存在：{source_dir}")
 
     source_entries = read_source_entries(source_dir)
     if not source_entries:
-        raise RuntimeError(f"{source_dir} 中没有 realtime_pose_v1 源数据。")
+        raise RuntimeError(f"{source_dir} 中没有 {args.schema} 源数据。")
 
     split_plans: list[SplitTaskPlan] = []
     for split_index, split in enumerate(args.splits):
@@ -132,7 +140,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         if args.limit > 0:
             split_entries = split_entries[: args.limit]
         if not split_entries:
-            raise RuntimeError(f"split={split} 没有匹配 realtime_pose_v1 源数据。")
+            raise RuntimeError(f"split={split} 没有匹配 {args.schema} 源数据。")
         split_plans.append(
             SplitTaskPlan(
                 split=split,
@@ -160,6 +168,7 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
         output_dir=plan.output_dir,
         overwrite=bool(args.overwrite),
         split_dir=plan.split_dir,
+        schema_name=str(args.schema),
     )
 
     counts = {}
@@ -176,14 +185,20 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
     return counts
 
 
-def prepare_task_output_dir(source_dir: Path, output_dir: Path, overwrite: bool, split_dir: Path | None) -> None:
+def prepare_task_output_dir(
+    source_dir: Path,
+    output_dir: Path,
+    overwrite: bool,
+    split_dir: Path | None,
+    schema_name: str,
+) -> None:
     """准备 task 输出目录，并在覆盖已有目录前做路径安全检查。"""
 
     validate_task_output_dir_available(source_dir=source_dir, output_dir=output_dir, overwrite=overwrite)
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_task_output_marker(source_dir=source_dir, output_dir=output_dir, split_dir=split_dir)
+    write_task_output_marker(source_dir=source_dir, output_dir=output_dir, split_dir=split_dir, schema_name=schema_name)
 
 
 def validate_task_output_dir_available(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
@@ -222,14 +237,16 @@ def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -
             "请确认路径无误后手动清理，或选择新的 output_dir。"
         )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    if marker.get("schema_name") != REALTIME_POSE_SCHEMA_NAME or marker.get("task_format") != TASK_FORMAT_REALTIME_POSE_V1:
-        raise ValueError(f"output_dir 标记不是 realtime_pose_v1 task 目录：{marker_path}")
+    schema = get_schema_spec(marker.get("schema_name"))
+    if marker.get("task_format") != schema.task_format:
+        raise ValueError(f"output_dir 标记不是合法 realtime_pose task 目录：{marker_path}")
 
 
-def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path | None) -> None:
+def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path | None, schema_name: str) -> None:
+    schema = get_schema_spec(schema_name)
     marker = {
-        "schema_name": REALTIME_POSE_SCHEMA_NAME,
-        "task_format": TASK_FORMAT_REALTIME_POSE_V1,
+        "schema_name": schema.name,
+        "task_format": schema.task_format,
         "source_dir": str(source_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
@@ -246,7 +263,7 @@ def read_source_entries(source_dir: Path) -> list[dict]:
                 if not line.strip():
                     continue
                 entry = json.loads(line)
-                if entry.get("status", "converted") != "converted":
+                if entry.get("status", "converted") not in USABLE_SOURCE_STATUSES:
                     continue
                 path = resolve_manifest_file(source_dir, entry.get("output_path") or entry.get("source_relative_path"))
                 entries.append(
@@ -325,14 +342,28 @@ def generate_split_tasks(
     task_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_split_dir / "manifest.jsonl"
     written = 0
+    skipped_short_sources: list[dict] = []
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         progress = tqdm(total=len(entries) * int(args.samples_per_file), desc=f"生成 {split} realtime tasks", unit="window")
         for entry in entries:
             source_path = Path(entry["source_path"])
-            source = load_realtime_source(source_path)
+            known_frames = int(entry.get("frames") or 0)
+            if 0 < known_frames < REALTIME_POSE_SEQ_LEN:
+                if should_raise_for_short_source(args):
+                    raise ValueError(format_short_source_error(source_path=source_path, source_frames=known_frames))
+                skipped_short_sources.append(make_short_source_record(entry, source_path, known_frames))
+                progress.update(int(args.samples_per_file))
+                continue
+
+            schema = get_schema_spec(args.schema)
+            source = load_realtime_source(source_path, schema_name=schema.name)
             source_frames = int(source["body_pose_parent_6d"].shape[0])
             if source_frames < REALTIME_POSE_SEQ_LEN:
-                raise ValueError(f"{source_path} 至少需要 {REALTIME_POSE_SEQ_LEN} 帧，实际为 {source_frames}")
+                if should_raise_for_short_source(args):
+                    raise ValueError(format_short_source_error(source_path=source_path, source_frames=source_frames))
+                skipped_short_sources.append(make_short_source_record(entry, source_path, source_frames))
+                progress.update(int(args.samples_per_file))
+                continue
 
             for sample_index in range(int(args.samples_per_file)):
                 start_frame = int(rng.integers(0, source_frames - REALTIME_POSE_SEQ_LEN + 1))
@@ -355,7 +386,7 @@ def generate_split_tasks(
                         compress=bool(args.compress_tasks),
                         **clip,
                         sensor_valid=sensor_valid,
-                        inpaint_mask=create_realtime_inpaint_mask(),
+                        inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
                         start_frame=np.int64(start_frame),
                         valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
                         source_frames=np.int64(source_frames),
@@ -372,9 +403,9 @@ def generate_split_tasks(
                         "valid_length": REALTIME_POSE_SEQ_LEN,
                         "source_frames": source_frames,
                         "seq_len": REALTIME_POSE_SEQ_LEN,
-                        "feature_dim": REALTIME_POSE_INPUT_DIM,
-                        "task_format": TASK_FORMAT_REALTIME_POSE_V1,
-                        "schema_name": REALTIME_POSE_SCHEMA_NAME,
+                        "feature_dim": schema.feature_dim,
+                        "task_format": schema.task_format,
+                        "schema_name": schema.name,
                         "task_mode": TASK_MODE_REALTIME_POSE,
                         "target_start": REALTIME_POSE_TARGET_START,
                         "target_length": REALTIME_POSE_TARGET_LENGTH,
@@ -389,7 +420,39 @@ def generate_split_tasks(
                         manifest_file.flush()
                 progress.update(1)
         progress.close()
+    write_short_source_report(output_split_dir=output_split_dir, split=split, records=skipped_short_sources)
     return written
+
+
+def should_raise_for_short_source(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "short_source_policy", SHORT_SOURCE_POLICY_SKIP)) == SHORT_SOURCE_POLICY_ERROR
+
+
+def format_short_source_error(source_path: Path, source_frames: int) -> str:
+    return f"{source_path} 至少需要 {REALTIME_POSE_SEQ_LEN} 帧，实际为 {source_frames}"
+
+
+def make_short_source_record(entry: dict, source_path: Path, source_frames: int) -> dict:
+    return {
+        "source_path": str(source_path),
+        "source_relative_path": normalize_slashes(entry.get("source_relative_path", "")),
+        "stablemotion_split_key": normalize_slashes(entry.get("stablemotion_split_key", "")),
+        "source_frames": int(source_frames),
+        "required_frames": REALTIME_POSE_SEQ_LEN,
+    }
+
+
+def write_short_source_report(output_split_dir: Path, split: str, records: list[dict]) -> None:
+    if not records:
+        return
+    report_path = output_split_dir / SHORT_SOURCE_REPORT_NAME
+    with report_path.open("w", encoding="utf-8") as report_file:
+        for record in records:
+            report_file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    print(
+        f"[generate_realtime_pose_tasks] split={split} skipped_short_sources={len(records)} report={report_path}",
+        flush=True,
+    )
 
 
 def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
@@ -411,12 +474,18 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
     )
 
 
-def load_realtime_source(path: Path) -> dict[str, np.ndarray]:
+def load_realtime_source(path: Path, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
+    schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
-        missing = sorted(SOURCE_KEYS.difference(data.files))
+        required_keys = set(SOURCE_KEYS)
+        if schema.supports_root_motion:
+            required_keys.update({"root_delta_xz_ref", "root_height"})
+        if schema.supports_contact:
+            required_keys.add("foot_contact")
+        missing = sorted(required_keys.difference(data.files))
         if missing:
-            raise KeyError(f"{path} 缺少 realtime_pose_v1 源字段：{missing}")
-        source = {key: data[key].astype(np.float32, copy=True) for key in SOURCE_KEYS}
+            raise KeyError(f"{path} 缺少 {schema.name} 源字段：{missing}")
+        source = {key: data[key].astype(np.float32, copy=True) for key in required_keys}
     frame_count = source["body_pose_parent_6d"].shape[0]
     expected_shapes = {
         "body_pose_parent_6d": (frame_count, 144),
@@ -428,6 +497,11 @@ def load_realtime_source(path: Path) -> dict[str, np.ndarray]:
         "joints_world": (frame_count, 24, 3),
         "joint_offsets_parent": (24, 3),
     }
+    if schema.supports_root_motion:
+        expected_shapes["root_delta_xz_ref"] = (frame_count, 2)
+        expected_shapes["root_height"] = (frame_count, 1)
+    if schema.supports_contact:
+        expected_shapes["foot_contact"] = (frame_count, 2)
     for key, shape in expected_shapes.items():
         if tuple(source[key].shape) != shape:
             raise ValueError(f"{path} 字段 {key} 应为 {shape}，实际为 {tuple(source[key].shape)}")

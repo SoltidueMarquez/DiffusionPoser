@@ -1,18 +1,34 @@
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.diffusionposer_dit import DiffusionPoserDiT
+from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 
 
 def create_model_and_diffusion(args):
-    model = DiffusionPoserDiT(
-        input_feats=args.input_feats,
-        latent_dim=args.latent_dim,
-        num_layers=args.layers,
-        num_heads=args.heads,
-        dropout=args.dropout,
-        zero_init=args.zero_init,
-        max_seq_len=args.max_seq_len,
-    )
+    model_arch = getattr(args, "model_arch", "full_feature_dit")
+    if model_arch == "target_dit":
+        model = RealtimePoseTargetDiT(
+            input_feats=args.input_feats,
+            schema_name=getattr(args, "schema", "realtime_pose_v2_contact"),
+            latent_dim=args.latent_dim,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            dropout=args.dropout,
+            zero_init=args.zero_init,
+            max_seq_len=args.max_seq_len,
+        )
+    elif model_arch == "full_feature_dit":
+        model = DiffusionPoserDiT(
+            input_feats=args.input_feats,
+            latent_dim=args.latent_dim,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            dropout=args.dropout,
+            zero_init=args.zero_init,
+            max_seq_len=args.max_seq_len,
+        )
+    else:
+        raise ValueError(f"未知 model_arch={model_arch}")
     diffusion = create_gaussian_diffusion(args)
     return model, diffusion
 

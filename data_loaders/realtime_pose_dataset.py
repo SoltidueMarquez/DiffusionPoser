@@ -17,19 +17,17 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
-    BODY_POSE_START,
     HIP_TRACKER_INDEX,
-    REALTIME_POSE_INPUT_DIM,
+    FOOT_CONTACT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
+    ROOT_DELTA_XZ_DIM,
+    ROOT_HEIGHT_DIM,
     ROOT_YAW_DELTA_DIM,
-    ROOT_YAW_DELTA_START,
     SENSOR_VALID_DIM,
-    SENSOR_VALID_START,
-    TASK_FORMAT_REALTIME_POSE_V1,
+    SchemaSpec,
     TRACKER_COUNT,
     TRACKER_MASK_FILL_MODES,
     TRACKER_MASK_FILL_ZERO,
@@ -38,16 +36,13 @@ from data_loaders.sensor_masking import (
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
     TRACKER_MASK_POLICY_FIXED_CATEGORIES,
     TRACKER_MASK_POLICY_TASK,
-    TRACKER_POS_DIM,
-    TRACKER_POS_REF_START,
-    TRACKER_ROT_DIM,
-    TRACKER_ROT_REF_START,
     make_tracker_pattern,
     normalize_tracker_pattern_categories,
     repeat_pattern_sensor_valid,
     validate_realtime_seq_len,
     validate_realtime_target,
     validate_sensor_valid,
+    get_schema_spec,
 )
 from utils.normalizer import RealtimePoseNormalizer
 
@@ -60,7 +55,7 @@ class RandomContext:
 
 
 class RealtimePoseTaskDataset(Dataset):
-    """读取 `realtime_pose_v1` materialized task 并输出 `[C,T]` 训练样本。"""
+    """读取 realtime_pose materialized task 并输出 `[C,T]` 训练样本。"""
 
     def __init__(
         self,
@@ -81,11 +76,22 @@ class RealtimePoseTaskDataset(Dataset):
         tracker_mask_seed: int = 0,
         tracker_mask_fill: str = TRACKER_MASK_FILL_ZERO,
         tracker_mask_categories: list[str] | tuple[str, ...] | None = None,
+        schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+        history_pose_dropout_prob: float = 0.0,
+        history_pose_replace_prob: float = 0.0,
+        history_yaw_replace_prob: float = 0.0,
+        history_root_yaw_drift_std: float = 0.0,
+        tracker_latency_max_frames: int = 0,
+        tracker_burst_dropout_prob: float = 0.0,
+        tracker_outlier_prob: float = 0.0,
+        predicted_history_cache_dir: str | Path | None = None,
+        predicted_history_prob: float = 0.0,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.seq_len = int(seq_len)
         validate_realtime_seq_len(self.seq_len)
+        self.schema = get_schema_spec(schema_name)
         self.normalize_input = bool(normalize_input)
         self.preload_data = bool(preload_data)
         self.is_train_split = "train" in str(split).lower()
@@ -95,6 +101,15 @@ class RealtimePoseTaskDataset(Dataset):
         self.history_pose_noise_std = float(history_pose_noise_std)
         self.history_yaw_noise_std = float(history_yaw_noise_std)
         self.root_yaw_ref_noise_std = float(root_yaw_ref_noise_std)
+        self.history_pose_dropout_prob = float(history_pose_dropout_prob)
+        self.history_pose_replace_prob = float(history_pose_replace_prob)
+        self.history_yaw_replace_prob = float(history_yaw_replace_prob)
+        self.history_root_yaw_drift_std = float(history_root_yaw_drift_std)
+        self.tracker_latency_max_frames = int(tracker_latency_max_frames)
+        self.tracker_burst_dropout_prob = float(tracker_burst_dropout_prob)
+        self.tracker_outlier_prob = float(tracker_outlier_prob)
+        self.predicted_history_cache_dir = Path(predicted_history_cache_dir) if predicted_history_cache_dir else None
+        self.predicted_history_prob = float(predicted_history_prob)
         self.tracker_mask_policy = self.resolve_tracker_mask_policy(tracker_mask_policy)
         self.tracker_mask_seed = int(tracker_mask_seed)
         self.tracker_mask_fill = str(tracker_mask_fill)
@@ -103,7 +118,11 @@ class RealtimePoseTaskDataset(Dataset):
         self.tracker_mask_categories = normalize_tracker_pattern_categories(tracker_mask_categories)
         self.epoch = 0
         self.access_index = 0
-        self.normalizer = create_normalizer(normalizer_dir=normalizer_dir, normalize_input=self.normalize_input)
+        self.normalizer = create_normalizer(
+            normalizer_dir=normalizer_dir,
+            normalize_input=self.normalize_input,
+            schema_name=self.schema.name,
+        )
 
         self.manifest_path = find_manifest_path(data_dir=self.data_dir, split=split)
         self.manifest_dir = self.manifest_path.parent
@@ -114,10 +133,12 @@ class RealtimePoseTaskDataset(Dataset):
             raise RuntimeError(f"{self.manifest_path} 中没有可用 realtime_pose_v1 task。")
 
         for entry in self.entries:
-            if str(entry.get("schema_name", "")) != REALTIME_POSE_SCHEMA_NAME:
-                raise ValueError(f"任务 {entry.get('task_id')} 不是 {REALTIME_POSE_SCHEMA_NAME}。")
-            if str(entry.get("task_format", "")) != TASK_FORMAT_REALTIME_POSE_V1:
+            if str(entry.get("schema_name", "")) != self.schema.name:
+                raise ValueError(f"任务 {entry.get('task_id')} 不是 {self.schema.name}。")
+            if str(entry.get("task_format", "")) != self.schema.task_format:
                 raise ValueError(f"任务 {entry.get('task_id')} 的 task_format 不匹配。")
+            if int(entry.get("feature_dim", -1)) != self.schema.feature_dim:
+                raise ValueError(f"任务 {entry.get('task_id')} feature_dim 不等于 {self.schema.feature_dim}。")
             if int(entry.get("seq_len", -1)) != self.seq_len:
                 raise ValueError(f"任务 {entry.get('task_id')} 的 seq_len 不等于 {self.seq_len}。")
             validate_realtime_target(int(entry.get("target_start", -1)), int(entry.get("target_length", -1)))
@@ -125,7 +146,11 @@ class RealtimePoseTaskDataset(Dataset):
         self.task_cache = None
         if self.preload_data:
             self.task_cache = [
-                load_materialized_task_npz(manifest_dir=self.manifest_dir, task_path=entry["task_path"])
+                load_materialized_task_npz(
+                    manifest_dir=self.manifest_dir,
+                    task_path=entry["task_path"],
+                    schema_name=self.schema.name,
+                )
                 for entry in self.entries
             ]
 
@@ -136,7 +161,7 @@ class RealtimePoseTaskDataset(Dataset):
         entry = self.entries[index]
         random_context = self.next_random_context()
         task = self.load_task(index=index, entry=entry)
-        arrays = load_realtime_task_arrays(task=task, seq_len=self.seq_len)
+        arrays = load_realtime_task_arrays(task=task, seq_len=self.seq_len, schema_name=self.schema.name)
         arrays, applied_tracker_pattern = self.apply_tracker_mask_policy(
             arrays=arrays,
             entry=entry,
@@ -155,23 +180,49 @@ class RealtimePoseTaskDataset(Dataset):
                 tracker_pos_noise_std=self.tracker_pos_noise_std,
                 tracker_rot_noise_std=self.tracker_rot_noise_std,
                 non_hip_tracker_dropout_prob=self.non_hip_tracker_dropout_prob,
+                tracker_latency_max_frames=self.tracker_latency_max_frames,
+                tracker_burst_dropout_prob=self.tracker_burst_dropout_prob,
+                tracker_outlier_prob=self.tracker_outlier_prob,
                 history_pose_noise_std=self.history_pose_noise_std,
                 history_yaw_noise_std=self.history_yaw_noise_std,
                 root_yaw_ref_noise_std=self.root_yaw_ref_noise_std,
             )
 
         sensor_valid = arrays["sensor_valid"]
-        features = encode_realtime_pose_features(arrays)
+        raw_features = encode_realtime_pose_features(arrays, schema_name=self.schema.name)
+        features = raw_features.copy()
         if self.normalizer is not None:
             features = self.normalizer.normalize(features)
-            zero_missing_tracker_channels(features=features, sensor_valid=sensor_valid)
+            zero_missing_tracker_channels(features=features, sensor_valid=sensor_valid, schema_name=self.schema.name)
 
         conditioned = features.copy()
-        conditioned[REALTIME_POSE_TARGET_START, BODY_POSE_START:REALTIME_POSE_TARGET_DIM] = 0.0
+        if self.is_train_split:
+            rng = self.stable_rng(
+                entry=entry,
+                index=index,
+                salt=f"history_condition:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
+            )
+            conditioned = self.apply_predicted_history_cache(
+                conditioned=conditioned,
+                entry=entry,
+                rng=rng,
+            )
+            apply_history_condition_corruption(
+                conditioned=conditioned,
+                schema=self.schema,
+                rng=rng,
+                history_pose_noise_std=self.history_pose_noise_std,
+                history_yaw_noise_std=self.history_yaw_noise_std,
+                history_pose_dropout_prob=self.history_pose_dropout_prob,
+                history_pose_replace_prob=self.history_pose_replace_prob,
+                history_yaw_replace_prob=self.history_yaw_replace_prob,
+                history_root_yaw_drift_std=self.history_root_yaw_drift_std,
+            )
+        conditioned[REALTIME_POSE_TARGET_START, self.schema.target_slice()] = 0.0
         inpaint_mask = np.asarray(arrays["inpaint_mask"], dtype=bool)
         valid_frame_mask = np.ones(self.seq_len, dtype=bool)
 
-        return {
+        item = {
             "x": torch.from_numpy(features.T).float(),
             "conditioned_x": torch.from_numpy(conditioned.T).float(),
             "valid_frame_mask": torch.from_numpy(valid_frame_mask).bool(),
@@ -181,24 +232,86 @@ class RealtimePoseTaskDataset(Dataset):
             "target_joints_world": torch.from_numpy(arrays["joints_world"][REALTIME_POSE_TARGET_START]).float(),
             "prev_joints_world": torch.from_numpy(arrays["joints_world"][REALTIME_POSE_TARGET_START - 1]).float(),
             "target_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START]).float(),
+            "prev_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START - 1]).float(),
             "prev_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START - 1])).float(),
             "target_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START])).float(),
+            "target_tracker_pos_ref": torch.from_numpy(
+                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_pos_slice()].reshape(TRACKER_COUNT, 3)
+            ).float(),
+            "target_tracker_rot_ref_6d": torch.from_numpy(
+                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_rot_slice()].reshape(TRACKER_COUNT, 6)
+            ).float(),
+            "target_sensor_valid": torch.from_numpy(sensor_valid[REALTIME_POSE_TARGET_START]).bool(),
             "joint_offsets_parent": torch.from_numpy(arrays["joint_offsets_parent"]).float(),
             "length": self.seq_len,
             "keyid": entry.get("task_id", ""),
             "source_path": entry.get("source_path", ""),
             "task_mode": entry.get("task_mode", ""),
-            "schema_name": entry.get("schema_name", ""),
+            "schema_name": self.schema.name,
             "target_start": REALTIME_POSE_TARGET_START,
             "target_length": REALTIME_POSE_TARGET_LENGTH,
             "tracker_pattern": applied_tracker_pattern,
             "tracker_mask_policy": self.tracker_mask_policy,
         }
+        if self.schema.supports_root_motion:
+            item["target_root_delta_xz_ref"] = torch.from_numpy(
+                arrays["root_delta_xz_ref"][REALTIME_POSE_TARGET_START]
+            ).float()
+            item["target_root_height"] = torch.tensor(float(arrays["root_height"][REALTIME_POSE_TARGET_START, 0])).float()
+        if self.schema.supports_contact:
+            item["target_foot_contact"] = torch.from_numpy(arrays["foot_contact"][REALTIME_POSE_TARGET_START]).float()
+        return item
 
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:
         if self.task_cache is not None:
             return self.task_cache[index]
-        return load_materialized_task_npz(manifest_dir=self.manifest_dir, task_path=entry["task_path"])
+        return load_materialized_task_npz(
+            manifest_dir=self.manifest_dir,
+            task_path=entry["task_path"],
+            schema_name=self.schema.name,
+        )
+
+    def apply_predicted_history_cache(
+        self,
+        conditioned: np.ndarray,
+        entry: dict,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """
+        用离线 rollout 预测 history 替换 GT history。
+
+        cache 文件以 `task_id.npz` 命名，只接受归一化空间的
+        `predicted_features_normalized`。这里故意不自动兼容 raw/features 字段，
+        避免把不同特征空间混进 `conditioned_x`。
+        """
+
+        if self.predicted_history_cache_dir is None or self.predicted_history_prob <= 0:
+            return conditioned
+        if rng.random() >= self.predicted_history_prob:
+            return conditioned
+        task_id = entry.get("task_id")
+        if not task_id:
+            raise KeyError("predicted history cache 需要 manifest entry 包含 task_id。")
+        cache_path = self.predicted_history_cache_dir / f"{task_id}.npz"
+        if not cache_path.exists():
+            raise FileNotFoundError(f"predicted history cache 不存在：{cache_path}")
+        with np.load(cache_path, allow_pickle=False) as data:
+            if "predicted_features_normalized" not in data.files:
+                raise KeyError(f"{cache_path} 缺少 predicted_features_normalized 字段。")
+            if "schema_name" not in data.files or str(np.asarray(data["schema_name"]).item()) != self.schema.name:
+                raise ValueError(f"{cache_path} schema_name 必须为 {self.schema.name}。")
+            if "feature_space" not in data.files or str(np.asarray(data["feature_space"]).item()) != "normalized":
+                raise ValueError(f"{cache_path} feature_space 必须为 normalized。")
+            cached = np.asarray(data["predicted_features_normalized"], dtype=np.float32)
+        if cached.ndim == 3:
+            cached = cached[0]
+        if cached.shape != conditioned.shape:
+            raise ValueError(f"{cache_path} cache shape 应为 {conditioned.shape}，实际为 {cached.shape}")
+        conditioned[:REALTIME_POSE_TARGET_START, self.schema.target_slice()] = cached[
+            :REALTIME_POSE_TARGET_START,
+            self.schema.target_slice(),
+        ]
+        return conditioned
 
     def set_epoch(self, epoch: int) -> None:
         """训练循环在 epoch 开头调用，使动态 mask 和增强能随 epoch 可复现地变化。"""
@@ -292,12 +405,16 @@ class RealtimePoseTaskDataset(Dataset):
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
-def create_normalizer(normalizer_dir: str | Path | None, normalize_input: bool) -> RealtimePoseNormalizer | None:
+def create_normalizer(
+    normalizer_dir: str | Path | None,
+    normalize_input: bool,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> RealtimePoseNormalizer | None:
     if not normalize_input:
         return None
     if normalizer_dir is None or str(normalizer_dir).strip() == "":
         raise ValueError("开启 normalize_input 时必须提供 normalizer_dir。")
-    return RealtimePoseNormalizer(base_dir=normalizer_dir)
+    return RealtimePoseNormalizer(base_dir=normalizer_dir, schema_name=schema_name)
 
 
 def find_manifest_path(data_dir: Path, split: str) -> Path:
@@ -317,7 +434,11 @@ def read_task_manifest(manifest_path: Path) -> list[dict]:
     return entries
 
 
-def load_materialized_task_npz(manifest_dir: Path, task_path: str) -> dict[str, np.ndarray]:
+def load_materialized_task_npz(
+    manifest_dir: Path,
+    task_path: str,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> dict[str, np.ndarray]:
     path = manifest_dir / task_path
     if not path.exists():
         raise FileNotFoundError(f"realtime_pose_v1 task 文件不存在：{path}")
@@ -339,14 +460,24 @@ def load_materialized_task_npz(manifest_dir: Path, task_path: str) -> dict[str, 
         "source_frames",
         "seq_len",
     }
+    schema = get_schema_spec(schema_name)
+    if schema.supports_root_motion:
+        required.update({"root_delta_xz_ref", "root_height"})
+    if schema.supports_contact:
+        required.add("foot_contact")
     missing = sorted(required.difference(task))
     if missing:
-        raise KeyError(f"{path} 缺少 realtime_pose_v1 字段：{missing}")
+        raise KeyError(f"{path} 缺少 {schema.name} 字段：{missing}")
     return task
 
 
-def load_realtime_task_arrays(task: dict[str, np.ndarray], seq_len: int) -> dict[str, np.ndarray]:
+def load_realtime_task_arrays(
+    task: dict[str, np.ndarray],
+    seq_len: int,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> dict[str, np.ndarray]:
     validate_realtime_seq_len(seq_len)
+    schema = get_schema_spec(schema_name)
     task_seq_len = scalar_int(task, "seq_len")
     validate_realtime_seq_len(task_seq_len)
     valid_length = scalar_int(task, "valid_length")
@@ -362,25 +493,43 @@ def load_realtime_task_arrays(task: dict[str, np.ndarray], seq_len: int) -> dict
         "joints_world": array_shape(task["joints_world"], (seq_len, 24, 3), "joints_world").astype(np.float32),
         "joint_offsets_parent": array_shape(task["joint_offsets_parent"], (24, 3), "joint_offsets_parent").astype(np.float32),
         "sensor_valid": array_shape(task["sensor_valid"], (seq_len, SENSOR_VALID_DIM), "sensor_valid").astype(bool),
-        "inpaint_mask": array_shape(task["inpaint_mask"], (seq_len, REALTIME_POSE_INPUT_DIM), "inpaint_mask").astype(bool),
+        "inpaint_mask": array_shape(task["inpaint_mask"], (seq_len, schema.feature_dim), "inpaint_mask").astype(bool),
     }
+    if schema.supports_root_motion:
+        arrays["root_delta_xz_ref"] = array_shape(
+            task["root_delta_xz_ref"],
+            (seq_len, ROOT_DELTA_XZ_DIM),
+            "root_delta_xz_ref",
+        ).astype(np.float32)
+        arrays["root_height"] = array_shape(task["root_height"], (seq_len, ROOT_HEIGHT_DIM), "root_height").astype(np.float32)
+    if schema.supports_contact:
+        arrays["foot_contact"] = array_shape(task["foot_contact"], (seq_len, FOOT_CONTACT_DIM), "foot_contact").astype(np.float32)
     validate_sensor_valid(arrays["sensor_valid"])
-    expected_mask = np.zeros((seq_len, REALTIME_POSE_INPUT_DIM), dtype=bool)
-    expected_mask[REALTIME_POSE_TARGET_START, BODY_POSE_START:REALTIME_POSE_TARGET_DIM] = True
+    expected_mask = np.zeros((seq_len, schema.feature_dim), dtype=bool)
+    expected_mask[REALTIME_POSE_TARGET_START, schema.target_slice()] = True
     if not np.array_equal(arrays["inpaint_mask"], expected_mask):
-        raise ValueError("inpaint_mask 必须只覆盖第 61 帧的 body_pose + root_yaw_delta_sincos。")
+        raise ValueError(f"inpaint_mask 必须只覆盖第 61 帧的 {schema.target_dim} 维 target。")
     return arrays
 
 
-def encode_realtime_pose_features(arrays: dict[str, np.ndarray]) -> np.ndarray:
+def encode_realtime_pose_features(
+    arrays: dict[str, np.ndarray],
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> np.ndarray:
+    schema = get_schema_spec(schema_name)
     seq_len = arrays["body_pose_parent_6d"].shape[0]
-    features = np.zeros((seq_len, REALTIME_POSE_INPUT_DIM), dtype=np.float32)
-    features[:, BODY_POSE_START:BODY_POSE_START + BODY_POSE_DIM] = arrays["body_pose_parent_6d"]
-    features[:, ROOT_YAW_DELTA_START:ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM] = arrays["root_yaw_delta_sincos"]
-    features[:, TRACKER_POS_REF_START:TRACKER_POS_REF_START + TRACKER_POS_DIM] = encode_tracker_pos_ref(arrays).reshape(seq_len, -1)
-    features[:, TRACKER_ROT_REF_START:TRACKER_ROT_REF_START + TRACKER_ROT_DIM] = encode_tracker_rot_ref(arrays).reshape(seq_len, -1)
-    features[:, SENSOR_VALID_START:SENSOR_VALID_START + SENSOR_VALID_DIM] = arrays["sensor_valid"].astype(np.float32)
-    zero_missing_tracker_channels(features=features, sensor_valid=arrays["sensor_valid"])
+    features = np.zeros((seq_len, schema.feature_dim), dtype=np.float32)
+    features[:, schema.body_pose_slice()] = arrays["body_pose_parent_6d"]
+    features[:, schema.root_yaw_delta_slice()] = arrays["root_yaw_delta_sincos"]
+    if schema.supports_root_motion:
+        features[:, schema.root_delta_xz_slice()] = arrays["root_delta_xz_ref"]
+        features[:, schema.root_height_slice()] = arrays["root_height"]
+    if schema.supports_contact:
+        features[:, schema.foot_contact_slice()] = arrays["foot_contact"]
+    features[:, schema.tracker_pos_slice()] = encode_tracker_pos_ref(arrays).reshape(seq_len, -1)
+    features[:, schema.tracker_rot_slice()] = encode_tracker_rot_ref(arrays).reshape(seq_len, -1)
+    features[:, schema.sensor_valid_slice()] = arrays["sensor_valid"].astype(np.float32)
+    zero_missing_tracker_channels(features=features, sensor_valid=arrays["sensor_valid"], schema_name=schema.name)
     return features
 
 
@@ -411,16 +560,19 @@ def encode_tracker_rot_ref(arrays: dict[str, np.ndarray]) -> np.ndarray:
     return rotation_6d_forward_up_np(result).astype(np.float32)
 
 
-def zero_missing_tracker_channels(features: np.ndarray, sensor_valid: np.ndarray) -> None:
+def zero_missing_tracker_channels(
+    features: np.ndarray,
+    sensor_valid: np.ndarray,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> None:
+    schema = get_schema_spec(schema_name)
     valid = np.asarray(sensor_valid, dtype=bool)
     for sensor_index in range(TRACKER_COUNT):
         missing = ~valid[:, sensor_index]
         if not missing.any():
             continue
-        pos_start = TRACKER_POS_REF_START + sensor_index * 3
-        rot_start = TRACKER_ROT_REF_START + sensor_index * 6
-        features[missing, pos_start:pos_start + 3] = 0.0
-        features[missing, rot_start:rot_start + 6] = 0.0
+        features[missing, schema.tracker_pos_slice(sensor_index)] = 0.0
+        features[missing, schema.tracker_rot_slice(sensor_index)] = 0.0
 
 
 def augment_realtime_arrays(
@@ -429,21 +581,34 @@ def augment_realtime_arrays(
     tracker_pos_noise_std: float = 0.0,
     tracker_rot_noise_std: float = 0.0,
     non_hip_tracker_dropout_prob: float = 0.0,
+    tracker_latency_max_frames: int = 0,
+    tracker_burst_dropout_prob: float = 0.0,
+    tracker_outlier_prob: float = 0.0,
     history_pose_noise_std: float = 0.0,
     history_yaw_noise_std: float = 0.0,
     root_yaw_ref_noise_std: float = 0.0,
 ) -> dict[str, np.ndarray]:
-    """训练增强只改条件可见信息，hip 永远有效且每帧至少 3 个 tracker。"""
+    """训练增强只改 tracker 条件；history pose/yaw 污染在 `conditioned_x` 上单独做。"""
 
     result = {key: value.copy() for key, value in arrays.items()}
     sensor_valid = result["sensor_valid"].copy()
-    if non_hip_tracker_dropout_prob > 0:
+    dropout_prob = max(float(non_hip_tracker_dropout_prob), float(tracker_burst_dropout_prob))
+    if dropout_prob > 0:
         sensor_valid = dropout_non_hip_trackers(
             sensor_valid=sensor_valid,
             rng=rng,
-            dropout_prob=float(non_hip_tracker_dropout_prob),
+            dropout_prob=dropout_prob,
         )
         result["sensor_valid"] = sensor_valid
+
+    if tracker_latency_max_frames > 0:
+        delay = int(rng.integers(0, int(tracker_latency_max_frames) + 1))
+        if delay > 0:
+            for key in ("tracker_pos_world", "tracker_rot_world_6d"):
+                delayed = result[key].copy()
+                delayed[delay:] = result[key][:-delay]
+                delayed[:delay] = result[key][:1]
+                result[key] = delayed
 
     if tracker_pos_noise_std > 0:
         noise = rng.normal(0.0, tracker_pos_noise_std, size=result["tracker_pos_world"].shape).astype(np.float32)
@@ -453,23 +618,13 @@ def augment_realtime_arrays(
         noise = rng.normal(0.0, tracker_rot_noise_std, size=result["tracker_rot_world_6d"].shape).astype(np.float32)
         result["tracker_rot_world_6d"] = result["tracker_rot_world_6d"] + noise * sensor_valid[:, :, None].astype(np.float32)
 
-    history = slice(0, REALTIME_POSE_TARGET_START)
-    if history_pose_noise_std > 0:
-        result["body_pose_parent_6d"][history] += rng.normal(
-            0.0,
-            history_pose_noise_std,
-            size=result["body_pose_parent_6d"][history].shape,
-        ).astype(np.float32)
-
-    if history_yaw_noise_std > 0:
-        yaw_noise = rng.normal(
-            0.0,
-            history_yaw_noise_std,
-            size=result["root_yaw_delta_sincos"][history].shape,
-        ).astype(np.float32)
-        result["root_yaw_delta_sincos"][history] += yaw_noise
-        norms = np.linalg.norm(result["root_yaw_delta_sincos"], axis=-1, keepdims=True)
-        result["root_yaw_delta_sincos"] = result["root_yaw_delta_sincos"] / np.maximum(norms, 1e-8)
+    if tracker_outlier_prob > 0:
+        outlier_mask = (rng.random(result["tracker_pos_world"].shape[:2]) < float(tracker_outlier_prob)) & sensor_valid
+        if outlier_mask.any():
+            pos_outlier = rng.normal(0.0, 0.15, size=result["tracker_pos_world"].shape).astype(np.float32)
+            rot_outlier = rng.normal(0.0, 0.20, size=result["tracker_rot_world_6d"].shape).astype(np.float32)
+            result["tracker_pos_world"] = result["tracker_pos_world"] + pos_outlier * outlier_mask[:, :, None].astype(np.float32)
+            result["tracker_rot_world_6d"] = result["tracker_rot_world_6d"] + rot_outlier * outlier_mask[:, :, None].astype(np.float32)
 
     if root_yaw_ref_noise_std > 0:
         result["root_yaw_ref_noise"] = rng.normal(
@@ -478,6 +633,56 @@ def augment_realtime_arrays(
             size=(REALTIME_POSE_SEQ_LEN,),
         ).astype(np.float32)
     return result
+
+
+def apply_history_condition_corruption(
+    conditioned: np.ndarray,
+    schema: SchemaSpec,
+    rng: np.random.Generator,
+    history_pose_noise_std: float = 0.0,
+    history_yaw_noise_std: float = 0.0,
+    history_pose_dropout_prob: float = 0.0,
+    history_pose_replace_prob: float = 0.0,
+    history_yaw_replace_prob: float = 0.0,
+    history_root_yaw_drift_std: float = 0.0,
+) -> None:
+    """只污染 history 条件，模拟 Unity 中预测 history 写回后的分布偏移。"""
+
+    history = slice(0, REALTIME_POSE_TARGET_START)
+    pose_slice = schema.body_pose_slice()
+    yaw_slice = schema.root_yaw_delta_slice()
+    history_pose = conditioned[history, pose_slice]
+    history_yaw = conditioned[history, yaw_slice]
+    if history_pose_noise_std > 0:
+        history_pose += rng.normal(
+            0.0,
+            float(history_pose_noise_std),
+            size=history_pose.shape,
+        ).astype(np.float32)
+    if history_pose_dropout_prob > 0:
+        drop_frames = rng.random(history_pose.shape[0]) < float(history_pose_dropout_prob)
+        history_pose[drop_frames] = 0.0
+    if history_pose_replace_prob > 0:
+        replace_frames = rng.random(history_pose.shape[0]) < float(history_pose_replace_prob)
+        for frame_index in np.where(replace_frames)[0]:
+            if frame_index > 0:
+                history_pose[frame_index] = history_pose[frame_index - 1]
+    if history_yaw_noise_std > 0:
+        history_yaw += rng.normal(
+            0.0,
+            float(history_yaw_noise_std),
+            size=history_yaw.shape,
+        ).astype(np.float32)
+    if history_root_yaw_drift_std > 0:
+        drift = rng.normal(0.0, float(history_root_yaw_drift_std), size=(history_yaw.shape[0], 1)).astype(np.float32)
+        history_yaw += np.cumsum(drift, axis=0)
+    if history_yaw_replace_prob > 0:
+        replace_frames = rng.random(history_yaw.shape[0]) < float(history_yaw_replace_prob)
+        for frame_index in np.where(replace_frames)[0]:
+            if frame_index > 0:
+                history_yaw[frame_index] = history_yaw[frame_index - 1]
+    yaw_norm = np.linalg.norm(history_yaw, axis=-1, keepdims=True)
+    history_yaw[:] = history_yaw / np.maximum(yaw_norm, 1e-8)
 
 
 def dropout_non_hip_trackers(

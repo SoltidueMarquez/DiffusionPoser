@@ -15,6 +15,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
     SENSOR_VALID_START,
     TASK_MODE_REALTIME_POSE,
+    get_schema_spec,
 )
 from diffusion import logger
 from utils import dist_util
@@ -42,6 +43,7 @@ class TrainLoop:
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
         self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
+        self.schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
 
         self.save_dir = Path(args.save_dir)
@@ -84,8 +86,8 @@ class TrainLoop:
             raise FileNotFoundError(f"开启 --weighted_loss 后找不到特征权重文件：{feature_w_path}")
 
         feature_w = torch.load(feature_w_path, map_location="cpu", weights_only=True).float().flatten()
-        if feature_w.numel() != REALTIME_POSE_INPUT_DIM:
-            raise ValueError(f"feature_w 应为 {REALTIME_POSE_INPUT_DIM} 维，实际为 {feature_w.numel()} 维")
+        if feature_w.numel() != self.schema.feature_dim:
+            raise ValueError(f"feature_w 应为 {self.schema.feature_dim} 维，实际为 {feature_w.numel()} 维")
         feature_w.requires_grad_(False)
         return feature_w
 
@@ -249,8 +251,8 @@ class TrainLoop:
 
                 sample = batch["x"]  # [B, 206, 61]
                 batch_size, channels, seq_len = sample.shape
-                if channels != REALTIME_POSE_INPUT_DIM:
-                    raise ValueError(f"训练输入应为 [B, {REALTIME_POSE_INPUT_DIM}, T]，实际为 {tuple(sample.shape)}")
+                if channels != self.schema.feature_dim:
+                    raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
 
                 feature_w = self._feature_weights_for_batch(batch_size, seq_len)
                 timesteps = torch.randint(
@@ -301,8 +303,9 @@ class TrainLoop:
             raise ValueError(f"inpaint_mask 应为 {tuple(sample.shape)}，实际为 {tuple(inpaint_mask.shape)}")
 
         inpaint_mask = inpaint_mask & valid_frame_mask.unsqueeze(1)
-        inpaint_mask[:, REALTIME_POSE_TARGET_DIM:REALTIME_POSE_INPUT_DIM, :] = False
-        if inpaint_mask[:, SENSOR_VALID_START:, :].any():
+        inpaint_mask[:, self.schema.target_dim:self.schema.feature_dim, :] = False
+        sensor_slice = self.schema.sensor_valid_slice()
+        if inpaint_mask[:, sensor_slice, :].any():
             raise ValueError("sensor_valid 不能参与 diffusion loss，请检查 task 的 inpaint_mask。")
         if not inpaint_mask.any():
             raise ValueError("当前 batch 的 inpaint_mask 没有待补全部分，请检查离线任务生成结果。")
@@ -314,14 +317,24 @@ class TrainLoop:
         y = {
             "mask": inpaint_mask,
             "inpainted_motion": conditioned_sample,
-            "schema_name": REALTIME_POSE_SCHEMA_NAME,
+            "schema_name": self.schema.name,
             "target_joints_world": batch["target_joints_world"],
             "prev_joints_world": batch["prev_joints_world"],
             "target_root_pos_world": batch["target_root_pos_world"],
             "prev_root_yaw": batch["prev_root_yaw"],
             "target_root_yaw": batch["target_root_yaw"],
+            "target_tracker_pos_ref": batch["target_tracker_pos_ref"],
+            "target_tracker_rot_ref_6d": batch["target_tracker_rot_ref_6d"],
+            "target_sensor_valid": batch["target_sensor_valid"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
+            "sensor_valid": batch["sensor_valid"],
         }
+        if self.schema.supports_root_motion:
+            y["prev_root_pos_world"] = batch["prev_root_pos_world"]
+            y["target_root_delta_xz_ref"] = batch["target_root_delta_xz_ref"]
+            y["target_root_height"] = batch["target_root_height"]
+        if self.schema.supports_contact:
+            y["target_foot_contact"] = batch["target_foot_contact"]
         if self.normalizer_mean is not None and self.normalizer_std is not None:
             y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
             y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)

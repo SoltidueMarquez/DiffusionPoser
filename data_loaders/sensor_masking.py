@@ -6,7 +6,13 @@ import numpy as np
 
 
 REALTIME_POSE_SCHEMA_NAME = "realtime_pose_v1"
+REALTIME_POSE_V1_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
+REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
+REALTIME_POSE_V2_CONTACT_SCHEMA_NAME = "realtime_pose_v2_contact"
+DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
 TASK_FORMAT_REALTIME_POSE_V1 = "materialized_realtime_pose_v1"
+TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
+TASK_FORMAT_REALTIME_POSE_V2_CONTACT = "materialized_realtime_pose_v2_contact"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
 TASK_MODES = (TASK_MODE_REALTIME_POSE,)
 
@@ -17,6 +23,9 @@ REALTIME_POSE_TARGET_LENGTH = 1
 SMPL_JOINT_COUNT = 24
 BODY_POSE_DIM = SMPL_JOINT_COUNT * 6
 ROOT_YAW_DELTA_DIM = 2
+ROOT_DELTA_XZ_DIM = 2
+ROOT_HEIGHT_DIM = 1
+FOOT_CONTACT_DIM = 2
 TRACKER_COUNT = 6
 TRACKER_POS_DIM = TRACKER_COUNT * 3
 TRACKER_ROT_DIM = TRACKER_COUNT * 6
@@ -29,6 +38,25 @@ TRACKER_ROT_REF_START = TRACKER_POS_REF_START + TRACKER_POS_DIM
 SENSOR_VALID_START = TRACKER_ROT_REF_START + TRACKER_ROT_DIM
 REALTIME_POSE_INPUT_DIM = SENSOR_VALID_START + SENSOR_VALID_DIM
 REALTIME_POSE_TARGET_DIM = BODY_POSE_DIM + ROOT_YAW_DELTA_DIM
+
+V2_MOTION_ROOT_DELTA_XZ_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
+V2_MOTION_ROOT_HEIGHT_START = V2_MOTION_ROOT_DELTA_XZ_START + ROOT_DELTA_XZ_DIM
+V2_MOTION_TRACKER_POS_REF_START = V2_MOTION_ROOT_HEIGHT_START + ROOT_HEIGHT_DIM
+V2_MOTION_TRACKER_ROT_REF_START = V2_MOTION_TRACKER_POS_REF_START + TRACKER_POS_DIM
+V2_MOTION_SENSOR_VALID_START = V2_MOTION_TRACKER_ROT_REF_START + TRACKER_ROT_DIM
+REALTIME_POSE_V2_MOTION_INPUT_DIM = V2_MOTION_SENSOR_VALID_START + SENSOR_VALID_DIM
+REALTIME_POSE_V2_MOTION_TARGET_DIM = BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM
+
+V2_CONTACT_ROOT_DELTA_XZ_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
+V2_CONTACT_ROOT_HEIGHT_START = V2_CONTACT_ROOT_DELTA_XZ_START + ROOT_DELTA_XZ_DIM
+V2_CONTACT_FOOT_CONTACT_START = V2_CONTACT_ROOT_HEIGHT_START + ROOT_HEIGHT_DIM
+V2_CONTACT_TRACKER_POS_REF_START = V2_CONTACT_FOOT_CONTACT_START + FOOT_CONTACT_DIM
+V2_CONTACT_TRACKER_ROT_REF_START = V2_CONTACT_TRACKER_POS_REF_START + TRACKER_POS_DIM
+V2_CONTACT_SENSOR_VALID_START = V2_CONTACT_TRACKER_ROT_REF_START + TRACKER_ROT_DIM
+REALTIME_POSE_V2_CONTACT_INPUT_DIM = V2_CONTACT_SENSOR_VALID_START + SENSOR_VALID_DIM
+REALTIME_POSE_V2_CONTACT_TARGET_DIM = (
+    BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM + FOOT_CONTACT_DIM
+)
 
 TRACKER_NAMES = (
     "head",
@@ -94,6 +122,122 @@ class TrackerPattern:
         }
 
 
+@dataclass(frozen=True)
+class SchemaSpec:
+    """集中描述 realtime_pose 各版本的通道布局，避免调用侧硬编码切片。"""
+
+    name: str
+    task_format: str
+    feature_dim: int
+    target_dim: int
+    body_pose_start: int
+    root_yaw_delta_start: int
+    tracker_pos_ref_start: int
+    tracker_rot_ref_start: int
+    sensor_valid_start: int
+    root_delta_xz_start: int | None = None
+    root_height_start: int | None = None
+    foot_contact_start: int | None = None
+
+    @property
+    def supports_root_motion(self) -> bool:
+        return self.root_delta_xz_start is not None and self.root_height_start is not None
+
+    @property
+    def supports_contact(self) -> bool:
+        return self.foot_contact_start is not None
+
+    def target_slice(self) -> slice:
+        return slice(BODY_POSE_START, self.target_dim)
+
+    def body_pose_slice(self) -> slice:
+        return slice(self.body_pose_start, self.body_pose_start + BODY_POSE_DIM)
+
+    def root_yaw_delta_slice(self) -> slice:
+        return slice(self.root_yaw_delta_start, self.root_yaw_delta_start + ROOT_YAW_DELTA_DIM)
+
+    def root_delta_xz_slice(self) -> slice:
+        if self.root_delta_xz_start is None:
+            raise ValueError(f"{self.name} 不包含 root_delta_xz_ref。")
+        return slice(self.root_delta_xz_start, self.root_delta_xz_start + ROOT_DELTA_XZ_DIM)
+
+    def root_height_slice(self) -> slice:
+        if self.root_height_start is None:
+            raise ValueError(f"{self.name} 不包含 root_height。")
+        return slice(self.root_height_start, self.root_height_start + ROOT_HEIGHT_DIM)
+
+    def foot_contact_slice(self) -> slice:
+        if self.foot_contact_start is None:
+            raise ValueError(f"{self.name} 不包含 foot_contact。")
+        return slice(self.foot_contact_start, self.foot_contact_start + FOOT_CONTACT_DIM)
+
+    def tracker_pos_slice(self, tracker_index: int | None = None) -> slice:
+        if tracker_index is None:
+            return slice(self.tracker_pos_ref_start, self.tracker_pos_ref_start + TRACKER_POS_DIM)
+        start = self.tracker_pos_ref_start + int(tracker_index) * 3
+        return slice(start, start + 3)
+
+    def tracker_rot_slice(self, tracker_index: int | None = None) -> slice:
+        if tracker_index is None:
+            return slice(self.tracker_rot_ref_start, self.tracker_rot_ref_start + TRACKER_ROT_DIM)
+        start = self.tracker_rot_ref_start + int(tracker_index) * 6
+        return slice(start, start + 6)
+
+    def sensor_valid_slice(self) -> slice:
+        return slice(self.sensor_valid_start, self.sensor_valid_start + SENSOR_VALID_DIM)
+
+
+SCHEMA_SPECS: dict[str, SchemaSpec] = {
+    REALTIME_POSE_V1_SCHEMA_NAME: SchemaSpec(
+        name=REALTIME_POSE_V1_SCHEMA_NAME,
+        task_format=TASK_FORMAT_REALTIME_POSE_V1,
+        feature_dim=REALTIME_POSE_INPUT_DIM,
+        target_dim=REALTIME_POSE_TARGET_DIM,
+        body_pose_start=BODY_POSE_START,
+        root_yaw_delta_start=ROOT_YAW_DELTA_START,
+        tracker_pos_ref_start=TRACKER_POS_REF_START,
+        tracker_rot_ref_start=TRACKER_ROT_REF_START,
+        sensor_valid_start=SENSOR_VALID_START,
+    ),
+    REALTIME_POSE_V2_MOTION_SCHEMA_NAME: SchemaSpec(
+        name=REALTIME_POSE_V2_MOTION_SCHEMA_NAME,
+        task_format=TASK_FORMAT_REALTIME_POSE_V2_MOTION,
+        feature_dim=REALTIME_POSE_V2_MOTION_INPUT_DIM,
+        target_dim=REALTIME_POSE_V2_MOTION_TARGET_DIM,
+        body_pose_start=BODY_POSE_START,
+        root_yaw_delta_start=ROOT_YAW_DELTA_START,
+        root_delta_xz_start=V2_MOTION_ROOT_DELTA_XZ_START,
+        root_height_start=V2_MOTION_ROOT_HEIGHT_START,
+        tracker_pos_ref_start=V2_MOTION_TRACKER_POS_REF_START,
+        tracker_rot_ref_start=V2_MOTION_TRACKER_ROT_REF_START,
+        sensor_valid_start=V2_MOTION_SENSOR_VALID_START,
+    ),
+    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME: SchemaSpec(
+        name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        task_format=TASK_FORMAT_REALTIME_POSE_V2_CONTACT,
+        feature_dim=REALTIME_POSE_V2_CONTACT_INPUT_DIM,
+        target_dim=REALTIME_POSE_V2_CONTACT_TARGET_DIM,
+        body_pose_start=BODY_POSE_START,
+        root_yaw_delta_start=ROOT_YAW_DELTA_START,
+        root_delta_xz_start=V2_CONTACT_ROOT_DELTA_XZ_START,
+        root_height_start=V2_CONTACT_ROOT_HEIGHT_START,
+        foot_contact_start=V2_CONTACT_FOOT_CONTACT_START,
+        tracker_pos_ref_start=V2_CONTACT_TRACKER_POS_REF_START,
+        tracker_rot_ref_start=V2_CONTACT_TRACKER_ROT_REF_START,
+        sensor_valid_start=V2_CONTACT_SENSOR_VALID_START,
+    ),
+}
+REALTIME_POSE_SCHEMA_NAMES = tuple(SCHEMA_SPECS.keys())
+
+
+def get_schema_spec(schema_name: str | None) -> SchemaSpec:
+    name = str(schema_name or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    try:
+        return SCHEMA_SPECS[name]
+    except KeyError as exc:
+        raise ValueError(f"未知 realtime pose schema: {name}，可选值为 {REALTIME_POSE_SCHEMA_NAMES}") from exc
+
+
 def validate_realtime_seq_len(seq_len: int) -> None:
     if int(seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose_v1 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {seq_len}")
@@ -123,10 +267,14 @@ def validate_sensor_valid(sensor_valid: np.ndarray, min_valid_trackers: int = MI
     return valid
 
 
-def create_realtime_inpaint_mask(seq_len: int = REALTIME_POSE_SEQ_LEN) -> np.ndarray:
+def create_realtime_inpaint_mask(
+    seq_len: int = REALTIME_POSE_SEQ_LEN,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> np.ndarray:
     validate_realtime_seq_len(seq_len)
-    mask = np.zeros((seq_len, REALTIME_POSE_INPUT_DIM), dtype=bool)
-    mask[REALTIME_POSE_TARGET_START, BODY_POSE_START:REALTIME_POSE_TARGET_DIM] = True
+    schema = get_schema_spec(schema_name)
+    mask = np.zeros((seq_len, schema.feature_dim), dtype=bool)
+    mask[REALTIME_POSE_TARGET_START, schema.target_slice()] = True
     return mask
 
 

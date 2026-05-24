@@ -70,8 +70,8 @@ def validate_args(args) -> None:
         raise ValueError("--target_fps 必须为正数")
     if args.batch_size <= 0:
         raise ValueError("--batch_size 必须为正整数")
-    if args.overwrite and args.skip_existing:
-        raise ValueError("--overwrite 和 --skip_existing 不能同时启用")
+    if args.overwrite and args.skip_existing and not getattr(args, "rebuild_manifest", False):
+        raise ValueError("--overwrite 和 --skip_existing 不能同时启用；如只想重写 manifest，请使用 --rebuild_manifest")
 
 
 def iter_amass_motion_files(amass_dir: Path) -> list[Path]:

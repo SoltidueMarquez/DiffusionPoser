@@ -16,6 +16,7 @@ from data_loaders.sensor_masking import (
     TRACKER_MASK_POLICY_AUTO,
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
     TRACKER_MASK_POLICY_TASK,
+    get_schema_spec,
 )
 from sample.utils import choose_sampler, load_checkpoint_model
 from utils import dist_util
@@ -33,18 +34,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_realtime_inpaint_mask(batch_size: int, device: torch.device) -> torch.Tensor:
-    mask = torch.zeros(batch_size, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN, dtype=torch.bool, device=device)
-    mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = True
+def build_realtime_inpaint_mask(
+    batch_size: int,
+    device: torch.device,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> torch.Tensor:
+    schema = get_schema_spec(schema_name)
+    mask = torch.zeros(batch_size, schema.feature_dim, REALTIME_POSE_SEQ_LEN, dtype=torch.bool, device=device)
+    mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
     return mask
 
 
-def reconstruct_batch(model, diffusion, batch: dict, device: torch.device, use_ddim: bool = True) -> torch.Tensor:
+def reconstruct_batch(
+    model,
+    diffusion,
+    batch: dict,
+    device: torch.device,
+    use_ddim: bool = True,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+) -> torch.Tensor:
+    schema = get_schema_spec(schema_name)
     sample = batch["conditioned_x"].to(device)
     batch_size = sample.shape[0]
-    if tuple(sample.shape[1:]) != (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN):
-        raise ValueError(f"realtime_pose_v1 sample 应为 [B,206,61]，实际为 {tuple(sample.shape)}")
-    inpaint_mask = build_realtime_inpaint_mask(batch_size, device)
+    if tuple(sample.shape[1:]) != (schema.feature_dim, REALTIME_POSE_SEQ_LEN):
+        raise ValueError(f"{schema.name} sample 应为 [B,{schema.feature_dim},61]，实际为 {tuple(sample.shape)}")
+    inpaint_mask = build_realtime_inpaint_mask(batch_size, device, schema_name=schema.name)
     valid_frame_mask = batch["valid_frame_mask"].to(device)
     model_kwargs = {
         "inpaint_cond": inpaint_mask,
@@ -53,7 +67,7 @@ def reconstruct_batch(model, diffusion, batch: dict, device: torch.device, use_d
         "y": {
             "mask": inpaint_mask,
             "inpainted_motion": sample,
-            "schema_name": REALTIME_POSE_SCHEMA_NAME,
+            "schema_name": schema.name,
         },
     }
     sampler = choose_sampler(diffusion, use_ddim=use_ddim)
@@ -87,6 +101,7 @@ def save_reconstruction(
     reconstructed: torch.Tensor,
     inpaint_mask: torch.Tensor,
     normalizer=None,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     has_normalizer = normalizer is not None
@@ -97,7 +112,7 @@ def save_reconstruction(
     conditioned_raw = inverse_normalized_features(conditioned_input, normalizer=normalizer)
     reconstructed_raw = inverse_normalized_features(reconstructed_input, normalizer=normalizer)
     payload = {
-        "schema_name": np.asarray(REALTIME_POSE_SCHEMA_NAME),
+        "schema_name": np.asarray(schema_name),
         "feature_space": np.asarray("raw"),
         "input_feature_space": np.asarray("normalized" if has_normalizer else "raw"),
         # 旧字段继续保留，但现在明确写 raw，避免评估默认落在归一化空间。
@@ -136,6 +151,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
         folder_path=getattr(args, "folder_path", "") or None,
+        schema_name=args.schema,
         tracker_mask_policy=sample_mask_policy,
         tracker_mask_seed=args.tracker_mask_seed,
         tracker_mask_fill=args.tracker_mask_fill,
@@ -146,8 +162,15 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
 
     model, diffusion = create_model_and_diffusion(args)
     model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-    reconstructed = reconstruct_batch(model, diffusion, batch, device=device, use_ddim=str(args.ts_respace).startswith("ddim"))
-    inpaint_mask = build_realtime_inpaint_mask(1, device)
+    reconstructed = reconstruct_batch(
+        model,
+        diffusion,
+        batch,
+        device=device,
+        use_ddim=str(args.ts_respace).startswith("ddim"),
+        schema_name=args.schema,
+    )
+    inpaint_mask = build_realtime_inpaint_mask(1, device, schema_name=args.schema)
     output_dir = Path(args.output_dir or Path(args.model_path).with_suffix("").name).resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"
     save_reconstruction(
@@ -157,6 +180,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         reconstructed,
         inpaint_mask,
         normalizer=getattr(dataset, "normalizer", None),
+        schema_name=args.schema,
     )
     print(f"[reconstruct_stream] weights={source} output={output_path}")
     return {"output_path": output_path}

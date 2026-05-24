@@ -2,19 +2,57 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "realtime_pose_v1: 1 convert AMASS source",
+            "label": "realtime_pose_v2: one-stop convert-to-train",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "scripts.run_realtime_pose_pipeline",
+                "--schema", "realtime_pose_v2_contact",
+                "--amass_dir", "${workspaceFolder}/dataset/AMASS",
+                "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--reuse_source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--split_dir", "${workspaceFolder}/data_loaders/splits",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
+                "--model_arch", "target_dit",
+                "--num_steps", "${input:realtimePosePipelineNumSteps}",
+                "--train_batch_size", "${input:realtimePosePipelineBatchSize}",
+                "--samples_per_file", "4",
+                "--short_source_policy", "skip",
+                "--mirror",
+                "--skip_existing",
+                "--overwrite"
+            ],
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_v2: 1 convert source fast",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "data_converter.amass_to_realtime_pose",
+                "--schema", "realtime_pose_v2_contact",
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
-                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--reuse_source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
                 "--target_fps", "60",
                 "--batch_size", "256",
                 "--mirror",
-                "--skip_existing"
+                "--skip_existing",
+                "--rebuild_manifest"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -26,14 +64,40 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 2 compute normalizer",
+            "label": "realtime_pose_v2: 1b rebuild source from AMASS",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "data_converter.amass_to_realtime_pose",
+                "--schema", "realtime_pose_v2_contact",
+                "--amass_dir", "${workspaceFolder}/dataset/AMASS",
+                "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--target_fps", "60",
+                "--batch_size", "256",
+                "--mirror",
+                "--overwrite"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_v2: 2 compute normalizer",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "data_loaders.compute_realtime_pose_normalizer",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
-                "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--schema", "realtime_pose_v2_contact",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--split", "train",
                 "--overwrite"
@@ -48,19 +112,21 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 3 generate full-tracker tasks",
+            "label": "realtime_pose_v2: 3 generate full-tracker tasks",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "data_loaders.generate_realtime_pose_tasks",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
-                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz_tasks",
+                "--schema", "realtime_pose_v2_contact",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--splits", "train", "test",
                 "--seq_len", "61",
                 "--samples_per_file", "4",
                 "--mask_policy", "full",
+                "--short_source_policy", "skip",
                 "--overwrite"
             ],
             "options": {
@@ -73,23 +139,25 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 4 train",
+            "label": "realtime_pose_v2: 4 train target_dit",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "train.train_diffusionposer",
-                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v1_train",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz_tasks",
+                "--schema", "realtime_pose_v2_contact",
+                "--model_arch", "target_dit",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--data_split", "train",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
                 "--cuda", "true",
-                "--batch_size", "256",
+                "--batch_size", "${input:realtimePosePipelineBatchSize}",
                 "--seq_len", "61",
-                "--input_feats", "206",
+                "--input_feats", "211",
                 "--max_seq_len", "61",
                 "--layers", "8",
                 "--heads", "8",
@@ -99,9 +167,9 @@
                 "--predict_xstart", "1",
                 "--model_ema",
                 "--gradient_clip",
-                "--lr", "5e-5",
-                "--num_steps", "2000000",
-                "--save_interval", "2000",
+                "--lr", "1e-4",
+                "--num_steps", "${input:realtimePosePipelineNumSteps}",
+                "--save_interval", "50000",
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
@@ -110,12 +178,13 @@
                 "--tracker_mask_seed", "10",
                 "--tracker_mask_fill", "zero",
                 "--tracker_mask_categories", "all",
-                "--tracker_pos_noise_std", "0.005",
-                "--tracker_rot_noise_std", "0.01",
-                "--non_hip_tracker_dropout_prob", "0.1",
-                "--history_pose_noise_std", "0.01",
-                "--history_yaw_noise_std", "0.01",
-                "--root_yaw_ref_noise_std", "0.01",
+                "--history_pose_noise_std", "0.02",
+                "--history_yaw_noise_std", "0.02",
+                "--history_pose_dropout_prob", "0.05",
+                "--history_pose_replace_prob", "0.05",
+                "--tracker_latency_max_frames", "2",
+                "--tracker_burst_dropout_prob", "0.05",
+                "--tracker_outlier_prob", "0.01",
                 "--overwrite"
             ],
             "options": {
@@ -128,25 +197,27 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 4b resume latest",
+            "label": "realtime_pose_v2: 4b resume latest",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "train.train_diffusionposer",
-                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v1_train",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz_tasks",
+                "--schema", "realtime_pose_v2_contact",
+                "--model_arch", "target_dit",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--data_split", "train",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
                 "--resume_checkpoint", "latest",
                 "--overwrite",
                 "--cuda", "true",
-                "--batch_size", "256",
+                "--batch_size", "${input:realtimePosePipelineBatchSize}",
                 "--seq_len", "61",
-                "--input_feats", "206",
+                "--input_feats", "211",
                 "--max_seq_len", "61",
                 "--layers", "8",
                 "--heads", "8",
@@ -156,9 +227,9 @@
                 "--predict_xstart", "1",
                 "--model_ema",
                 "--gradient_clip",
-                "--lr", "5e-5",
-                "--num_steps", "2000000",
-                "--save_interval", "2000",
+                "--lr", "1e-4",
+                "--num_steps", "${input:realtimePosePipelineNumSteps}",
+                "--save_interval", "50000",
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
@@ -167,12 +238,13 @@
                 "--tracker_mask_seed", "10",
                 "--tracker_mask_fill", "zero",
                 "--tracker_mask_categories", "all",
-                "--tracker_pos_noise_std", "0.005",
-                "--tracker_rot_noise_std", "0.01",
-                "--non_hip_tracker_dropout_prob", "0.1",
-                "--history_pose_noise_std", "0.01",
-                "--history_yaw_noise_std", "0.01",
-                "--root_yaw_ref_noise_std", "0.01"
+                "--history_pose_noise_std", "0.02",
+                "--history_yaw_noise_std", "0.02",
+                "--history_pose_dropout_prob", "0.05",
+                "--history_pose_replace_prob", "0.05",
+                "--tracker_latency_max_frames", "2",
+                "--tracker_burst_dropout_prob", "0.05",
+                "--tracker_outlier_prob", "0.01"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -184,24 +256,26 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 5 reconstruct stream test",
+            "label": "realtime_pose_v2: 5 reconstruct stream test",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "sample.reconstruct_stream",
-                "--model_path", "${input:realtimePoseModelPath}",
-                "--output_dir", "${workspaceFolder}/output/realtime_pose_v1_stream",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz_tasks",
+                "--schema", "realtime_pose_v2_contact",
+                "--model_arch", "target_dit",
+                "--model_path", "${input:realtimePoseV2ModelPath}",
+                "--output_dir", "${workspaceFolder}/output/realtime_pose_v2_stream",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--data_split", "test",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
                 "--cuda", "true",
                 "--batch_size", "1",
                 "--seq_len", "61",
-                "--input_feats", "206",
+                "--input_feats", "211",
                 "--max_seq_len", "61",
                 "--use_ema", "true",
                 "--num_workers", "0"
@@ -216,14 +290,14 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 6 evaluate stream output",
+            "label": "realtime_pose_v2: 6 evaluate stream output",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "eval.evaluate_realtime_pose",
-                "--input_dir", "${workspaceFolder}/output/realtime_pose_v1_stream",
-                "--output_json", "${workspaceFolder}/output/realtime_pose_v1_stream/realtime_pose_eval_summary.json"
+                "--input_dir", "${workspaceFolder}/output/realtime_pose_v2_stream",
+                "--output_json", "${workspaceFolder}/output/realtime_pose_v2_stream/realtime_pose_eval_summary.json"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -235,14 +309,15 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 7 export Unity runtime assets",
+            "label": "realtime_pose_v2: 7 export Unity runtime assets",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "export.write_unity_runtime_assets",
+                "--schema", "realtime_pose_v2_contact",
                 "--output_dir", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--normalize_input",
                 "--strict_normalizer"
             ],
@@ -256,15 +331,17 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: 8 export Sentis denoiser",
+            "label": "realtime_pose_v2: 8 export Sentis denoiser",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "export.export_sentis_denoiser",
-                "--model_path", "${input:realtimePoseModelPath}",
+                "--schema", "realtime_pose_v2_contact",
+                "--model_arch", "target_dit",
+                "--model_path", "${input:realtimePoseV2ModelPath}",
                 "--output_dir", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
                 "--normalize_input", "true",
                 "--strict_normalizer",
                 "--use_ema", "true",
@@ -280,7 +357,7 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v1: smoke tests",
+            "label": "realtime_pose_v2: smoke tests",
             "type": "shell",
             "command": "conda",
             "args": [
@@ -300,10 +377,22 @@
     ],
     "inputs": [
         {
-            "id": "realtimePoseModelPath",
+            "id": "realtimePoseV2ModelPath",
             "type": "promptString",
-            "description": "realtime_pose_v1 checkpoint path",
-            "default": "${workspaceFolder}/runs/realtime_pose_v1_train/model000002000.pt"
+            "description": "realtime_pose_v2_contact target_dit checkpoint path",
+            "default": "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit/model000050000.pt"
+        },
+        {
+            "id": "realtimePosePipelineNumSteps",
+            "type": "promptString",
+            "description": "v2 training steps",
+            "default": "1000000"
+        },
+        {
+            "id": "realtimePosePipelineBatchSize",
+            "type": "promptString",
+            "description": "v2 train batch size",
+            "default": "64"
         }
     ]
 }

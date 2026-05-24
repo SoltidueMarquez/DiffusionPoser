@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM
+from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 
 
 def get_dataset_loader(
@@ -26,13 +26,24 @@ def get_dataset_loader(
     tracker_mask_seed: int = 0,
     tracker_mask_fill: str = "zero",
     tracker_mask_categories: list[str] | tuple[str, ...] | None = None,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    history_pose_dropout_prob: float = 0.0,
+    history_pose_replace_prob: float = 0.0,
+    history_yaw_replace_prob: float = 0.0,
+    history_root_yaw_drift_std: float = 0.0,
+    tracker_latency_max_frames: int = 0,
+    tracker_burst_dropout_prob: float = 0.0,
+    tracker_outlier_prob: float = 0.0,
+    predicted_history_cache_dir: str | None = None,
+    predicted_history_prob: float = 0.0,
 ):
     """返回 realtime_pose_v1 训练 / 测试 DataLoader。"""
 
     if not data_dir:
         raise ValueError("请提供 --data_dir，指向 data_loaders.generate_realtime_pose_tasks 生成的任务目录。")
-    if int(input_feats) != REALTIME_POSE_INPUT_DIM:
-        raise ValueError(f"realtime_pose_v1 需要 input_feats={REALTIME_POSE_INPUT_DIM}，当前为 {input_feats}")
+    schema = get_schema_spec(schema_name)
+    if int(input_feats) != schema.feature_dim:
+        raise ValueError(f"{schema.name} 需要 input_feats={schema.feature_dim}，当前为 {input_feats}")
 
     dataset = RealtimePoseTaskDataset(
         data_dir=data_dir,
@@ -52,6 +63,16 @@ def get_dataset_loader(
         tracker_mask_seed=tracker_mask_seed,
         tracker_mask_fill=tracker_mask_fill,
         tracker_mask_categories=tracker_mask_categories,
+        schema_name=schema.name,
+        history_pose_dropout_prob=history_pose_dropout_prob,
+        history_pose_replace_prob=history_pose_replace_prob,
+        history_yaw_replace_prob=history_yaw_replace_prob,
+        history_root_yaw_drift_std=history_root_yaw_drift_std,
+        tracker_latency_max_frames=tracker_latency_max_frames,
+        tracker_burst_dropout_prob=tracker_burst_dropout_prob,
+        tracker_outlier_prob=tracker_outlier_prob,
+        predicted_history_cache_dir=predicted_history_cache_dir,
+        predicted_history_prob=predicted_history_prob,
     )
     loader_kwargs = {
         "batch_size": batch_size,

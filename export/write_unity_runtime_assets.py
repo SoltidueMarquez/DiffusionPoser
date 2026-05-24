@@ -18,24 +18,21 @@ from data_loaders.realtime_pose_kinematics import SMPL_JOINT_NAMES, TRACKER_JOIN
 from data_loaders.sensor_masking import (  # noqa: E402
     BODY_POSE_DIM,
     BODY_POSE_START,
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
-    REALTIME_POSE_INPUT_DIM,
-    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
     ROOT_YAW_DELTA_DIM,
     ROOT_YAW_DELTA_START,
     SENSOR_VALID_DIM,
-    SENSOR_VALID_START,
     TRACKER_COUNT,
     TRACKER_NAMES,
     TRACKER_POS_DIM,
-    TRACKER_POS_REF_START,
     TRACKER_ROT_DIM,
-    TRACKER_ROT_REF_START,
+    get_schema_spec,
 )
 from utils.normalizer import enforce_realtime_pose_normalizer_contract  # noqa: E402
 
@@ -53,27 +50,30 @@ def default_unity_model_dir() -> Path:
     )
 
 
-def expected_realtime_pose_input_dim() -> int:
-    return REALTIME_POSE_INPUT_DIM
+def expected_realtime_pose_input_dim(schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> int:
+    return get_schema_spec(schema_name).feature_dim
 
 
 def build_realtime_pose_feature_schema(
-    feature_dim: int = REALTIME_POSE_INPUT_DIM,
+    feature_dim: int | None = None,
     sequence_length: int = REALTIME_POSE_SEQ_LEN,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, Any]:
-    if int(feature_dim) != REALTIME_POSE_INPUT_DIM:
-        raise ValueError(f"realtime_pose_v1 featureDim 必须为 {REALTIME_POSE_INPUT_DIM}，实际为 {feature_dim}")
+    schema = get_schema_spec(schema_name)
+    feature_dim = schema.feature_dim if feature_dim is None else int(feature_dim)
+    if int(feature_dim) != schema.feature_dim:
+        raise ValueError(f"{schema.name} featureDim 必须为 {schema.feature_dim}，实际为 {feature_dim}")
     if int(sequence_length) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose_v1 sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
 
-    return {
+    payload = {
         "schemaVersion": 1,
-        "schemaName": REALTIME_POSE_SCHEMA_NAME,
-        "featureDim": REALTIME_POSE_INPUT_DIM,
+        "schemaName": schema.name,
+        "featureDim": schema.feature_dim,
         "sequenceLength": REALTIME_POSE_SEQ_LEN,
         "targetStart": REALTIME_POSE_TARGET_START,
         "targetLength": REALTIME_POSE_TARGET_LENGTH,
-        "targetFeatureLength": REALTIME_POSE_TARGET_DIM,
+        "targetFeatureLength": schema.target_dim,
         "boneCount": len(SMPL_JOINT_NAMES),
         "boneNames": list(SMPL_JOINT_NAMES),
         "trackerCount": TRACKER_COUNT,
@@ -83,31 +83,43 @@ def build_realtime_pose_feature_schema(
         "minValidTrackers": MIN_VALID_TRACKERS,
         "bodyPoseParent6d": {"name": "body_pose_parent_6d", "start": BODY_POSE_START, "length": BODY_POSE_DIM},
         "rootYawDeltaSinCos": {"name": "root_yaw_delta_sincos", "start": ROOT_YAW_DELTA_START, "length": ROOT_YAW_DELTA_DIM},
-        "trackerPositionReference": {"name": "tracker_pos_ref", "start": TRACKER_POS_REF_START, "length": TRACKER_POS_DIM},
-        "trackerRotation6dReference": {"name": "tracker_rot_ref_6d", "start": TRACKER_ROT_REF_START, "length": TRACKER_ROT_DIM},
-        "sensorValid": {"name": "sensor_valid", "start": SENSOR_VALID_START, "length": SENSOR_VALID_DIM},
+        "trackerPositionReference": {"name": "tracker_pos_ref", "start": schema.tracker_pos_ref_start, "length": TRACKER_POS_DIM},
+        "trackerRotation6dReference": {"name": "tracker_rot_ref_6d", "start": schema.tracker_rot_ref_start, "length": TRACKER_ROT_DIM},
+        "sensorValid": {"name": "sensor_valid", "start": schema.sensor_valid_start, "length": SENSOR_VALID_DIM},
         "runtimeRules": {
             "requiresHipTracker": True,
             "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
             "trackerReferenceYaw": "previous_frame_root_yaw",
-            "onnxDummyInputShape": [1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN],
+            "onnxDummyInputShape": [1, schema.feature_dim, REALTIME_POSE_SEQ_LEN],
             "failSafe": "hold_previous_frame_when_tracker_validity_fails",
         },
     }
+    if schema.supports_root_motion:
+        payload["rootDeltaXZReference"] = {"name": "root_delta_xz_ref", "start": schema.root_delta_xz_start, "length": 2}
+        payload["rootHeight"] = {"name": "root_height", "start": schema.root_height_start, "length": 1}
+    if schema.supports_contact:
+        payload["footContact"] = {"name": "foot_contact", "start": schema.foot_contact_start, "length": 2}
+    return payload
 
 
-def build_ddim_schedule(diffusion_steps: int, noise_schedule: str, predict_xstart: bool = True) -> dict[str, Any]:
+def build_ddim_schedule(
+    diffusion_steps: int,
+    noise_schedule: str,
+    predict_xstart: bool = True,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+) -> dict[str, Any]:
     if not predict_xstart:
-        raise ValueError("Unity realtime_pose_v1 DDIM sampler requires predict_xstart=True.")
+        raise ValueError("Unity realtime_pose DDIM sampler requires predict_xstart=True.")
 
     from diffusion import gaussian_diffusion as gd
 
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps, scale_betas=1.0)
     alphas = 1.0 - np.asarray(betas, dtype=np.float64)
     alphas_cumprod = np.cumprod(alphas).astype(np.float32)
+    schema = get_schema_spec(schema_name)
     return {
         "schemaVersion": 1,
-        "schemaName": REALTIME_POSE_SCHEMA_NAME,
+        "schemaName": schema.name,
         "trainStepCount": int(diffusion_steps),
         "noiseSchedule": str(noise_schedule),
         "predictXStart": True,
@@ -121,11 +133,13 @@ def build_normalizer(
     normalize_input: bool,
     strict: bool,
     epsilon: float = 1e-8,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, Any]:
-    if int(feature_dim) != REALTIME_POSE_INPUT_DIM:
-        raise ValueError(f"realtime_pose_v1 normalizer feature_dim 必须为 {REALTIME_POSE_INPUT_DIM}。")
+    schema = get_schema_spec(schema_name)
+    if int(feature_dim) != schema.feature_dim:
+        raise ValueError(f"{schema.name} normalizer feature_dim 必须为 {schema.feature_dim}。")
     if not normalize_input:
-        return disabled_normalizer(feature_dim, epsilon)
+        return disabled_normalizer(feature_dim, epsilon, schema_name=schema.name)
     if normalizer_dir is None:
         raise FileNotFoundError("normalize_input=True 时必须提供 normalizer_dir，不能导出 disabled normalizer。")
 
@@ -137,6 +151,7 @@ def build_normalizer(
     mean_tensor, std_tensor = enforce_realtime_pose_normalizer_contract(
         torch_load(mean_path).float().flatten(),
         torch_load(std_path).float().flatten(),
+        schema_name=schema.name,
     )
     mean = mean_tensor.cpu().numpy()
     std = std_tensor.cpu().numpy()
@@ -145,13 +160,13 @@ def build_normalizer(
         if strict:
             raise ValueError(message)
         print(f"[write_unity_runtime_assets] WARNING: {message} Writing disabled normalizer.")
-        return disabled_normalizer(feature_dim, epsilon)
+        return disabled_normalizer(feature_dim, epsilon, schema_name=schema.name)
     if not np.isfinite(mean).all() or not np.isfinite(std).all() or np.any(std <= 0):
         raise ValueError("Normalizer mean/std contain NaN, Inf, or non-positive std values.")
 
     return {
         "enabled": True,
-        "schemaName": REALTIME_POSE_SCHEMA_NAME,
+        "schemaName": schema.name,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [float(value) for value in mean.astype(np.float32).tolist()],
@@ -159,10 +174,14 @@ def build_normalizer(
     }
 
 
-def disabled_normalizer(feature_dim: int, epsilon: float = 1e-8) -> dict[str, Any]:
+def disabled_normalizer(
+    feature_dim: int,
+    epsilon: float = 1e-8,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+) -> dict[str, Any]:
     return {
         "enabled": False,
-        "schemaName": REALTIME_POSE_SCHEMA_NAME,
+        "schemaName": schema_name,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [0.0] * int(feature_dim),
@@ -188,7 +207,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def write_runtime_assets(
     output_dir: Path,
-    feature_dim: int = REALTIME_POSE_INPUT_DIM,
+    feature_dim: int | None = None,
     sequence_length: int = REALTIME_POSE_SEQ_LEN,
     diffusion_steps: int = 50,
     noise_schedule: str = "cosine",
@@ -196,14 +215,17 @@ def write_runtime_assets(
     normalizer_dir: Path | None = None,
     normalize_input: bool = False,
     strict_normalizer: bool = False,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, Path]:
+    schema = get_schema_spec(schema_name)
+    feature_dim = schema.feature_dim if feature_dim is None or int(feature_dim) <= 0 else int(feature_dim)
     output_dir.mkdir(parents=True, exist_ok=True)
     assets = {
         "feature_schema": output_dir / "feature_schema.json",
         "normalizer": output_dir / "normalizer.json",
         "ddim_schedule": output_dir / "ddim_schedule.json",
     }
-    write_json(assets["feature_schema"], build_realtime_pose_feature_schema(feature_dim, sequence_length))
+    write_json(assets["feature_schema"], build_realtime_pose_feature_schema(feature_dim, sequence_length, schema_name=schema.name))
     write_json(
         assets["normalizer"],
         build_normalizer(
@@ -211,6 +233,7 @@ def write_runtime_assets(
             normalizer_dir=normalizer_dir,
             normalize_input=normalize_input,
             strict=strict_normalizer,
+            schema_name=schema.name,
         ),
     )
     write_json(
@@ -219,16 +242,18 @@ def write_runtime_assets(
             diffusion_steps=diffusion_steps,
             noise_schedule=noise_schedule,
             predict_xstart=predict_xstart,
+            schema_name=schema.name,
         ),
     )
     return assets
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Write Unity realtime_pose_v1 runtime JSON assets.")
+    parser = argparse.ArgumentParser(description="Write Unity realtime_pose runtime JSON assets.")
     parser.add_argument("--output_dir", default=str(default_unity_model_dir()), type=str)
-    parser.add_argument("--feature_dim", default=REALTIME_POSE_INPUT_DIM, type=int)
+    parser.add_argument("--feature_dim", default=0, type=int)
     parser.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
+    parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES)
     parser.add_argument("--diffusion_steps", default=50, type=int)
     parser.add_argument("--noise_schedule", default="cosine", choices=["linear", "cosine"])
     parser.add_argument("--normalizer_dir", default="", type=str)
@@ -250,6 +275,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer_dir=normalizer_dir,
         normalize_input=bool(args.normalize_input),
         strict_normalizer=bool(args.strict_normalizer or args.normalize_input),
+        schema_name=str(args.schema),
     )
     for name, path in assets.items():
         print(f"[write_unity_runtime_assets] {name}: {path}")

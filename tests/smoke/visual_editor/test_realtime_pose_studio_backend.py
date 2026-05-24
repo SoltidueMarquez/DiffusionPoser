@@ -27,6 +27,8 @@ def test_realtime_pose_studio_scans_frames_and_exports_tasks(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",

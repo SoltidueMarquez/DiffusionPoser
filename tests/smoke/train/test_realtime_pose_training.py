@@ -7,7 +7,7 @@ import pytest
 
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
 from data_loaders.get_data import get_dataset_loader
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN
+from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.diffusionposer_dit import DiffusionPoserDiT
@@ -41,6 +41,8 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -53,6 +55,7 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         seq_len=REALTIME_POSE_SEQ_LEN,
         split="train",
         normalize_input=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
     )
     batch = next(iter(loader))
     dist_util.setup_dist(-1)
@@ -78,6 +81,7 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         snr_gamma=0.0,
         l1_loss=False,
         task_mode="realtime_pose_reconstruction",
+        schema=REALTIME_POSE_SCHEMA_NAME,
         checkpoint_max_keep=0,
         save_dir=str(tmp_path / "run"),
         num_steps=1,
@@ -91,7 +95,15 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
     model_kwargs = loop.mask_manager(batch, batch["x"])
     t = torch.zeros(1, dtype=torch.long)
     losses = diffusion.training_losses(model, batch["x"], t, model_kwargs=model_kwargs, snr_gamma=0.0)
-    assert {"loss", "simple_loss", "yaw_loss", "fk_loss", "joint_vel_loss", "foot_lock_loss"}.issubset(losses)
+    assert {
+        "loss",
+        "simple_loss",
+        "yaw_loss",
+        "fk_loss",
+        "joint_vel_loss",
+        "foot_lock_loss",
+        "sensor_reprojection_pos_loss",
+    }.issubset(losses)
     losses["loss"].mean().backward()
 
 

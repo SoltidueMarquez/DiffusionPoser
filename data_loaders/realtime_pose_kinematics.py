@@ -75,6 +75,86 @@ def make_yaw_rotation_torch(yaw: torch.Tensor) -> torch.Tensor:
     return rotations
 
 
+def encode_root_delta_xz_ref(root_pos_world: np.ndarray, root_yaw: np.ndarray) -> np.ndarray:
+    """
+    把相邻 root 位移编码到 previous-root-yaw 参考系。
+
+    输入 `root_pos_world` 为 `[T,3]`，`root_yaw` 为 `[T]`。第 0 帧没有历史位移，
+    固定写成 `[0,0]`；第 t 帧使用 `root_yaw[t-1]` 作为参考朝向，和 tracker ref
+    的运行时约定保持一致。
+    """
+
+    roots = np.asarray(root_pos_world, dtype=np.float64)
+    yaws = np.asarray(root_yaw, dtype=np.float64)
+    if roots.ndim != 2 or roots.shape[1] != 3:
+        raise ValueError(f"root_pos_world 应为 [T,3]，实际为 {roots.shape}")
+    if yaws.shape != (roots.shape[0],):
+        raise ValueError(f"root_yaw 应为 [T]，实际为 {yaws.shape}")
+
+    delta_world = np.zeros_like(roots)
+    if roots.shape[0] > 1:
+        delta_world[1:] = roots[1:] - roots[:-1]
+    ref_yaw = np.concatenate([yaws[:1], yaws[:-1]], axis=0)
+    rotations = make_yaw_rotation_np(ref_yaw)
+    delta_ref = np.einsum("ti,tij->tj", delta_world, rotations)
+    return delta_ref[:, [0, 2]].astype(np.float32)
+
+
+def integrate_root_delta_xz_ref(
+    prev_root_pos_world: np.ndarray,
+    prev_root_yaw: np.ndarray,
+    root_delta_xz_ref: np.ndarray,
+) -> np.ndarray:
+    """
+    将 previous-yaw 参考系下的 xz 位移积分回世界系 root 位置。
+
+    `prev_root_pos_world`、`prev_root_yaw` 和 `root_delta_xz_ref` 的前导维一致；
+    返回 `[N,3]`，y 分量保持 previous root 的 ground height。
+    """
+
+    prev_pos = np.asarray(prev_root_pos_world, dtype=np.float64)
+    prev_yaw = np.asarray(prev_root_yaw, dtype=np.float64)
+    delta_ref = np.asarray(root_delta_xz_ref, dtype=np.float64)
+    if prev_pos.shape[-1] != 3 or delta_ref.shape[-1] != 2:
+        raise ValueError(f"root integration shape 不匹配：prev={prev_pos.shape}, delta={delta_ref.shape}")
+    flat_prev = prev_pos.reshape(-1, 3)
+    flat_yaw = prev_yaw.reshape(-1)
+    flat_delta = delta_ref.reshape(-1, 2)
+    delta_3d = np.zeros((flat_delta.shape[0], 3), dtype=np.float64)
+    delta_3d[:, 0] = flat_delta[:, 0]
+    delta_3d[:, 2] = flat_delta[:, 1]
+    rotations = make_yaw_rotation_np(flat_yaw)
+    delta_world = np.einsum("ti,tji->tj", delta_3d, rotations)
+    result = flat_prev + delta_world
+    return result.reshape(prev_pos.shape).astype(np.float32)
+
+
+def derive_foot_contact(
+    joints_world: np.ndarray,
+    fps: float = 60.0,
+    height_threshold: float = 0.05,
+    speed_threshold: float = 0.05,
+) -> np.ndarray:
+    """
+    从 GT joints 派生左右脚接触标签 `[T,2]`。
+
+    `speed_threshold` 使用 m/frame 语义；保留 fps 参数是为了调用处能显式记录数据帧率。
+    """
+
+    del fps
+    joints = np.asarray(joints_world, dtype=np.float64)
+    if joints.ndim != 3 or joints.shape[1:] != (24, 3):
+        raise ValueError(f"joints_world 应为 [T,24,3]，实际为 {joints.shape}")
+    foot_indices = [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]]
+    foot_pos = joints[:, foot_indices]
+    velocity_xz = np.zeros((joints.shape[0], 2), dtype=np.float64)
+    if joints.shape[0] > 1:
+        velocity_xz[1:] = np.linalg.norm(foot_pos[1:, :, [0, 2]] - foot_pos[:-1, :, [0, 2]], axis=-1)
+    low = foot_pos[:, :, 1] < float(height_threshold)
+    still = velocity_xz < float(speed_threshold)
+    return (low & still).astype(np.float32)
+
+
 def rotation_6d_forward_up_np(rotations: np.ndarray) -> np.ndarray:
     forward = rotations[..., :, 2]
     up = rotations[..., :, 1]

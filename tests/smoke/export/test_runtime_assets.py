@@ -6,13 +6,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    get_schema_spec,
+)
 from export.export_sentis_denoiser import validate_normalizer_export_contract
 from export.write_unity_runtime_assets import build_normalizer, write_runtime_assets
 
 
 def test_runtime_assets_are_realtime_pose_only(tmp_path):
-    assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False)
+    assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False, schema_name=REALTIME_POSE_SCHEMA_NAME)
     schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
     assert schema["schemaName"] == REALTIME_POSE_SCHEMA_NAME
     assert schema["featureDim"] == REALTIME_POSE_INPUT_DIM
@@ -38,6 +44,7 @@ def test_realtime_normalizer_requires_206_dimensions(tmp_path):
         normalizer_dir=normalizer_dir,
         normalize_input=True,
         strict=True,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
     )
     assert payload["enabled"] is True
     assert payload["featureDim"] == REALTIME_POSE_INPUT_DIM
@@ -51,7 +58,19 @@ def test_normalized_runtime_asset_export_requires_normalizer_dir():
             normalizer_dir=None,
             normalize_input=True,
             strict=False,
+            schema_name=REALTIME_POSE_SCHEMA_NAME,
         )
+
+
+def test_runtime_assets_default_to_v2_contact(tmp_path):
+    schema_spec = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False)
+    schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
+    assert schema["schemaName"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+    assert schema["featureDim"] == schema_spec.feature_dim
+    assert schema["targetFeatureLength"] == schema_spec.target_dim
+    assert schema["rootDeltaXZReference"]["start"] == schema_spec.root_delta_xz_start
+    assert schema["footContact"]["start"] == schema_spec.foot_contact_start
 
 
 def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():

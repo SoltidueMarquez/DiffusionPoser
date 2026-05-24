@@ -10,7 +10,7 @@ import torch
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_to_realtime_pose import build_realtime_pose_features
 from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
-from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
+from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main, read_source_entries
 from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
@@ -19,12 +19,14 @@ from data_loaders.realtime_pose_dataset import (
     load_realtime_task_arrays,
 )
 from data_loaders.sensor_masking import (
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     HIP_TRACKER_INDEX,
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
+    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     SENSOR_VALID_DIM,
     SENSOR_VALID_START,
     TRACKER_PATTERN_CATEGORIES,
@@ -47,7 +49,7 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     rotations[..., 2, 2] = 1.0
     motion.joint_rotations = rotations
 
-    features = build_realtime_pose_features(motion)
+    features = build_realtime_pose_features(motion, schema_name=REALTIME_POSE_SCHEMA_NAME)
     assert features["body_pose_parent_6d"].shape == (4, 144)
     assert features["root_pos_world"].shape == (4, 3)
     assert features["root_yaw_delta_sincos"].shape == (4, 2)
@@ -55,6 +57,74 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     assert features["tracker_rot_world_6d"].shape == (4, 6, 6)
     assert features["joints_world"].shape == (4, 24, 3)
     assert "contact" not in features
+
+
+def test_converter_cli_defaults_to_current_recommended_schema():
+    args = amass_converter.parse_args([])
+    assert args.schema == DEFAULT_REALTIME_POSE_SCHEMA_NAME
+
+
+def test_converter_reuses_existing_source_to_build_v2_without_smpl(monkeypatch, tmp_path):
+    amass_dir = tmp_path / "AMASS"
+    reuse_dir = tmp_path / "reuse_v1"
+    output_dir = tmp_path / "converted_v2"
+    fake_amass_path = amass_dir / "ACCAD" / "toy_realtime.npz"
+    fake_amass_path.parent.mkdir(parents=True)
+    fake_amass_path.write_bytes(b"reuse path does not load this file")
+
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    for key in ("root_delta_xz_ref", "root_height", "foot_contact"):
+        source.pop(key)
+    reuse_path = reuse_dir / "ACCAD" / "toy_realtime.npz"
+    reuse_path.parent.mkdir(parents=True)
+    np.savez(reuse_path, **source)
+
+    def fail_smpl(*args, **kwargs):
+        raise AssertionError("reuse path should not run SMPL forward")
+
+    monkeypatch.setattr(amass_converter, "run_smpl_forward", fail_smpl)
+    args = SimpleNamespace(
+        amass_dir=amass_dir,
+        output_dir=output_dir,
+        target_fps=60.0,
+        batch_size=1,
+        schema=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        reuse_source_dir=reuse_dir,
+        skip_existing=False,
+        overwrite=True,
+    )
+    record = amass_converter.convert_one_motion(
+        path=fake_amass_path,
+        args=args,
+        model_cache=object(),
+        mirror_variant=False,
+    )
+    assert record["status"] == "reused_source"
+    with np.load(output_dir / "ACCAD" / "toy_realtime.npz", allow_pickle=False) as data:
+        assert "root_delta_xz_ref" in data.files
+        assert "root_height" in data.files
+        assert "foot_contact" in data.files
+        metadata = json.loads(str(data["metadata"].item()))
+    assert metadata["schema_name"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+
+
+def test_source_manifest_reused_entries_are_usable(tmp_path):
+    source_dir = tmp_path / "converted"
+    source_path = source_dir / "ACCAD" / "toy_realtime.npz"
+    source_path.parent.mkdir(parents=True)
+    np.savez(source_path, **build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN))
+    manifest_entry = {
+        "status": "reused_source",
+        "output_path": "ACCAD/toy_realtime.npz",
+        "source_relative_path": "ACCAD/toy_realtime.npz",
+        "stablemotion_split_key": "ACCAD/toy_realtime",
+        "frames": REALTIME_POSE_SEQ_LEN,
+    }
+    with (source_dir / "manifest.jsonl").open("w", encoding="utf-8") as file:
+        file.write(json.dumps(manifest_entry, ensure_ascii=False) + "\n")
+    entries = read_source_entries(source_dir)
+    assert len(entries) == 1
+    assert entries[0]["source_path"] == str(source_path)
 
 
 def test_fk_reconstructs_pelvis_from_ground_root_offset():
@@ -103,6 +173,8 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
             "train",
             "--samples_per_file",
             "2",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -125,6 +197,65 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
         assert not task["inpaint_mask"][:, REALTIME_POSE_TARGET_DIM:].any()
 
 
+def test_task_generator_skips_short_sources_by_default(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN - 3)
+
+    counts = generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(output_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "2",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+
+    assert counts["train"] == 0
+    assert (output_dir / "train" / "manifest.jsonl").read_text(encoding="utf-8") == ""
+    report_path = output_dir / "train" / "skipped_short_sources.jsonl"
+    records = [json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["source_frames"] == REALTIME_POSE_SEQ_LEN - 3
+    assert records[0]["required_frames"] == REALTIME_POSE_SEQ_LEN
+
+
+def test_task_generator_strict_short_source_policy_raises(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN - 3)
+
+    with pytest.raises(ValueError, match="至少需要"):
+        generate_realtime_pose_tasks_main(
+            [
+                "--source_dir",
+                str(source_dir),
+                "--output_dir",
+                str(output_dir),
+                "--splits",
+                "train",
+                "--samples_per_file",
+                "1",
+                "--schema",
+                REALTIME_POSE_SCHEMA_NAME,
+                "--split_dir",
+                "",
+                "--short_source_policy",
+                "error",
+                "--overwrite",
+            ]
+        )
+
+
 def test_task_generator_default_split_filter_rejects_unmatched_source(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
@@ -141,6 +272,8 @@ def test_task_generator_default_split_filter_rejects_unmatched_source(tmp_path):
                 "train",
                 "--samples_per_file",
                 "1",
+                "--schema",
+                REALTIME_POSE_SCHEMA_NAME,
                 "--overwrite",
             ]
         )
@@ -197,6 +330,8 @@ def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(t
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--mask_policy",
@@ -233,6 +368,8 @@ def test_dataset_outputs_206_by_61_and_reference_uses_previous_yaw(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -275,6 +412,8 @@ def test_dataset_dynamic_tracker_mask_samples_legal_categories(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -316,6 +455,8 @@ def test_dataset_dynamic_mask_and_augmentation_are_seed_reproducible(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -354,6 +495,47 @@ def test_dataset_dynamic_mask_and_augmentation_are_seed_reproducible(tmp_path):
     assert any(not np.allclose(item_a[2], item_c[2]) for item_a, item_c in zip(seq_a, seq_c))
 
 
+def test_dataset_history_condition_corruption_only_indexes_history_frames(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(output_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+
+    dataset = RealtimePoseTaskDataset(
+        output_dir,
+        split="train",
+        normalize_input=False,
+        history_pose_dropout_prob=1.0,
+        history_pose_replace_prob=1.0,
+        history_yaw_replace_prob=1.0,
+        history_root_yaw_drift_std=0.01,
+    )
+    item = dataset[0]
+
+    conditioned = item["conditioned_x"].numpy()
+    clean = item["x"].numpy()
+    assert conditioned.shape[1] == REALTIME_POSE_SEQ_LEN
+    assert np.allclose(conditioned[:144, :REALTIME_POSE_TARGET_START], 0.0)
+    assert not np.allclose(clean[:144, :REALTIME_POSE_TARGET_START], 0.0)
+    assert np.allclose(conditioned[:REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START], 0.0)
+
+
 def test_dataset_fixed_tracker_mask_is_reproducible_and_zero_fills_invalid_channels(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
@@ -368,6 +550,8 @@ def test_dataset_fixed_tracker_mask_is_reproducible_and_zero_fills_invalid_chann
             "test",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -419,6 +603,7 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             output_dir=str(normalizer_dir),
             split_dir="",
             split="train",
+            schema=REALTIME_POSE_SCHEMA_NAME,
             eps=1e-8,
             overwrite=True,
         )
@@ -433,6 +618,8 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             "train",
             "--samples_per_file",
             "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
