@@ -16,7 +16,7 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
-from utils.normalizer import RealtimePoseNormalizer
+from utils.normalizer import REALTIME_POSE_MIN_NORMALIZER_STD, RealtimePoseNormalizer
 
 
 def test_v2_contact_feature_layout_and_root_integration():
@@ -80,6 +80,23 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
     assert "target_foot_contact" in item
     assert item["target_tracker_pos_ref"].shape == (6, 3)
     assert item["target_sensor_valid"].shape == (6,)
+
+
+def test_realtime_normalizer_does_not_amplify_near_constant_channels(tmp_path):
+    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    mean = torch.zeros(schema.feature_dim)
+    std = torch.ones(schema.feature_dim)
+    std[0] = REALTIME_POSE_MIN_NORMALIZER_STD / 10.0
+    normalizer = RealtimePoseNormalizer(tmp_path / "meta", disable=True, schema_name=schema.name)
+    normalizer.save(mean, std)
+
+    loaded = RealtimePoseNormalizer(tmp_path / "meta", schema_name=schema.name)
+    assert float(loaded.std[0]) == 1.0
+    features = torch.zeros(1, schema.feature_dim)
+    features[0, 0] = 1e-4
+    normalized = loaded.normalize(features)
+    assert torch.isfinite(normalized).all()
+    assert float(normalized[0, 0]) < 1e-3
 
 
 def test_predicted_history_cache_requires_normalized_feature_space(tmp_path):

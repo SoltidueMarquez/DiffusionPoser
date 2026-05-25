@@ -66,7 +66,14 @@ class TrainLoop:
         self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
 
-        self.scaler = GradScaler("cuda", enabled=self.device.type == "cuda")
+        self.amp_dtype = self._select_amp_dtype()
+        self.scaler = GradScaler(
+            "cuda",
+            enabled=self.device.type == "cuda" and self.amp_dtype == torch.float16,
+            init_scale=1024.0,
+        )
+        if self.device.type == "cuda":
+            logger.log(f"amp dtype: {self.amp_dtype}, grad scaler enabled: {self.scaler.is_enabled()}")
         self.opt = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
         if self.resume_step:
@@ -77,6 +84,15 @@ class TrainLoop:
             self._load_ema_state()
 
     # region 初始化与恢复
+    def _select_amp_dtype(self) -> torch.dtype:
+        """CUDA 上优先使用 bf16，避免 realtime_pose 几何辅助 loss 在 fp16 下溢出。"""
+
+        if self.device.type != "cuda":
+            return torch.float32
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
     def _load_feature_weights(self, args):
         if not args.weighted_loss:
             return None
@@ -243,7 +259,7 @@ class TrainLoop:
     def forward_backward(self, batch):
         self.opt.zero_grad(set_to_none=True)
 
-        with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.device.type == "cuda"):
+        with autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.device.type == "cuda"):
             for i in range(0, batch["x"].shape[0], self.microbatch):
                 # 当前保持整 batch 训练，后续如果 batch 很大再引入 microbatch 梯度累积。
                 assert i == 0
@@ -273,6 +289,7 @@ class TrainLoop:
                     use_l1=self.use_l1,
                 )
                 loss = losses["loss"].mean()
+                validate_finite_losses(losses=losses, loss=loss, batch=batch)
                 log_loss_dict(self.diffusion, timesteps, losses)
                 self.scaler.scale(loss).backward()
 
@@ -495,3 +512,25 @@ def log_loss_dict(diffusion, timesteps, losses):
         for timestep, loss in zip(timesteps.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * timestep / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", float(loss))
+
+
+def validate_finite_losses(losses: dict, loss: torch.Tensor, batch: dict) -> None:
+    """训练中一旦出现 NaN/Inf 立即停止，避免继续写出不可用日志和 checkpoint。"""
+
+    bad_terms = []
+    for key, values in losses.items():
+        if torch.is_tensor(values) and not torch.isfinite(values).all():
+            bad_terms.append(key)
+    if torch.isfinite(loss).all() and not bad_terms:
+        return
+
+    keyids = batch.get("keyid", [])
+    if isinstance(keyids, (list, tuple)):
+        keyid_preview = [str(value) for value in keyids[:3]]
+    else:
+        keyid_preview = [str(keyids)]
+    raise FloatingPointError(
+        "训练 loss 出现 NaN/Inf；"
+        f"bad_terms={bad_terms or ['loss']}; "
+        f"keyid_preview={keyid_preview}"
+    )

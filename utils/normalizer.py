@@ -12,17 +12,23 @@ from data_loaders.sensor_masking import (
 )
 
 
+REALTIME_POSE_MIN_NORMALIZER_STD = 1e-4
+
+
 def enforce_realtime_pose_normalizer_contract(
     mean: torch.Tensor,
     std: torch.Tensor,
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """固定 sensor_valid/contact 为条件标签，避免标准化破坏二值语义。"""
+    """固定二值条件和近常量通道的尺度，避免标准化把微小数值噪声放大到 fp16 溢出。"""
 
     schema = get_schema_spec(schema_name)
     mean = mean.float().flatten().clone()
     std = std.float().flatten().clone()
     if mean.numel() == schema.feature_dim and std.numel() == schema.feature_dim:
+        # AMASS 转换里会出现理论恒定的旋转/位置通道，统计 std 可能接近 1e-8。
+        # 这些通道按原始物理尺度训练更稳定，否则会把 1e-4 级噪声放大成上万。
+        std[std < REALTIME_POSE_MIN_NORMALIZER_STD] = 1.0
         sensor_slice = schema.sensor_valid_slice()
         mean[sensor_slice] = 0.0
         std[sensor_slice] = 1.0

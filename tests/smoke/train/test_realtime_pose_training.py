@@ -11,7 +11,7 @@ from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_S
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.diffusionposer_dit import DiffusionPoserDiT
-from train.training_loop import TrainLoop
+from train.training_loop import TrainLoop, validate_finite_losses
 from utils import dist_util
 from tests.smoke.realtime_pose_fixtures import write_toy_source_dataset
 
@@ -105,6 +105,16 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         "sensor_reprojection_pos_loss",
     }.issubset(losses)
     losses["loss"].mean().backward()
+
+
+def test_training_loss_nan_fails_fast():
+    losses = {
+        "loss": torch.tensor([float("nan")]),
+        "simple_loss": torch.tensor([1.0]),
+        "fk_loss": torch.tensor([float("inf")]),
+    }
+    with pytest.raises(FloatingPointError, match="bad_terms"):
+        validate_finite_losses(losses=losses, loss=losses["loss"].mean(), batch={"keyid": ["bad_task"]})
 
 
 class NoopPlatform:
