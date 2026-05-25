@@ -17,7 +17,7 @@ from data_loaders.sensor_masking import (
 
 
 def train_args():
-    parser = ArgumentParser(description="Train a realtime_pose_v1 diffusion reconstruction model.")
+    parser = ArgumentParser(description="Train a realtime_pose_v2 diffusion reconstruction model.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -74,7 +74,7 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     group.add_argument("--data_dir", required=True, type=str, help="realtime_pose materialized task 目录。")
     group.add_argument("--data_split", default="train", type=str)
-    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_60hz", type=str)
+    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_v2_60hz", type=str)
     group.add_argument("--normalize_input", default=True, type=str2bool)
     group.add_argument("--preload_data", default=False, type=str2bool)
     group.add_argument("--input_feats", default=default_schema.feature_dim, type=int)

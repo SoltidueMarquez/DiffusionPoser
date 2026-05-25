@@ -35,7 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert = parser.add_argument_group("convert")
     convert.add_argument("--skip_convert", action="store_true")
     convert.add_argument("--rebuild_source", action="store_true")
-    convert.add_argument("--reuse_source_dir", default="dataset/AMASS_realtime_pose_60hz", type=str)
+    convert.add_argument("--reuse_source_dir", default="", type=str)
     convert.add_argument("--target_fps", default=60.0, type=float)
     convert.add_argument("--convert_batch_size", default=256, type=int)
     convert.add_argument("--convert_limit", default=0, type=int)

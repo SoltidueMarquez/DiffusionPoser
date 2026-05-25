@@ -56,7 +56,9 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     assert features["tracker_pos_world"].shape == (4, 6, 3)
     assert features["tracker_rot_world_6d"].shape == (4, 6, 6)
     assert features["joints_world"].shape == (4, 24, 3)
-    assert "contact" not in features
+    assert features["root_delta_xz_ref"].shape == (4, 2)
+    assert features["root_height"].shape == (4, 1)
+    assert features["foot_contact"].shape == (4, 2)
 
 
 def test_converter_cli_defaults_to_current_recommended_schema():
@@ -64,20 +66,17 @@ def test_converter_cli_defaults_to_current_recommended_schema():
     assert args.schema == DEFAULT_REALTIME_POSE_SCHEMA_NAME
 
 
-def test_converter_reuses_existing_source_to_build_v2_without_smpl(monkeypatch, tmp_path):
+def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path):
     amass_dir = tmp_path / "AMASS"
-    reuse_dir = tmp_path / "reuse_v1"
+    reuse_dir = tmp_path / "reuse_v2"
     output_dir = tmp_path / "converted_v2"
     fake_amass_path = amass_dir / "ACCAD" / "toy_realtime.npz"
     fake_amass_path.parent.mkdir(parents=True)
     fake_amass_path.write_bytes(b"reuse path does not load this file")
 
-    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
-    for key in ("root_delta_xz_ref", "root_height", "foot_contact"):
-        source.pop(key)
     reuse_path = reuse_dir / "ACCAD" / "toy_realtime.npz"
     reuse_path.parent.mkdir(parents=True)
-    np.savez(reuse_path, **source)
+    np.savez(reuse_path, **build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN))
 
     def fail_smpl(*args, **kwargs):
         raise AssertionError("reuse path should not run SMPL forward")
@@ -354,7 +353,7 @@ def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(t
         assert (sensor_valid.sum(axis=1) >= 3).all()
 
 
-def test_dataset_outputs_206_by_61_and_reference_uses_previous_yaw(tmp_path):
+def test_dataset_outputs_schema_dim_by_61_and_reference_uses_previous_yaw(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
     write_toy_source_dataset(source_dir)
@@ -386,16 +385,24 @@ def test_dataset_outputs_206_by_61_and_reference_uses_previous_yaw(tmp_path):
     task = dataset.load_task(0, entry)
     arrays = load_realtime_task_arrays(task, seq_len=REALTIME_POSE_SEQ_LEN)
     base = encode_realtime_pose_features(arrays)
+    schema = dataset.schema
+    tracker_slice = slice(schema.tracker_pos_slice().start, schema.tracker_rot_slice().stop)
     changed_current = {key: value.copy() for key, value in arrays.items()}
     changed_current["root_yaw"][REALTIME_POSE_TARGET_START] += 1.0
     current_encoded = encode_realtime_pose_features(changed_current)
-    np.testing.assert_allclose(base[REALTIME_POSE_TARGET_START, 146:200], current_encoded[REALTIME_POSE_TARGET_START, 146:200])
+    np.testing.assert_allclose(
+        base[REALTIME_POSE_TARGET_START, tracker_slice],
+        current_encoded[REALTIME_POSE_TARGET_START, tracker_slice],
+    )
 
     changed_prev = {key: value.copy() for key, value in arrays.items()}
     changed_prev["root_yaw"][REALTIME_POSE_TARGET_START - 1] += 1.0
     prev_encoded = encode_realtime_pose_features(changed_prev)
     with pytest.raises(AssertionError):
-        np.testing.assert_allclose(base[REALTIME_POSE_TARGET_START, 146:200], prev_encoded[REALTIME_POSE_TARGET_START, 146:200])
+        np.testing.assert_allclose(
+            base[REALTIME_POSE_TARGET_START, tracker_slice],
+            prev_encoded[REALTIME_POSE_TARGET_START, tracker_slice],
+        )
 
 
 def test_dataset_dynamic_tracker_mask_samples_legal_categories(tmp_path):

@@ -16,13 +16,13 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
-    TASK_FORMAT_REALTIME_POSE_V1,
     TASK_MODE_REALTIME_POSE,
     TRACKER_NAMES,
     TRACKER_PATTERN_CATEGORIES,
     TASK_MASK_POLICY_FIXED_PATTERNS,
     TASK_MASK_POLICY_FULL,
     create_realtime_inpaint_mask,
+    get_schema_spec,
     make_tracker_pattern,
     repeat_pattern_sensor_valid,
     validate_sensor_valid,
@@ -87,6 +87,7 @@ def file_stat_payload(path: Path) -> dict[str, Any]:
 
 
 def load_task_npz(path: Path) -> dict[str, np.ndarray]:
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     with np.load(path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
     required = {
@@ -105,9 +106,13 @@ def load_task_npz(path: Path) -> dict[str, np.ndarray]:
         "source_frames",
         "seq_len",
     }
+    if schema.supports_root_motion:
+        required.update({"root_delta_xz_ref", "root_height"})
+    if schema.supports_contact:
+        required.add("foot_contact")
     missing = sorted(required.difference(task))
     if missing:
-        raise KeyError(f"{path} missing realtime_pose_v1 task fields: {missing}")
+        raise KeyError(f"{path} missing realtime_pose_v2 task fields: {missing}")
     validate_realtime_motion_arrays(task, path)
     validate_sensor_valid(task["sensor_valid"])
     return task
@@ -120,6 +125,7 @@ def load_stream_npz(path: Path) -> dict[str, np.ndarray]:
 
 
 def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path | None = None) -> None:
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     label = f"{path} " if path else ""
     frame_count = int(np.asarray(payload["body_pose_parent_6d"]).shape[0])
     expected = {
@@ -132,6 +138,11 @@ def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path |
         "joints_world": (frame_count, 24, 3),
         "joint_offsets_parent": (24, 3),
     }
+    if schema.supports_root_motion:
+        expected["root_delta_xz_ref"] = (frame_count, 2)
+        expected["root_height"] = (frame_count, 1)
+    if schema.supports_contact:
+        expected["foot_contact"] = (frame_count, 2)
     for key, shape in expected.items():
         if key not in payload:
             raise KeyError(f"{label}missing `{key}`")
@@ -183,7 +194,7 @@ def build_realtime_pose_frames(
             }
         )
     return {
-        "schema_name": "realtime_pose_studio_frames_v1",
+        "schema_name": "realtime_pose_studio_frames_v2",
         "asset_id": asset_id,
         "track_id": track_id,
         "start": int(start),
@@ -206,6 +217,7 @@ def write_realtime_task_dataset(
     request: dict[str, Any],
 ) -> dict[str, Any]:
     validate_realtime_motion_arrays(source)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     frame_count = int(source["body_pose_parent_6d"].shape[0])
     target_frames = resolve_target_frames(request=request, frame_count=frame_count)
     split = safe_token(str(request.get("split") or "train"), fallback="train")
@@ -239,7 +251,7 @@ def write_realtime_task_dataset(
                     compress=False,
                     **clip,
                     sensor_valid=sensor_valid,
-                    inpaint_mask=create_realtime_inpaint_mask(),
+                    inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
                     start_frame=np.int64(start_frame),
                     valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
                     source_frames=np.int64(frame_count),
@@ -256,9 +268,9 @@ def write_realtime_task_dataset(
                     "valid_length": REALTIME_POSE_SEQ_LEN,
                     "source_frames": frame_count,
                     "seq_len": REALTIME_POSE_SEQ_LEN,
-                    "feature_dim": REALTIME_POSE_INPUT_DIM,
-                    "task_format": TASK_FORMAT_REALTIME_POSE_V1,
-                    "schema_name": REALTIME_POSE_SCHEMA_NAME,
+                    "feature_dim": schema.feature_dim,
+                    "task_format": schema.task_format,
+                    "schema_name": schema.name,
                     "task_mode": TASK_MODE_REALTIME_POSE,
                     "target_start": REALTIME_POSE_TARGET_START,
                     "target_length": REALTIME_POSE_TARGET_LENGTH,
@@ -271,7 +283,7 @@ def write_realtime_task_dataset(
                 tasks.append({"task_id": task_id, "target_frame": int(target_frame), "task_path": str(task_path)})
 
     dataset_index = {
-        "schema_name": "realtime_pose_studio_export_v1",
+        "schema_name": "realtime_pose_studio_export_v2",
         "created_at": utc_now(),
         "export_dir": str(export_dir),
         "split": split,

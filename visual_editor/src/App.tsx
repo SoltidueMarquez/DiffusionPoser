@@ -149,12 +149,12 @@ function buildAssetPresets(asset: MotionAsset | undefined): ContextPreset[] {
   };
 
   if (asset.kind === "source") {
-    pushPreset("realtime_source", "Realtime Source", "Show realtime_pose_v1 converted source motion.", [makePaneFromTrack(asset, "realtime_source", "Source")]);
+    pushPreset("realtime_source", "Realtime Source", "Show realtime_pose_v2 converted source motion.", [makePaneFromTrack(asset, "realtime_source", "Source")]);
     return presets;
   }
 
   if (asset.kind === "task") {
-    pushPreset("task_reference", "Task Reference", "Show realtime_pose_v1 materialized task.", [makePaneFromTrack(asset, "task_reference", "Task Reference")]);
+    pushPreset("task_reference", "Task Reference", "Show realtime_pose_v2 materialized task.", [makePaneFromTrack(asset, "task_reference", "Task Reference")]);
     return presets;
   }
 
@@ -441,7 +441,7 @@ export function App() {
     try {
       const track = activeTrack;
       if (!track?.compatible_realtime_pose) {
-        throw new Error("Active track is not realtime_pose_v1 exportable");
+        throw new Error("Active track is not realtime_pose_v2 exportable");
       }
       const position = positionText.split(",").map((part) => Number(part.trim()));
       if (position.length !== 3 || position.some((part) => !Number.isFinite(part))) {

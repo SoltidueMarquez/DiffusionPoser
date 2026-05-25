@@ -130,7 +130,7 @@ class RealtimePoseTaskDataset(Dataset):
         if folder_path:
             self.entries = filter_entries_by_folder_path(self.entries, folder_path=folder_path)
         if not self.entries:
-            raise RuntimeError(f"{self.manifest_path} 中没有可用 realtime_pose_v1 task。")
+            raise RuntimeError(f"{self.manifest_path} 中没有可用 realtime_pose task。")
 
         for entry in self.entries:
             if str(entry.get("schema_name", "")) != self.schema.name:
@@ -422,7 +422,7 @@ def find_manifest_path(data_dir: Path, split: str) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"找不到 realtime_pose_v1 manifest，已尝试：{', '.join(str(path) for path in candidates)}")
+    raise FileNotFoundError(f"找不到 realtime_pose manifest，已尝试：{', '.join(str(path) for path in candidates)}")
 
 
 def read_task_manifest(manifest_path: Path) -> list[dict]:
@@ -441,7 +441,7 @@ def load_materialized_task_npz(
 ) -> dict[str, np.ndarray]:
     path = manifest_dir / task_path
     if not path.exists():
-        raise FileNotFoundError(f"realtime_pose_v1 task 文件不存在：{path}")
+        raise FileNotFoundError(f"realtime_pose task 文件不存在：{path}")
     with np.load(path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
     required = {

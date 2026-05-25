@@ -63,7 +63,7 @@ class RealtimePoseNormalizer:
     def load(self) -> None:
         if not self.mean_path.exists() or not self.std_path.exists():
             raise FileNotFoundError(
-                "找不到 realtime_pose_v1 normalizer 文件，请先运行 "
+                "找不到 realtime_pose normalizer 文件，请先运行 "
                 "`python -m data_loaders.compute_realtime_pose_normalizer ...`。"
             )
         mean = torch.load(self.mean_path, map_location="cpu", weights_only=True).float().flatten()

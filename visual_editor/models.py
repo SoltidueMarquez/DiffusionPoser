@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_REALTIME_POSE_FPS = 60.0
-LIBRARY_CACHE_SCHEMA = "realtime_pose_studio_library_cache_v1"
-LIBRARY_CACHE_VERSION = 2
-EDIT_PROJECT_SCHEMA = "realtime_pose_studio_edit_project_v1"
-EDITED_DATASET_SCHEMA = "realtime_pose_studio_edited_dataset_v1"
+LIBRARY_CACHE_SCHEMA = "realtime_pose_studio_library_cache_v2"
+LIBRARY_CACHE_VERSION = 3
+EDIT_PROJECT_SCHEMA = "realtime_pose_studio_edit_project_v2"
+EDITED_DATASET_SCHEMA = "realtime_pose_studio_edited_dataset_v2"
 
 
 @dataclass

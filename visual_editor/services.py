@@ -56,7 +56,7 @@ class CompareService:
                 warnings.append(f"{label}: {type(exc).__name__}: {exc}")
             payload_panes.append({"pane_index": index, "label": label, "asset": asset.to_dict(), "track": track.to_dict(), **frame_payload})
         return {
-            "schema_name": "realtime_pose_studio_compare_frames_v1",
+            "schema_name": "realtime_pose_studio_compare_frames_v2",
             "start": int(start),
             "count": int(count),
             "fps": fps,
@@ -66,7 +66,7 @@ class CompareService:
 
 
 class EditService:
-    """轻量 task exporter。keyframe 编辑保留 API 外壳，导出时只生成 realtime_pose_v1 task。"""
+    """轻量 task exporter。keyframe 编辑保留 API 外壳，导出时只生成 realtime_pose_v2 task。"""
 
     def __init__(self, config: StudioConfig, decoder: MotionDecoder):
         self.config = config

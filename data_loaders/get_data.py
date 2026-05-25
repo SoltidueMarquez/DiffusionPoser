@@ -37,7 +37,7 @@ def get_dataset_loader(
     predicted_history_cache_dir: str | None = None,
     predicted_history_prob: float = 0.0,
 ):
-    """返回 realtime_pose_v1 训练 / 测试 DataLoader。"""
+    """返回 realtime_pose_v2 训练 / 测试 DataLoader。"""
 
     if not data_dir:
         raise ValueError("请提供 --data_dir，指向 data_loaders.generate_realtime_pose_tasks 生成的任务目录。")

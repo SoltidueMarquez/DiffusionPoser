@@ -53,6 +53,9 @@ class MotionDecoder:
                 "root_pos_world",
                 "root_yaw",
                 "root_yaw_delta_sincos",
+                "root_delta_xz_ref",
+                "root_height",
+                "foot_contact",
                 "tracker_pos_world",
                 "tracker_rot_world_6d",
                 "joints_world",
@@ -61,7 +64,7 @@ class MotionDecoder:
             return motion, task
         if track.data_key in {"reference_features", "conditioned_features", "reconstructed_features"}:
             raise ValueError("result feature tracks do not contain root/joint arrays for studio FK display yet")
-        raise ValueError(f"track is not realtime_pose_v1-compatible: {track.track_id}")
+        raise ValueError(f"track is not realtime_pose_v2-compatible: {track.track_id}")
 
     def load_result_track(self, track: MotionTrack) -> np.ndarray:
         payload = load_stream_npz(track.source_path)
@@ -72,4 +75,4 @@ class MotionDecoder:
     def mesh(self, *, asset_id: str, track_id: str, frame: int) -> dict[str, Any]:
         del frame
         self.get_track(asset_id, track_id)
-        raise ValueError("realtime_pose_v1 Studio 当前只提供 joints/tracker 帧数据，SMPL mesh 预览尚未接入。")
+        raise ValueError("realtime_pose_v2 Studio 当前只提供 joints/tracker 帧数据，SMPL mesh 预览尚未接入。")

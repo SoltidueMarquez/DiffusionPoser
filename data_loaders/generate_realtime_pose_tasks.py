@@ -14,7 +14,6 @@ from tqdm.auto import tqdm
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     MIN_VALID_TRACKERS,
-    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -70,8 +69,8 @@ class TaskGenerationPlan:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_60hz", type=str)
-    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_60hz_tasks", type=str)
+    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=str)
+    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_v2_60hz_tasks", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
 
     task = parser.add_argument_group("task")
@@ -474,7 +473,7 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
     )
 
 
-def load_realtime_source(path: Path, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
+def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
         required_keys = set(SOURCE_KEYS)

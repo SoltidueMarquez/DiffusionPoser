@@ -1,6 +1,6 @@
 # DiffusionPoser RealtimePose
 
-当前推荐主链路是 `realtime_pose_v2_contact`。`realtime_pose_v1` 仅保留为显式 legacy baseline，用于 rollout 诊断和对照；旧 X277/current277 数据、task、checkpoint、Unity schema 不兼容。
+当前主链路是 `realtime_pose_v2_contact`；旧 X277/current277 数据、task、checkpoint、Unity schema 不兼容。
 
 ## Schema 契约
 
@@ -8,7 +8,6 @@
 
 | schema | feature_dim | target_dim | target |
 | --- | ---: | ---: | --- |
-| `realtime_pose_v1` | 206 | 146 | pose + yaw |
 | `realtime_pose_v2_motion` | 209 | 149 | pose + yaw + root_delta_xz_ref + root_height |
 | `realtime_pose_v2_contact` | 211 | 151 | v2_motion + left/right foot contact |
 
@@ -37,7 +36,6 @@ conda run -n diffusionposer5070 python -m scripts.run_realtime_pose_pipeline `
   --amass_dir dataset/AMASS `
   --smpl_model_dir dataset/body_models `
   --source_dir dataset/AMASS_realtime_pose_v2_60hz `
-  --reuse_source_dir dataset/AMASS_realtime_pose_60hz `
   --normalizer_dir dataset/meta_AMASS_realtime_pose_v2_60hz `
   --task_dir dataset/AMASS_realtime_pose_v2_60hz_tasks `
   --save_dir runs/realtime_pose_v2_contact_target_dit `
@@ -47,7 +45,7 @@ conda run -n diffusionposer5070 python -m scripts.run_realtime_pose_pipeline `
   --overwrite
 ```
 
-`--reuse_source_dir` 会优先复用已有 v1/v2 source，快速派生 v2 的 `root_delta_xz_ref`、`root_height` 和 `foot_contact`，避免重复跑很慢的 SMPL forward。只有复用目录缺文件时才会回退到 AMASS+SMPL。
+`--reuse_source_dir` 只接受已经包含当前 schema 全部字段的 v2 source；默认不启用复用，避免把旧特征格式混入当前训练链路。
 
 如果前面步骤已经完成，可以用 `--start_at tasks` 或 `--start_at train` 从中间继续；只想检查将要执行的命令，用 `--dry_run`。如果确实要强制重跑 source SMPL forward，添加 `--rebuild_source`。
 
@@ -108,22 +106,20 @@ conda run -n diffusionposer5070 python -m train.train_diffusionposer `
 --predicted_history_cache_dir output/pred_history_cache --predicted_history_prob 0.25
 ```
 
-## Rollout Baseline
-
-v1 rollout 只作为显式 baseline：
+## Rollout
 
 ```powershell
 conda run -n diffusionposer5070 python -m sample.reconstruct_rollout `
-  --schema realtime_pose_v1 `
-  --model_path runs/realtime_pose_v1_train/model000050000.pt `
-  --data_dir dataset/AMASS_realtime_pose_60hz_tasks `
+  --schema realtime_pose_v2_contact `
+  --model_path runs/realtime_pose_v2_contact_target_dit/model000050000.pt `
+  --data_dir dataset/AMASS_realtime_pose_v2_60hz_tasks `
   --data_split test `
-  --normalizer_dir dataset/meta_AMASS_realtime_pose_60hz `
-  --output_dir output/realtime_pose_v1_rollout
+  --normalizer_dir dataset/meta_AMASS_realtime_pose_v2_60hz `
+  --output_dir output/realtime_pose_v2_rollout
 
 conda run -n diffusionposer5070 python -m eval.evaluate_realtime_pose_rollout `
-  --input_dir output/realtime_pose_v1_rollout `
-  --output_json output/realtime_pose_v1_rollout/rollout_eval_summary.json
+  --input_dir output/realtime_pose_v2_rollout `
+  --output_json output/realtime_pose_v2_rollout/rollout_eval_summary.json
 ```
 
 ## 导出

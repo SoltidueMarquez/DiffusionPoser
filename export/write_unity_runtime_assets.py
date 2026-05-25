@@ -64,7 +64,7 @@ def build_realtime_pose_feature_schema(
     if int(feature_dim) != schema.feature_dim:
         raise ValueError(f"{schema.name} featureDim 必须为 {schema.feature_dim}，实际为 {feature_dim}")
     if int(sequence_length) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"realtime_pose_v1 sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
+        raise ValueError(f"realtime_pose sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
 
     payload = {
         "schemaVersion": 1,

@@ -7,9 +7,10 @@ from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     BODY_POSE_START,
-    REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
     ROOT_YAW_DELTA_DIM,
     ROOT_YAW_DELTA_START,
+    get_schema_spec,
 )
 
 
@@ -20,13 +21,14 @@ def decode_realtime_pose_joints(
     joint_offsets_parent: np.ndarray,
 ) -> np.ndarray:
     """
-    用 realtime_pose_v1 的 `body_pose_parent_6d + root_yaw` 做轻量 FK。
-    输入特征为 `[T,206]`，输出 joints 为 `[T,24,3]`，供可视化和 smoke test 使用。
+    用 realtime_pose_v2 的 `body_pose_parent_6d + root_yaw` 做轻量 FK。
+    输入特征为 `[T,C]`，输出 joints 为 `[T,24,3]`，供可视化和 smoke test 使用。
     """
 
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     features = np.asarray(features, dtype=np.float32)
-    if features.ndim != 2 or features.shape[1] != REALTIME_POSE_INPUT_DIM:
-        raise ValueError(f"features 应为 [T,{REALTIME_POSE_INPUT_DIM}]，实际为 {features.shape}")
+    if features.ndim != 2 or features.shape[1] != schema.feature_dim:
+        raise ValueError(f"features 应为 [T,{schema.feature_dim}]，实际为 {features.shape}")
     pose = torch.from_numpy(features[:, BODY_POSE_START:BODY_POSE_START + BODY_POSE_DIM]).float()
     root_pos = torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)).float()
     yaw = torch.from_numpy(np.asarray(root_yaw, dtype=np.float32)).float()
@@ -47,7 +49,8 @@ def decode_root_yaw_from_delta(prev_root_yaw: float, root_yaw_delta_sincos: np.n
 
 
 def extract_target_yaw_delta(features: np.ndarray) -> np.ndarray:
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     features = np.asarray(features, dtype=np.float32)
-    if features.shape[-1] != REALTIME_POSE_INPUT_DIM:
-        raise ValueError(f"features 最后一维应为 {REALTIME_POSE_INPUT_DIM}，实际为 {features.shape[-1]}")
+    if features.shape[-1] != schema.feature_dim:
+        raise ValueError(f"features 最后一维应为 {schema.feature_dim}，实际为 {features.shape[-1]}")
     return features[..., ROOT_YAW_DELTA_START:ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM]

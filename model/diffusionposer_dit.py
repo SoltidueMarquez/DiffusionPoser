@@ -34,16 +34,16 @@ class SinusoidalTimestepEmbedding(nn.Module):
 
 class DiffusionPoserDiT(nn.Module):
     """
-    realtime_pose_v1 条件扩散去噪网络。
+    realtime_pose_v2 条件扩散去噪网络。
 
-    输入和输出均为 `[B, C, T]`，默认 `C=206, T<=61`。`inpaint_cond=True`
+    输入和输出均为 `[B, C, T]`，默认 `C=211, T<=61`。`inpaint_cond=True`
     的位置由扩散生成，False 的位置保持为观测条件。frame positional embedding
     用来告诉 Transformer token 在 61 帧窗口中的位置。
     """
 
     def __init__(
         self,
-        input_feats: int = 206,
+        input_feats: int = 211,
         latent_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,

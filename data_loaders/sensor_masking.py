@@ -5,12 +5,10 @@ from dataclasses import dataclass
 import numpy as np
 
 
-REALTIME_POSE_SCHEMA_NAME = "realtime_pose_v1"
-REALTIME_POSE_V1_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
 REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
 REALTIME_POSE_V2_CONTACT_SCHEMA_NAME = "realtime_pose_v2_contact"
-DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
-TASK_FORMAT_REALTIME_POSE_V1 = "materialized_realtime_pose_v1"
+REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
 TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
 TASK_FORMAT_REALTIME_POSE_V2_CONTACT = "materialized_realtime_pose_v2_contact"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
@@ -33,11 +31,6 @@ SENSOR_VALID_DIM = TRACKER_COUNT
 
 BODY_POSE_START = 0
 ROOT_YAW_DELTA_START = BODY_POSE_START + BODY_POSE_DIM
-TRACKER_POS_REF_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
-TRACKER_ROT_REF_START = TRACKER_POS_REF_START + TRACKER_POS_DIM
-SENSOR_VALID_START = TRACKER_ROT_REF_START + TRACKER_ROT_DIM
-REALTIME_POSE_INPUT_DIM = SENSOR_VALID_START + SENSOR_VALID_DIM
-REALTIME_POSE_TARGET_DIM = BODY_POSE_DIM + ROOT_YAW_DELTA_DIM
 
 V2_MOTION_ROOT_DELTA_XZ_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
 V2_MOTION_ROOT_HEIGHT_START = V2_MOTION_ROOT_DELTA_XZ_START + ROOT_DELTA_XZ_DIM
@@ -57,6 +50,11 @@ REALTIME_POSE_V2_CONTACT_INPUT_DIM = V2_CONTACT_SENSOR_VALID_START + SENSOR_VALI
 REALTIME_POSE_V2_CONTACT_TARGET_DIM = (
     BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM + FOOT_CONTACT_DIM
 )
+TRACKER_POS_REF_START = V2_CONTACT_TRACKER_POS_REF_START
+TRACKER_ROT_REF_START = V2_CONTACT_TRACKER_ROT_REF_START
+SENSOR_VALID_START = V2_CONTACT_SENSOR_VALID_START
+REALTIME_POSE_INPUT_DIM = REALTIME_POSE_V2_CONTACT_INPUT_DIM
+REALTIME_POSE_TARGET_DIM = REALTIME_POSE_V2_CONTACT_TARGET_DIM
 
 TRACKER_NAMES = (
     "head",
@@ -188,17 +186,6 @@ class SchemaSpec:
 
 
 SCHEMA_SPECS: dict[str, SchemaSpec] = {
-    REALTIME_POSE_V1_SCHEMA_NAME: SchemaSpec(
-        name=REALTIME_POSE_V1_SCHEMA_NAME,
-        task_format=TASK_FORMAT_REALTIME_POSE_V1,
-        feature_dim=REALTIME_POSE_INPUT_DIM,
-        target_dim=REALTIME_POSE_TARGET_DIM,
-        body_pose_start=BODY_POSE_START,
-        root_yaw_delta_start=ROOT_YAW_DELTA_START,
-        tracker_pos_ref_start=TRACKER_POS_REF_START,
-        tracker_rot_ref_start=TRACKER_ROT_REF_START,
-        sensor_valid_start=SENSOR_VALID_START,
-    ),
     REALTIME_POSE_V2_MOTION_SCHEMA_NAME: SchemaSpec(
         name=REALTIME_POSE_V2_MOTION_SCHEMA_NAME,
         task_format=TASK_FORMAT_REALTIME_POSE_V2_MOTION,
@@ -240,13 +227,13 @@ def get_schema_spec(schema_name: str | None) -> SchemaSpec:
 
 def validate_realtime_seq_len(seq_len: int) -> None:
     if int(seq_len) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"realtime_pose_v1 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {seq_len}")
+        raise ValueError(f"realtime_pose 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {seq_len}")
 
 
 def validate_realtime_target(target_start: int, target_length: int) -> None:
     if int(target_start) != REALTIME_POSE_TARGET_START or int(target_length) != REALTIME_POSE_TARGET_LENGTH:
         raise ValueError(
-            "realtime_pose_v1 固定只补全第 61 帧："
+            "realtime_pose 固定只补全第 61 帧："
             f"target_start={target_start}, target_length={target_length}"
         )
 
@@ -256,7 +243,7 @@ def validate_sensor_valid(sensor_valid: np.ndarray, min_valid_trackers: int = MI
     if valid.ndim != 2 or valid.shape[1] != TRACKER_COUNT:
         raise ValueError(f"sensor_valid 应为 [T, {TRACKER_COUNT}]，实际为 {valid.shape}")
     if not valid[:, HIP_TRACKER_INDEX].all():
-        raise ValueError("realtime_pose_v1 要求 waist/hip tracker 在所有帧都有效。")
+        raise ValueError("realtime_pose 要求 waist/hip tracker 在所有帧都有效。")
     counts = valid.sum(axis=1)
     if np.any(counts < int(min_valid_trackers)):
         first_bad = int(np.where(counts < int(min_valid_trackers))[0][0])

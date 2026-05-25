@@ -8,10 +8,8 @@ import torch
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
 from data_loaders.sensor_masking import (
-    REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
     TRACKER_MASK_POLICY_AUTO,
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
@@ -25,7 +23,7 @@ from utils.parser_util import add_base_options, add_data_options, add_diffusion_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample realtime_pose_v1 single-frame reconstruction tasks.")
+    parser = argparse.ArgumentParser(description="Sample realtime_pose_v2 single-frame reconstruction tasks.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -115,7 +113,7 @@ def save_reconstruction(
         "schema_name": np.asarray(schema_name),
         "feature_space": np.asarray("raw"),
         "input_feature_space": np.asarray("normalized" if has_normalizer else "raw"),
-        # 旧字段继续保留，但现在明确写 raw，避免评估默认落在归一化空间。
+        # 兼容已有评估读取字段，但现在明确写 raw，避免评估默认落在归一化空间。
         "reference_features": reference_raw,
         "conditioned_features": conditioned_raw,
         "reconstructed_features": reconstructed_raw,

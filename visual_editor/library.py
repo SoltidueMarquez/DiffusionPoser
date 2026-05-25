@@ -13,7 +13,7 @@ from visual_editor.realtime_pose import iter_jsonl, load_task_npz, stable_id
 
 
 class MotionLibrary:
-    """扫描 realtime_pose_v1 source、task 和 reconstruction result。"""
+    """扫描 realtime_pose_v2 source、task 和 reconstruction result。"""
 
     def __init__(self, config: StudioConfig):
         self.config = config
@@ -28,7 +28,7 @@ class MotionLibrary:
         assets.update(self.scan_results())
         self.assets = assets
         self.index_meta = {
-            "schema_name": "realtime_pose_studio_library_v1",
+            "schema_name": "realtime_pose_studio_library_v2",
             "source_dir": str(self.config.source_dir),
             "data_dir": str(self.config.data_dir),
             "result_dir": str(self.config.result_dir),
@@ -172,7 +172,7 @@ class MotionLibrary:
 
     def payload(self) -> dict[str, Any]:
         return {
-            "schema_name": "realtime_pose_studio_library_v1",
+            "schema_name": "realtime_pose_studio_library_v2",
             "index": self.index_meta,
             "assets": [asset.to_dict() for asset in self.assets.values()],
             "stats": {
@@ -186,7 +186,7 @@ class MotionLibrary:
 
 def default_compare_presets() -> list[ComparePreset]:
     return [
-        ComparePreset("realtime_source", "Realtime Source", 1, "Show converted realtime_pose_v1 source motion."),
-        ComparePreset("task_reference", "Task Reference", 1, "Show realtime_pose_v1 materialized task."),
+        ComparePreset("realtime_source", "Realtime Source", 1, "Show converted realtime_pose_v2 source motion."),
+        ComparePreset("task_reference", "Task Reference", 1, "Show realtime_pose_v2 materialized task."),
         ComparePreset("result", "Reconstruction Result", 3, "Compare reference, conditioned, and reconstructed tracks."),
     ]

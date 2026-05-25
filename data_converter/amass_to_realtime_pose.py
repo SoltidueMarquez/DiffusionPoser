@@ -1,8 +1,7 @@
 """
 把 AMASS SMPL/SMPL-H 动作转换为 realtime_pose 源数据。
 
-默认生成当前推荐的 `realtime_pose_v2_contact`；v1 legacy baseline 需要显式传
-`--schema realtime_pose_v1`。
+默认生成当前主链路 `realtime_pose_v2_contact`。
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
     parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
-    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_60hz", type=Path)
+    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=Path)
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--limit", default=0, type=int)
@@ -60,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow_partial", action="store_true")
     parser.add_argument("--reuse_source_dir", default="", type=Path)
     parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    # 复用旧 validate_args 所需字段；新 schema 不实际使用 contact/visualize 参数。
+    # 复用 shared validate_args 所需字段；当前转换链路不实际使用这些可视化参数。
     parser.add_argument("--height_threshold", default=0.04, type=float)
     parser.add_argument("--speed_threshold", default=0.15, type=float)
     parser.add_argument("--visualize", action="store_true")
@@ -79,7 +78,7 @@ def build_realtime_pose_features(
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     target_fps: float = 60.0,
 ) -> dict[str, np.ndarray]:
-    """构建 realtime_pose 源字段；v1 调用默认行为保持不变。"""
+    """构建 realtime_pose_v2 源字段。"""
 
     schema = get_schema_spec(schema_name)
     joint_positions = smpl_motion.joint_positions.astype(np.float64)
@@ -216,39 +215,14 @@ def reusable_source_path_for(path: Path, args: argparse.Namespace, mirror_varian
 def load_reusable_realtime_features(
     reuse_path: Path,
     schema_name: str,
-    target_fps: float,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    schema = get_schema_spec(schema_name)
     with np.load(reuse_path, allow_pickle=False) as data:
-        required = {
-            "body_pose_parent_6d",
-            "root_pos_world",
-            "root_yaw",
-            "root_yaw_delta_sincos",
-            "tracker_pos_world",
-            "tracker_rot_world_6d",
-            "joints_world",
-            "joint_offsets_parent",
-        }
+        required = required_source_fields(schema_name)
         missing = sorted(required.difference(data.files))
         if missing:
             raise KeyError(f"{reuse_path} 不能作为 realtime source 复用，缺少字段：{missing}")
         features = {key: np.asarray(data[key]).astype(np.float32, copy=True) for key in required}
         metadata = load_metadata_from_npz(data)
-
-    if schema.supports_root_motion:
-        features["root_delta_xz_ref"] = encode_root_delta_xz_ref(
-            root_pos_world=features["root_pos_world"],
-            root_yaw=features["root_yaw"],
-        )
-        features["root_height"] = features["joints_world"][:, JOINT_INDEX["pelvis"], 1:2].astype(np.float32)
-    if schema.supports_contact:
-        features["foot_contact"] = derive_foot_contact(
-            joints_world=features["joints_world"],
-            fps=float(target_fps),
-            height_threshold=0.05,
-            speed_threshold=0.05,
-        )
     return features, metadata
 
 
@@ -335,7 +309,6 @@ def reuse_realtime_source_file(
     features, metadata = load_reusable_realtime_features(
         reuse_path=reuse_path,
         schema_name=str(args.schema),
-        target_fps=float(args.target_fps),
     )
     save_reused_realtime_source(
         output_path=output_path,

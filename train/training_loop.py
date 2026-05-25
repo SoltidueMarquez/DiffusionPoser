@@ -10,10 +10,7 @@ from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
 from data_loaders.sensor_masking import (
-    REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_TARGET_DIM,
-    SENSOR_VALID_START,
     TASK_MODE_REALTIME_POSE,
     get_schema_spec,
 )
@@ -22,7 +19,7 @@ from utils import dist_util
 
 
 class TrainLoop:
-    """realtime_pose_v1 扩散训练循环。"""
+    """realtime_pose_v2 扩散训练循环。"""
 
     def __init__(self, args, train_platform, model, diffusion, data):
         self.args = args
@@ -136,7 +133,7 @@ class TrainLoop:
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if missing_keys or unexpected_keys:
             raise RuntimeError(
-                "checkpoint 与当前 realtime_pose_v1 模型结构不匹配，已停止恢复。"
+                "checkpoint 与当前 realtime_pose_v2 模型结构不匹配，已停止恢复。"
                 f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
             )
 
@@ -240,7 +237,7 @@ class TrainLoop:
         if not self.args.eval_during_training:
             return
         if not self._eval_skip_logged:
-            logger.log("训练期评估入口尚未接入 realtime_pose_v1 采样评估，本次训练跳过 --eval_during_training。")
+            logger.log("训练期评估入口尚未接入 realtime_pose_v2 采样评估，本次训练跳过 --eval_during_training。")
             self._eval_skip_logged = True
 
     def run_step(self, batch):
@@ -265,7 +262,7 @@ class TrainLoop:
                 assert i == 0
                 assert self.microbatch == self.batch_size
 
-                sample = batch["x"]  # [B, 206, 61]
+                sample = batch["x"]  # [B, C, 61]
                 batch_size, channels, seq_len = sample.shape
                 if channels != self.schema.feature_dim:
                     raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
@@ -314,7 +311,7 @@ class TrainLoop:
 
         inpaint_mask = batch.get("inpaint_mask")
         if inpaint_mask is None:
-            raise ValueError("训练 batch 缺少 inpaint_mask，请先生成 realtime_pose_v1 task。")
+            raise ValueError("训练 batch 缺少 inpaint_mask，请先生成 realtime_pose task。")
         inpaint_mask = inpaint_mask.bool()
         if inpaint_mask.shape != sample.shape:
             raise ValueError(f"inpaint_mask 应为 {tuple(sample.shape)}，实际为 {tuple(inpaint_mask.shape)}")

@@ -9,7 +9,6 @@ import torch
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
 from data_loaders.realtime_pose_kinematics import fk_parent_local_torch, integrate_root_delta_xz_ref
 from data_loaders.sensor_masking import (
-    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_TARGET_START,
     SchemaSpec,
     TRACKER_COUNT,
@@ -22,7 +21,7 @@ from utils.parser_util import add_base_options, add_data_options, add_diffusion_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run explicit realtime_pose_v1 rollout baseline.")
+    parser = argparse.ArgumentParser(description="Run realtime_pose_v2 rollout reconstruction.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -121,7 +120,7 @@ def rollout_dataset(
     limit: int = 0,
 ) -> dict[str, np.ndarray]:
     """
-    对 materialized windows 执行显式 rollout baseline。
+    对 materialized windows 执行显式 rollout 重建。
 
     输出按“每个窗口的 target 帧”组织为 `[1, N, ...]`，N 是处理过的窗口数。
     当后续窗口 history 覆盖到已经预测过的绝对帧时，会用预测 target slice 替换 GT history。
@@ -236,8 +235,6 @@ def save_rollout(path: Path, payload: dict[str, np.ndarray]) -> None:
 def main(argv: list[str] | None = None) -> dict[str, Path]:
     parser = build_arg_parser()
     args = parse_and_load_from_model(parser, argv=argv)
-    if args.schema != REALTIME_POSE_SCHEMA_NAME:
-        raise ValueError("reconstruct_rollout 当前只作为 v1 explicit baseline，请传 --schema realtime_pose_v1。")
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
     dataset = RealtimePoseTaskDataset(
@@ -260,7 +257,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         use_ddim=str(args.ts_respace).startswith("ddim"),
         limit=int(args.rollout_limit),
     )
-    output_dir = Path(args.output_dir or "output/realtime_pose_v1_rollout").resolve()
+    output_dir = Path(args.output_dir or "output/realtime_pose_v2_rollout").resolve()
     output_path = output_dir / "rollout_result.npz"
     save_rollout(output_path, payload)
     print(f"[reconstruct_rollout] weights={source} output={output_path}")

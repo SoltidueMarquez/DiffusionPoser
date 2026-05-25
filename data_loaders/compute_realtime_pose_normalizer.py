@@ -26,8 +26,8 @@ from utils.normalizer import RealtimePoseNormalizer
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compute realtime_pose mean/std normalizer from converted source data.")
     group = parser.add_argument_group("paths")
-    group.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_60hz", type=str)
-    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_60hz", type=str)
+    group.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=str)
+    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_v2_60hz", type=str)
     group.add_argument("--split_dir", default="data_loaders/splits", type=str)
 
     group = parser.add_argument_group("statistics")
@@ -68,7 +68,7 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, int 
         running_count += int(features.shape[0])
 
     if running_sum is None or running_sumsq is None or running_count <= 0:
-        raise RuntimeError("没有成功统计到有效帧，无法生成 realtime_pose_v1 normalizer。")
+        raise RuntimeError("没有成功统计到有效帧，无法生成 realtime_pose normalizer。")
 
     mean, std = finalize_mean_std(running_sum, running_sumsq, running_count, eps=float(args.eps))
     normalizer = RealtimePoseNormalizer(base_dir=output_dir, eps=float(args.eps), disable=True, schema_name=schema.name)
