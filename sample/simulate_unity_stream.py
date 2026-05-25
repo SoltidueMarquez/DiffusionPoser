@@ -248,11 +248,19 @@ class UnityStreamState:
     def has_full_history(self) -> bool:
         return len(self.history_raw) == REALTIME_POSE_TARGET_START
 
-    def make_initial_history_frame(self, tracker_feature_raw: np.ndarray, root_height: float = 0.0) -> np.ndarray:
+    def make_initial_history_frame(
+        self,
+        tracker_feature_raw: np.ndarray,
+        root_height: float = 0.0,
+        target_feature_raw: np.ndarray | None = None,
+    ) -> np.ndarray:
         frame = np.asarray(tracker_feature_raw, dtype=np.float32).copy()
-        frame[self.schema.target_slice()] = initial_target_feature(self.schema.name, root_height=root_height)[
-            self.schema.target_slice()
-        ]
+        target = (
+            initial_target_feature(self.schema.name, root_height=root_height)
+            if target_feature_raw is None
+            else np.asarray(target_feature_raw, dtype=np.float32)
+        )
+        frame[self.schema.target_slice()] = target[self.schema.target_slice()]
         return frame
 
     def append_warmup_frame(
@@ -260,10 +268,15 @@ class UnityStreamState:
         tracker_feature_raw: np.ndarray,
         root_pos_world: np.ndarray,
         root_height: float = 0.0,
+        target_feature_raw: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if self.current_root_pos_world is None:
             self.current_root_pos_world = np.asarray(root_pos_world, dtype=np.float32).copy()
-        history_frame = self.make_initial_history_frame(tracker_feature_raw, root_height=root_height)
+        history_frame = self.make_initial_history_frame(
+            tracker_feature_raw,
+            root_height=root_height,
+            target_feature_raw=target_feature_raw,
+        )
         self.history_raw.append(history_frame)
         self.last_output_raw = history_frame.copy()
         self.last_root_pos_world = self.current_root_pos_world.copy()
@@ -281,9 +294,15 @@ class UnityStreamState:
         tracker_feature_raw: np.ndarray,
         output_frame_raw: np.ndarray,
         root_pos_world: np.ndarray,
+        history_target_raw: np.ndarray | None = None,
     ) -> None:
         history_frame = np.asarray(tracker_feature_raw, dtype=np.float32).copy()
-        history_frame[self.schema.target_slice()] = np.asarray(output_frame_raw, dtype=np.float32)[self.schema.target_slice()]
+        target_source = (
+            np.asarray(output_frame_raw, dtype=np.float32)
+            if history_target_raw is None
+            else np.asarray(history_target_raw, dtype=np.float32)
+        )
+        history_frame[self.schema.target_slice()] = target_source[self.schema.target_slice()]
         self.history_raw.append(history_frame)
         self.last_output_raw = history_frame.copy()
         self.last_root_pos_world = np.asarray(root_pos_world, dtype=np.float32).copy()
@@ -293,6 +312,7 @@ class UnityStreamState:
         tracker_feature_raw: np.ndarray,
         predicted_frame_raw: np.ndarray,
         fallback_root_pos_world: np.ndarray,
+        history_target_raw: np.ndarray | None = None,
     ) -> np.ndarray:
         predicted = np.asarray(predicted_frame_raw, dtype=np.float32)
         prev_root_yaw = float(self.current_root_yaw)
@@ -315,7 +335,12 @@ class UnityStreamState:
             root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
 
         self.current_root_pos_world = root_pos.astype(np.float32)
-        self.append_output_frame(tracker_feature_raw, predicted, root_pos_world=self.current_root_pos_world)
+        self.append_output_frame(
+            tracker_feature_raw,
+            predicted,
+            root_pos_world=self.current_root_pos_world,
+            history_target_raw=history_target_raw,
+        )
         return self.current_root_pos_world.copy()
 
     def hold_output(self, tracker_feature_raw: np.ndarray, root_pos_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -348,8 +373,13 @@ def simulate_unity_stream(
     initial_root_yaw: float = 0.0,
     invalid_frame_policy: str = INVALID_FRAME_POLICY_HOLD,
     warmup_target_raw: np.ndarray | None = None,
+    history_features_raw: np.ndarray | None = None,
+    history_features_until_frame: int | None = None,
+    reference_root_yaw: np.ndarray | None = None,
+    reference_root_pos_world: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
+    frame_count = int(tracker_pos_world.shape[0])
     state = UnityStreamState(
         schema_name=schema.name,
         initial_root_yaw=initial_root_yaw,
@@ -358,6 +388,24 @@ def simulate_unity_stream(
     warmup_target = None if warmup_target_raw is None else np.asarray(warmup_target_raw, dtype=np.float32)
     if warmup_target is not None and warmup_target.shape != (schema.feature_dim,):
         raise ValueError(f"warmup_target_raw 应为 [{schema.feature_dim}]，实际为 {warmup_target.shape}")
+    history_features = None if history_features_raw is None else np.asarray(history_features_raw, dtype=np.float32)
+    if history_features is not None and history_features.shape != (frame_count, schema.feature_dim):
+        raise ValueError(
+            f"history_features_raw 应为 [{frame_count},{schema.feature_dim}]，实际为 {history_features.shape}"
+        )
+    history_until = (
+        frame_count
+        if history_features is not None and history_features_until_frame is None
+        else max(0, min(frame_count, int(history_features_until_frame or 0)))
+    )
+    reference_yaw = None if reference_root_yaw is None else np.asarray(reference_root_yaw, dtype=np.float32)
+    if reference_yaw is not None and reference_yaw.shape != (frame_count,):
+        raise ValueError(f"reference_root_yaw 应为 [{frame_count}]，实际为 {reference_yaw.shape}")
+    reference_root_pos = (
+        None if reference_root_pos_world is None else np.asarray(reference_root_pos_world, dtype=np.float32)
+    )
+    if reference_root_pos is not None and reference_root_pos.shape != (frame_count, 3):
+        raise ValueError(f"reference_root_pos_world 应为 [{frame_count},3]，实际为 {reference_root_pos.shape}")
 
     predicted_features = []
     conditioned_features = []
@@ -366,13 +414,27 @@ def simulate_unity_stream(
     validity_flags = []
     is_predicted = []
 
-    for frame_index in range(int(tracker_pos_world.shape[0])):
+    for frame_index in range(frame_count):
         frame_valid = np.asarray(sensor_valid[frame_index], dtype=bool)
         validity_ok = sensor_validity_ok(frame_valid)
         if not validity_ok and invalid_frame_policy == INVALID_FRAME_POLICY_RAISE:
             raise ValueError(f"第 {frame_index} 帧 tracker 有效性不满足运行时合约：{frame_valid.astype(int).tolist()}")
 
-        root_pos = estimate_root_pos_from_hip_tracker(tracker_pos_world[frame_index])
+        use_reference_history_frame = history_features is not None and frame_index < history_until
+        use_reference_state_frame = (
+            frame_index < history_until if history_features_until_frame is not None else True
+        )
+
+        if reference_yaw is not None and use_reference_state_frame:
+            state.current_root_yaw = float(reference_yaw[max(frame_index - 1, 0)])
+        if reference_root_pos is not None and use_reference_state_frame:
+            state.current_root_pos_world = reference_root_pos[max(frame_index - 1, 0)].copy()
+
+        root_pos = (
+            reference_root_pos[frame_index].copy()
+            if reference_root_pos is not None and use_reference_state_frame
+            else estimate_root_pos_from_hip_tracker(tracker_pos_world[frame_index])
+        )
         tracker_feature_raw = encode_unity_tracker_frame(
             tracker_pos_world=tracker_pos_world[frame_index],
             tracker_rot_world_6d=tracker_rot_world_6d[frame_index],
@@ -381,22 +443,40 @@ def simulate_unity_stream(
             schema_name=schema.name,
             root_pos_world=root_pos,
         )
+        history_target_raw = history_features[frame_index] if use_reference_history_frame else None
 
         if not state.has_full_history():
             predicted_frame_raw, output_root_pos = state.append_warmup_frame(
                 tracker_feature_raw=tracker_feature_raw,
                 root_pos_world=root_pos,
                 root_height=float(tracker_pos_world[frame_index, HIP_TRACKER_INDEX, 1]),
+                target_feature_raw=history_target_raw if history_target_raw is not None else warmup_target,
             )
-            if warmup_target is not None:
-                predicted_frame_raw[schema.target_slice()] = warmup_target[schema.target_slice()]
-                state.history_raw[-1][schema.target_slice()] = warmup_target[schema.target_slice()]
-                state.last_output_raw = state.history_raw[-1].copy()
+            if reference_yaw is not None and use_reference_state_frame:
+                state.current_root_yaw = float(reference_yaw[frame_index])
+            if reference_root_pos is not None and use_reference_state_frame:
+                output_root_pos = reference_root_pos[frame_index].copy()
+                state.current_root_pos_world = output_root_pos.copy()
             conditioned_frame_raw = tracker_feature_raw.copy()
             conditioned_frame_raw[schema.target_slice()] = 0.0
             frame_predicted = False
         elif not validity_ok:
-            predicted_frame_raw, output_root_pos = state.hold_output(tracker_feature_raw, root_pos_world=root_pos)
+            if history_target_raw is None:
+                predicted_frame_raw, output_root_pos = state.hold_output(tracker_feature_raw, root_pos_world=root_pos)
+            else:
+                predicted_frame_raw = tracker_feature_raw.copy()
+                predicted_frame_raw[schema.target_slice()] = history_target_raw[schema.target_slice()]
+                output_root_pos = root_pos.copy()
+                state.append_output_frame(
+                    tracker_feature_raw=tracker_feature_raw,
+                    output_frame_raw=predicted_frame_raw,
+                    root_pos_world=output_root_pos,
+                    history_target_raw=history_target_raw,
+                )
+                if reference_yaw is not None and use_reference_state_frame:
+                    state.current_root_yaw = float(reference_yaw[frame_index])
+                if reference_root_pos is not None and use_reference_state_frame:
+                    state.current_root_pos_world = output_root_pos.copy()
             conditioned_frame_raw = tracker_feature_raw.copy()
             conditioned_frame_raw[schema.target_slice()] = 0.0
             frame_predicted = False
@@ -423,6 +503,7 @@ def simulate_unity_stream(
                 tracker_feature_raw=tracker_feature_raw,
                 predicted_frame_raw=predicted_frame_raw,
                 fallback_root_pos_world=root_pos,
+                history_target_raw=history_target_raw,
             )
             frame_predicted = True
 

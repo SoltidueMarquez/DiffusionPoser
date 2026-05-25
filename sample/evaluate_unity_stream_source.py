@@ -36,6 +36,14 @@ from utils.parser_util import (
 )
 
 
+HISTORY_POSE_SOURCE_PREDICTED = "predicted"
+HISTORY_POSE_SOURCE_REFERENCE = "reference"
+HISTORY_POSE_SOURCE_CHOICES = (HISTORY_POSE_SOURCE_REFERENCE, HISTORY_POSE_SOURCE_PREDICTED)
+WARMUP_TARGET_SOURCE_FIRST_FRAME = "first_frame"
+WARMUP_TARGET_SOURCE_IDENTITY = "identity"
+WARMUP_TARGET_SOURCE_CHOICES = (WARMUP_TARGET_SOURCE_FIRST_FRAME, WARMUP_TARGET_SOURCE_IDENTITY)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a realtime_pose_v2_contact Unity stream against a long GT source.")
     add_base_options(parser)
@@ -51,6 +59,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     group.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--loop_count", default=1, type=int)
     group.add_argument("--initial_root_yaw", default=None, type=float)
+    group.add_argument(
+        "--history_pose_source",
+        default=HISTORY_POSE_SOURCE_REFERENCE,
+        choices=HISTORY_POSE_SOURCE_CHOICES,
+        type=str,
+        help="reference 表示只用长序列 GT 初始化前 60 帧 history，之后自回归；predicted 表示 warm-up 后全程自回归。",
+    )
+    group.add_argument(
+        "--warmup_target_source",
+        default=WARMUP_TARGET_SOURCE_FIRST_FRAME,
+        choices=WARMUP_TARGET_SOURCE_CHOICES,
+        type=str,
+        help="predicted 历史模式下 warm-up target 的来源；identity 为运行时零/identity 初始化。",
+    )
     group.add_argument("--render_mp4", default=True, type=str2bool)
     group.add_argument("--render_fps", default=30, type=int)
     group.add_argument("--render_stride", default=1, type=int)
@@ -137,13 +159,24 @@ def build_long_sequence_payload(
     use_ddim: bool,
     normalizer: RealtimePoseNormalizer | None,
     initial_root_yaw: float | None = None,
+    history_pose_source: str = HISTORY_POSE_SOURCE_REFERENCE,
+    warmup_target_source: str = WARMUP_TARGET_SOURCE_FIRST_FRAME,
 ) -> dict[str, np.ndarray]:
     frame_count = int(source["tracker_pos_world"].shape[0])
     if frame_count <= REALTIME_POSE_TARGET_START:
         raise ValueError(f"长序列至少需要 {REALTIME_POSE_TARGET_START + 1} 帧，实际为 {frame_count}")
+    if history_pose_source not in HISTORY_POSE_SOURCE_CHOICES:
+        raise ValueError(f"history_pose_source 必须是 {HISTORY_POSE_SOURCE_CHOICES} 之一，实际为 {history_pose_source}")
+    if warmup_target_source not in WARMUP_TARGET_SOURCE_CHOICES:
+        raise ValueError(f"warmup_target_source 必须是 {WARMUP_TARGET_SOURCE_CHOICES} 之一，实际为 {warmup_target_source}")
 
     reference_features = encode_realtime_pose_features(source, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
-    warmup_target_raw = reference_features[0].copy()
+    use_reference_history = history_pose_source == HISTORY_POSE_SOURCE_REFERENCE
+    warmup_target_raw = (
+        None
+        if use_reference_history or warmup_target_source == WARMUP_TARGET_SOURCE_IDENTITY
+        else reference_features[0].copy()
+    )
     stream_payload = simulate_unity_stream(
         model=model,
         diffusion=diffusion,
@@ -156,6 +189,10 @@ def build_long_sequence_payload(
         normalizer=normalizer,
         initial_root_yaw=float(source["root_yaw"][0] if initial_root_yaw is None else initial_root_yaw),
         warmup_target_raw=warmup_target_raw,
+        history_features_raw=reference_features if use_reference_history else None,
+        history_features_until_frame=REALTIME_POSE_TARGET_START if use_reference_history else None,
+        reference_root_yaw=np.asarray(source["root_yaw"], dtype=np.float32) if use_reference_history else None,
+        reference_root_pos_world=np.asarray(source["root_pos_world"], dtype=np.float32) if use_reference_history else None,
     )
 
     predicted_features = np.asarray(stream_payload["predicted_features_raw"][0], dtype=np.float32)
@@ -193,6 +230,10 @@ def build_long_sequence_payload(
                 "schema_name": REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
                 "frames": frame_count,
                 "warmup_frames": REALTIME_POSE_TARGET_START,
+                "history_pose_source": history_pose_source,
+                "warmup_target_source": warmup_target_source,
+                "reference_history_frames": REALTIME_POSE_TARGET_START if use_reference_history else 0,
+                "autoregressive_after_warmup": True,
             },
             dtype=object,
         ),
@@ -249,6 +290,8 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         use_ddim=str(args.ts_respace).startswith("ddim"),
         normalizer=normalizer,
         initial_root_yaw=args.initial_root_yaw,
+        history_pose_source=str(args.history_pose_source),
+        warmup_target_source=str(args.warmup_target_source),
     )
     metadata = dict(payload["metadata"].item())
     metadata.update({"weights": source_name, "loop_count": int(args.loop_count)})
