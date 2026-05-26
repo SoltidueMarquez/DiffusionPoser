@@ -5,14 +5,22 @@ import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.sensor_masking import (
+    HIP_TRACKER_INDEX,
+    LEFT_HAND_TRACKER_INDEX,
     REALTIME_POSE_TARGET_START,
     REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    SMPL_JOINT_COUNT,
     get_schema_spec,
 )
 from sample.simulate_unity_stream import (
     IDENTITY_6D,
+    apply_tracker_position_ik,
+    clamp_body_pose_delta,
     encode_unity_tracker_frame,
+    fk_tracker_positions_from_target,
+    initial_target_feature,
     simulate_unity_stream,
+    smooth_tracker_positions_for_ik,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
@@ -67,22 +75,29 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
     np.testing.assert_array_equal(encoded[schema.sensor_valid_slice()], reference[frame_index, schema.sensor_valid_slice()])
 
 
-def test_simulate_unity_stream_predicts_after_warmup_and_updates_root_yaw():
+def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
     source = build_toy_realtime_source(frame_count=63)
     sensor_valid = np.ones((63, 6), dtype=bool)
+    measured_yaw = source["root_yaw"].astype(np.float32)
+    tracker_rot = source["tracker_rot_world_6d"].copy()
+    tracker_rot[:, 3, 0] = np.sin(measured_yaw)
+    tracker_rot[:, 3, 1] = 0.0
+    tracker_rot[:, 3, 2] = np.cos(measured_yaw)
+    tracker_rot[:, 3, 3:] = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
     diffusion = FixedV2Diffusion(yaw_delta=0.1)
 
     payload = simulate_unity_stream(
         model=object(),
         diffusion=diffusion,
         tracker_pos_world=source["tracker_pos_world"],
-        tracker_rot_world_6d=source["tracker_rot_world_6d"],
+        tracker_rot_world_6d=tracker_rot,
         sensor_valid=sensor_valid,
         device=torch.device("cpu"),
         use_ddim=False,
         schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
         normalizer=None,
         initial_root_yaw=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
     )
 
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
@@ -93,9 +108,106 @@ def test_simulate_unity_stream_predicts_after_warmup_and_updates_root_yaw():
     np.testing.assert_allclose(payload["root_yaw_predicted"][0, :REALTIME_POSE_TARGET_START], 0.0)
     np.testing.assert_allclose(
         payload["root_yaw_predicted"][0, REALTIME_POSE_TARGET_START:],
-        np.asarray([0.1, 0.2, 0.3]),
+        measured_yaw[REALTIME_POSE_TARGET_START:],
         atol=1e-6,
     )
+    np.testing.assert_allclose(
+        payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, [0, 2]],
+        source["root_pos_world"][REALTIME_POSE_TARGET_START:][:, [0, 2]],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        payload["predicted_features_raw"][0, REALTIME_POSE_TARGET_START:, schema.root_height_slice()],
+        source["tracker_pos_world"][REALTIME_POSE_TARGET_START:, 3, 1:2],
+        atol=1e-6,
+    )
+
+
+def test_tracker_ik_pulls_known_hand_joint_toward_tracker():
+    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    offsets = np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
+    offsets[3] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[6] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[9] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[13] = np.asarray([-0.05, 0.05, 0.0], dtype=np.float32)
+    offsets[16] = np.asarray([-0.18, 0.0, 0.0], dtype=np.float32)
+    offsets[18] = np.asarray([-0.22, 0.0, 0.0], dtype=np.float32)
+    offsets[20] = np.asarray([-0.22, 0.0, 0.0], dtype=np.float32)
+    frame = initial_target_feature(schema.name, root_height=0.0)
+    root_pos = np.zeros((3,), dtype=np.float32)
+    tracker_pos = fk_tracker_positions_from_target(
+        target_raw=frame,
+        root_pos_world=root_pos,
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+    tracker_pos[LEFT_HAND_TRACKER_INDEX] += np.asarray([0.12, -0.12, 0.22], dtype=np.float32)
+    sensor_valid = np.zeros((6,), dtype=bool)
+    sensor_valid[[HIP_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX]] = True
+
+    before = fk_tracker_positions_from_target(
+        target_raw=frame,
+        root_pos_world=root_pos,
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+    corrected = apply_tracker_position_ik(
+        predicted_frame_raw=frame,
+        root_pos_world=root_pos,
+        root_yaw=0.0,
+        tracker_pos_world=tracker_pos,
+        sensor_valid=sensor_valid,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+        iterations=80,
+        lr=0.05,
+        blend=1.0,
+        delta_limit=0.0,
+    )
+    after = fk_tracker_positions_from_target(
+        target_raw=corrected,
+        root_pos_world=root_pos,
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+
+    before_error = np.linalg.norm(before[LEFT_HAND_TRACKER_INDEX] - tracker_pos[LEFT_HAND_TRACKER_INDEX])
+    after_error = np.linalg.norm(after[LEFT_HAND_TRACKER_INDEX] - tracker_pos[LEFT_HAND_TRACKER_INDEX])
+    assert after_error < before_error * 0.55
+
+
+def test_tracker_ik_smoothing_and_delta_clamp_are_bounded():
+    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    measured = np.zeros((6, 3), dtype=np.float32)
+    measured[LEFT_HAND_TRACKER_INDEX] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    previous = np.zeros((6, 3), dtype=np.float32)
+    valid = np.zeros((6,), dtype=bool)
+    valid[[HIP_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX]] = True
+
+    smoothed, smoothed_valid = smooth_tracker_positions_for_ik(
+        tracker_pos_world=measured,
+        sensor_valid=valid,
+        previous_smoothed_pos_world=previous,
+        previous_valid=valid,
+        smoothing=0.6,
+    )
+
+    np.testing.assert_array_equal(smoothed_valid, valid)
+    np.testing.assert_allclose(smoothed[LEFT_HAND_TRACKER_INDEX], np.asarray([0.4, 0.0, 0.0], dtype=np.float32))
+
+    base = initial_target_feature(schema.name)[schema.body_pose_slice()]
+    moved = base.copy()
+    moved[:6] += 1.0
+    clamped = clamp_body_pose_delta(
+        body_pose_parent_6d=moved,
+        reference_body_pose_parent_6d=base,
+        delta_limit=0.08,
+    )
+    per_joint_delta = np.linalg.norm(clamped.reshape(24, 6) - base.reshape(24, 6), axis=-1)
+    assert float(per_joint_delta.max()) <= 0.081
 
 
 def test_warmup_window_contains_tracker_history_and_tpose_targets():

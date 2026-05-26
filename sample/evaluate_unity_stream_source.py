@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from argparse import BooleanOptionalAction
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,15 @@ from data_loaders.sensor_masking import (
 )
 from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
-from sample.simulate_unity_stream import full_valid_sensor_mask, simulate_unity_stream
+from sample.simulate_unity_stream import (
+    DEFAULT_TRACKER_IK_BLEND,
+    DEFAULT_TRACKER_IK_DELTA_LIMIT,
+    DEFAULT_TRACKER_IK_ITERATIONS,
+    DEFAULT_TRACKER_IK_LR,
+    DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
+    full_valid_sensor_mask,
+    simulate_unity_stream,
+)
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -76,6 +85,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     group.add_argument("--render_mp4", default=True, type=str2bool)
     group.add_argument("--render_fps", default=30, type=int)
     group.add_argument("--render_stride", default=1, type=int)
+    group.add_argument("--render_camera_mode", default="follow", choices=["global", "follow"], type=str)
+    group.add_argument("--render_layout", default="overlay", choices=["split", "overlay"], type=str)
+    group.add_argument("--render_local_radius", default=1.25, type=float)
+    group.add_argument(
+        "--root_correction",
+        default=True,
+        action=BooleanOptionalAction,
+        help="用真实 waist tracker 修正在线 root yaw/root xz/root height。",
+    )
+    group.add_argument(
+        "--tracker_ik",
+        default=True,
+        action=BooleanOptionalAction,
+        help="推理后用已知 head/hands/feet tracker 做 position IK。",
+    )
+    group.add_argument("--tracker_ik_iterations", default=DEFAULT_TRACKER_IK_ITERATIONS, type=int)
+    group.add_argument("--tracker_ik_lr", default=DEFAULT_TRACKER_IK_LR, type=float)
+    group.add_argument("--tracker_ik_blend", default=DEFAULT_TRACKER_IK_BLEND, type=float)
+    group.add_argument("--tracker_ik_target_smoothing", default=DEFAULT_TRACKER_IK_TARGET_SMOOTHING, type=float)
+    group.add_argument("--tracker_ik_delta_limit", default=DEFAULT_TRACKER_IK_DELTA_LIMIT, type=float)
     return parser
 
 
@@ -161,6 +190,13 @@ def build_long_sequence_payload(
     initial_root_yaw: float | None = None,
     history_pose_source: str = HISTORY_POSE_SOURCE_REFERENCE,
     warmup_target_source: str = WARMUP_TARGET_SOURCE_FIRST_FRAME,
+    root_correction: bool = True,
+    tracker_ik: bool = True,
+    tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
+    tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
+    tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
+    tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
+    tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
 ) -> dict[str, np.ndarray]:
     frame_count = int(source["tracker_pos_world"].shape[0])
     if frame_count <= REALTIME_POSE_TARGET_START:
@@ -193,6 +229,14 @@ def build_long_sequence_payload(
         history_features_until_frame=REALTIME_POSE_TARGET_START if use_reference_history else None,
         reference_root_yaw=np.asarray(source["root_yaw"], dtype=np.float32) if use_reference_history else None,
         reference_root_pos_world=np.asarray(source["root_pos_world"], dtype=np.float32) if use_reference_history else None,
+        joint_offsets_parent=np.asarray(source["joint_offsets_parent"], dtype=np.float32),
+        root_correction=bool(root_correction),
+        tracker_ik=bool(tracker_ik),
+        tracker_ik_iterations=int(tracker_ik_iterations),
+        tracker_ik_lr=float(tracker_ik_lr),
+        tracker_ik_blend=float(tracker_ik_blend),
+        tracker_ik_target_smoothing=float(tracker_ik_target_smoothing),
+        tracker_ik_delta_limit=float(tracker_ik_delta_limit),
     )
 
     predicted_features = np.asarray(stream_payload["predicted_features_raw"][0], dtype=np.float32)
@@ -225,6 +269,13 @@ def build_long_sequence_payload(
         "is_predicted": stream_payload["is_predicted"],
         "eval_frame_mask": stream_payload["eval_frame_mask"],
         "warmup_frames": np.asarray(REALTIME_POSE_TARGET_START, dtype=np.int64),
+        "root_correction": stream_payload["root_correction"],
+        "tracker_ik": stream_payload["tracker_ik"],
+        "tracker_ik_iterations": stream_payload["tracker_ik_iterations"],
+        "tracker_ik_lr": stream_payload["tracker_ik_lr"],
+        "tracker_ik_blend": stream_payload["tracker_ik_blend"],
+        "tracker_ik_target_smoothing": stream_payload["tracker_ik_target_smoothing"],
+        "tracker_ik_delta_limit": stream_payload["tracker_ik_delta_limit"],
         "metadata": np.asarray(
             {
                 "schema_name": REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
@@ -234,6 +285,13 @@ def build_long_sequence_payload(
                 "warmup_target_source": warmup_target_source,
                 "reference_history_frames": REALTIME_POSE_TARGET_START if use_reference_history else 0,
                 "autoregressive_after_warmup": True,
+                "root_correction": bool(root_correction),
+                "tracker_ik": bool(tracker_ik),
+                "tracker_ik_iterations": int(tracker_ik_iterations),
+                "tracker_ik_lr": float(tracker_ik_lr),
+                "tracker_ik_blend": float(tracker_ik_blend),
+                "tracker_ik_target_smoothing": float(tracker_ik_target_smoothing),
+                "tracker_ik_delta_limit": float(tracker_ik_delta_limit),
             },
             dtype=object,
         ),
@@ -292,6 +350,13 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         initial_root_yaw=args.initial_root_yaw,
         history_pose_source=str(args.history_pose_source),
         warmup_target_source=str(args.warmup_target_source),
+        root_correction=bool(args.root_correction),
+        tracker_ik=bool(args.tracker_ik),
+        tracker_ik_iterations=int(args.tracker_ik_iterations),
+        tracker_ik_lr=float(args.tracker_ik_lr),
+        tracker_ik_blend=float(args.tracker_ik_blend),
+        tracker_ik_target_smoothing=float(args.tracker_ik_target_smoothing),
+        tracker_ik_delta_limit=float(args.tracker_ik_delta_limit),
     )
     metadata = dict(payload["metadata"].item())
     metadata.update({"weights": source_name, "loop_count": int(args.loop_count)})
@@ -317,6 +382,9 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
             root_yaw_predicted=payload["root_yaw_predicted"],
             fps=int(args.render_fps),
             stride=int(args.render_stride),
+            camera_mode=str(args.render_camera_mode),
+            layout=str(args.render_layout),
+            local_radius=float(args.render_local_radius),
         )
         outputs["mp4_path"] = mp4_path
 

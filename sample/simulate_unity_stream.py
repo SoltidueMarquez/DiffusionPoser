@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from argparse import BooleanOptionalAction
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +11,9 @@ import torch
 
 from data_loaders.realtime_pose_dataset import zero_missing_tracker_channels
 from data_loaders.realtime_pose_kinematics import (
+    SMPL_PARENTS,
+    TRACKER_JOINT_INDICES,
+    fk_parent_local_torch,
     integrate_root_delta_xz_ref,
     make_yaw_rotation_np,
     rotation_6d_forward_up_np,
@@ -47,6 +51,12 @@ IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
 INVALID_FRAME_POLICY_HOLD = "hold"
 INVALID_FRAME_POLICY_RAISE = "raise"
 INVALID_FRAME_POLICIES = (INVALID_FRAME_POLICY_HOLD, INVALID_FRAME_POLICY_RAISE)
+DEFAULT_TRACKER_IK_ITERATIONS = 4
+DEFAULT_TRACKER_IK_LR = 0.04
+DEFAULT_TRACKER_IK_BLEND = 0.4
+DEFAULT_TRACKER_IK_TARGET_SMOOTHING = 0.6
+DEFAULT_TRACKER_IK_DELTA_LIMIT = 0.08
+TRACKER_IK_REGULARIZATION_WEIGHT = 0.01
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -73,6 +83,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     stream.add_argument("--assume_identity_tracker_rot", action="store_true")
     stream.add_argument("--limit", default=0, type=int)
+    stream.add_argument(
+        "--root_correction",
+        default=True,
+        action=BooleanOptionalAction,
+        help="用 waist tracker 的真实 transform 修正预测 root yaw/root xz/root height。",
+    )
+    stream.add_argument(
+        "--tracker_ik",
+        default=True,
+        action=BooleanOptionalAction,
+        help="在推理后用已知 head/hands/feet tracker 做 position IK，修正 body pose。",
+    )
+    stream.add_argument("--tracker_ik_iterations", default=DEFAULT_TRACKER_IK_ITERATIONS, type=int)
+    stream.add_argument("--tracker_ik_lr", default=DEFAULT_TRACKER_IK_LR, type=float)
+    stream.add_argument("--tracker_ik_blend", default=DEFAULT_TRACKER_IK_BLEND, type=float)
+    stream.add_argument("--tracker_ik_target_smoothing", default=DEFAULT_TRACKER_IK_TARGET_SMOOTHING, type=float)
+    stream.add_argument("--tracker_ik_delta_limit", default=DEFAULT_TRACKER_IK_DELTA_LIMIT, type=float)
     return parser
 
 
@@ -117,14 +144,25 @@ def load_tracker_stream(
         if sensor_valid.shape != (tracker_pos_world.shape[0], TRACKER_COUNT):
             raise ValueError(f"sensor_valid 应为 [T,{TRACKER_COUNT}]，实际为 {sensor_valid.shape}")
 
+        joint_offsets_parent = (
+            np.asarray(data["joint_offsets_parent"], dtype=np.float32)
+            if "joint_offsets_parent" in data.files
+            else None
+        )
+        if joint_offsets_parent is not None and joint_offsets_parent.shape != (SMPL_JOINT_COUNT, 3):
+            raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {joint_offsets_parent.shape}")
+
     frame_count = tracker_pos_world.shape[0]
     if int(limit) > 0:
         frame_count = min(frame_count, int(limit))
-    return {
+    stream = {
         "tracker_pos_world": tracker_pos_world[:frame_count],
         "tracker_rot_world_6d": tracker_rot_world_6d[:frame_count],
         "sensor_valid": sensor_valid[:frame_count],
     }
+    if joint_offsets_parent is not None:
+        stream["joint_offsets_parent"] = joint_offsets_parent
+    return stream
 
 
 def sensor_validity_ok(sensor_valid: np.ndarray) -> bool:
@@ -136,6 +174,311 @@ def estimate_root_pos_from_hip_tracker(tracker_pos_world: np.ndarray) -> np.ndar
     root_pos = np.asarray(tracker_pos_world[HIP_TRACKER_INDEX], dtype=np.float32).copy()
     root_pos[1] = 0.0
     return root_pos
+
+
+def estimate_root_yaw_from_hip_tracker(
+    tracker_rot_world_6d: np.ndarray,
+    sensor_valid: np.ndarray,
+    fallback_yaw: float,
+) -> float:
+    """从 waist tracker 的世界旋转取水平 forward yaw；退化旋转时沿用模型预测。"""
+
+    valid = np.asarray(sensor_valid, dtype=bool)
+    if valid.shape != (TRACKER_COUNT,) or not valid[HIP_TRACKER_INDEX]:
+        return float(fallback_yaw)
+    tracker_rot = np.asarray(tracker_rot_world_6d, dtype=np.float32)
+    if tracker_rot.shape != (TRACKER_COUNT, 6):
+        raise ValueError(f"单帧 tracker_rot_world_6d 应为 [{TRACKER_COUNT},6]，实际为 {tracker_rot.shape}")
+
+    hip_rotation = rotation_6d_to_matrix_np(tracker_rot[HIP_TRACKER_INDEX: HIP_TRACKER_INDEX + 1])[0]
+    forward = hip_rotation[:, 2]
+    horizontal_norm = float(np.linalg.norm(forward[[0, 2]]))
+    if horizontal_norm < 1e-6:
+        return float(fallback_yaw)
+    return float(np.arctan2(float(forward[0]), float(forward[2])))
+
+
+def encode_single_root_delta_xz_ref(
+    prev_root_pos_world: np.ndarray,
+    prev_root_yaw: float,
+    root_pos_world: np.ndarray,
+) -> np.ndarray:
+    prev_pos = np.asarray(prev_root_pos_world, dtype=np.float64)
+    root_pos = np.asarray(root_pos_world, dtype=np.float64)
+    delta_world = root_pos - prev_pos
+    delta_world[1] = 0.0
+    yaw_rotation = make_yaw_rotation_np(np.asarray([float(prev_root_yaw)], dtype=np.float64))[0]
+    delta_ref = delta_world @ yaw_rotation
+    return delta_ref[[0, 2]].astype(np.float32)
+
+
+def fk_tracker_positions_from_target(
+    target_raw: np.ndarray,
+    root_pos_world: np.ndarray,
+    root_yaw: float,
+    joint_offsets_parent: np.ndarray,
+    schema_name: str,
+) -> np.ndarray:
+    """用预测 target 做 FK，返回 6 个 tracker 对应关节的世界位置。"""
+
+    schema = get_schema_spec(schema_name)
+    target = np.asarray(target_raw, dtype=np.float32)
+    offsets = np.asarray(joint_offsets_parent, dtype=np.float32).copy()
+    if offsets.shape != (SMPL_JOINT_COUNT, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
+    if schema.supports_root_motion:
+        offsets[0, 1] = float(target[schema.root_height_slice()][0])
+    with torch.no_grad():
+        joints = fk_parent_local_torch(
+            body_pose_parent_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
+            root_pos_world=torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)[None]).float(),
+            root_yaw=torch.tensor([float(root_yaw)], dtype=torch.float32),
+            parent_offsets=torch.from_numpy(offsets[None]).float(),
+        )
+    return joints.numpy()[0, TRACKER_JOINT_INDICES].astype(np.float32)
+
+
+def tracker_ik_joint_mask(tracker_indices: np.ndarray) -> np.ndarray:
+    """
+    根据已知 tracker 端点找出需要参与 IK 的祖先关节。
+    root yaw/root xz 已经由 waist tracker 单独强约束，所以这里冻结 0 号 pelvis local rotation，
+    避免 IK 把整个人体姿态重新整体扭转。
+    """
+
+    mask = np.zeros((SMPL_JOINT_COUNT,), dtype=bool)
+    for tracker_index in np.asarray(tracker_indices, dtype=np.int64).reshape(-1):
+        joint_index = int(TRACKER_JOINT_INDICES[int(tracker_index)])
+        while joint_index >= 0:
+            if joint_index != 0:
+                mask[joint_index] = True
+            joint_index = int(SMPL_PARENTS[joint_index])
+    return mask
+
+
+def normalize_body_pose_6d(body_pose_parent_6d: np.ndarray) -> np.ndarray:
+    rotations = rotation_6d_to_matrix_np(
+        np.asarray(body_pose_parent_6d, dtype=np.float32).reshape(SMPL_JOINT_COUNT, 6)
+    )
+    return rotation_6d_forward_up_np(rotations).reshape(-1).astype(np.float32)
+
+
+def blend_body_pose_6d(base_body_pose_parent_6d: np.ndarray, target_body_pose_parent_6d: np.ndarray, blend: float) -> np.ndarray:
+    base = np.asarray(base_body_pose_parent_6d, dtype=np.float32).reshape(-1)
+    target = np.asarray(target_body_pose_parent_6d, dtype=np.float32).reshape(-1)
+    if base.shape != (SMPL_JOINT_COUNT * 6,) or target.shape != (SMPL_JOINT_COUNT * 6,):
+        raise ValueError(f"body_pose_parent_6d 应为 [{SMPL_JOINT_COUNT * 6}]。")
+    weight = float(np.clip(float(blend), 0.0, 1.0))
+    mixed = base + weight * (target - base)
+    return normalize_body_pose_6d(mixed)
+
+
+def clamp_body_pose_delta(
+    body_pose_parent_6d: np.ndarray,
+    reference_body_pose_parent_6d: np.ndarray | None,
+    delta_limit: float,
+) -> np.ndarray:
+    if reference_body_pose_parent_6d is None or float(delta_limit) <= 0.0:
+        return normalize_body_pose_6d(body_pose_parent_6d)
+    pose = np.asarray(body_pose_parent_6d, dtype=np.float32).reshape(SMPL_JOINT_COUNT, 6)
+    reference = np.asarray(reference_body_pose_parent_6d, dtype=np.float32).reshape(SMPL_JOINT_COUNT, 6)
+    delta = pose - reference
+    delta_norm = np.linalg.norm(delta, axis=-1, keepdims=True)
+    scale = np.minimum(1.0, float(delta_limit) / np.maximum(delta_norm, 1e-8))
+    return normalize_body_pose_6d(reference + delta * scale)
+
+
+def smooth_tracker_positions_for_ik(
+    tracker_pos_world: np.ndarray,
+    sensor_valid: np.ndarray,
+    previous_smoothed_pos_world: np.ndarray | None,
+    previous_valid: np.ndarray | None,
+    smoothing: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    对 IK target 做 EMA，降低 tracker 噪声直接传到关节角的高频抖动。
+    只平滑连续有效的 tracker；新变为有效的 tracker 直接使用当前测量，避免 stale target。
+    """
+
+    measured = np.asarray(tracker_pos_world, dtype=np.float32)
+    valid = np.asarray(sensor_valid, dtype=bool)
+    if measured.shape != (TRACKER_COUNT, 3):
+        raise ValueError(f"单帧 tracker_pos_world 应为 [{TRACKER_COUNT},3]，实际为 {measured.shape}")
+    if valid.shape != (TRACKER_COUNT,):
+        raise ValueError(f"单帧 sensor_valid 应为 [{TRACKER_COUNT}]，实际为 {valid.shape}")
+    alpha = float(np.clip(float(smoothing), 0.0, 0.99))
+    if (
+        alpha <= 0.0
+        or previous_smoothed_pos_world is None
+        or previous_valid is None
+        or np.asarray(previous_smoothed_pos_world).shape != (TRACKER_COUNT, 3)
+        or np.asarray(previous_valid).shape != (TRACKER_COUNT,)
+    ):
+        return measured.copy(), valid.copy()
+
+    smoothed = measured.copy()
+    reusable = valid & np.asarray(previous_valid, dtype=bool)
+    previous = np.asarray(previous_smoothed_pos_world, dtype=np.float32)
+    smoothed[reusable] = alpha * previous[reusable] + (1.0 - alpha) * measured[reusable]
+    return smoothed.astype(np.float32), valid.copy()
+
+
+def apply_tracker_position_ik(
+    predicted_frame_raw: np.ndarray,
+    root_pos_world: np.ndarray,
+    root_yaw: float,
+    tracker_pos_world: np.ndarray,
+    sensor_valid: np.ndarray,
+    joint_offsets_parent: np.ndarray | None,
+    schema_name: str,
+    enabled: bool = True,
+    iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
+    lr: float = DEFAULT_TRACKER_IK_LR,
+    initial_body_pose_parent_6d: np.ndarray | None = None,
+    previous_body_pose_parent_6d: np.ndarray | None = None,
+    blend: float = DEFAULT_TRACKER_IK_BLEND,
+    delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
+) -> np.ndarray:
+    """
+    用已知 tracker 位置对预测 pose 做一小步运行时 IK 投影。
+
+    输入/输出都是单帧 raw feature `[211]`。IK 只修改 `body_pose_parent_6d`，
+    root yaw/root xz/root height 由 root correction 负责，因此这里不改变 root 状态。
+    """
+
+    corrected = np.asarray(predicted_frame_raw, dtype=np.float32).copy()
+    if not enabled or joint_offsets_parent is None or int(iterations) <= 0 or float(blend) <= 0.0:
+        return corrected
+
+    schema = get_schema_spec(schema_name)
+    tracker_pos = np.asarray(tracker_pos_world, dtype=np.float32)
+    valid = np.asarray(sensor_valid, dtype=bool)
+    offsets = np.asarray(joint_offsets_parent, dtype=np.float32).copy()
+    if tracker_pos.shape != (TRACKER_COUNT, 3):
+        raise ValueError(f"单帧 tracker_pos_world 应为 [{TRACKER_COUNT},3]，实际为 {tracker_pos.shape}")
+    if valid.shape != (TRACKER_COUNT,):
+        raise ValueError(f"单帧 sensor_valid 应为 [{TRACKER_COUNT}]，实际为 {valid.shape}")
+    if offsets.shape != (SMPL_JOINT_COUNT, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
+
+    ik_tracker_indices = np.flatnonzero(valid)
+    ik_tracker_indices = ik_tracker_indices[ik_tracker_indices != HIP_TRACKER_INDEX]
+    if ik_tracker_indices.size == 0:
+        return corrected
+
+    trainable_joint_mask = tracker_ik_joint_mask(ik_tracker_indices)
+    if not trainable_joint_mask.any():
+        return corrected
+
+    if schema.supports_root_motion:
+        offsets[0, 1] = float(corrected[schema.root_height_slice()][0])
+
+    target_joint_indices = torch.as_tensor(TRACKER_JOINT_INDICES[ik_tracker_indices], dtype=torch.long)
+    target_positions = torch.from_numpy(tracker_pos[ik_tracker_indices]).float()[None]
+    root_pos = torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)[None]).float()
+    root_pos[:, 1] = 0.0
+    root_yaw_tensor = torch.tensor([float(root_yaw)], dtype=torch.float32)
+    parent_offsets = torch.from_numpy(offsets[None]).float()
+    original_body_pose = corrected[schema.body_pose_slice()].copy()
+    original_pose = torch.from_numpy(original_body_pose.reshape(1, SMPL_JOINT_COUNT, 6)).float()
+    initial_pose = original_pose.clone()
+    if initial_body_pose_parent_6d is not None:
+        warm_start = np.asarray(initial_body_pose_parent_6d, dtype=np.float32).reshape(SMPL_JOINT_COUNT, 6)
+        initial_pose[:, trainable_joint_mask] = torch.from_numpy(warm_start[trainable_joint_mask]).float()[None]
+    trainable_mask = torch.from_numpy(trainable_joint_mask).bool()
+    pose = initial_pose.clone().detach().requires_grad_(True)
+    optimizer = torch.optim.Adam([pose], lr=float(lr))
+
+    for _ in range(int(iterations)):
+        optimizer.zero_grad(set_to_none=True)
+        joints = fk_parent_local_torch(
+            body_pose_parent_6d=pose.reshape(1, -1),
+            root_pos_world=root_pos,
+            root_yaw=root_yaw_tensor,
+            parent_offsets=parent_offsets,
+        )
+        error = joints[:, target_joint_indices] - target_positions
+        position_loss = error.square().mean()
+        regularization = (pose[:, trainable_mask] - original_pose[:, trainable_mask]).square().mean()
+        loss = position_loss + TRACKER_IK_REGULARIZATION_WEIGHT * regularization
+        loss.backward()
+        if pose.grad is not None:
+            pose.grad[:, ~trainable_mask] = 0.0
+        optimizer.step()
+        with torch.no_grad():
+            pose[:, ~trainable_mask] = original_pose[:, ~trainable_mask]
+
+    ik_body_pose = normalize_body_pose_6d(pose.detach().cpu().numpy().reshape(-1))
+    blended_body_pose = blend_body_pose_6d(original_body_pose, ik_body_pose, blend=blend)
+    corrected[schema.body_pose_slice()] = clamp_body_pose_delta(
+        blended_body_pose,
+        reference_body_pose_parent_6d=previous_body_pose_parent_6d,
+        delta_limit=float(delta_limit),
+    )
+    return corrected
+
+
+def correct_predicted_root_with_trackers(
+    predicted_frame_raw: np.ndarray,
+    prev_root_yaw: float,
+    prev_root_pos_world: np.ndarray,
+    model_root_yaw: float,
+    model_root_pos_world: np.ndarray,
+    tracker_pos_world: np.ndarray,
+    tracker_rot_world_6d: np.ndarray,
+    sensor_valid: np.ndarray,
+    schema_name: str,
+    joint_offsets_parent: np.ndarray | None = None,
+    enabled: bool = True,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    用真实 waist tracker 把 root 状态拉回传感器坐标。
+
+    diffusion 仍负责生成 body pose/contact 等未观测自由度；root yaw、root xz 和
+    root height 是在线系统最容易积分漂移的状态，因此在每帧预测后投影回真实 tracker。
+    """
+
+    schema = get_schema_spec(schema_name)
+    corrected = np.asarray(predicted_frame_raw, dtype=np.float32).copy()
+    if not enabled:
+        return corrected, float(model_root_yaw), np.asarray(model_root_pos_world, dtype=np.float32).copy()
+
+    tracker_pos = np.asarray(tracker_pos_world, dtype=np.float32)
+    if tracker_pos.shape != (TRACKER_COUNT, 3):
+        raise ValueError(f"单帧 tracker_pos_world 应为 [{TRACKER_COUNT},3]，实际为 {tracker_pos.shape}")
+
+    measured_root_yaw = estimate_root_yaw_from_hip_tracker(
+        tracker_rot_world_6d=tracker_rot_world_6d,
+        sensor_valid=sensor_valid,
+        fallback_yaw=model_root_yaw,
+    )
+    measured_root_height = float(tracker_pos[HIP_TRACKER_INDEX, 1])
+    if schema.supports_root_motion:
+        corrected[schema.root_height_slice()] = np.asarray([measured_root_height], dtype=np.float32)
+
+    root_pos = np.asarray(model_root_pos_world, dtype=np.float32).copy()
+    if joint_offsets_parent is not None:
+        predicted_tracker_pos = fk_tracker_positions_from_target(
+            target_raw=corrected,
+            root_pos_world=root_pos,
+            root_yaw=measured_root_yaw,
+            joint_offsets_parent=joint_offsets_parent,
+            schema_name=schema.name,
+        )
+        hip_correction = tracker_pos[HIP_TRACKER_INDEX] - predicted_tracker_pos[HIP_TRACKER_INDEX]
+        root_pos[[0, 2]] += hip_correction[[0, 2]]
+        root_pos[1] = 0.0
+    else:
+        root_pos = estimate_root_pos_from_hip_tracker(tracker_pos)
+
+    yaw_delta = float(measured_root_yaw - float(prev_root_yaw))
+    corrected[schema.root_yaw_delta_slice()] = np.asarray([np.sin(yaw_delta), np.cos(yaw_delta)], dtype=np.float32)
+    if schema.supports_root_motion:
+        corrected[schema.root_delta_xz_slice()] = encode_single_root_delta_xz_ref(
+            prev_root_pos_world=prev_root_pos_world,
+            prev_root_yaw=float(prev_root_yaw),
+            root_pos_world=root_pos,
+        )
+    return corrected, float(measured_root_yaw), root_pos.astype(np.float32)
 
 
 def encode_unity_tracker_frame(
@@ -238,6 +581,8 @@ class UnityStreamState:
     last_output_raw: np.ndarray | None = None
     last_root_pos_world: np.ndarray | None = None
     last_validity_ok: bool = True
+    tracker_ik_smoothed_pos_world: np.ndarray | None = None
+    tracker_ik_smoothed_valid: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.invalid_frame_policy not in INVALID_FRAME_POLICIES:
@@ -307,19 +652,47 @@ class UnityStreamState:
         self.last_output_raw = history_frame.copy()
         self.last_root_pos_world = np.asarray(root_pos_world, dtype=np.float32).copy()
 
+    def update_tracker_ik_targets(self, tracker_pos_world: np.ndarray, sensor_valid: np.ndarray, smoothing: float) -> np.ndarray:
+        smoothed, smoothed_valid = smooth_tracker_positions_for_ik(
+            tracker_pos_world=tracker_pos_world,
+            sensor_valid=sensor_valid,
+            previous_smoothed_pos_world=self.tracker_ik_smoothed_pos_world,
+            previous_valid=self.tracker_ik_smoothed_valid,
+            smoothing=float(smoothing),
+        )
+        self.tracker_ik_smoothed_pos_world = smoothed.copy()
+        self.tracker_ik_smoothed_valid = smoothed_valid.copy()
+        return smoothed
+
     def accept_prediction(
         self,
         tracker_feature_raw: np.ndarray,
         predicted_frame_raw: np.ndarray,
         fallback_root_pos_world: np.ndarray,
         history_target_raw: np.ndarray | None = None,
-    ) -> np.ndarray:
+        tracker_pos_world: np.ndarray | None = None,
+        tracker_rot_world_6d: np.ndarray | None = None,
+        sensor_valid: np.ndarray | None = None,
+        joint_offsets_parent: np.ndarray | None = None,
+        root_correction: bool = True,
+        tracker_ik: bool = True,
+        tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
+        tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
+        tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
+        tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
+        tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
+    ) -> tuple[np.ndarray, np.ndarray]:
         predicted = np.asarray(predicted_frame_raw, dtype=np.float32)
         prev_root_yaw = float(self.current_root_yaw)
         prev_root_pos = (
             np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
             if self.current_root_pos_world is None
             else self.current_root_pos_world.copy()
+        )
+        previous_body_pose = (
+            None
+            if self.last_output_raw is None
+            else np.asarray(self.last_output_raw[self.schema.body_pose_slice()], dtype=np.float32).copy()
         )
         yaw_delta = predicted[self.schema.root_yaw_delta_slice()]
         self.current_root_yaw = float(prev_root_yaw + np.arctan2(float(yaw_delta[0]), float(yaw_delta[1])))
@@ -334,14 +707,55 @@ class UnityStreamState:
         else:
             root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
 
+        if tracker_pos_world is not None and tracker_rot_world_6d is not None and sensor_valid is not None:
+            predicted, self.current_root_yaw, root_pos = correct_predicted_root_with_trackers(
+                predicted_frame_raw=predicted,
+                prev_root_yaw=prev_root_yaw,
+                prev_root_pos_world=prev_root_pos,
+                model_root_yaw=self.current_root_yaw,
+                model_root_pos_world=root_pos,
+                tracker_pos_world=tracker_pos_world,
+                tracker_rot_world_6d=tracker_rot_world_6d,
+                sensor_valid=sensor_valid,
+                schema_name=self.schema.name,
+                joint_offsets_parent=joint_offsets_parent,
+                enabled=root_correction,
+            )
+            ik_tracker_pos_world = (
+                self.update_tracker_ik_targets(
+                    tracker_pos_world=tracker_pos_world,
+                    sensor_valid=sensor_valid,
+                    smoothing=float(tracker_ik_target_smoothing),
+                )
+                if tracker_ik
+                else tracker_pos_world
+            )
+            predicted = apply_tracker_position_ik(
+                predicted_frame_raw=predicted,
+                root_pos_world=root_pos,
+                root_yaw=self.current_root_yaw,
+                tracker_pos_world=ik_tracker_pos_world,
+                sensor_valid=sensor_valid,
+                joint_offsets_parent=joint_offsets_parent,
+                schema_name=self.schema.name,
+                enabled=tracker_ik,
+                iterations=tracker_ik_iterations,
+                lr=tracker_ik_lr,
+                initial_body_pose_parent_6d=previous_body_pose,
+                previous_body_pose_parent_6d=previous_body_pose,
+                blend=tracker_ik_blend,
+                delta_limit=tracker_ik_delta_limit,
+            )
+
         self.current_root_pos_world = root_pos.astype(np.float32)
+        predicted_frame_raw[...] = predicted
         self.append_output_frame(
             tracker_feature_raw,
             predicted,
             root_pos_world=self.current_root_pos_world,
             history_target_raw=history_target_raw,
         )
-        return self.current_root_pos_world.copy()
+        return predicted.copy(), self.current_root_pos_world.copy()
 
     def hold_output(self, tracker_feature_raw: np.ndarray, root_pos_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self.last_output_raw is None:
@@ -377,6 +791,14 @@ def simulate_unity_stream(
     history_features_until_frame: int | None = None,
     reference_root_yaw: np.ndarray | None = None,
     reference_root_pos_world: np.ndarray | None = None,
+    joint_offsets_parent: np.ndarray | None = None,
+    root_correction: bool = True,
+    tracker_ik: bool = True,
+    tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
+    tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
+    tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
+    tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
+    tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
 ) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
     frame_count = int(tracker_pos_world.shape[0])
@@ -406,6 +828,9 @@ def simulate_unity_stream(
     )
     if reference_root_pos is not None and reference_root_pos.shape != (frame_count, 3):
         raise ValueError(f"reference_root_pos_world 应为 [{frame_count},3]，实际为 {reference_root_pos.shape}")
+    joint_offsets = None if joint_offsets_parent is None else np.asarray(joint_offsets_parent, dtype=np.float32)
+    if joint_offsets is not None and joint_offsets.shape != (SMPL_JOINT_COUNT, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {joint_offsets.shape}")
 
     predicted_features = []
     conditioned_features = []
@@ -499,11 +924,22 @@ def simulate_unity_stream(
             reconstructed_raw = inverse_feature_window(reconstructed_np, normalizer=normalizer)
             predicted_frame_raw = reconstructed_raw[REALTIME_POSE_TARGET_START].copy()
             conditioned_frame_raw = inverse_feature_window(conditioned_raw, normalizer=normalizer)[REALTIME_POSE_TARGET_START]
-            output_root_pos = state.accept_prediction(
+            predicted_frame_raw, output_root_pos = state.accept_prediction(
                 tracker_feature_raw=tracker_feature_raw,
                 predicted_frame_raw=predicted_frame_raw,
                 fallback_root_pos_world=root_pos,
                 history_target_raw=history_target_raw,
+                tracker_pos_world=tracker_pos_world[frame_index],
+                tracker_rot_world_6d=tracker_rot_world_6d[frame_index],
+                sensor_valid=frame_valid,
+                joint_offsets_parent=joint_offsets,
+                root_correction=bool(root_correction),
+                tracker_ik=bool(tracker_ik),
+                tracker_ik_iterations=int(tracker_ik_iterations),
+                tracker_ik_lr=float(tracker_ik_lr),
+                tracker_ik_blend=float(tracker_ik_blend),
+                tracker_ik_target_smoothing=float(tracker_ik_target_smoothing),
+                tracker_ik_delta_limit=float(tracker_ik_delta_limit),
             )
             frame_predicted = True
 
@@ -533,6 +969,13 @@ def simulate_unity_stream(
         "is_predicted": predicted_mask[None],
         "eval_frame_mask": (predicted_mask & validity_mask)[None],
         "warmup_frames": np.asarray(REALTIME_POSE_TARGET_START, dtype=np.int64),
+        "root_correction": np.asarray(bool(root_correction)),
+        "tracker_ik": np.asarray(bool(tracker_ik)),
+        "tracker_ik_iterations": np.asarray(int(tracker_ik_iterations), dtype=np.int64),
+        "tracker_ik_lr": np.asarray(float(tracker_ik_lr), dtype=np.float32),
+        "tracker_ik_blend": np.asarray(float(tracker_ik_blend), dtype=np.float32),
+        "tracker_ik_target_smoothing": np.asarray(float(tracker_ik_target_smoothing), dtype=np.float32),
+        "tracker_ik_delta_limit": np.asarray(float(tracker_ik_delta_limit), dtype=np.float32),
         "inpaint_mask": build_realtime_inpaint_mask(1, torch.device("cpu"), schema_name=schema.name)
         .cpu()
         .numpy()
@@ -581,6 +1024,14 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer=normalizer,
         initial_root_yaw=float(args.initial_root_yaw),
         invalid_frame_policy=args.invalid_frame_policy,
+        joint_offsets_parent=stream.get("joint_offsets_parent"),
+        root_correction=bool(args.root_correction),
+        tracker_ik=bool(args.tracker_ik),
+        tracker_ik_iterations=int(args.tracker_ik_iterations),
+        tracker_ik_lr=float(args.tracker_ik_lr),
+        tracker_ik_blend=float(args.tracker_ik_blend),
+        tracker_ik_target_smoothing=float(args.tracker_ik_target_smoothing),
+        tracker_ik_delta_limit=float(args.tracker_ik_delta_limit),
     )
     output_dir = Path(args.output_dir or "output/unity_stream_simulation").resolve()
     output_path = output_dir / "unity_stream_simulation.npz"

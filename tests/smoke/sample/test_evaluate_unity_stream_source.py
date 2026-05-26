@@ -54,6 +54,7 @@ def test_long_sequence_payload_aligns_gt_and_skips_warmup():
         device=torch.device("cpu"),
         use_ddim=False,
         normalizer=None,
+        root_correction=False,
     )
 
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
@@ -145,6 +146,8 @@ def test_render_realtime_pose_comparison_writes_mp4(tmp_path):
         root_yaw_predicted=source["root_yaw"][None].copy(),
         fps=5,
         stride=1,
+        camera_mode="follow",
+        layout="overlay",
     )
 
     assert output_path.exists()
