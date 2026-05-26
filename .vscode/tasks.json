@@ -89,16 +89,15 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v2: 2 compute normalizer",
+            "label": "realtime_pose_v2: 3 compute normalizer from tasks",
             "type": "shell",
             "command": "conda",
             "args": [
                 "run", "--no-capture-output", "-n", "diffusionposer5070",
                 "python", "-m", "data_loaders.compute_realtime_pose_normalizer",
                 "--schema", "realtime_pose_v2_contact",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
-                "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--split", "train",
                 "--overwrite"
             ],
@@ -112,7 +111,7 @@
             "problemMatcher": []
         },
         {
-            "label": "realtime_pose_v2: 3 generate full-tracker tasks",
+            "label": "realtime_pose_v2: 2 generate full-tracker tasks",
             "type": "shell",
             "command": "conda",
             "args": [

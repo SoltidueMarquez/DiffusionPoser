@@ -86,6 +86,7 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         save_dir=str(tmp_path / "run"),
         num_steps=1,
         eval_during_training=False,
+        eval_num_batches=1,
         weighted_loss=False,
         normalizer_dir="",
         feature_w_file="feature_w.pt",
@@ -102,9 +103,121 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         "fk_loss",
         "joint_vel_loss",
         "foot_lock_loss",
+        "aux_loss",
         "sensor_reprojection_pos_loss",
+        "sensor_reprojection_rot_loss",
     }.issubset(losses)
+    assert torch.allclose(losses["loss"], losses["simple_loss"] + losses["aux_loss"])
     losses["loss"].mean().backward()
+
+    model_kwargs["y"]["target_foot_contact"] = torch.zeros_like(model_kwargs["y"]["target_foot_contact"])
+    aux_terms = diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs)
+    assert torch.allclose(aux_terms["foot_lock_loss"], torch.zeros_like(aux_terms["foot_lock_loss"]))
+
+    model_kwargs_missing_contact = loop.mask_manager(batch, batch["x"])
+    del model_kwargs_missing_contact["y"]["target_foot_contact"]
+    with pytest.raises(KeyError, match="target_foot_contact"):
+        diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_contact)
+
+
+def test_train_loop_eval_reports_validation_loss(tmp_path):
+    source_dir = tmp_path / "sources"
+    task_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(task_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+    loader = get_dataset_loader(
+        data_dir=str(task_dir),
+        batch_size=1,
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        seq_len=REALTIME_POSE_SEQ_LEN,
+        split="train",
+        normalize_input=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+    )
+    dist_util.setup_dist(-1)
+    model = DiffusionPoserDiT(input_feats=REALTIME_POSE_INPUT_DIM, latent_dim=32, num_layers=1, num_heads=4, max_seq_len=REALTIME_POSE_SEQ_LEN)
+    betas = gd.get_named_beta_schedule("cosine", 4, scale_betas=1.0)
+    diffusion = SpacedDiffusion(
+        use_timesteps=space_timesteps(4, [4]),
+        betas=betas,
+        model_mean_type=gd.ModelMeanType.START_X,
+        model_var_type=gd.ModelVarType.FIXED_SMALL,
+        loss_type=gd.LossType.MSE,
+        rescale_timesteps=False,
+    )
+    args = argparse.Namespace(
+        batch_size=1,
+        lr=1e-4,
+        log_interval=1,
+        save_interval=0,
+        resume_checkpoint="",
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        gradient_clip=False,
+        snr_gamma=0.0,
+        l1_loss=False,
+        task_mode="realtime_pose_reconstruction",
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        checkpoint_max_keep=0,
+        save_dir=str(tmp_path / "run"),
+        num_steps=1,
+        eval_during_training=True,
+        eval_num_batches=1,
+        weighted_loss=False,
+        normalizer_dir="",
+        feature_w_file="feature_w.pt",
+        model_ema=False,
+    )
+    platform = NoopPlatform()
+    loop = TrainLoop(args, train_platform=platform, model=model, diffusion=diffusion, data=loader, eval_data=loader)
+
+    loop.evaluate()
+
+    reported_names = {item["name"] for item in platform.scalars}
+    assert "eval/loss" in reported_names
+    assert "eval/simple_loss" in reported_names
+    assert "eval/aux_loss" in reported_names
+
+
+def test_train_loop_rejects_empty_train_loader(tmp_path):
+    args = argparse.Namespace(
+        batch_size=4,
+        lr=1e-4,
+        log_interval=1,
+        save_interval=0,
+        resume_checkpoint="",
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        gradient_clip=False,
+        snr_gamma=0.0,
+        l1_loss=False,
+        task_mode="realtime_pose_reconstruction",
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        checkpoint_max_keep=0,
+        save_dir=str(tmp_path / "run"),
+        num_steps=1,
+        eval_during_training=False,
+        eval_num_batches=1,
+    )
+
+    with pytest.raises(RuntimeError, match="没有可用 batch"):
+        TrainLoop(args, train_platform=NoopPlatform(), model=torch.nn.Linear(1, 1), diffusion=object(), data=[])
 
 
 def test_training_loss_nan_fails_fast():
@@ -118,5 +231,9 @@ def test_training_loss_nan_fails_fast():
 
 
 class NoopPlatform:
+    def __init__(self):
+        self.scalars = []
+
     def report_scalar(self, *args, **kwargs):
+        self.scalars.append(kwargs)
         return None

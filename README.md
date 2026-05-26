@@ -28,7 +28,7 @@
 
 ## 一站式脚本
 
-推荐直接从 AMASS 转换、normalizer、task 生成一路跑到训练：
+推荐直接从 AMASS 转换、task 生成、normalizer 统计一路跑到训练：
 
 ```powershell
 conda run -n diffusionposer5070 python -m scripts.run_realtime_pose_pipeline `
@@ -47,7 +47,7 @@ conda run -n diffusionposer5070 python -m scripts.run_realtime_pose_pipeline `
 
 `--reuse_source_dir` 只接受已经包含当前 schema 全部字段的 v2 source；默认不启用复用，避免把旧特征格式混入当前训练链路。
 
-如果前面步骤已经完成，可以用 `--start_at tasks` 或 `--start_at train` 从中间继续；只想检查将要执行的命令，用 `--dry_run`。如果确实要强制重跑 source SMPL forward，添加 `--rebuild_source`。
+如果前面步骤已经完成，可以用 `--start_at tasks`、`--start_at normalizer` 或 `--start_at train` 从中间继续；只想检查将要执行的命令，用 `--dry_run`。如果确实要强制重跑 source SMPL forward，添加 `--rebuild_source`。
 
 VSCode 里可以直接运行：
 
@@ -64,14 +64,6 @@ conda run -n diffusionposer5070 python -m data_converter.amass_to_realtime_pose 
   --target_fps 60 `
   --overwrite
 
-conda run -n diffusionposer5070 python -m data_loaders.compute_realtime_pose_normalizer `
-  --schema realtime_pose_v2_contact `
-  --source_dir dataset/AMASS_realtime_pose_v2_60hz `
-  --output_dir dataset/meta_AMASS_realtime_pose_v2_60hz `
-  --split_dir data_loaders/splits `
-  --split train `
-  --overwrite
-
 conda run -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_tasks `
   --schema realtime_pose_v2_contact `
   --source_dir dataset/AMASS_realtime_pose_v2_60hz `
@@ -80,6 +72,13 @@ conda run -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_ta
   --splits train test `
   --samples_per_file 4 `
   --mask_policy full `
+  --overwrite
+
+conda run -n diffusionposer5070 python -m data_loaders.compute_realtime_pose_normalizer `
+  --schema realtime_pose_v2_contact `
+  --task_dir dataset/AMASS_realtime_pose_v2_60hz_tasks `
+  --output_dir dataset/meta_AMASS_realtime_pose_v2_60hz `
+  --split train `
   --overwrite
 ```
 

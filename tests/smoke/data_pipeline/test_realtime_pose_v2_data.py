@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -17,6 +18,13 @@ from data_loaders.sensor_masking import (
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
 from utils.normalizer import REALTIME_POSE_MIN_NORMALIZER_STD, RealtimePoseNormalizer
+from utils.run_dirs import read_latest_pointer
+
+
+def latest_artifact_dir(root: Path, kind: str) -> Path:
+    latest = read_latest_pointer(root, kind=kind)
+    assert latest is not None
+    return latest
 
 
 def test_v2_contact_feature_layout_and_root_integration():
@@ -57,7 +65,8 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
             "--overwrite",
         ]
     )
-    manifest_path = task_dir / "train" / "manifest.jsonl"
+    task_output_dir = latest_artifact_dir(task_dir, kind="tasks")
+    manifest_path = task_output_dir / "train" / "manifest.jsonl"
     entry = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
     assert entry["feature_dim"] == schema.feature_dim

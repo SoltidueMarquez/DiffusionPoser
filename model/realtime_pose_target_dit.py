@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_START, get_schema_spec
+from model.causal_attention import build_target_dit_causal_mask
 from model.diffusionposer_dit import SinusoidalTimestepEmbedding
 
 
@@ -118,10 +119,16 @@ class RealtimePoseTargetDiT(nn.Module):
         sensor_tokens = self.sensor_encoder(sensor_values)
         tokens = torch.cat([target_token, sensor_tokens, frame_tokens], dim=1)
 
-        # token 顺序：[target, 6 sensor, T frame]。只有 frame tokens 使用 valid_frame_mask 做 padding。
+        # token 顺序：[target, 6 sensor, T frame]。causal mask 负责时间可见性，padding mask 只表示有效帧。
         token_mask = torch.zeros(batch_size, 1 + sensor_tokens.shape[1] + seq_len, dtype=torch.bool, device=hidden_states.device)
         token_mask[:, 1 + sensor_tokens.shape[1]:] = ~valid_frame_mask
-        hidden = self.transformer(tokens, src_key_padding_mask=token_mask)
+        causal_mask = build_target_dit_causal_mask(
+            seq_len=seq_len,
+            tracker_count=sensor_tokens.shape[1],
+            target_frame=REALTIME_POSE_TARGET_START,
+            device=hidden_states.device,
+        )
+        hidden = self.transformer(tokens, mask=causal_mask, src_key_padding_mask=token_mask)
         pred_target = self.output_proj(hidden[:, 0])
         target_mask = inpaint_cond[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START].to(dtype=hidden_states.dtype)
         input_target = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]

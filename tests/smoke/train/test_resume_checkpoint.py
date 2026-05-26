@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import torch
 
-from train.training_loop import TrainLoop, find_latest_model_checkpoint, find_resume_checkpoint
+from train.training_loop import TrainLoop, find_latest_model_checkpoint, find_latest_run_dir, find_resume_checkpoint
 
 
 class DummyModel:
@@ -41,14 +42,29 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
 
             self.assertEqual(resolved.name, "model000000008.pt")
 
-    def test_missing_explicit_checkpoint_falls_back_to_latest(self):
+    def test_latest_keyword_uses_latest_run_pointer_when_save_dir_is_run_root(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_root = Path(tmp_dir)
+            run_dir = run_root / "20260526_120000_debug"
+            run_dir.mkdir()
+            (run_dir / "model000000012.pt").write_bytes(b"")
+            (run_root / "latest_run.json").write_text(
+                json.dumps({"save_dir": str(run_dir)}),
+                encoding="utf-8",
+            )
+
+            resolved = Path(find_resume_checkpoint(run_root, "latest"))
+
+            self.assertEqual(resolved, run_dir / "model000000012.pt")
+            self.assertEqual(find_latest_run_dir(run_root), run_dir)
+
+    def test_missing_explicit_checkpoint_raises_without_fallback(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_dir = Path(tmp_dir)
             (save_dir / "model000000006.pt").write_bytes(b"")
 
-            resolved = Path(find_resume_checkpoint(save_dir, save_dir / "model000000002.pt"))
-
-            self.assertEqual(resolved.name, "model000000006.pt")
+            with self.assertRaises(FileNotFoundError):
+                find_resume_checkpoint(save_dir, save_dir / "model000000002.pt")
 
     def test_empty_resume_checkpoint_keeps_fresh_training(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -108,6 +124,44 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
         loop.run_loop()
 
         self.assertEqual(loop.step, 0)
+
+    def test_lr_anneal_steps_does_not_stop_training(self):
+        loop = object.__new__(TrainLoop)
+        loop.model = DummyModel()
+        loop.data = [{"x": torch.zeros(1)}, {"x": torch.zeros(1)}]
+        loop.device = torch.device("cpu")
+        loop.num_epochs = 1
+        loop.step = 0
+        loop.resume_step = 0
+        loop.num_steps = 2
+        loop.lr_anneal_steps = 1
+        loop.log_interval = 0
+        loop.save_interval = 0
+
+        optimized_steps = []
+        loop.run_step = lambda batch: optimized_steps.append(loop.step + loop.resume_step)
+        loop.log_step = lambda: None
+        loop.report_metrics = lambda: None
+        loop.save = lambda: None
+        loop.evaluate = lambda: None
+
+        loop.run_loop()
+
+        self.assertEqual(optimized_steps, [0, 1])
+        self.assertEqual(loop.step, 2)
+
+    def test_anneal_lr_updates_optimizer_param_groups(self):
+        loop = object.__new__(TrainLoop)
+        loop.lr = 0.1
+        loop.lr_anneal_steps = 10
+        loop.step = 5
+        loop.resume_step = 0
+        loop.opt = type("DummyOpt", (), {"param_groups": [{"lr": 0.1}, {"lr": 0.1}]})()
+
+        loop._anneal_lr()
+
+        self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], 0.05)
+        self.assertAlmostEqual(loop.opt.param_groups[1]["lr"], 0.05)
 
 
 if __name__ == "__main__":

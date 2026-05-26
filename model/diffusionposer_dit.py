@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from model.causal_attention import build_frame_causal_mask
+
 
 class SinusoidalTimestepEmbedding(nn.Module):
     """把扩散时间步编码成连续向量，表示当前样本的噪声强度。"""
@@ -118,5 +120,6 @@ class DiffusionPoserDiT(nn.Module):
         hidden = hidden + self.frame_pos_embed[:, :seq_len]
 
         key_padding_mask = ~valid_frame_mask
-        hidden = self.transformer(hidden, src_key_padding_mask=key_padding_mask)
+        causal_mask = build_frame_causal_mask(seq_len, device=hidden_states.device)
+        hidden = self.transformer(hidden, mask=causal_mask, src_key_padding_mask=key_padding_mask)
         return self.output_proj(hidden).transpose(1, 2)

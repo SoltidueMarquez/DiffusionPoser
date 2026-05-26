@@ -16,7 +16,14 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from data_loaders.realtime_pose_kinematics import JOINT_INDEX, TRACKER_JOINT_INDICES, fk_parent_local_torch, make_yaw_rotation_torch
+from data_loaders.realtime_pose_kinematics import (
+    JOINT_INDEX,
+    TRACKER_JOINT_INDICES,
+    fk_parent_local_torch,
+    make_yaw_rotation_torch,
+    rotation_6d_forward_up_torch,
+    rotation_6d_to_matrix_torch,
+)
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_START,
     get_schema_spec,
@@ -127,11 +134,31 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
+        aux_loss_weight=1.0,
+        yaw_loss_weight=10.0,
+        fk_loss_weight=2.0,
+        joint_vel_loss_weight=0.5,
+        foot_lock_loss_weight=0.5,
+        root_delta_loss_weight=1.0,
+        root_height_loss_weight=1.0,
+        contact_loss_weight=0.5,
+        tracker_pos_loss_weight=5.0,
+        tracker_rot_loss_weight=2.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
+        self.aux_loss_weight = float(aux_loss_weight)
+        self.yaw_loss_weight = float(yaw_loss_weight)
+        self.fk_loss_weight = float(fk_loss_weight)
+        self.joint_vel_loss_weight = float(joint_vel_loss_weight)
+        self.foot_lock_loss_weight = float(foot_lock_loss_weight)
+        self.root_delta_loss_weight = float(root_delta_loss_weight)
+        self.root_height_loss_weight = float(root_height_loss_weight)
+        self.contact_loss_weight = float(contact_loss_weight)
+        self.tracker_pos_loss_weight = float(tracker_pos_loss_weight)
+        self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1349,6 +1376,7 @@ class GaussianDiffusion:
             "target_root_pos_world",
             "prev_root_yaw",
             "joint_offsets_parent",
+            "target_foot_contact",
         )
         missing = [name for name in required if name not in y]
         if missing:
@@ -1415,11 +1443,12 @@ class GaussianDiffusion:
             offsets = offsets.clone()
             offsets[:, 0, 1] = pred_root_height.view(-1)
 
-        pred_joints = fk_parent_local_torch(
+        pred_joints, pred_global_rot = fk_parent_local_torch(
             body_pose_parent_6d=pred_pose,
             root_pos_world=target_root_pos,
             root_yaw=pred_root_yaw,
             parent_offsets=offsets,
+            return_global_rot=True,
         )
 
         fk_loss = ((pred_joints - target_joints) ** 2).flatten(1).mean(dim=1)
@@ -1432,8 +1461,9 @@ class GaussianDiffusion:
             device=pred_xstart.device,
             dtype=torch.long,
         )
-        gt_foot_delta_xz = target_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
-        contact_mask = torch.linalg.norm(gt_foot_delta_xz, dim=-1) < 0.03
+        contact_mask = y["target_foot_contact"].to(device=pred_xstart.device, dtype=pred_xstart.dtype) > 0.5
+        if tuple(contact_mask.shape) != (pred_xstart.shape[0], 2):
+            raise ValueError(f"target_foot_contact 应为 [B, 2]，实际为 {tuple(contact_mask.shape)}")
         pred_foot_delta_xz = pred_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
         foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * contact_mask.float()
         foot_lock_count = contact_mask.float().sum(dim=1).clamp_min(1.0)
@@ -1457,6 +1487,7 @@ class GaussianDiffusion:
             result["contact_loss"] = torch.abs(pred_contact - gt_contact).mean(dim=1)
 
         target_tracker_pos_ref = y.get("target_tracker_pos_ref")
+        target_tracker_rot_ref = y.get("target_tracker_rot_ref_6d")
         target_sensor_valid = y.get("target_sensor_valid")
         if target_tracker_pos_ref is not None and target_sensor_valid is not None:
             target_tracker_pos_ref = target_tracker_pos_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
@@ -1473,6 +1504,25 @@ class GaussianDiffusion:
             reproj = torch.abs(pred_tracker_ref - target_tracker_pos_ref).mean(dim=-1)
             denom = valid_target.float().sum(dim=1).clamp_min(1.0)
             result["sensor_reprojection_pos_loss"] = (reproj * valid_target.float()).sum(dim=1) / denom
+        if target_tracker_rot_ref is not None and target_sensor_valid is not None:
+            target_tracker_rot_ref = target_tracker_rot_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
+            tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
+            pred_tracker_rot_world = pred_global_rot[:, tracker_indices]
+            # tracker_rot_ref_6d 的定义是 `R(prev_yaw)^T @ tracker_rot_world`。
+            # 这里把 FK 得到的关节全局旋转投到同一参考系，只对 valid tracker 做旋转对齐。
+            ref_inv = make_yaw_rotation_torch(prev_root_yaw).transpose(-1, -2)
+            pred_tracker_rot_ref = torch.einsum("bij,btjk->btik", ref_inv, pred_tracker_rot_world)
+            target_tracker_rot_ref = rotation_6d_to_matrix_torch(target_tracker_rot_ref)
+            pred_tracker_rot_ref_6d = rotation_6d_forward_up_torch(pred_tracker_rot_ref)
+            target_tracker_rot_ref_6d = rotation_6d_forward_up_torch(target_tracker_rot_ref)
+            rot_cos = (
+                pred_tracker_rot_ref_6d.reshape(pred_tracker_rot_ref_6d.shape[0], pred_tracker_rot_ref_6d.shape[1], 2, 3)
+                * target_tracker_rot_ref_6d.reshape(target_tracker_rot_ref_6d.shape[0], target_tracker_rot_ref_6d.shape[1], 2, 3)
+            ).sum(dim=-1)
+            rot_reproj = 1.0 - rot_cos.mean(dim=-1)
+            denom = valid_target.float().sum(dim=1).clamp_min(1.0)
+            result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
         return result
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, feature_w=None, snr_gamma=5, use_l1=False):
@@ -1583,18 +1633,25 @@ class GaussianDiffusion:
                 if aux_terms:
                     terms.update(aux_terms)
                     aux_loss = (
-                        10.0 * terms["yaw_loss"]
-                        + 2.0 * terms["fk_loss"]
-                        + 0.5 * terms["joint_vel_loss"]
-                        + 0.5 * terms["foot_lock_loss"]
+                        self.yaw_loss_weight * terms["yaw_loss"]
+                        + self.fk_loss_weight * terms["fk_loss"]
+                        + self.joint_vel_loss_weight * terms["joint_vel_loss"]
+                        + self.foot_lock_loss_weight * terms["foot_lock_loss"]
                     )
                     if "root_delta_loss" in terms:
-                        aux_loss = aux_loss + terms["root_delta_loss"] + terms["root_height_loss"]
+                        aux_loss = (
+                            aux_loss
+                            + self.root_delta_loss_weight * terms["root_delta_loss"]
+                            + self.root_height_loss_weight * terms["root_height_loss"]
+                        )
                     if "contact_loss" in terms:
-                        aux_loss = aux_loss + 0.5 * terms["contact_loss"]
+                        aux_loss = aux_loss + self.contact_loss_weight * terms["contact_loss"]
                     if "sensor_reprojection_pos_loss" in terms:
-                        aux_loss = aux_loss + 0.5 * terms["sensor_reprojection_pos_loss"]
-                    terms["loss"] = terms["loss"] + aux_loss
+                        aux_loss = aux_loss + self.tracker_pos_loss_weight * terms["sensor_reprojection_pos_loss"]
+                    if "sensor_reprojection_rot_loss" in terms:
+                        aux_loss = aux_loss + self.tracker_rot_loss_weight * terms["sensor_reprojection_rot_loss"]
+                    terms["aux_loss"] = self.aux_loss_weight * aux_loss
+                    terms["loss"] = terms["loss"] + terms["aux_loss"]
 
         else:
             raise NotImplementedError(self.loss_type)

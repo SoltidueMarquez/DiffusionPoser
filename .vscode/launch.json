@@ -87,7 +87,7 @@
             ]
         },
         {
-            "name": "realtime_pose_v2 | 2 compute normalizer",
+            "name": "realtime_pose_v2 | 3 compute normalizer from tasks",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -102,15 +102,14 @@
             },
             "args": [
                 "--schema", "realtime_pose_v2_contact",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
                 "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
-                "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--split", "train",
                 "--overwrite"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 3 generate full-tracker tasks",
+            "name": "realtime_pose_v2 | 2 generate full-tracker tasks",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",

@@ -45,6 +45,7 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 from utils.normalizer import RealtimePoseNormalizer
+from utils.run_dirs import resolve_latest_or_self
 
 
 @dataclass(frozen=True)
@@ -418,6 +419,7 @@ def create_normalizer(
 
 
 def find_manifest_path(data_dir: Path, split: str) -> Path:
+    data_dir = resolve_latest_or_self(data_dir, kind="tasks")
     candidates = [data_dir / split / "manifest.jsonl", data_dir / "manifest.jsonl"]
     for candidate in candidates:
         if candidate.exists():

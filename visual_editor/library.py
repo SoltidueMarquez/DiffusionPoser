@@ -8,6 +8,7 @@ import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME
+from utils.run_dirs import resolve_latest_or_self
 from visual_editor.models import ComparePreset, MotionAsset, MotionTrack, StudioConfig
 from visual_editor.realtime_pose import iter_jsonl, load_task_npz, stable_id
 
@@ -76,7 +77,7 @@ class MotionLibrary:
 
     def scan_tasks(self) -> dict[str, MotionAsset]:
         assets: dict[str, MotionAsset] = {}
-        data_dir = self.config.data_dir
+        data_dir = resolve_latest_or_self(self.config.data_dir, kind="tasks")
         if not data_dir.exists():
             return assets
         manifest_paths = sorted(data_dir.glob("*/manifest.jsonl"))

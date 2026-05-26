@@ -10,6 +10,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SCHEMA_NAME,
     get_schema_spec,
 )
+from utils.run_dirs import resolve_latest_or_self
 
 
 REALTIME_POSE_MIN_NORMALIZER_STD = 1e-4
@@ -49,11 +50,11 @@ class RealtimePoseNormalizer:
         disable: bool = False,
         schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     ):
-        self.base_dir = Path(base_dir)
-        self.mean_path = self.base_dir / "mean.pt"
-        self.std_path = self.base_dir / "std.pt"
         self.eps = float(eps)
         self.disable = bool(disable)
+        self.base_dir = Path(base_dir) if self.disable else resolve_latest_or_self(base_dir, kind="normalizer")
+        self.mean_path = self.base_dir / "mean.pt"
+        self.std_path = self.base_dir / "std.pt"
         self.schema = get_schema_spec(schema_name)
         self.mean: torch.Tensor | None = None
         self.std: torch.Tensor | None = None

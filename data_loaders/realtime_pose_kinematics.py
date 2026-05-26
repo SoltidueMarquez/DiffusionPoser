@@ -161,6 +161,12 @@ def rotation_6d_forward_up_np(rotations: np.ndarray) -> np.ndarray:
     return np.concatenate([forward, up], axis=-1)
 
 
+def rotation_6d_forward_up_torch(rotations: torch.Tensor) -> torch.Tensor:
+    forward = rotations[..., :, 2]
+    up = rotations[..., :, 1]
+    return torch.cat([forward, up], dim=-1)
+
+
 def rotation_6d_to_matrix_np(rotation_6d: np.ndarray) -> np.ndarray:
     values = np.asarray(rotation_6d, dtype=np.float64)
     forward = values[..., 0:3]
@@ -251,7 +257,8 @@ def fk_parent_local_torch(
     root_pos_world: torch.Tensor,
     root_yaw: torch.Tensor,
     parent_offsets: torch.Tensor,
-) -> torch.Tensor:
+    return_global_rot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """从 parent-local 6D pose 做可微 FK，输入形状 `[B,144]`，输出 `[B,24,3]`。"""
 
     batch_size = body_pose_parent_6d.shape[0]
@@ -271,4 +278,7 @@ def fk_parent_local_torch(
             joint_pos = joints[parent_index] + torch.einsum("bij,bj->bi", parent_rot, offset)
         global_rot.append(joint_rot)
         joints.append(joint_pos)
-    return torch.stack(joints, dim=1)
+    stacked_joints = torch.stack(joints, dim=1)
+    if return_global_rot:
+        return stacked_joints, torch.stack(global_rot, dim=1)
+    return stacked_joints

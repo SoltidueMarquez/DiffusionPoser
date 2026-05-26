@@ -9,12 +9,12 @@ from pathlib import Path
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
 
 
-PIPELINE_STAGES = ("convert", "normalizer", "tasks", "train")
+PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run realtime_pose data conversion, normalizer, task generation, and training in one command."
+        description="Run realtime_pose data conversion, task generation, normalizer, and training in one command."
     )
     paths = parser.add_argument_group("paths")
     paths.add_argument("--amass_dir", default="dataset/AMASS", type=str)
@@ -30,7 +30,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--start_at", default="convert", choices=PIPELINE_STAGES)
     pipeline.add_argument("--stop_after", default="train", choices=PIPELINE_STAGES)
     pipeline.add_argument("--dry_run", action="store_true")
-    pipeline.add_argument("--overwrite", action=BooleanOptionalAction, default=True)
+    pipeline.add_argument("--run_name", default="auto", type=str)
+    pipeline.add_argument("--overwrite", action=BooleanOptionalAction, default=False)
 
     convert = parser.add_argument_group("convert")
     convert.add_argument("--skip_convert", action="store_true")
@@ -64,7 +65,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--train_batch_size", default=64, type=int)
     train.add_argument("--num_workers", default=0, type=int)
     train.add_argument("--num_steps", default=1_000_000, type=int)
-    train.add_argument("--save_interval", default=50_000, type=int)
+    train.add_argument("--save_interval", default=5_000, type=int)
     train.add_argument("--log_interval", default=1_000, type=int)
     train.add_argument("--checkpoint_max_keep", default=3, type=int)
     train.add_argument("--lr", default=1e-4, type=float)
@@ -166,10 +167,10 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
 def build_normalizer_args(args: argparse.Namespace) -> list[str]:
     command = [
         "--schema", args.schema,
-        "--source_dir", normalize_path(args.source_dir),
+        "--task_dir", normalize_path(args.task_dir),
         "--output_dir", normalize_path(args.normalizer_dir),
-        "--split_dir", normalize_path(args.split_dir),
         "--split", args.normalizer_split,
+        "--run_name", args.run_name,
     ]
     add_flag(command, bool(args.overwrite), "--overwrite")
     return command
@@ -186,6 +187,7 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--mask_policy", args.mask_policy,
         "--fixed_tracker_patterns", *[str(pattern) for pattern in args.fixed_tracker_patterns],
         "--short_source_policy", args.short_source_policy,
+        "--run_name", args.run_name,
     ]
     add_flag(command, bool(args.overwrite), "--overwrite")
     return command
@@ -201,6 +203,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--data_split", "train",
         "--normalizer_dir", normalize_path(args.normalizer_dir),
         "--save_dir", normalize_path(args.save_dir),
+        "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
         "--num_workers", str(args.num_workers),
         "--num_steps", str(args.num_steps),
@@ -244,10 +247,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
     stages = selected_stages(args.start_at, args.stop_after)
     if "convert" in stages and not args.skip_convert:
         run_python_module("data_converter.amass_to_realtime_pose", build_convert_args(args), dry_run=args.dry_run)
-    if "normalizer" in stages and not args.skip_normalizer:
-        run_python_module("data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args), dry_run=args.dry_run)
     if "tasks" in stages and not args.skip_tasks:
         run_python_module("data_loaders.generate_realtime_pose_tasks", build_task_args(args), dry_run=args.dry_run)
+    if "normalizer" in stages and not args.skip_normalizer:
+        run_python_module("data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args), dry_run=args.dry_run)
     if "train" in stages and not args.skip_train:
         run_python_module("train.train_diffusionposer", build_train_args(args), dry_run=args.dry_run)
 

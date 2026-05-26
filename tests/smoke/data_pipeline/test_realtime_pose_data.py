@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,6 +35,13 @@ from data_loaders.sensor_masking import (
     TRACKER_ROT_REF_START,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
+from utils.run_dirs import read_latest_pointer
+
+
+def latest_artifact_dir(root: Path, kind: str) -> Path:
+    latest = read_latest_pointer(root, kind=kind)
+    assert latest is not None
+    return latest
 
 
 def test_converter_feature_builder_outputs_realtime_schema_shapes():
@@ -179,7 +187,9 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
             "--overwrite",
         ]
     )
-    manifest_path = output_dir / "train" / "manifest.jsonl"
+    task_output_dir = latest_artifact_dir(output_dir, kind="tasks")
+    assert (output_dir / "latest_tasks.json").exists()
+    manifest_path = task_output_dir / "train" / "manifest.jsonl"
     entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
     assert len(entries) == 2
     assert {entry["tracker_pattern"] for entry in entries} == {"full-trackers"}
@@ -220,8 +230,9 @@ def test_task_generator_skips_short_sources_by_default(tmp_path):
     )
 
     assert counts["train"] == 0
-    assert (output_dir / "train" / "manifest.jsonl").read_text(encoding="utf-8") == ""
-    report_path = output_dir / "train" / "skipped_short_sources.jsonl"
+    task_output_dir = latest_artifact_dir(output_dir, kind="tasks")
+    assert (task_output_dir / "train" / "manifest.jsonl").read_text(encoding="utf-8") == ""
+    report_path = task_output_dir / "train" / "skipped_short_sources.jsonl"
     records = [json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()]
     assert len(records) == 1
     assert records[0]["source_frames"] == REALTIME_POSE_SEQ_LEN - 3
@@ -299,7 +310,7 @@ def test_task_generator_overwrite_rejects_unsafe_directories(tmp_path):
     output_dir = tmp_path / "non_task_dir"
     output_dir.mkdir()
     (output_dir / "keep.txt").write_text("user data", encoding="utf-8")
-    with pytest.raises(ValueError, match="标记"):
+    with pytest.raises(ValueError, match="latest_tasks"):
         generate_realtime_pose_tasks_main(
             [
                 "--source_dir",
@@ -340,7 +351,8 @@ def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(t
             "--overwrite",
         ]
     )
-    manifest_path = output_dir / "train" / "manifest.jsonl"
+    task_output_dir = latest_artifact_dir(output_dir, kind="tasks")
+    manifest_path = task_output_dir / "train" / "manifest.jsonl"
     entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
     categories = {entry["tracker_pattern"] for entry in entries}
     assert set(TRACKER_PATTERN_CATEGORIES).issubset(categories)
@@ -604,17 +616,6 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
     output_dir = tmp_path / "tasks"
     write_toy_source_dataset(source_dir)
 
-    compute_realtime_pose_normalizer(
-        SimpleNamespace(
-            source_dir=str(source_dir),
-            output_dir=str(normalizer_dir),
-            split_dir="",
-            split="train",
-            schema=REALTIME_POSE_SCHEMA_NAME,
-            eps=1e-8,
-            overwrite=True,
-        )
-    )
     generate_realtime_pose_tasks_main(
         [
             "--source_dir",
@@ -631,6 +632,16 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             "",
             "--overwrite",
         ]
+    )
+    compute_realtime_pose_normalizer(
+        SimpleNamespace(
+            task_dir=str(output_dir),
+            output_dir=str(normalizer_dir),
+            split="train",
+            schema=REALTIME_POSE_SCHEMA_NAME,
+            eps=1e-8,
+            overwrite=True,
+        )
     )
 
     dataset = RealtimePoseTaskDataset(
@@ -659,6 +670,80 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             assert np.allclose(x[rot_start:rot_start + 6, missing], 0.0)
     sensor_values = np.concatenate([values.reshape(-1) for values in sensor_values])
     assert set(np.unique(sensor_values).tolist()).issubset({0.0, 1.0})
+
+
+def test_task_normalizer_ignores_invalid_tracker_zero_fill_in_stats(tmp_path):
+    source_dir = tmp_path / "sources"
+    task_dir = tmp_path / "tasks"
+    normalizer_dir = tmp_path / "meta"
+    write_toy_source_dataset(source_dir)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(task_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--mask_policy",
+            "fixed_patterns",
+            "--fixed_tracker_patterns",
+            "full-trackers",
+            "upper-body",
+            "--overwrite",
+        ]
+    )
+
+    meta = compute_realtime_pose_normalizer(
+        SimpleNamespace(
+            task_dir=str(task_dir),
+            output_dir=str(normalizer_dir),
+            split="train",
+            schema=REALTIME_POSE_SCHEMA_NAME,
+            eps=1e-8,
+            overwrite=True,
+        )
+    )
+    assert meta["matched_tasks"] == 2
+
+    task_output_dir = latest_artifact_dir(task_dir, kind="tasks")
+    manifest_path = task_output_dir / "train" / "manifest.jsonl"
+    entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    tracker_valid_counts = np.zeros(6, dtype=np.int64)
+    all_features = []
+    all_valid = []
+    for entry in entries:
+        task = load_materialized_task_npz(manifest_path.parent, entry["task_path"], schema_name=REALTIME_POSE_SCHEMA_NAME)
+        arrays = load_realtime_task_arrays(task, seq_len=REALTIME_POSE_SEQ_LEN, schema_name=REALTIME_POSE_SCHEMA_NAME)
+        all_features.append(encode_realtime_pose_features(arrays, schema_name=REALTIME_POSE_SCHEMA_NAME))
+        all_valid.append(arrays["sensor_valid"])
+        tracker_valid_counts += arrays["sensor_valid"].sum(axis=0).astype(np.int64)
+    assert meta["tracker_valid_observation_counts"] == tracker_valid_counts.astype(int).tolist()
+
+    features = np.concatenate(all_features, axis=0)
+    valid_all = np.concatenate(all_valid, axis=0)
+    partial_trackers = np.where((tracker_valid_counts > 0) & (tracker_valid_counts < len(entries) * REALTIME_POSE_SEQ_LEN))[0]
+    assert partial_trackers.size > 0
+    chosen = None
+    for tracker_index in partial_trackers.tolist():
+        candidate_slice = slice(TRACKER_POS_REF_START + tracker_index * 3, TRACKER_POS_REF_START + tracker_index * 3 + 3)
+        expected = features[valid_all[:, tracker_index], candidate_slice].mean(axis=0)
+        biased = features[:, candidate_slice].mean(axis=0)
+        if not np.allclose(expected, biased, atol=1e-6):
+            chosen = (candidate_slice, expected, biased)
+            break
+    assert chosen is not None
+    pos_slice, expected_mean, biased_mean = chosen
+    normalizer_output_dir = latest_artifact_dir(normalizer_dir, kind="normalizer")
+    saved_mean = torch.load(normalizer_output_dir / "mean.pt", map_location="cpu", weights_only=True).numpy()[pos_slice]
+    np.testing.assert_allclose(saved_mean, expected_mean, atol=1e-6)
+    assert not np.allclose(saved_mean, biased_mean, atol=1e-6)
 
 
 def test_converter_fails_on_partial_conversion_by_default(monkeypatch, tmp_path):

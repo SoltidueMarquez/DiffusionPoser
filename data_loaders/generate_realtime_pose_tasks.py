@@ -31,6 +31,7 @@ from data_loaders.sensor_masking import (
     repeat_pattern_sensor_valid,
     validate_sensor_valid,
 )
+from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
 SOURCE_KEYS = {
@@ -61,6 +62,7 @@ class SplitTaskPlan:
 @dataclass(frozen=True)
 class TaskGenerationPlan:
     source_dir: Path
+    output_root: Path
     output_dir: Path
     split_dir: Path | None
     split_plans: list[SplitTaskPlan]
@@ -90,6 +92,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--seed", default=10, type=int)
     runtime.add_argument("--compress_tasks", action="store_true")
     runtime.add_argument("--manifest_flush_interval", default=100, type=int)
+    runtime.add_argument("--run_name", default="auto", type=str)
     runtime.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -123,7 +126,9 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         raise ValueError(f"min_valid_trackers 至少为 {MIN_VALID_TRACKERS}")
 
     source_dir = Path(args.source_dir).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    output_root = Path(args.output_dir).resolve()
+    validate_task_output_root_available(source_dir=source_dir, output_root=output_root)
+    output_dir = timestamped_child_dir(output_root, resolve_task_run_label(args))
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     if not source_dir.exists():
         raise FileNotFoundError(f"{args.schema} 源目录不存在：{source_dir}")
@@ -155,6 +160,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     )
     return TaskGenerationPlan(
         source_dir=source_dir,
+        output_root=output_root,
         output_dir=output_dir,
         split_dir=split_dir,
         split_plans=split_plans,
@@ -162,6 +168,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
 
 
 def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argparse.Namespace) -> dict[str, int]:
+    args.output_dir = str(plan.output_dir)
     prepare_task_output_dir(
         source_dir=plan.source_dir,
         output_dir=plan.output_dir,
@@ -181,7 +188,28 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             args=args,
             source_split_dir=plan.split_dir,
         )
+    write_latest_pointer(
+        root_dir=plan.output_root,
+        kind="tasks",
+        output_dir=plan.output_dir,
+        metadata={
+            "task_dir": str(plan.output_dir),
+            "task_root": str(plan.output_root),
+            "schema_name": str(args.schema),
+            "source_dir": str(plan.source_dir),
+            "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
+            "splits": [split_plan.split for split_plan in plan.split_plans],
+            "counts": counts,
+        },
+    )
     return counts
+
+
+def resolve_task_run_label(args: argparse.Namespace) -> str:
+    run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
+    if run_name.lower() in {"", "auto"}:
+        return f"{getattr(args, 'schema', DEFAULT_REALTIME_POSE_SCHEMA_NAME)}_tasks_seed{getattr(args, 'seed', 0)}"
+    return run_name
 
 
 def prepare_task_output_dir(
@@ -198,6 +226,37 @@ def prepare_task_output_dir(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_task_output_marker(source_dir=source_dir, output_dir=output_dir, split_dir=split_dir, schema_name=schema_name)
+
+
+def validate_task_output_root_available(source_dir: Path, output_root: Path) -> None:
+    """校验时间戳产物根目录，避免把源数据目录或陌生非空目录当作 task root。"""
+
+    if output_root == source_dir:
+        raise ValueError(f"output_dir 不能与 source_dir 相同：{output_root}")
+    try:
+        source_inside_output_root = source_dir.is_relative_to(output_root)
+    except AttributeError:
+        source_inside_output_root = str(source_dir).startswith(str(output_root))
+    if source_inside_output_root:
+        raise ValueError(
+            f"output_dir 根目录不能包含 source_dir：output_dir={output_root}, source_dir={source_dir}"
+        )
+    protected_names = {"dataset", "runs", "save", "output"}
+    if output_root.name in protected_names:
+        raise ValueError(f"拒绝把仓库级产物目录直接作为 task 根目录：{output_root}")
+    if not output_root.exists():
+        return
+    if not output_root.is_dir():
+        raise NotADirectoryError(f"output_dir 必须是目录：{output_root}")
+    children = list(output_root.iterdir())
+    if not children:
+        return
+    if (output_root / "latest_tasks.json").exists() or (output_root / "latest_tasks.txt").exists():
+        return
+    raise ValueError(
+        f"拒绝使用非空且没有 latest_tasks 指针的 output_dir 根目录：{output_root}。"
+        "请换一个目录，或先确认并清理旧内容。"
+    )
 
 
 def validate_task_output_dir_available(source_dir: Path, output_dir: Path, overwrite: bool) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -21,12 +22,13 @@ from utils import dist_util
 class TrainLoop:
     """realtime_pose_v2 扩散训练循环。"""
 
-    def __init__(self, args, train_platform, model, diffusion, data):
+    def __init__(self, args, train_platform, model, diffusion, data, eval_data=None):
         self.args = args
         self.train_platform = train_platform
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.eval_data = eval_data
 
         self.batch_size = args.batch_size
         self.microbatch = args.batch_size
@@ -48,9 +50,20 @@ class TrainLoop:
         self.resume_step = 0
         self.global_batch = self.batch_size
         self.num_steps = args.num_steps
-        self.num_epochs = self.num_steps // max(1, len(self.data)) + 1
+        self.data_num_batches = len(self.data)
+        if self.data_num_batches <= 0:
+            raise RuntimeError(
+                "训练 DataLoader 没有可用 batch；请降低 --batch_size 或增加训练样本，"
+                "当前 train split 会 drop_last。"
+            )
+        self.eval_num_batches = max(0, int(getattr(args, "eval_num_batches", 0)))
+        if getattr(args, "eval_during_training", False):
+            if self.eval_data is None:
+                raise RuntimeError("开启 --eval_during_training 时必须提供 eval DataLoader。")
+            if len(self.eval_data) <= 0:
+                raise RuntimeError("eval DataLoader 没有可用 batch；请检查 --eval_split 或降低 --batch_size。")
+        self.num_epochs = self.num_steps // self.data_num_batches + 1
         self.device = dist_util.dev()
-        self._eval_skip_logged = False
 
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
@@ -229,16 +242,57 @@ class TrainLoop:
 
     def _should_stop(self) -> bool:
         global_step = self.step + self.resume_step
-        if self.lr_anneal_steps and global_step >= self.lr_anneal_steps:
-            return True
         return global_step >= self.num_steps
 
     def evaluate(self):
         if not self.args.eval_during_training:
             return
-        if not self._eval_skip_logged:
-            logger.log("训练期评估入口尚未接入 realtime_pose_v2 采样评估，本次训练跳过 --eval_during_training。")
-            self._eval_skip_logged = True
+        if self.eval_data is None:
+            raise RuntimeError("开启 --eval_during_training 时必须提供 eval DataLoader。")
+
+        was_training = bool(getattr(self.model, "training", False))
+        self.model.eval()
+        totals: dict[str, torch.Tensor] = {}
+        count = 0
+        max_batches = self.eval_num_batches if self.eval_num_batches > 0 else len(self.eval_data)
+
+        with torch.no_grad():
+            for batch_index, batch in enumerate(self.eval_data):
+                if batch_index >= max_batches:
+                    break
+                batch = move_batch_to_device(batch, self.device)
+                sample = batch["x"]
+                batch_size = sample.shape[0]
+                # eval 使用固定时间步轮转，避免验证 loss 随随机 timestep 抖动太大。
+                timesteps = (torch.arange(batch_size, device=self.device) + batch_index) % self.diffusion.num_timesteps
+                with autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.device.type == "cuda"):
+                    losses = self.compute_losses(batch=batch, timesteps=timesteps)
+                    loss = losses["loss"].mean()
+                validate_finite_losses(losses=losses, loss=loss, batch=batch)
+                for key, values in losses.items():
+                    if torch.is_tensor(values):
+                        totals[key] = totals.get(key, torch.zeros((), device=self.device)) + values.detach().float().mean()
+                count += 1
+
+        if count <= 0:
+            raise RuntimeError("eval DataLoader 没有产出 batch，无法计算训练期评估指标。")
+
+        global_step = self.step + self.resume_step
+        for key, total in totals.items():
+            value = float((total / count).item())
+            metric_name = f"eval/{key}"
+            logger.logkv_mean(metric_name, value)
+            self.train_platform.report_scalar(
+                name=metric_name,
+                value=value,
+                iteration=global_step,
+                group_name="Eval",
+            )
+            if key == "loss":
+                print(f"step[{global_step}]: eval/loss[{value:0.5f}]")
+
+        if was_training:
+            self.model.train()
 
     def run_step(self, batch):
         self.forward_backward(batch)
@@ -247,6 +301,7 @@ class TrainLoop:
             self.scaler.unscale_(self.opt)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
+        self._anneal_lr()
         self.scaler.step(self.opt)
         self.scaler.update()
 
@@ -262,33 +317,44 @@ class TrainLoop:
                 assert i == 0
                 assert self.microbatch == self.batch_size
 
-                sample = batch["x"]  # [B, C, 61]
-                batch_size, channels, seq_len = sample.shape
-                if channels != self.schema.feature_dim:
-                    raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
-
-                feature_w = self._feature_weights_for_batch(batch_size, seq_len)
                 timesteps = torch.randint(
                     low=0,
                     high=self.diffusion.num_timesteps,
-                    size=(batch_size,),
+                    size=(batch["x"].shape[0],),
                     device=self.device,
                 )
-                model_kwargs = self.mask_manager(batch, sample)
-
-                losses = self.diffusion.training_losses(
-                    self.model,
-                    sample,
-                    timesteps,
-                    model_kwargs=model_kwargs,
-                    feature_w=feature_w,
-                    snr_gamma=self.snr_gamma,
-                    use_l1=self.use_l1,
-                )
+                losses = self.compute_losses(batch=batch, timesteps=timesteps)
                 loss = losses["loss"].mean()
                 validate_finite_losses(losses=losses, loss=loss, batch=batch)
                 log_loss_dict(self.diffusion, timesteps, losses)
                 self.scaler.scale(loss).backward()
+
+    def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
+        sample = batch["x"]  # [B, C, 61]
+        batch_size, channels, seq_len = sample.shape
+        if channels != self.schema.feature_dim:
+            raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
+
+        feature_w = self._feature_weights_for_batch(batch_size, seq_len)
+        model_kwargs = self.mask_manager(batch, sample)
+        return self.diffusion.training_losses(
+            self.model,
+            sample,
+            timesteps,
+            model_kwargs=model_kwargs,
+            feature_w=feature_w,
+            snr_gamma=self.snr_gamma,
+            use_l1=self.use_l1,
+        )
+
+    def _anneal_lr(self):
+        if self.lr_anneal_steps <= 0:
+            return
+        global_step = self.step + self.resume_step
+        frac_done = min(float(global_step) / float(self.lr_anneal_steps), 1.0)
+        lr = self.lr * (1.0 - frac_done)
+        for param_group in self.opt.param_groups:
+            param_group["lr"] = lr
 
     def _feature_weights_for_batch(self, batch_size: int, seq_len: int):
         if self.feature_w is None:
@@ -367,6 +433,8 @@ class TrainLoop:
         global_step = self.step + self.resume_step
         logger.logkv("step", global_step)
         logger.logkv("samples", global_step * self.global_batch)
+        if hasattr(self, "opt"):
+            logger.logkv("lr", self.opt.param_groups[0]["lr"])
 
     def report_metrics(self):
         current = logger.get_current().name2val
@@ -456,8 +524,12 @@ def find_resume_checkpoint(save_dir: str | Path, requested_checkpoint: str | Pat
     if not requested_text:
         return ""
 
-    latest_checkpoint = find_latest_model_checkpoint(save_dir)
     if requested_text.lower() in {"latest", "auto"}:
+        latest_checkpoint = find_latest_model_checkpoint(save_dir)
+        if latest_checkpoint is None:
+            latest_run_dir = find_latest_run_dir(save_dir)
+            if latest_run_dir is not None:
+                latest_checkpoint = find_latest_model_checkpoint(latest_run_dir)
         if latest_checkpoint is None:
             raise FileNotFoundError(f"save_dir 中没有可恢复的 model*.pt checkpoint：{Path(save_dir)}")
         logger.log(f"auto resume from latest checkpoint: {latest_checkpoint}")
@@ -467,17 +539,7 @@ def find_resume_checkpoint(save_dir: str | Path, requested_checkpoint: str | Pat
     if requested_path.exists():
         return str(requested_path)
 
-    if latest_checkpoint is not None:
-        logger.log(
-            f"requested resume checkpoint not found: {requested_path}; "
-            f"fallback to latest checkpoint: {latest_checkpoint}"
-        )
-        return str(latest_checkpoint)
-
-    raise FileNotFoundError(
-        f"--resume_checkpoint 指向的文件不存在：{requested_path}，"
-        f"并且 save_dir 中也没有可恢复的 model*.pt checkpoint：{Path(save_dir)}"
-    )
+    raise FileNotFoundError(f"--resume_checkpoint 指向的文件不存在：{requested_path}")
 
 
 def find_latest_model_checkpoint(save_dir: str | Path) -> Path | None:
@@ -499,6 +561,32 @@ def find_latest_model_checkpoint(save_dir: str | Path) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda item: item[0])[1]
+
+
+def find_latest_run_dir(save_dir: str | Path) -> Path | None:
+    """读取 run 根目录里的 latest 指针，定位最近一次自动创建的 run 子目录。"""
+
+    save_dir = Path(save_dir)
+    json_path = save_dir / "latest_run.json"
+    if json_path.exists():
+        try:
+            with json_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            latest_dir = Path(str(payload.get("save_dir", ""))).expanduser()
+            if latest_dir.exists():
+                return latest_dir
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    text_path = save_dir / "latest_run.txt"
+    if text_path.exists():
+        try:
+            latest_dir = Path(text_path.read_text(encoding="utf-8").strip()).expanduser()
+        except OSError:
+            return None
+        if latest_dir.exists():
+            return latest_dir
+    return None
 
 
 def log_loss_dict(diffusion, timesteps, losses):
