@@ -197,6 +197,14 @@ def build_long_sequence_payload(
     tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
     tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
     tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
+    ik_init_mode: str = "random",
+    ik_init_timestep: int = -1,
+    ik_init_iterations: int = 16,
+    ik_init_lr: float = 0.03,
+    ik_init_pos_weight: float = 1.0,
+    ik_init_rot_weight: float = 0.2,
+    ik_init_reg_weight: float = 0.01,
+    ik_init_delta_limit: float = 0.15,
 ) -> dict[str, np.ndarray]:
     frame_count = int(source["tracker_pos_world"].shape[0])
     if frame_count <= REALTIME_POSE_TARGET_START:
@@ -237,6 +245,14 @@ def build_long_sequence_payload(
         tracker_ik_blend=float(tracker_ik_blend),
         tracker_ik_target_smoothing=float(tracker_ik_target_smoothing),
         tracker_ik_delta_limit=float(tracker_ik_delta_limit),
+        ik_init_mode=ik_init_mode,
+        ik_init_timestep=int(ik_init_timestep),
+        ik_init_iterations=int(ik_init_iterations),
+        ik_init_lr=float(ik_init_lr),
+        ik_init_pos_weight=float(ik_init_pos_weight),
+        ik_init_rot_weight=float(ik_init_rot_weight),
+        ik_init_reg_weight=float(ik_init_reg_weight),
+        ik_init_delta_limit=float(ik_init_delta_limit),
     )
 
     predicted_features = np.asarray(stream_payload["predicted_features_raw"][0], dtype=np.float32)
@@ -276,6 +292,14 @@ def build_long_sequence_payload(
         "tracker_ik_blend": stream_payload["tracker_ik_blend"],
         "tracker_ik_target_smoothing": stream_payload["tracker_ik_target_smoothing"],
         "tracker_ik_delta_limit": stream_payload["tracker_ik_delta_limit"],
+        "ik_init_mode": stream_payload["ik_init_mode"],
+        "ik_init_timestep": stream_payload["ik_init_timestep"],
+        "ik_init_iterations": stream_payload["ik_init_iterations"],
+        "ik_init_lr": stream_payload["ik_init_lr"],
+        "ik_init_pos_weight": stream_payload["ik_init_pos_weight"],
+        "ik_init_rot_weight": stream_payload["ik_init_rot_weight"],
+        "ik_init_reg_weight": stream_payload["ik_init_reg_weight"],
+        "ik_init_delta_limit": stream_payload["ik_init_delta_limit"],
         "metadata": np.asarray(
             {
                 "schema_name": REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
@@ -292,6 +316,14 @@ def build_long_sequence_payload(
                 "tracker_ik_blend": float(tracker_ik_blend),
                 "tracker_ik_target_smoothing": float(tracker_ik_target_smoothing),
                 "tracker_ik_delta_limit": float(tracker_ik_delta_limit),
+                "ik_init_mode": str(ik_init_mode),
+                "ik_init_timestep": int(stream_payload["ik_init_timestep"]),
+                "ik_init_iterations": int(ik_init_iterations),
+                "ik_init_lr": float(ik_init_lr),
+                "ik_init_pos_weight": float(ik_init_pos_weight),
+                "ik_init_rot_weight": float(ik_init_rot_weight),
+                "ik_init_reg_weight": float(ik_init_reg_weight),
+                "ik_init_delta_limit": float(ik_init_delta_limit),
             },
             dtype=object,
         ),
@@ -357,6 +389,14 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         tracker_ik_blend=float(args.tracker_ik_blend),
         tracker_ik_target_smoothing=float(args.tracker_ik_target_smoothing),
         tracker_ik_delta_limit=float(args.tracker_ik_delta_limit),
+        ik_init_mode=args.ik_init_mode,
+        ik_init_timestep=int(args.ik_init_timestep),
+        ik_init_iterations=int(args.ik_init_iterations),
+        ik_init_lr=float(args.ik_init_lr),
+        ik_init_pos_weight=float(args.ik_init_pos_weight),
+        ik_init_rot_weight=float(args.ik_init_rot_weight),
+        ik_init_reg_weight=float(args.ik_init_reg_weight),
+        ik_init_delta_limit=float(args.ik_init_delta_limit),
     )
     metadata = dict(payload["metadata"].item())
     metadata.update({"weights": source_name, "loop_count": int(args.loop_count)})

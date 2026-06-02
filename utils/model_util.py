@@ -56,5 +56,8 @@ def create_gaussian_diffusion(args):
         root_height_loss_weight=getattr(args, "root_height_loss_weight", 1.0),
         contact_loss_weight=getattr(args, "contact_loss_weight", 0.5),
         tracker_pos_loss_weight=getattr(args, "tracker_pos_loss_weight", 5.0),
+        tracker_pos_huber_beta=getattr(args, "tracker_pos_huber_beta", 0.05),
+        tracker_pos_timestep_min_weight=getattr(args, "tracker_pos_timestep_min_weight", 0.1),
+        tracker_pos_timestep_gamma=getattr(args, "tracker_pos_timestep_gamma", 2.0),
         tracker_rot_loss_weight=getattr(args, "tracker_rot_loss_weight", 2.0),
     )

@@ -16,6 +16,13 @@ from data_loaders.sensor_masking import (
     TRACKER_MASK_POLICY_TASK,
     get_schema_spec,
 )
+from sample.ik_initializer import (
+    IK_INIT_MODE_TRACKER_POSE,
+    build_tracker_pose_init_image,
+    resolve_ik_init_timestep,
+    skip_timesteps_from_start,
+    validate_ik_init_mode,
+)
 from sample.utils import choose_sampler, load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -50,6 +57,8 @@ def reconstruct_batch(
     device: torch.device,
     use_ddim: bool = True,
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+    init_image: torch.Tensor | None = None,
+    start_timestep: int | None = None,
 ) -> torch.Tensor:
     schema = get_schema_spec(schema_name)
     sample = batch["conditioned_x"].to(device)
@@ -69,6 +78,15 @@ def reconstruct_batch(
         },
     }
     sampler = choose_sampler(diffusion, use_ddim=use_ddim)
+    sampler_kwargs = {}
+    if init_image is not None:
+        init_image = init_image.to(device=device, dtype=sample.dtype)
+        if init_image.shape != sample.shape:
+            raise ValueError(f"init_image 应与 sample 同形状，实际 {tuple(init_image.shape)} vs {tuple(sample.shape)}")
+        if start_timestep is None:
+            raise ValueError("传入 init_image 时必须同时传入 start_timestep。")
+        sampler_kwargs["init_image"] = init_image
+        sampler_kwargs["skip_timesteps"] = skip_timesteps_from_start(diffusion, int(start_timestep))
     with torch.no_grad():
         reconstructed = sampler(
             model,
@@ -76,8 +94,40 @@ def reconstruct_batch(
             noise=None,
             clip_denoised=False,
             model_kwargs=model_kwargs,
+            **sampler_kwargs,
         )
     return torch.where(inpaint_mask, reconstructed, sample)
+
+
+def build_ik_init_image_for_batch(
+    batch: dict,
+    *,
+    device: torch.device,
+    schema_name: str,
+    normalizer=None,
+    ik_init_mode: str = "random",
+    ik_init_iterations: int = 16,
+    ik_init_lr: float = 0.03,
+    ik_init_pos_weight: float = 1.0,
+    ik_init_rot_weight: float = 0.2,
+    ik_init_reg_weight: float = 0.01,
+    ik_init_delta_limit: float = 0.15,
+) -> torch.Tensor | None:
+    mode = validate_ik_init_mode(ik_init_mode)
+    if mode != IK_INIT_MODE_TRACKER_POSE:
+        return None
+    return build_tracker_pose_init_image(
+        conditioned_x=batch["conditioned_x"].to(device),
+        schema_name=schema_name,
+        normalizer=normalizer,
+        joint_offsets_parent=batch.get("joint_offsets_parent"),
+        iterations=ik_init_iterations,
+        lr=ik_init_lr,
+        pos_weight=ik_init_pos_weight,
+        rot_weight=ik_init_rot_weight,
+        reg_weight=ik_init_reg_weight,
+        delta_limit=ik_init_delta_limit,
+    )
 
 
 def tensor_bct_to_numpy_btc(tensor: torch.Tensor) -> np.ndarray:
@@ -160,6 +210,24 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
 
     model, diffusion = create_model_and_diffusion(args)
     model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
+    ik_init_image = build_ik_init_image_for_batch(
+        batch,
+        device=device,
+        schema_name=args.schema,
+        normalizer=getattr(dataset, "normalizer", None),
+        ik_init_mode=args.ik_init_mode,
+        ik_init_iterations=args.ik_init_iterations,
+        ik_init_lr=args.ik_init_lr,
+        ik_init_pos_weight=args.ik_init_pos_weight,
+        ik_init_rot_weight=args.ik_init_rot_weight,
+        ik_init_reg_weight=args.ik_init_reg_weight,
+        ik_init_delta_limit=args.ik_init_delta_limit,
+    )
+    ik_start_timestep = (
+        resolve_ik_init_timestep(diffusion, args.ik_init_timestep)
+        if ik_init_image is not None
+        else None
+    )
     reconstructed = reconstruct_batch(
         model,
         diffusion,
@@ -167,6 +235,8 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         device=device,
         use_ddim=str(args.ts_respace).startswith("ddim"),
         schema_name=args.schema,
+        init_image=ik_init_image,
+        start_timestep=ik_start_timestep,
     )
     inpaint_mask = build_realtime_inpaint_mask(1, device, schema_name=args.schema)
     output_dir = Path(args.output_dir or Path(args.model_path).with_suffix("").name).resolve()

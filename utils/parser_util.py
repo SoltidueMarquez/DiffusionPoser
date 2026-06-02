@@ -110,6 +110,14 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--source_fps", default=60.0, type=float)
     group.add_argument("--use_ema", default=True, type=str2bool)
+    group.add_argument("--ik_init_mode", default="random", choices=["random", "tracker_pose"], type=str)
+    group.add_argument("--ik_init_timestep", default=-1, type=int)
+    group.add_argument("--ik_init_iterations", default=16, type=int)
+    group.add_argument("--ik_init_lr", default=0.03, type=float)
+    group.add_argument("--ik_init_pos_weight", default=1.0, type=float)
+    group.add_argument("--ik_init_rot_weight", default=0.2, type=float)
+    group.add_argument("--ik_init_reg_weight", default=0.01, type=float)
+    group.add_argument("--ik_init_delta_limit", default=0.15, type=float)
 
 
 def add_model_options(parser: ArgumentParser):
@@ -160,6 +168,9 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--root_height_loss_weight", default=1.0, type=float)
     group.add_argument("--contact_loss_weight", default=0.5, type=float)
     group.add_argument("--tracker_pos_loss_weight", default=5.0, type=float)
+    group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)
+    group.add_argument("--tracker_pos_timestep_min_weight", default=0.1, type=float)
+    group.add_argument("--tracker_pos_timestep_gamma", default=2.0, type=float)
     group.add_argument("--tracker_rot_loss_weight", default=2.0, type=float)
     group.add_argument("--model_ema", action="store_true")
     group.add_argument("--model_ema_steps", type=int, default=10)

@@ -8,10 +8,12 @@ from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
     REALTIME_POSE_TARGET_START,
+    REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     SMPL_JOINT_COUNT,
     get_schema_spec,
 )
+from sample.ik_initializer import build_tracker_pose_init_image
 from sample.simulate_unity_stream import (
     IDENTITY_6D,
     apply_tracker_position_ik,
@@ -28,12 +30,17 @@ from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 class FixedV2Diffusion:
     def __init__(self, yaw_delta: float):
         self.yaw_delta = float(yaw_delta)
+        self.num_timesteps = 10
         self.calls = 0
         self.conditioned_inputs = []
+        self.init_images = []
+        self.skip_timesteps = []
 
-    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs):
+    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs, init_image=None, skip_timesteps=0):
         del model, noise, clip_denoised
         self.calls += 1
+        self.init_images.append(None if init_image is None else init_image.detach().cpu().clone())
+        self.skip_timesteps.append(int(skip_timesteps))
         sample = model_kwargs["y"]["inpainted_motion"].clone()
         self.conditioned_inputs.append(sample.detach().cpu().numpy().copy())
         schema = get_schema_spec(model_kwargs["y"]["schema_name"])
@@ -179,6 +186,67 @@ def test_tracker_ik_pulls_known_hand_joint_toward_tracker():
     assert after_error < before_error * 0.55
 
 
+def test_tracker_pose_init_refines_known_hand_tracker_with_rotation_loss_enabled():
+    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    offsets = np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
+    offsets[3] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[6] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[9] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
+    offsets[13] = np.asarray([-0.05, 0.05, 0.0], dtype=np.float32)
+    offsets[16] = np.asarray([-0.18, 0.0, 0.0], dtype=np.float32)
+    offsets[18] = np.asarray([-0.22, 0.0, 0.0], dtype=np.float32)
+    offsets[20] = np.asarray([-0.22, 0.0, 0.0], dtype=np.float32)
+    frame = initial_target_feature(schema.name, root_height=0.0)
+    tracker_pos = fk_tracker_positions_from_target(
+        target_raw=frame,
+        root_pos_world=np.zeros((3,), dtype=np.float32),
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+    tracker_pos[LEFT_HAND_TRACKER_INDEX] += np.asarray([0.12, -0.12, 0.22], dtype=np.float32)
+    tracker_rot = np.tile(IDENTITY_6D, (6, 1)).astype(np.float32)
+    sensor_valid = np.zeros((6,), dtype=bool)
+    sensor_valid[[HIP_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX]] = True
+    conditioned = torch.zeros((1, schema.feature_dim, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
+    conditioned[0, schema.target_slice(), REALTIME_POSE_TARGET_START - 1] = torch.from_numpy(frame[schema.target_slice()])
+    conditioned[0, schema.tracker_pos_slice(), REALTIME_POSE_TARGET_START] = torch.from_numpy(tracker_pos.reshape(-1))
+    conditioned[0, schema.tracker_rot_slice(), REALTIME_POSE_TARGET_START] = torch.from_numpy(tracker_rot.reshape(-1))
+    conditioned[0, schema.sensor_valid_slice(), REALTIME_POSE_TARGET_START] = torch.from_numpy(sensor_valid.astype(np.float32))
+
+    init_image = build_tracker_pose_init_image(
+        conditioned_x=conditioned,
+        schema_name=schema.name,
+        joint_offsets_parent=torch.from_numpy(offsets[None]),
+        iterations=80,
+        lr=0.05,
+        pos_weight=1.0,
+        rot_weight=0.2,
+        reg_weight=0.01,
+        delta_limit=0.0,
+    )
+
+    before = fk_tracker_positions_from_target(
+        target_raw=frame,
+        root_pos_world=np.zeros((3,), dtype=np.float32),
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+    after_feature = init_image[0, :, REALTIME_POSE_TARGET_START].detach().numpy()
+    after = fk_tracker_positions_from_target(
+        target_raw=after_feature,
+        root_pos_world=np.zeros((3,), dtype=np.float32),
+        root_yaw=0.0,
+        joint_offsets_parent=offsets,
+        schema_name=schema.name,
+    )
+    before_error = np.linalg.norm(before[LEFT_HAND_TRACKER_INDEX] - tracker_pos[LEFT_HAND_TRACKER_INDEX])
+    after_error = np.linalg.norm(after[LEFT_HAND_TRACKER_INDEX] - tracker_pos[LEFT_HAND_TRACKER_INDEX])
+    assert np.isfinite(after_feature).all()
+    assert after_error < before_error * 0.75
+
+
 def test_tracker_ik_smoothing_and_delta_clamp_are_bounded():
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
     measured = np.zeros((6, 3), dtype=np.float32)
@@ -257,3 +325,32 @@ def test_warmup_window_contains_tracker_history_and_tpose_targets():
         np.tile(np.asarray([0.0, 1.0], dtype=np.float32)[:, None], (1, REALTIME_POSE_TARGET_START)),
     )
     np.testing.assert_allclose(conditioned[schema.target_slice(), REALTIME_POSE_TARGET_START], 0.0)
+
+
+def test_unity_stream_records_tracker_pose_ik_init_metadata():
+    source = build_toy_realtime_source(frame_count=61)
+    sensor_valid = np.ones((61, 6), dtype=bool)
+    diffusion = FixedV2Diffusion(yaw_delta=0.0)
+
+    payload = simulate_unity_stream(
+        model=object(),
+        diffusion=diffusion,
+        tracker_pos_world=source["tracker_pos_world"],
+        tracker_rot_world_6d=source["tracker_rot_world_6d"],
+        sensor_valid=sensor_valid,
+        device=torch.device("cpu"),
+        use_ddim=False,
+        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        normalizer=None,
+        initial_root_yaw=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
+        tracker_ik=False,
+        ik_init_mode="tracker_pose",
+        ik_init_timestep=3,
+    )
+
+    assert diffusion.init_images[0] is not None
+    assert diffusion.skip_timesteps[0] == 6
+    assert payload["ik_init_mode"].item() == "tracker_pose"
+    assert int(payload["ik_init_timestep"]) == 3
+    assert int(payload["ik_init_iterations"]) == 16

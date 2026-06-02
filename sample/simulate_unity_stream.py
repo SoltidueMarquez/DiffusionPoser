@@ -32,7 +32,13 @@ from data_loaders.sensor_masking import (
     TRACKER_COUNT,
     get_schema_spec,
 )
-from sample.reconstruct_stream import build_realtime_inpaint_mask, reconstruct_batch, tensor_bct_to_numpy_btc
+from sample.ik_initializer import IK_INIT_MODE_TRACKER_POSE, resolve_ik_init_timestep, validate_ik_init_mode
+from sample.reconstruct_stream import (
+    build_ik_init_image_for_batch,
+    build_realtime_inpaint_mask,
+    reconstruct_batch,
+    tensor_bct_to_numpy_btc,
+)
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -799,8 +805,22 @@ def simulate_unity_stream(
     tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
     tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
     tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
+    ik_init_mode: str = "random",
+    ik_init_timestep: int = -1,
+    ik_init_iterations: int = 16,
+    ik_init_lr: float = 0.03,
+    ik_init_pos_weight: float = 1.0,
+    ik_init_rot_weight: float = 0.2,
+    ik_init_reg_weight: float = 0.01,
+    ik_init_delta_limit: float = 0.15,
 ) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
+    ik_init_mode = validate_ik_init_mode(ik_init_mode)
+    resolved_ik_init_timestep = (
+        resolve_ik_init_timestep(diffusion, ik_init_timestep)
+        if ik_init_mode == IK_INIT_MODE_TRACKER_POSE
+        else -1
+    )
     frame_count = int(tracker_pos_world.shape[0])
     state = UnityStreamState(
         schema_name=schema.name,
@@ -912,6 +932,21 @@ def simulate_unity_stream(
                 "conditioned_x": torch.from_numpy(conditioned_raw.T).unsqueeze(0).float().to(device),
                 "valid_frame_mask": torch.ones(1, REALTIME_POSE_SEQ_LEN, dtype=torch.bool, device=device),
             }
+            if joint_offsets is not None:
+                batch["joint_offsets_parent"] = torch.from_numpy(joint_offsets).unsqueeze(0).float().to(device)
+            ik_init_image = build_ik_init_image_for_batch(
+                batch,
+                device=device,
+                schema_name=schema.name,
+                normalizer=normalizer,
+                ik_init_mode=ik_init_mode,
+                ik_init_iterations=ik_init_iterations,
+                ik_init_lr=ik_init_lr,
+                ik_init_pos_weight=ik_init_pos_weight,
+                ik_init_rot_weight=ik_init_rot_weight,
+                ik_init_reg_weight=ik_init_reg_weight,
+                ik_init_delta_limit=ik_init_delta_limit,
+            )
             reconstructed = reconstruct_batch(
                 model=model,
                 diffusion=diffusion,
@@ -919,6 +954,8 @@ def simulate_unity_stream(
                 device=device,
                 use_ddim=use_ddim,
                 schema_name=schema.name,
+                init_image=ik_init_image,
+                start_timestep=resolved_ik_init_timestep if ik_init_image is not None else None,
             )
             reconstructed_np = tensor_bct_to_numpy_btc(reconstructed)[0]
             reconstructed_raw = inverse_feature_window(reconstructed_np, normalizer=normalizer)
@@ -976,6 +1013,14 @@ def simulate_unity_stream(
         "tracker_ik_blend": np.asarray(float(tracker_ik_blend), dtype=np.float32),
         "tracker_ik_target_smoothing": np.asarray(float(tracker_ik_target_smoothing), dtype=np.float32),
         "tracker_ik_delta_limit": np.asarray(float(tracker_ik_delta_limit), dtype=np.float32),
+        "ik_init_mode": np.asarray(ik_init_mode),
+        "ik_init_timestep": np.asarray(int(resolved_ik_init_timestep), dtype=np.int64),
+        "ik_init_iterations": np.asarray(int(ik_init_iterations), dtype=np.int64),
+        "ik_init_lr": np.asarray(float(ik_init_lr), dtype=np.float32),
+        "ik_init_pos_weight": np.asarray(float(ik_init_pos_weight), dtype=np.float32),
+        "ik_init_rot_weight": np.asarray(float(ik_init_rot_weight), dtype=np.float32),
+        "ik_init_reg_weight": np.asarray(float(ik_init_reg_weight), dtype=np.float32),
+        "ik_init_delta_limit": np.asarray(float(ik_init_delta_limit), dtype=np.float32),
         "inpaint_mask": build_realtime_inpaint_mask(1, torch.device("cpu"), schema_name=schema.name)
         .cpu()
         .numpy()
@@ -1032,6 +1077,14 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         tracker_ik_blend=float(args.tracker_ik_blend),
         tracker_ik_target_smoothing=float(args.tracker_ik_target_smoothing),
         tracker_ik_delta_limit=float(args.tracker_ik_delta_limit),
+        ik_init_mode=args.ik_init_mode,
+        ik_init_timestep=int(args.ik_init_timestep),
+        ik_init_iterations=int(args.ik_init_iterations),
+        ik_init_lr=float(args.ik_init_lr),
+        ik_init_pos_weight=float(args.ik_init_pos_weight),
+        ik_init_rot_weight=float(args.ik_init_rot_weight),
+        ik_init_reg_weight=float(args.ik_init_reg_weight),
+        ik_init_delta_limit=float(args.ik_init_delta_limit),
     )
     output_dir = Path(args.output_dir or "output/unity_stream_simulation").resolve()
     output_path = output_dir / "unity_stream_simulation.npz"

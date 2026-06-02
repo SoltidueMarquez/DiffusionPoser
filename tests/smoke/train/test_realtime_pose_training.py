@@ -7,13 +7,63 @@ import pytest
 
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
 from data_loaders.get_data import get_dataset_loader
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN
+from data_loaders.sensor_masking import (
+    HIP_TRACKER_INDEX,
+    REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_START,
+    TRACKER_COUNT,
+    get_schema_spec,
+)
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.diffusionposer_dit import DiffusionPoserDiT
 from train.training_loop import TrainLoop, validate_finite_losses
 from utils import dist_util
-from tests.smoke.realtime_pose_fixtures import write_toy_source_dataset
+from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, write_toy_source_dataset
+
+
+def _make_sensor_reprojection_aux_inputs(target_tracker_pos_ref: torch.Tensor, target_sensor_valid: torch.Tensor):
+    """构造最小 realtime_pose batch，让 FK 后的 tracker ref 全为 0，便于单独检查位置重投影 loss。"""
+
+    batch_size = target_tracker_pos_ref.shape[0]
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    pred_xstart = torch.zeros(batch_size, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+    identity_pose = torch.as_tensor(IDENTITY_6D).repeat(24)
+    pred_xstart[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START] = identity_pose
+    pred_xstart[:, schema.root_yaw_delta_slice(), REALTIME_POSE_TARGET_START] = torch.tensor([0.0, 1.0])
+    x_start = pred_xstart.clone()
+    model_kwargs = {
+        "y": {
+            "schema_name": REALTIME_POSE_SCHEMA_NAME,
+            "target_joints_world": torch.zeros(batch_size, 24, 3),
+            "prev_joints_world": torch.zeros(batch_size, 24, 3),
+            "target_root_pos_world": torch.zeros(batch_size, 3),
+            "prev_root_pos_world": torch.zeros(batch_size, 3),
+            "prev_root_yaw": torch.zeros(batch_size),
+            "joint_offsets_parent": torch.zeros(batch_size, 24, 3),
+            "target_foot_contact": torch.zeros(batch_size, 2),
+            "target_tracker_pos_ref": target_tracker_pos_ref,
+            "target_sensor_valid": target_sensor_valid,
+        }
+    }
+    return pred_xstart, x_start, model_kwargs
+
+
+def _make_loss_test_diffusion() -> SpacedDiffusion:
+    betas = gd.get_named_beta_schedule("cosine", 4, scale_betas=1.0)
+    return SpacedDiffusion(
+        use_timesteps=space_timesteps(4, [4]),
+        betas=betas,
+        model_mean_type=gd.ModelMeanType.START_X,
+        model_var_type=gd.ModelVarType.FIXED_SMALL,
+        loss_type=gd.LossType.MSE,
+        rescale_timesteps=False,
+        tracker_pos_huber_beta=0.05,
+        tracker_pos_timestep_min_weight=0.1,
+        tracker_pos_timestep_gamma=2.0,
+    )
 
 
 def test_model_forward_has_frame_positional_embedding_and_seq_limit():
@@ -118,6 +168,55 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
     del model_kwargs_missing_contact["y"]["target_foot_contact"]
     with pytest.raises(KeyError, match="target_foot_contact"):
         diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_contact)
+
+
+def test_sensor_reprojection_pos_loss_ignores_hip_tracker_error():
+    diffusion = _make_loss_test_diffusion()
+    target_tracker_pos_ref = torch.zeros(1, TRACKER_COUNT, 3)
+    target_tracker_pos_ref[:, HIP_TRACKER_INDEX] = torch.tensor([10.0, 0.0, 0.0])
+    target_sensor_valid = torch.ones(1, TRACKER_COUNT, dtype=torch.bool)
+    pred_xstart, x_start, model_kwargs = _make_sensor_reprojection_aux_inputs(
+        target_tracker_pos_ref=target_tracker_pos_ref,
+        target_sensor_valid=target_sensor_valid,
+    )
+
+    losses = diffusion._realtime_pose_aux_losses(
+        pred_xstart,
+        x_start,
+        model_kwargs,
+        timesteps=torch.zeros(1, dtype=torch.long),
+    )
+
+    assert torch.allclose(losses["sensor_reprojection_pos_loss"], torch.zeros(1))
+
+
+def test_sensor_reprojection_pos_loss_is_larger_at_low_noise_timestep():
+    diffusion = _make_loss_test_diffusion()
+    target_tracker_pos_ref = torch.zeros(1, TRACKER_COUNT, 3)
+    target_tracker_pos_ref[:, 0] = torch.tensor([0.1, 0.0, 0.0])
+    target_sensor_valid = torch.ones(1, TRACKER_COUNT, dtype=torch.bool)
+    pred_xstart, x_start, model_kwargs = _make_sensor_reprojection_aux_inputs(
+        target_tracker_pos_ref=target_tracker_pos_ref,
+        target_sensor_valid=target_sensor_valid,
+    )
+
+    low_noise_losses = diffusion._realtime_pose_aux_losses(
+        pred_xstart,
+        x_start,
+        model_kwargs,
+        timesteps=torch.zeros(1, dtype=torch.long),
+    )
+    high_noise_losses = diffusion._realtime_pose_aux_losses(
+        pred_xstart,
+        x_start,
+        model_kwargs,
+        timesteps=torch.full((1,), diffusion.num_timesteps - 1, dtype=torch.long),
+    )
+
+    low_noise_loss = low_noise_losses["sensor_reprojection_pos_loss"]
+    high_noise_loss = high_noise_losses["sensor_reprojection_pos_loss"]
+    assert torch.all(low_noise_loss > high_noise_loss)
+    assert torch.allclose(high_noise_loss, low_noise_loss * diffusion.tracker_pos_timestep_min_weight)
 
 
 def test_train_loop_eval_reports_validation_loss(tmp_path):

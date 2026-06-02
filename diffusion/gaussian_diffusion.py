@@ -25,6 +25,7 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_torch,
 )
 from data_loaders.sensor_masking import (
+    HIP_TRACKER_INDEX,
     REALTIME_POSE_TARGET_START,
     get_schema_spec,
 )
@@ -143,6 +144,9 @@ class GaussianDiffusion:
         root_height_loss_weight=1.0,
         contact_loss_weight=0.5,
         tracker_pos_loss_weight=5.0,
+        tracker_pos_huber_beta=0.05,
+        tracker_pos_timestep_min_weight=0.1,
+        tracker_pos_timestep_gamma=2.0,
         tracker_rot_loss_weight=2.0,
     ):
         self.model_mean_type = model_mean_type
@@ -158,7 +162,16 @@ class GaussianDiffusion:
         self.root_height_loss_weight = float(root_height_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
         self.tracker_pos_loss_weight = float(tracker_pos_loss_weight)
+        self.tracker_pos_huber_beta = float(tracker_pos_huber_beta)
+        self.tracker_pos_timestep_min_weight = float(tracker_pos_timestep_min_weight)
+        self.tracker_pos_timestep_gamma = float(tracker_pos_timestep_gamma)
         self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
+        if self.tracker_pos_huber_beta <= 0.0:
+            raise ValueError("tracker_pos_huber_beta 必须大于 0")
+        if not 0.0 <= self.tracker_pos_timestep_min_weight <= 1.0:
+            raise ValueError("tracker_pos_timestep_min_weight 必须在 [0, 1] 范围内")
+        if self.tracker_pos_timestep_gamma < 0.0:
+            raise ValueError("tracker_pos_timestep_gamma 必须大于等于 0")
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1362,7 +1375,24 @@ class GaussianDiffusion:
             return values
         return values * std[start:end].view(1, -1) + mean[start:end].view(1, -1)
 
-    def _realtime_pose_aux_losses(self, pred_xstart, x_start, model_kwargs):
+    def _tracker_pos_timestep_weight(self, timesteps, batch_size, device, dtype):
+        """低噪声阶段的 pred_xstart 更可信，因此给 tracker 位置重投影更高权重。"""
+
+        if timesteps is None:
+            return torch.ones(batch_size, device=device, dtype=dtype)
+        timesteps = timesteps.to(device=device, dtype=dtype).view(-1)
+        if timesteps.shape[0] != batch_size:
+            raise ValueError(f"tracker timestep batch 不匹配：t={tuple(timesteps.shape)} batch_size={batch_size}")
+        if self.num_timesteps <= 1:
+            progress = torch.ones_like(timesteps)
+        else:
+            progress = 1.0 - timesteps / float(self.num_timesteps - 1)
+        progress = progress.clamp(0.0, 1.0)
+        return self.tracker_pos_timestep_min_weight + (
+            1.0 - self.tracker_pos_timestep_min_weight
+        ) * progress.pow(self.tracker_pos_timestep_gamma)
+
+    def _realtime_pose_aux_losses(self, pred_xstart, x_start, model_kwargs, timesteps=None):
         """计算 realtime_pose 第 61 帧的 yaw/FK/root/contact/sensor 辅助损失。"""
 
         y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
@@ -1495,15 +1525,32 @@ class GaussianDiffusion:
             tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
             pred_tracker = pred_joints[:, tracker_indices]
             # tracker_pos_ref 的定义是 `(tracker_world - current_root_world) @ R(prev_yaw)`。
-            # 这里用预测骨架和预测 root 重投影到同一个参考系，直接对齐观测 tracker 条件。
+            # hip/waist tracker 已经用于 root correction，这里只让 head/hands/feet 约束姿态，
+            # 避免 pelvis pose 和 root 位移在同一个观测上抢解释权。
             pred_tracker_ref = torch.einsum(
                 "btj,bjk->btk",
                 pred_tracker - target_root_pos[:, None],
                 make_yaw_rotation_torch(prev_root_yaw),
             )
-            reproj = torch.abs(pred_tracker_ref - target_tracker_pos_ref).mean(dim=-1)
-            denom = valid_target.float().sum(dim=1).clamp_min(1.0)
-            result["sensor_reprojection_pos_loss"] = (reproj * valid_target.float()).sum(dim=1) / denom
+            valid_nonhip = valid_target.clone()
+            valid_nonhip[:, HIP_TRACKER_INDEX] = False
+            tracker_distance = torch.linalg.norm(pred_tracker_ref - target_tracker_pos_ref, dim=-1)
+            beta = torch.as_tensor(self.tracker_pos_huber_beta, device=pred_xstart.device, dtype=pred_xstart.dtype)
+            reproj = torch.where(
+                tracker_distance < beta,
+                0.5 * tracker_distance.square() / beta,
+                tracker_distance - 0.5 * beta,
+            )
+            valid_weight = valid_nonhip.float()
+            denom = valid_weight.sum(dim=1).clamp_min(1.0)
+            tracker_loss = (reproj * valid_weight).sum(dim=1) / denom
+            timestep_weight = self._tracker_pos_timestep_weight(
+                timesteps,
+                batch_size=pred_xstart.shape[0],
+                device=pred_xstart.device,
+                dtype=pred_xstart.dtype,
+            )
+            result["sensor_reprojection_pos_loss"] = timestep_weight * tracker_loss
         if target_tracker_rot_ref is not None and target_sensor_valid is not None:
             target_tracker_rot_ref = target_tracker_rot_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
@@ -1629,7 +1676,7 @@ class GaussianDiffusion:
                 terms["loss"] *= mse_loss_weights
 
             if pred_xstart is not None:
-                aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs)
+                aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs, timesteps=t)
                 if aux_terms:
                     terms.update(aux_terms)
                     aux_loss = (

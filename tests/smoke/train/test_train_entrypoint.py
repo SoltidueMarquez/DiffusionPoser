@@ -19,6 +19,9 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertFalse(args.overwrite)
         self.assertEqual(args.run_name, "auto")
         self.assertEqual(args.save_interval, 5_000)
+        self.assertEqual(args.tracker_pos_huber_beta, 0.05)
+        self.assertEqual(args.tracker_pos_timestep_min_weight, 0.1)
+        self.assertEqual(args.tracker_pos_timestep_gamma, 2.0)
 
     def test_training_options_can_enable_overwrite(self):
         parser = ArgumentParser()
