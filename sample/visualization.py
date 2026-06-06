@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
+from data_loaders.realtime_pose_kinematics import fk_root_global_torch
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     BODY_POSE_START,
@@ -21,7 +21,7 @@ def decode_realtime_pose_joints(
     joint_offsets_parent: np.ndarray,
 ) -> np.ndarray:
     """
-    用 realtime_pose_v2 的 `body_pose_parent_6d + root_yaw` 做轻量 FK。
+    用 realtime_pose_v2 的 root-yaw-relative global 6D pose + root_yaw 做轻量 FK。
     输入特征为 `[T,C]`，输出 joints 为 `[T,24,3]`，供可视化和 smoke test 使用。
     """
 
@@ -35,7 +35,7 @@ def decode_realtime_pose_joints(
     offsets = torch.from_numpy(np.asarray(joint_offsets_parent, dtype=np.float32)).float()
     offsets = offsets.unsqueeze(0).expand(features.shape[0], -1, -1)
     with torch.no_grad():
-        joints = fk_parent_local_torch(pose, root_pos, yaw, offsets)
+        joints = fk_root_global_torch(pose, root_pos, yaw, offsets)
     return joints.cpu().numpy().astype(np.float32)
 
 

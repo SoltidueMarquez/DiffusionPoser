@@ -29,18 +29,21 @@ from data_converter.amass_smpl_utils import (
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
-    build_body_pose_parent_6d,
+    build_body_pose_root_global_6d,
     derive_foot_contact,
     encode_root_delta_xz_ref,
-    estimate_parent_offsets,
+    estimate_root_global_offsets,
     extract_yaw_from_rotations,
     rotation_6d_forward_up_np,
     wrap_radians,
 )
 from data_loaders.sensor_masking import (
+    LEGACY_BODY_POSE_PARENT_KEY,
+    POSE_REPRESENTATION_KEY,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAMES,
     get_schema_spec,
+    validate_pose_representation,
 )
 
 
@@ -92,22 +95,23 @@ def build_realtime_pose_features(
         yaw_delta[1:] = wrap_radians(root_yaw[1:].astype(np.float64) - root_yaw[:-1].astype(np.float64)).astype(np.float32)
     root_yaw_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
 
-    body_pose_parent_6d = build_body_pose_parent_6d(
+    body_pose_root_global_6d = build_body_pose_root_global_6d(
         global_rotations=joint_rotations,
         root_yaws=root_yaw.astype(np.float64),
     )
     tracker_pos_world = joint_positions[:, TRACKER_JOINT_INDICES].astype(np.float32)
     tracker_rot_world_6d = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
     joints_world = joint_positions.astype(np.float32)
-    joint_offsets_parent = estimate_parent_offsets(
+    joint_offsets_parent = estimate_root_global_offsets(
         joints_world=joints_world,
-        body_pose_parent_6d=body_pose_parent_6d,
+        body_pose_root_global_6d=body_pose_root_global_6d,
         root_yaws=root_yaw,
         root_pos_world=root_pos_world,
     )
 
     features = {
-        "body_pose_parent_6d": body_pose_parent_6d,
+        schema.body_pose_key: body_pose_root_global_6d,
+        POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
         "root_pos_world": root_pos_world.astype(np.float32),
         "root_yaw": root_yaw.astype(np.float32),
         "root_yaw_delta_sincos": root_yaw_delta_sincos,
@@ -140,8 +144,10 @@ def save_realtime_pose_motion(
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    schema = get_schema_spec(schema_name)
     metadata = {
         "schema_name": schema_name,
+        "pose_representation": schema.pose_representation,
         "source_path": str(source.path),
         "source_relative_path": str(source.relative_path),
         "original_source_relative_path": str(source.original_relative_path or source.relative_path),
@@ -149,7 +155,7 @@ def save_realtime_pose_motion(
         "is_mirrored": bool(source.is_mirrored),
         "source_fps": float(source.source_fps),
         "target_fps": float(target_fps),
-        "frames": int(features["body_pose_parent_6d"].shape[0]),
+        "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
     np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
@@ -184,16 +190,18 @@ def record_for_output(
     relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
     metadata: dict[str, Any] = {}
     frames = 0
+    schema = get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)))
     if output_path.exists():
         with np.load(output_path, allow_pickle=False) as data:
             metadata = load_metadata_from_npz(data)
-            if "body_pose_parent_6d" in data.files:
-                frames = int(data["body_pose_parent_6d"].shape[0])
+            if schema.body_pose_key in data.files:
+                frames = int(data[schema.body_pose_key].shape[0])
     source_relative_path = Path(str(metadata.get("source_relative_path", relative_path)))
     stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
     return {
         "status": status,
-        "schema_name": str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
+        "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
         "source_path": str(metadata.get("source_path", path)),
         "source_relative_path": str(source_relative_path),
         "original_source_relative_path": str(metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
@@ -216,12 +224,21 @@ def load_reusable_realtime_features(
     reuse_path: Path,
     schema_name: str,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    schema = get_schema_spec(schema_name)
     with np.load(reuse_path, allow_pickle=False) as data:
+        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
+            raise ValueError(f"{reuse_path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate source data.")
         required = required_source_fields(schema_name)
         missing = sorted(required.difference(data.files))
         if missing:
             raise KeyError(f"{reuse_path} 不能作为 realtime source 复用，缺少字段：{missing}")
-        features = {key: np.asarray(data[key]).astype(np.float32, copy=True) for key in required}
+        validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(reuse_path))
+        features = {
+            key: np.asarray(data[key]).astype(np.float32, copy=True)
+            for key in required
+            if key != POSE_REPRESENTATION_KEY
+        }
+        features[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
         metadata = load_metadata_from_npz(data)
     return features, metadata
 
@@ -229,7 +246,8 @@ def load_reusable_realtime_features(
 def required_source_fields(schema_name: str) -> set[str]:
     schema = get_schema_spec(schema_name)
     required = {
-        "body_pose_parent_6d",
+        schema.body_pose_key,
+        POSE_REPRESENTATION_KEY,
         "root_pos_world",
         "root_yaw",
         "root_yaw_delta_sincos",
@@ -248,8 +266,17 @@ def required_source_fields(schema_name: str) -> set[str]:
 def realtime_source_has_schema(path: Path, schema_name: str) -> bool:
     if not path.exists():
         return False
+    schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
-        return required_source_fields(schema_name).issubset(data.files)
+        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
+            return False
+        if not required_source_fields(schema_name).issubset(data.files):
+            return False
+        try:
+            validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
+        except ValueError:
+            return False
+        return True
 
 
 def save_reused_realtime_source(
@@ -262,17 +289,19 @@ def save_reused_realtime_source(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
+    schema = get_schema_spec(str(args.schema))
     next_metadata = dict(metadata)
     next_metadata.update(
         {
-            "schema_name": str(args.schema),
+            "schema_name": schema.name,
+            "pose_representation": schema.pose_representation,
             "source_path": str(next_metadata.get("source_path", path)),
             "source_relative_path": str(next_metadata.get("source_relative_path", relative_path)),
             "original_source_relative_path": str(next_metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
             "stablemotion_split_key": str(next_metadata.get("stablemotion_split_key", relative_path.with_suffix(".npy"))).replace("\\", "/"),
             "is_mirrored": bool(next_metadata.get("is_mirrored", mirror_variant)),
             "target_fps": float(args.target_fps),
-            "frames": int(features["body_pose_parent_6d"].shape[0]),
+            "frames": int(features[schema.body_pose_key].shape[0]),
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
@@ -420,6 +449,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
                 record = {
                     "status": "failed",
                     "schema_name": str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
+                    "pose_representation": get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))).pose_representation,
                     "source_path": str(path),
                     "source_relative_path": str(source_relative_path),
                     "stablemotion_split_key": str(source_relative_path.with_suffix(".npy")).replace("\\", "/"),

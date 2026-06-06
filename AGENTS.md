@@ -64,7 +64,8 @@ conda run -n diffusionposer5070 pytest tests/smoke/visual_editor
 - 固定为 60 帧历史条件 + 第 61 帧单帧补全。
 - `seq_len = 61`，`target_start = 60`，`target_length = 1`。
 - `feature_dim = 211`，模型输入输出均为 `[B, 211, 61]`。
-- 通道 `0:144` 是 `body_pose_parent_6d`，`144:146` 是 `root_yaw_delta_sincos`。
+- 通道 `0:144` 是 `body_pose_root_global_6d`，`144:146` 是 `root_yaw_delta_sincos`。
+- source/task/normalizer/runtime asset 必须包含 `pose_representation="root_yaw_global_6d"`；旧 `body_pose_parent_6d` 不兼容当前 schema。
 - 通道 `146:148` 是 `root_delta_xz_ref`，`148:149` 是 `root_height`，`149:151` 是 `foot_contact`。
 - 通道 `151:169` 是 `tracker_pos_ref`，`169:205` 是 `tracker_rot_ref_6d`，`205:211` 是 `sensor_valid`。
 - `inpaint_mask` 只允许覆盖第 61 帧的 `0:151`。

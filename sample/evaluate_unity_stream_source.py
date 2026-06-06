@@ -11,7 +11,7 @@ import torch
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
-from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
+from data_loaders.realtime_pose_kinematics import fk_root_global_torch
 from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
@@ -171,8 +171,8 @@ def decode_features_to_joints(
     roots[:, 1] = 0.0
     offsets[:, 0, 1] = values[:, schema.root_height_slice()].reshape(-1)
     with torch.no_grad():
-        joints = fk_parent_local_torch(
-            body_pose_parent_6d=torch.from_numpy(values[:, schema.body_pose_slice()]).float(),
+        joints = fk_root_global_torch(
+            body_pose_root_global_6d=torch.from_numpy(values[:, schema.body_pose_slice()]).float(),
             root_pos_world=torch.from_numpy(roots).float(),
             root_yaw=torch.from_numpy(yaw).float(),
             parent_offsets=torch.from_numpy(offsets).float(),

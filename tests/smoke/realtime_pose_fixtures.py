@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX, TRACKER_JOINT_INDICES, derive_foot_contact, encode_root_delta_xz_ref
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 
 
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -37,8 +37,10 @@ def build_toy_realtime_source(frame_count: int = 70) -> dict[str, np.ndarray]:
     root_delta_xz_ref = encode_root_delta_xz_ref(root_pos_world=root_pos, root_yaw=root_yaw)
     root_height = joints[:, 0, 1:2].astype(np.float32)
     foot_contact = derive_foot_contact(joints_world=joints)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     return {
-        "body_pose_parent_6d": body_pose,
+        schema.body_pose_key: body_pose,
+        POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
         "root_pos_world": root_pos,
         "root_yaw": root_yaw,
         "root_yaw_delta_sincos": root_yaw_delta_sincos,
@@ -61,6 +63,7 @@ def write_toy_source_dataset(source_dir: Path, frame_count: int = 70, schema_nam
     schema = get_schema_spec(schema_name)
     manifest_entry = {
         "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
         "status": "converted",
         "source_relative_path": "ACCAD/toy_realtime.npz",
         "stablemotion_split_key": "ACCAD/toy_realtime",

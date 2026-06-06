@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
-from data_loaders.realtime_pose_kinematics import fk_parent_local_torch, integrate_root_delta_xz_ref
+from data_loaders.realtime_pose_kinematics import fk_root_global_torch, integrate_root_delta_xz_ref
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_START,
     SchemaSpec,
@@ -57,8 +57,8 @@ def predicted_target_to_joints(
         offsets[:, 0, 1] = float(target_feature[schema.root_height_slice()][0])
 
     with torch.no_grad():
-        joints = fk_parent_local_torch(
-            body_pose_parent_6d=torch.from_numpy(target_feature[schema.body_pose_slice()][None].astype(np.float32)),
+        joints = fk_root_global_torch(
+            body_pose_root_global_6d=torch.from_numpy(target_feature[schema.body_pose_slice()][None].astype(np.float32)),
             root_pos_world=torch.from_numpy(root_pos),
             root_yaw=torch.from_numpy(pred_root_yaw),
             parent_offsets=torch.from_numpy(offsets),

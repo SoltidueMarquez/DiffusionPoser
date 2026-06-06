@@ -16,10 +16,12 @@ from data_loaders.realtime_pose_dataset import (
 )
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     TRACKER_COUNT,
     get_schema_spec,
+    validate_pose_representation,
 )
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
@@ -65,6 +67,11 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         entry_schema = str(entry.get("schema_name", schema.name))
         if entry_schema != schema.name:
             raise ValueError(f"task {entry.get('task_id', '<unknown>')} schema_name={entry_schema}，期望 {schema.name}")
+        validate_pose_representation(
+            entry.get(POSE_REPRESENTATION_KEY),
+            schema_name=schema.name,
+            source=f"{manifest_path}:{entry.get('task_id', '<unknown>')}",
+        )
         task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"], schema_name=schema.name)
         arrays = load_realtime_task_arrays(task=task, seq_len=REALTIME_POSE_SEQ_LEN, schema_name=schema.name)
         features = encode_realtime_pose_features(arrays, schema_name=schema.name)
@@ -84,6 +91,7 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
 
     meta = {
         "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
         "task_dir": str(task_dir),
         "normalizer_root": str(output_root),
         "output_dir": str(output_dir),
@@ -105,6 +113,7 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
             "normalizer_root": str(output_root),
             "task_dir": str(task_dir),
             "schema_name": schema.name,
+            "pose_representation": schema.pose_representation,
             "split": args.split,
             "matched_tasks": len(task_entries),
         },

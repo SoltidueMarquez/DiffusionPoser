@@ -223,6 +223,73 @@ def build_body_pose_parent_6d(global_rotations: np.ndarray, root_yaws: np.ndarra
     return rotation_6d_forward_up_np(local).reshape(global_rotations.shape[0], -1).astype(np.float32)
 
 
+def build_body_pose_root_global_6d(global_rotations: np.ndarray, root_yaws: np.ndarray) -> np.ndarray:
+    """Encode SMPL24 global rotations after removing only the root yaw."""
+
+    global_rotations = np.asarray(global_rotations, dtype=np.float64)
+    if global_rotations.ndim != 4 or global_rotations.shape[1:] != (24, 3, 3):
+        raise ValueError(f"global_rotations should be [T,24,3,3], got {global_rotations.shape}")
+    root_yaws = np.asarray(root_yaws, dtype=np.float64)
+    if root_yaws.shape != (global_rotations.shape[0],):
+        raise ValueError(f"root_yaws should be [T], got {root_yaws.shape}")
+    root_inv = np.swapaxes(make_yaw_rotation_np(root_yaws), -1, -2)
+    root_relative_global = root_inv[:, None] @ global_rotations
+    return rotation_6d_forward_up_np(root_relative_global).reshape(global_rotations.shape[0], -1).astype(np.float32)
+
+
+def root_global_6d_to_global_rot_torch(body_pose_root_global_6d: torch.Tensor, root_yaw: torch.Tensor) -> torch.Tensor:
+    """Decode root-yaw-relative global 6D pose to world/global rotations, shape `[B,24,3,3]`."""
+
+    batch_size = body_pose_root_global_6d.shape[0]
+    root_relative_global = rotation_6d_to_matrix_torch(body_pose_root_global_6d.reshape(batch_size, 24, 6))
+    yaw_rot = make_yaw_rotation_torch(root_yaw)
+    return torch.matmul(yaw_rot[:, None], root_relative_global)
+
+
+def root_global_6d_to_parent_local_torch(body_pose_root_global_6d: torch.Tensor) -> torch.Tensor:
+    """Convert current root-global 6D pose to parent-local 6D for debug/retarget-only consumers."""
+
+    batch_size = body_pose_root_global_6d.shape[0]
+    root_relative_global = rotation_6d_to_matrix_torch(body_pose_root_global_6d.reshape(batch_size, 24, 6))
+    local_rot: list[torch.Tensor] = []
+    for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
+        if parent_index < 0:
+            joint_rot = root_relative_global[:, joint_index]
+        else:
+            joint_rot = root_relative_global[:, parent_index].transpose(-1, -2) @ root_relative_global[:, joint_index]
+        local_rot.append(joint_rot)
+    local = torch.stack(local_rot, dim=1)
+    return rotation_6d_forward_up_torch(local).reshape(batch_size, -1)
+
+
+def estimate_root_global_offsets(
+    joints_world: np.ndarray,
+    body_pose_root_global_6d: np.ndarray,
+    root_yaws: np.ndarray,
+    root_pos_world: np.ndarray | None = None,
+    parents: np.ndarray = SMPL_PARENTS,
+) -> np.ndarray:
+    """Estimate rest offsets from the first frame under root-yaw-relative global pose semantics."""
+
+    joints = np.asarray(joints_world, dtype=np.float64)
+    if joints.ndim != 3 or joints.shape[1:] != (24, 3):
+        raise ValueError(f"joints_world should be [T,24,3], got {joints.shape}")
+    root_relative_global = rotation_6d_to_matrix_np(np.asarray(body_pose_root_global_6d[0], dtype=np.float64).reshape(24, 6))
+    root_yaw_rotation = make_yaw_rotation_np(np.asarray([root_yaws[0]], dtype=np.float64))[0]
+    global_rot = root_yaw_rotation[None] @ root_relative_global
+    offsets = np.zeros((24, 3), dtype=np.float32)
+    if root_pos_world is not None:
+        root_pos = np.asarray(root_pos_world, dtype=np.float64)
+        root_offset_world = joints[0, 0] - root_pos[0]
+        offsets[0] = (root_yaw_rotation.T @ root_offset_world).astype(np.float32)
+    for joint_index, parent_index in enumerate(parents):
+        if parent_index < 0:
+            continue
+        world_offset = joints[0, joint_index] - joints[0, parent_index]
+        offsets[joint_index] = (global_rot[parent_index].T @ world_offset).astype(np.float32)
+    return offsets
+
+
 def estimate_parent_offsets(
     joints_world: np.ndarray,
     body_pose_parent_6d: np.ndarray,
@@ -281,4 +348,34 @@ def fk_parent_local_torch(
     stacked_joints = torch.stack(joints, dim=1)
     if return_global_rot:
         return stacked_joints, torch.stack(global_rot, dim=1)
+    return stacked_joints
+
+
+def fk_root_global_torch(
+    body_pose_root_global_6d: torch.Tensor,
+    root_pos_world: torch.Tensor,
+    root_yaw: torch.Tensor,
+    parent_offsets: torch.Tensor,
+    return_global_rot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable FK for root-yaw-relative global 6D pose, input `[B,144]`, output `[B,24,3]`."""
+
+    global_rot = root_global_6d_to_global_rot_torch(
+        body_pose_root_global_6d=body_pose_root_global_6d,
+        root_yaw=root_yaw,
+    )
+    yaw_rot = make_yaw_rotation_torch(root_yaw)
+    joints: list[torch.Tensor] = []
+    for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
+        if parent_index < 0:
+            root_offset = parent_offsets[:, joint_index]
+            joint_pos = root_pos_world + torch.einsum("bij,bj->bi", yaw_rot, root_offset)
+        else:
+            parent_rot = global_rot[:, parent_index]
+            offset = parent_offsets[:, joint_index]
+            joint_pos = joints[parent_index] + torch.einsum("bij,bj->bi", parent_rot, offset)
+        joints.append(joint_pos)
+    stacked_joints = torch.stack(joints, dim=1)
+    if return_global_rot:
+        return stacked_joints, global_rot
     return stacked_joints

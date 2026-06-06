@@ -12,8 +12,11 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
+    BODY_POSE_ROOT_GLOBAL_KEY,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    LEGACY_BODY_POSE_PARENT_KEY,
     MIN_VALID_TRACKERS,
+    POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -29,13 +32,15 @@ from data_loaders.sensor_masking import (
     make_window_patterns,
     normalize_tracker_pattern_categories,
     repeat_pattern_sensor_valid,
+    validate_pose_representation,
     validate_sensor_valid,
 )
 from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
 SOURCE_KEYS = {
-    "body_pose_parent_6d",
+    BODY_POSE_ROOT_GLOBAL_KEY,
+    POSE_REPRESENTATION_KEY,
     "root_pos_world",
     "root_yaw",
     "root_yaw_delta_sincos",
@@ -50,6 +55,9 @@ SHORT_SOURCE_POLICY_SKIP = "skip"
 SHORT_SOURCE_POLICY_ERROR = "error"
 SHORT_SOURCE_POLICIES = (SHORT_SOURCE_POLICY_SKIP, SHORT_SOURCE_POLICY_ERROR)
 SHORT_SOURCE_REPORT_NAME = "skipped_short_sources.jsonl"
+MAX_TASK_ID_STEM_CHARS = 28
+MAX_TASK_ID_CATEGORY_CHARS = 12
+TASK_ID_DIGEST_CHARS = 16
 
 
 @dataclass(frozen=True)
@@ -133,7 +141,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     if not source_dir.exists():
         raise FileNotFoundError(f"{args.schema} 源目录不存在：{source_dir}")
 
-    source_entries = read_source_entries(source_dir)
+    source_entries = read_source_entries(source_dir, schema_name=str(args.schema))
     if not source_entries:
         raise RuntimeError(f"{source_dir} 中没有 {args.schema} 源数据。")
 
@@ -196,6 +204,7 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             "task_dir": str(plan.output_dir),
             "task_root": str(plan.output_root),
             "schema_name": str(args.schema),
+            "pose_representation": get_schema_spec(str(args.schema)).pose_representation,
             "source_dir": str(plan.source_dir),
             "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
             "splits": [split_plan.split for split_plan in plan.split_plans],
@@ -208,7 +217,7 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
 def resolve_task_run_label(args: argparse.Namespace) -> str:
     run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
     if run_name.lower() in {"", "auto"}:
-        return f"{getattr(args, 'schema', DEFAULT_REALTIME_POSE_SCHEMA_NAME)}_tasks_seed{getattr(args, 'seed', 0)}"
+        return f"rtp_tasks_seed{getattr(args, 'seed', 0)}"
     return run_name
 
 
@@ -298,6 +307,7 @@ def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -
     schema = get_schema_spec(marker.get("schema_name"))
     if marker.get("task_format") != schema.task_format:
         raise ValueError(f"output_dir 标记不是合法 realtime_pose task 目录：{marker_path}")
+    validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
 
 
 def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path | None, schema_name: str) -> None:
@@ -305,6 +315,7 @@ def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path
     marker = {
         "schema_name": schema.name,
         "task_format": schema.task_format,
+        POSE_REPRESENTATION_KEY: schema.pose_representation,
         "source_dir": str(source_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
@@ -312,7 +323,8 @@ def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path
     marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
-def read_source_entries(source_dir: Path) -> list[dict]:
+def read_source_entries(source_dir: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> list[dict]:
+    schema = get_schema_spec(schema_name)
     manifest_path = source_dir / "manifest.jsonl"
     if manifest_path.exists():
         entries = []
@@ -323,6 +335,13 @@ def read_source_entries(source_dir: Path) -> list[dict]:
                 entry = json.loads(line)
                 if entry.get("status", "converted") not in USABLE_SOURCE_STATUSES:
                     continue
+                if str(entry.get("schema_name", schema.name)) != schema.name:
+                    raise ValueError(f"{manifest_path} contains schema_name={entry.get('schema_name')}, expected {schema.name}.")
+                validate_pose_representation(
+                    entry.get(POSE_REPRESENTATION_KEY),
+                    schema_name=schema.name,
+                    source=f"{manifest_path}:{entry.get('source_relative_path', '<unknown>')}",
+                )
                 path = resolve_manifest_file(source_dir, entry.get("output_path") or entry.get("source_relative_path"))
                 entries.append(
                     {
@@ -354,8 +373,15 @@ def read_source_entries(source_dir: Path) -> list[dict]:
 def resolve_manifest_file(base_dir: Path, value: str | None) -> Path:
     if not value:
         raise KeyError("manifest entry 缺少 output_path/source_relative_path")
-    path = Path(value)
-    return path if path.is_absolute() else base_dir / normalize_slashes(value)
+    normalized = normalize_slashes(value)
+    path = Path(normalized)
+    if path.is_absolute():
+        return path
+    # converter 可能把 output_path 写成相对仓库根目录的 dataset/... 路径；
+    # 先按原路径解析，找不到时再按 source_dir 相对路径解析。
+    if path.exists():
+        return path
+    return base_dir / normalized
 
 
 def read_split_keys(split_dir: Path | None, split: str) -> set[str] | None:
@@ -415,7 +441,7 @@ def generate_split_tasks(
 
             schema = get_schema_spec(args.schema)
             source = load_realtime_source(source_path, schema_name=schema.name)
-            source_frames = int(source["body_pose_parent_6d"].shape[0])
+            source_frames = int(source[schema.body_pose_key].shape[0])
             if source_frames < REALTIME_POSE_SEQ_LEN:
                 if should_raise_for_short_source(args):
                     raise ValueError(format_short_source_error(source_path=source_path, source_frames=source_frames))
@@ -464,6 +490,7 @@ def generate_split_tasks(
                         "feature_dim": schema.feature_dim,
                         "task_format": schema.task_format,
                         "schema_name": schema.name,
+                        POSE_REPRESENTATION_KEY: schema.pose_representation,
                         "task_mode": TASK_MODE_REALTIME_POSE,
                         "target_start": REALTIME_POSE_TARGET_START,
                         "target_length": REALTIME_POSE_TARGET_LENGTH,
@@ -535,6 +562,8 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
 def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
+        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
+            raise ValueError(f"{path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate source data.")
         required_keys = set(SOURCE_KEYS)
         if schema.supports_root_motion:
             required_keys.update({"root_delta_xz_ref", "root_height"})
@@ -543,10 +572,16 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
         missing = sorted(required_keys.difference(data.files))
         if missing:
             raise KeyError(f"{path} 缺少 {schema.name} 源字段：{missing}")
-        source = {key: data[key].astype(np.float32, copy=True) for key in required_keys}
-    frame_count = source["body_pose_parent_6d"].shape[0]
+        validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
+        source = {
+            key: data[key].astype(np.float32, copy=True)
+            for key in required_keys
+            if key != POSE_REPRESENTATION_KEY
+        }
+        source[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
+    frame_count = source[schema.body_pose_key].shape[0]
     expected_shapes = {
-        "body_pose_parent_6d": (frame_count, 144),
+        schema.body_pose_key: (frame_count, 144),
         "root_pos_world": (frame_count, 3),
         "root_yaw": (frame_count,),
         "root_yaw_delta_sincos": (frame_count, 2),
@@ -569,12 +604,13 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
 def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -> dict[str, np.ndarray]:
     end_frame = int(start_frame) + int(seq_len)
     return {
-        key: value.copy() if key == "joint_offsets_parent" else value[start_frame:end_frame].copy()
+        key: value.copy() if key in {"joint_offsets_parent", POSE_REPRESENTATION_KEY} else value[start_frame:end_frame].copy()
         for key, value in source.items()
     }
 
 
 def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
+    task_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = task_path.with_name(task_path.name + ".tmp")
     if temp_path.exists():
         temp_path.unlink()
@@ -588,10 +624,25 @@ def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
 
 def make_task_id(split: str, stablemotion_split_key: str, sample_index: int, pattern_index: int, pattern_category: str) -> str:
     key = normalize_slashes(stablemotion_split_key)
-    stem = re.sub(r"[^A-Za-z0-9_]+", "_", Path(key).with_suffix("").as_posix()).strip("_")
-    digest = hashlib.sha1(f"{split}:{key}:{sample_index}:{pattern_index}:{pattern_category}".encode("utf-8")).hexdigest()[:8]
-    safe_category = re.sub(r"[^A-Za-z0-9_]+", "_", pattern_category).strip("_")
+    # 完整来源路径保存在 manifest；文件名只保留短 stem，避免 Windows MAX_PATH。
+    stem = re.sub(r"[^A-Za-z0-9_]+", "_", Path(key).with_suffix("").name).strip("_") or "source"
+    stem = truncate_middle(stem, MAX_TASK_ID_STEM_CHARS)
+    digest = hashlib.sha1(f"{split}:{key}:{sample_index}:{pattern_index}:{pattern_category}".encode("utf-8")).hexdigest()[
+        :TASK_ID_DIGEST_CHARS
+    ]
+    safe_category = re.sub(r"[^A-Za-z0-9_]+", "_", pattern_category).strip("_") or "pattern"
+    if safe_category == "full_trackers":
+        safe_category = "full"
+    safe_category = truncate_middle(safe_category, MAX_TASK_ID_CATEGORY_CHARS)
     return f"{stem}_s{sample_index:04d}_p{pattern_index:02d}_{safe_category}_{digest}"
+
+
+def truncate_middle(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    head = max_chars // 2
+    tail = max_chars - head - 1
+    return f"{value[:head]}_{value[-tail:]}"
 
 
 def main(argv: list[str] | None = None) -> dict[str, int]:

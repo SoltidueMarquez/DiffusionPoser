@@ -11,6 +11,7 @@ from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset, encode_realtime_pose_features
 from data_loaders.realtime_pose_kinematics import integrate_root_delta_xz_ref
 from data_loaders.sensor_masking import (
+    POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
@@ -30,6 +31,7 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
 def test_v2_contact_feature_layout_and_root_integration():
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
     source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    assert str(source[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
     source["sensor_valid"] = np.ones((REALTIME_POSE_SEQ_LEN, 6), dtype=bool)
     features = encode_realtime_pose_features(source, schema_name=schema.name)
     assert features.shape == (REALTIME_POSE_SEQ_LEN, schema.feature_dim)
@@ -70,11 +72,14 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
     entry = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
     schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
     assert entry["feature_dim"] == schema.feature_dim
+    assert entry[POSE_REPRESENTATION_KEY] == schema.pose_representation
 
     mean = torch.zeros(schema.feature_dim)
     std = torch.ones(schema.feature_dim)
     normalizer = RealtimePoseNormalizer(normalizer_dir, disable=True, schema_name=schema.name)
     normalizer.save(mean, std)
+    normalizer_meta = json.loads((normalizer_dir / "normalizer_meta.json").read_text(encoding="utf-8"))
+    assert normalizer_meta[POSE_REPRESENTATION_KEY] == schema.pose_representation
     dataset = RealtimePoseTaskDataset(
         task_dir,
         split="train",

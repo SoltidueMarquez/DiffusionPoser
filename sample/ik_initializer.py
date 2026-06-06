@@ -9,7 +9,7 @@ import torch
 from data_loaders.realtime_pose_kinematics import (
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
-    fk_parent_local_torch,
+    fk_root_global_torch,
     rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
 )
@@ -229,8 +229,8 @@ def _solve_single_frame_tracker_pose_ik(
 
     for _ in range(int(iterations)):
         optimizer.zero_grad(set_to_none=True)
-        joints, global_rot = fk_parent_local_torch(
-            body_pose_parent_6d=pose.reshape(1, -1),
+        joints, global_rot = fk_root_global_torch(
+            body_pose_root_global_6d=pose.reshape(1, -1),
             root_pos_world=root_pos_ref,
             root_yaw=root_yaw_ref,
             parent_offsets=offsets.reshape(1, SMPL_JOINT_COUNT, 3),

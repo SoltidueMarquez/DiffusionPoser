@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
+from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from visual_editor.models import MotionAsset, MotionTrack, StudioConfig
 from visual_editor.realtime_pose import build_realtime_pose_frames, load_stream_npz, load_task_npz
 
@@ -48,8 +49,10 @@ class MotionDecoder:
             return load_realtime_source(track.source_path), None
         if track.data_key == "task":
             task = load_task_npz(track.source_path)
+            schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
             motion = {key: task[key] for key in (
-                "body_pose_parent_6d",
+                schema.body_pose_key,
+                POSE_REPRESENTATION_KEY,
                 "root_pos_world",
                 "root_yaw",
                 "root_yaw_delta_sincos",

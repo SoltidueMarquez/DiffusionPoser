@@ -13,7 +13,7 @@ from data_loaders.realtime_pose_dataset import zero_missing_tracker_channels
 from data_loaders.realtime_pose_kinematics import (
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
-    fk_parent_local_torch,
+    fk_root_global_torch,
     integrate_root_delta_xz_ref,
     make_yaw_rotation_np,
     rotation_6d_forward_up_np,
@@ -235,8 +235,8 @@ def fk_tracker_positions_from_target(
     if schema.supports_root_motion:
         offsets[0, 1] = float(target[schema.root_height_slice()][0])
     with torch.no_grad():
-        joints = fk_parent_local_torch(
-            body_pose_parent_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
+        joints = fk_root_global_torch(
+            body_pose_root_global_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
             root_pos_world=torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)[None]).float(),
             root_yaw=torch.tensor([float(root_yaw)], dtype=torch.float32),
             parent_offsets=torch.from_numpy(offsets[None]).float(),
@@ -272,7 +272,7 @@ def blend_body_pose_6d(base_body_pose_parent_6d: np.ndarray, target_body_pose_pa
     base = np.asarray(base_body_pose_parent_6d, dtype=np.float32).reshape(-1)
     target = np.asarray(target_body_pose_parent_6d, dtype=np.float32).reshape(-1)
     if base.shape != (SMPL_JOINT_COUNT * 6,) or target.shape != (SMPL_JOINT_COUNT * 6,):
-        raise ValueError(f"body_pose_parent_6d 应为 [{SMPL_JOINT_COUNT * 6}]。")
+        raise ValueError(f"body_pose_root_global_6d 应为 [{SMPL_JOINT_COUNT * 6}]。")
     weight = float(np.clip(float(blend), 0.0, 1.0))
     mixed = base + weight * (target - base)
     return normalize_body_pose_6d(mixed)
@@ -347,7 +347,7 @@ def apply_tracker_position_ik(
     """
     用已知 tracker 位置对预测 pose 做一小步运行时 IK 投影。
 
-    输入/输出都是单帧 raw feature `[211]`。IK 只修改 `body_pose_parent_6d`，
+    输入/输出都是单帧 raw feature `[211]`。IK 只修改 body pose root-global 6D，
     root yaw/root xz/root height 由 root correction 负责，因此这里不改变 root 状态。
     """
 
@@ -396,8 +396,8 @@ def apply_tracker_position_ik(
 
     for _ in range(int(iterations)):
         optimizer.zero_grad(set_to_none=True)
-        joints = fk_parent_local_torch(
-            body_pose_parent_6d=pose.reshape(1, -1),
+        joints = fk_root_global_torch(
+            body_pose_root_global_6d=pose.reshape(1, -1),
             root_pos_world=root_pos,
             root_yaw=root_yaw_tensor,
             parent_offsets=parent_offsets,

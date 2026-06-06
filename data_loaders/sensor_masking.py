@@ -9,6 +9,10 @@ REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
 REALTIME_POSE_V2_CONTACT_SCHEMA_NAME = "realtime_pose_v2_contact"
 REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
 DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
+POSE_REPRESENTATION_KEY = "pose_representation"
+POSE_REPRESENTATION_ROOT_YAW_GLOBAL_6D = "root_yaw_global_6d"
+BODY_POSE_ROOT_GLOBAL_KEY = "body_pose_root_global_6d"
+LEGACY_BODY_POSE_PARENT_KEY = "body_pose_parent_6d"
 TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
 TASK_FORMAT_REALTIME_POSE_V2_CONTACT = "materialized_realtime_pose_v2_contact"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
@@ -133,6 +137,8 @@ class SchemaSpec:
     tracker_pos_ref_start: int
     tracker_rot_ref_start: int
     sensor_valid_start: int
+    pose_representation: str = POSE_REPRESENTATION_ROOT_YAW_GLOBAL_6D
+    body_pose_key: str = BODY_POSE_ROOT_GLOBAL_KEY
     root_delta_xz_start: int | None = None
     root_height_start: int | None = None
     foot_contact_start: int | None = None
@@ -223,6 +229,30 @@ def get_schema_spec(schema_name: str | None) -> SchemaSpec:
         return SCHEMA_SPECS[name]
     except KeyError as exc:
         raise ValueError(f"未知 realtime pose schema: {name}，可选值为 {REALTIME_POSE_SCHEMA_NAMES}") from exc
+
+
+def scalar_string(value: object, name: str) -> str:
+    array = np.asarray(value)
+    if array.shape == ():
+        return str(array.item())
+    if array.size == 1:
+        return str(array.reshape(()).item())
+    raise ValueError(f"{name} must be a scalar string, got shape={array.shape}")
+
+
+def validate_pose_representation(
+    value: object,
+    schema_name: str | None = None,
+    source: str = "payload",
+) -> str:
+    schema = get_schema_spec(schema_name)
+    representation = scalar_string(value, POSE_REPRESENTATION_KEY)
+    if representation != schema.pose_representation:
+        raise ValueError(
+            f"{source} pose_representation={representation!r}, "
+            f"expected {schema.pose_representation!r} for {schema.name}."
+        )
+    return representation
 
 
 def validate_realtime_seq_len(seq_len: int) -> None:

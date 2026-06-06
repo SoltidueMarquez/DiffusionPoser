@@ -17,6 +17,8 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
+    LEGACY_BODY_POSE_PARENT_KEY,
+    POSE_REPRESENTATION_KEY,
     HIP_TRACKER_INDEX,
     FOOT_CONTACT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
@@ -41,6 +43,7 @@ from data_loaders.sensor_masking import (
     repeat_pattern_sensor_valid,
     validate_realtime_seq_len,
     validate_realtime_target,
+    validate_pose_representation,
     validate_sensor_valid,
     get_schema_spec,
 )
@@ -138,6 +141,11 @@ class RealtimePoseTaskDataset(Dataset):
                 raise ValueError(f"任务 {entry.get('task_id')} 不是 {self.schema.name}。")
             if str(entry.get("task_format", "")) != self.schema.task_format:
                 raise ValueError(f"任务 {entry.get('task_id')} 的 task_format 不匹配。")
+            validate_pose_representation(
+                entry.get(POSE_REPRESENTATION_KEY),
+                schema_name=self.schema.name,
+                source=f"{self.manifest_path}:{entry.get('task_id', '<unknown>')}",
+            )
             if int(entry.get("feature_dim", -1)) != self.schema.feature_dim:
                 raise ValueError(f"任务 {entry.get('task_id')} feature_dim 不等于 {self.schema.feature_dim}。")
             if int(entry.get("seq_len", -1)) != self.seq_len:
@@ -446,8 +454,12 @@ def load_materialized_task_npz(
         raise FileNotFoundError(f"realtime_pose task 文件不存在：{path}")
     with np.load(path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
+    schema = get_schema_spec(schema_name)
+    if LEGACY_BODY_POSE_PARENT_KEY in task:
+        raise ValueError(f"{path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate realtime_pose tasks.")
     required = {
-        "body_pose_parent_6d",
+        schema.body_pose_key,
+        POSE_REPRESENTATION_KEY,
         "root_pos_world",
         "root_yaw",
         "root_yaw_delta_sincos",
@@ -462,7 +474,6 @@ def load_materialized_task_npz(
         "source_frames",
         "seq_len",
     }
-    schema = get_schema_spec(schema_name)
     if schema.supports_root_motion:
         required.update({"root_delta_xz_ref", "root_height"})
     if schema.supports_contact:
@@ -470,6 +481,7 @@ def load_materialized_task_npz(
     missing = sorted(required.difference(task))
     if missing:
         raise KeyError(f"{path} 缺少 {schema.name} 字段：{missing}")
+    validate_pose_representation(task[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
     return task
 
 
@@ -484,9 +496,10 @@ def load_realtime_task_arrays(
     validate_realtime_seq_len(task_seq_len)
     valid_length = scalar_int(task, "valid_length")
     validate_realtime_seq_len(valid_length)
+    validate_pose_representation(task[POSE_REPRESENTATION_KEY], schema_name=schema.name, source="task")
 
     arrays = {
-        "body_pose_parent_6d": array_shape(task["body_pose_parent_6d"], (seq_len, BODY_POSE_DIM), "body_pose_parent_6d").astype(np.float32),
+        schema.body_pose_key: array_shape(task[schema.body_pose_key], (seq_len, BODY_POSE_DIM), schema.body_pose_key).astype(np.float32),
         "root_pos_world": array_shape(task["root_pos_world"], (seq_len, 3), "root_pos_world").astype(np.float32),
         "root_yaw": array_shape(task["root_yaw"], (seq_len,), "root_yaw").astype(np.float32),
         "root_yaw_delta_sincos": array_shape(task["root_yaw_delta_sincos"], (seq_len, ROOT_YAW_DELTA_DIM), "root_yaw_delta_sincos").astype(np.float32),
@@ -519,9 +532,9 @@ def encode_realtime_pose_features(
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> np.ndarray:
     schema = get_schema_spec(schema_name)
-    seq_len = arrays["body_pose_parent_6d"].shape[0]
+    seq_len = arrays[schema.body_pose_key].shape[0]
     features = np.zeros((seq_len, schema.feature_dim), dtype=np.float32)
-    features[:, schema.body_pose_slice()] = arrays["body_pose_parent_6d"]
+    features[:, schema.body_pose_slice()] = arrays[schema.body_pose_key]
     features[:, schema.root_yaw_delta_slice()] = arrays["root_yaw_delta_sincos"]
     if schema.supports_root_motion:
         features[:, schema.root_delta_xz_slice()] = arrays["root_delta_xz_ref"]

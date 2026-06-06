@@ -10,7 +10,7 @@ conda run -n diffusionposer5070 python -m visual_editor.server --source_dir data
 
 ## 数据
 
-- Source：`realtime_pose_v2_contact` `.npz`，包含 `body_pose_parent_6d/root_pos_world/root_yaw/root_delta_xz_ref/root_height/foot_contact/tracker_pos_world/joints_world` 等源数组。
+- Source：`realtime_pose_v2_contact` `.npz`，包含 `body_pose_root_global_6d/pose_representation/root_pos_world/root_yaw/root_delta_xz_ref/root_height/foot_contact/tracker_pos_world/joints_world` 等源数组。
 - Task：`materialized_realtime_pose_v2_contact` `.npz`，包含 source 数组、`sensor_valid`、`inpaint_mask` 和 61 帧窗口元数据。
 - Result：采样结果 `.npz`，建议包含 `reference_features`、`conditioned_features`、`reconstructed_features`。
 

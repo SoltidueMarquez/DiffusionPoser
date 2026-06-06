@@ -11,8 +11,13 @@ import torch
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_to_realtime_pose import build_realtime_pose_features
 from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
-from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main, read_source_entries
-from data_loaders.realtime_pose_kinematics import fk_parent_local_torch
+from data_loaders.generate_realtime_pose_tasks import (
+    make_task_id,
+    load_realtime_source,
+    main as generate_realtime_pose_tasks_main,
+    read_source_entries,
+)
+from data_loaders.realtime_pose_kinematics import fk_root_global_torch
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     encode_realtime_pose_features,
@@ -22,6 +27,7 @@ from data_loaders.realtime_pose_dataset import (
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     HIP_TRACKER_INDEX,
+    POSE_REPRESENTATION_KEY,
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
@@ -33,6 +39,7 @@ from data_loaders.sensor_masking import (
     TRACKER_PATTERN_CATEGORIES,
     TRACKER_POS_REF_START,
     TRACKER_ROT_REF_START,
+    get_schema_spec,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
 from utils.run_dirs import read_latest_pointer
@@ -58,7 +65,9 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     motion.joint_rotations = rotations
 
     features = build_realtime_pose_features(motion, schema_name=REALTIME_POSE_SCHEMA_NAME)
-    assert features["body_pose_parent_6d"].shape == (4, 144)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    assert features[schema.body_pose_key].shape == (4, 144)
+    assert str(features[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
     assert features["root_pos_world"].shape == (4, 3)
     assert features["root_yaw_delta_sincos"].shape == (4, 2)
     assert features["tracker_pos_world"].shape == (4, 6, 3)
@@ -111,8 +120,10 @@ def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path)
         assert "root_delta_xz_ref" in data.files
         assert "root_height" in data.files
         assert "foot_contact" in data.files
+        assert str(data[POSE_REPRESENTATION_KEY].item()) == get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME).pose_representation
         metadata = json.loads(str(data["metadata"].item()))
     assert metadata["schema_name"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+    assert metadata["pose_representation"] == get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME).pose_representation
 
 
 def test_source_manifest_reused_entries_are_usable(tmp_path):
@@ -120,8 +131,11 @@ def test_source_manifest_reused_entries_are_usable(tmp_path):
     source_path = source_dir / "ACCAD" / "toy_realtime.npz"
     source_path.parent.mkdir(parents=True)
     np.savez(source_path, **build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN))
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     manifest_entry = {
         "status": "reused_source",
+        "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
         "output_path": "ACCAD/toy_realtime.npz",
         "source_relative_path": "ACCAD/toy_realtime.npz",
         "stablemotion_split_key": "ACCAD/toy_realtime",
@@ -132,6 +146,22 @@ def test_source_manifest_reused_entries_are_usable(tmp_path):
     entries = read_source_entries(source_dir)
     assert len(entries) == 1
     assert entries[0]["source_path"] == str(source_path)
+
+
+def test_realtime_source_loader_rejects_legacy_parent_local_pose(tmp_path):
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    legacy_source = {
+        key: value
+        for key, value in source.items()
+        if key not in {schema.body_pose_key, POSE_REPRESENTATION_KEY}
+    }
+    legacy_source["body_pose_parent_6d"] = source[schema.body_pose_key]
+    legacy_path = tmp_path / "legacy_source.npz"
+    np.savez(legacy_path, **legacy_source)
+
+    with pytest.raises(ValueError, match="legacy body_pose_parent_6d"):
+        load_realtime_source(legacy_path, schema_name=schema.name)
 
 
 def test_fk_reconstructs_pelvis_from_ground_root_offset():
@@ -152,8 +182,8 @@ def test_fk_reconstructs_pelvis_from_ground_root_offset():
     assert features["root_pos_world"][0, 1] == 0.0
     np.testing.assert_allclose(features["joint_offsets_parent"][0], np.asarray([0.0, 0.92, 0.0], dtype=np.float32))
 
-    pred_joints = fk_parent_local_torch(
-        body_pose_parent_6d=torch.from_numpy(features["body_pose_parent_6d"][:1]).float(),
+    pred_joints = fk_root_global_torch(
+        body_pose_root_global_6d=torch.from_numpy(features[get_schema_spec(REALTIME_POSE_SCHEMA_NAME).body_pose_key][:1]).float(),
         root_pos_world=torch.from_numpy(features["root_pos_world"][:1]).float(),
         root_yaw=torch.from_numpy(features["root_yaw"][:1]).float(),
         parent_offsets=torch.from_numpy(features["joint_offsets_parent"][None]).float(),
@@ -194,6 +224,7 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
     assert len(entries) == 2
     assert {entry["tracker_pattern"] for entry in entries} == {"full-trackers"}
     assert {entry["mask_policy"] for entry in entries} == {"full"}
+    assert {entry[POSE_REPRESENTATION_KEY] for entry in entries} == {get_schema_spec(REALTIME_POSE_SCHEMA_NAME).pose_representation}
 
     for entry in entries:
         task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"])
@@ -204,6 +235,25 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
         assert task["inpaint_mask"].shape == (REALTIME_POSE_SEQ_LEN, REALTIME_POSE_INPUT_DIM)
         assert task["inpaint_mask"][REALTIME_POSE_TARGET_START, :REALTIME_POSE_TARGET_DIM].all()
         assert not task["inpaint_mask"][:, REALTIME_POSE_TARGET_DIM:].any()
+
+
+def test_task_id_stays_short_for_long_amass_paths():
+    task_id = make_task_id(
+        split="train",
+        stablemotion_split_key=(
+            "BioMotionLab_NTroje/rub042/very_long_nested_subject_name/"
+            "rub042_0027_circle_walk_stageii_poses"
+        ),
+        sample_index=12,
+        pattern_index=3,
+        pattern_category="full-trackers",
+    )
+
+    assert len(task_id) <= 72
+    assert "full_trackers" not in task_id
+    digest = task_id.split("_")[-1]
+    assert len(digest) == 16
+    assert all(char in "0123456789abcdef" for char in digest)
 
 
 def test_task_generator_skips_short_sources_by_default(tmp_path):

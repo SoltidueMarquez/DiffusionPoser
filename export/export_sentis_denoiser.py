@@ -27,7 +27,7 @@ from data_loaders.sensor_masking import (  # noqa: E402
     get_schema_spec,
 )
 from utils.model_util import create_model_and_diffusion  # noqa: E402
-from write_unity_runtime_assets import default_unity_model_dir, write_runtime_assets  # noqa: E402
+from write_unity_runtime_assets import default_unity_model_dir, validate_normalizer_metadata, write_runtime_assets  # noqa: E402
 
 
 DEFAULT_MODEL_CONFIG = {
@@ -133,6 +133,10 @@ def validate_normalizer_export_contract(cli_args: argparse.Namespace, checkpoint
             "导出 normalized checkpoint 时缺少 normalizer 文件："
             + ", ".join(str(path) for path in missing)
         )
+
+
+    schema_name = str(getattr(cli_args, "schema", None) or checkpoint_args.get("schema") or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    validate_normalizer_metadata(normalizer_dir=normalizer_dir, schema_name=schema_name)
 
 
 def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:

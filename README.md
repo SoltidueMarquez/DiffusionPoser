@@ -15,7 +15,7 @@
 
 | 范围 | 维度 | 含义 |
 | --- | ---: | --- |
-| `0:144` | 144 | `body_pose_parent_6d` |
+| `0:144` | 144 | `body_pose_root_global_6d` |
 | `144:146` | 2 | `root_yaw_delta_sincos` |
 | `146:148` | 2 | `root_delta_xz_ref` |
 | `148:149` | 1 | `root_height` |
@@ -23,6 +23,8 @@
 | `151:169` | 18 | `tracker_pos_ref` |
 | `169:205` | 36 | `tracker_rot_ref_6d` |
 | `205:211` | 6 | `sensor_valid` |
+
+source/task/normalizer/runtime asset 必须带 `pose_representation="root_yaw_global_6d"`；旧 `body_pose_parent_6d` 数据与当前 schema 不兼容，需要重新生成。
 
 `sensor_valid` 和 `foot_contact` 在 normalizer 中固定 `mean=0,std=1`。invalid tracker 的 position/rotation 通道在归一化后置零。
 

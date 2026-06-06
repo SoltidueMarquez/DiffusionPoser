@@ -19,7 +19,7 @@ from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, com
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
-    fk_parent_local_torch,
+    fk_root_global_torch,
     make_yaw_rotation_torch,
     rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
@@ -1473,8 +1473,8 @@ class GaussianDiffusion:
             offsets = offsets.clone()
             offsets[:, 0, 1] = pred_root_height.view(-1)
 
-        pred_joints, pred_global_rot = fk_parent_local_torch(
-            body_pose_parent_6d=pred_pose,
+        pred_joints, pred_global_rot = fk_root_global_torch(
+            body_pose_root_global_6d=pred_pose,
             root_pos_world=target_root_pos,
             root_yaw=pred_root_yaw,
             parent_offsets=offsets,

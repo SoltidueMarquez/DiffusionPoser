@@ -21,6 +21,7 @@ from data_loaders.sensor_masking import (  # noqa: E402
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
+    POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -33,6 +34,7 @@ from data_loaders.sensor_masking import (  # noqa: E402
     TRACKER_POS_DIM,
     TRACKER_ROT_DIM,
     get_schema_spec,
+    validate_pose_representation,
 )
 from utils.normalizer import enforce_realtime_pose_normalizer_contract  # noqa: E402
 
@@ -67,8 +69,9 @@ def build_realtime_pose_feature_schema(
         raise ValueError(f"realtime_pose sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
 
     payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "schemaName": schema.name,
+        "poseRepresentation": schema.pose_representation,
         "featureDim": schema.feature_dim,
         "sequenceLength": REALTIME_POSE_SEQ_LEN,
         "targetStart": REALTIME_POSE_TARGET_START,
@@ -81,12 +84,13 @@ def build_realtime_pose_feature_schema(
         "trackerJointIndices": [int(value) for value in TRACKER_JOINT_INDICES.tolist()],
         "hipTrackerIndex": HIP_TRACKER_INDEX,
         "minValidTrackers": MIN_VALID_TRACKERS,
-        "bodyPoseParent6d": {"name": "body_pose_parent_6d", "start": BODY_POSE_START, "length": BODY_POSE_DIM},
+        "bodyPoseRootGlobal6d": {"name": schema.body_pose_key, "start": BODY_POSE_START, "length": BODY_POSE_DIM},
         "rootYawDeltaSinCos": {"name": "root_yaw_delta_sincos", "start": ROOT_YAW_DELTA_START, "length": ROOT_YAW_DELTA_DIM},
         "trackerPositionReference": {"name": "tracker_pos_ref", "start": schema.tracker_pos_ref_start, "length": TRACKER_POS_DIM},
         "trackerRotation6dReference": {"name": "tracker_rot_ref_6d", "start": schema.tracker_rot_ref_start, "length": TRACKER_ROT_DIM},
         "sensorValid": {"name": "sensor_valid", "start": schema.sensor_valid_start, "length": SENSOR_VALID_DIM},
         "runtimeRules": {
+            "poseRepresentation": schema.pose_representation,
             "requiresHipTracker": True,
             "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
             "trackerReferenceYaw": "previous_frame_root_yaw",
@@ -120,11 +124,30 @@ def build_ddim_schedule(
     return {
         "schemaVersion": 1,
         "schemaName": schema.name,
+        "poseRepresentation": schema.pose_representation,
         "trainStepCount": int(diffusion_steps),
         "noiseSchedule": str(noise_schedule),
         "predictXStart": True,
         "alphasCumprod": [float(value) for value in alphas_cumprod.tolist()],
     }
+
+
+def validate_normalizer_metadata(normalizer_dir: Path, schema_name: str) -> dict[str, Any]:
+    schema = get_schema_spec(schema_name)
+    meta_path = normalizer_dir / "normalizer_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"normalize_input=True requires {meta_path}; old parent-local normalizers are not compatible."
+        )
+    with meta_path.open("r", encoding="utf-8") as file:
+        meta = json.load(file)
+    if str(meta.get("schema_name", "")) != schema.name:
+        raise ValueError(f"normalizer schema_name={meta.get('schema_name')!r}, expected {schema.name!r}.")
+    validate_pose_representation(meta.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(meta_path))
+    feature_dim = int(meta.get("feature_dim", -1))
+    if feature_dim != schema.feature_dim:
+        raise ValueError(f"normalizer feature_dim={feature_dim}, expected {schema.feature_dim}.")
+    return meta
 
 
 def build_normalizer(
@@ -145,6 +168,7 @@ def build_normalizer(
 
     mean_path = normalizer_dir / "mean.pt"
     std_path = normalizer_dir / "std.pt"
+    validate_normalizer_metadata(normalizer_dir=normalizer_dir, schema_name=schema.name)
     if not mean_path.exists() or not std_path.exists():
         raise FileNotFoundError(f"normalize_input=True 时缺少 normalizer tensors: {mean_path}, {std_path}")
 
@@ -167,6 +191,7 @@ def build_normalizer(
     return {
         "enabled": True,
         "schemaName": schema.name,
+        "poseRepresentation": schema.pose_representation,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [float(value) for value in mean.astype(np.float32).tolist()],
@@ -179,9 +204,11 @@ def disabled_normalizer(
     epsilon: float = 1e-8,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, Any]:
+    schema = get_schema_spec(schema_name)
     return {
         "enabled": False,
-        "schemaName": schema_name,
+        "schemaName": schema.name,
+        "poseRepresentation": schema.pose_representation,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [0.0] * int(feature_dim),
