@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_START, REALTIME_POSE_V2_CONTACT_SCHEMA_NAME, get_schema_spec
+from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_TARGET_START, get_schema_spec
 from sample.evaluate_unity_stream_source import build_long_sequence_payload, repeat_source_sequence
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
 from sample.simulate_unity_stream import IDENTITY_6D
@@ -57,7 +57,7 @@ def test_long_sequence_payload_aligns_gt_and_skips_warmup():
         root_correction=False,
     )
 
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assert diffusion.calls == 2
     assert payload["reference_features_raw"].shape == (1, 62, schema.feature_dim)
     assert payload["predicted_features_raw"].shape == (1, 62, schema.feature_dim)
@@ -65,8 +65,8 @@ def test_long_sequence_payload_aligns_gt_and_skips_warmup():
     assert payload["predicted_joints_world"].shape == (1, 62, 24, 3)
     assert not payload["eval_frame_mask"][0, :REALTIME_POSE_TARGET_START].any()
     assert payload["eval_frame_mask"][0, REALTIME_POSE_TARGET_START:].all()
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
-    reference_features = encode_realtime_pose_features(source, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    reference_features = encode_realtime_pose_features(source, schema_name=REALTIME_POSE_SCHEMA_NAME)
     np.testing.assert_allclose(
         payload["predicted_features_raw"][0, :REALTIME_POSE_TARGET_START, schema.target_slice()],
         reference_features[:REALTIME_POSE_TARGET_START, schema.target_slice()],
@@ -108,7 +108,7 @@ def test_predicted_history_identity_warmup_uses_identity_target():
         warmup_target_source="identity",
     )
 
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     expected_pose = np.tile(IDENTITY_6D, 24)
     np.testing.assert_allclose(
         payload["predicted_features_raw"][0, :REALTIME_POSE_TARGET_START, schema.body_pose_slice()],

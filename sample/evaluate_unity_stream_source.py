@@ -11,11 +11,10 @@ import torch
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
-from data_loaders.realtime_pose_kinematics import fk_root_global_torch
 from data_loaders.sensor_masking import (
+    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     TRACKER_COUNT,
     get_schema_spec,
 )
@@ -27,6 +26,7 @@ from sample.simulate_unity_stream import (
     DEFAULT_TRACKER_IK_ITERATIONS,
     DEFAULT_TRACKER_IK_LR,
     DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
+    fk_joints_from_target,
     full_valid_sensor_mask,
     simulate_unity_stream,
 )
@@ -54,12 +54,12 @@ WARMUP_TARGET_SOURCE_CHOICES = (WARMUP_TARGET_SOURCE_FIRST_FRAME, WARMUP_TARGET_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate a realtime_pose_v2_contact Unity stream against a long GT source.")
+    parser = argparse.ArgumentParser(description="Evaluate a realtime_pose_body_fbx_local_v1 Unity stream against a long GT source.")
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
     add_sampling_options(parser)
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     group = parser.add_argument_group("long_sequence")
     group.add_argument("--source_path", required=True, type=str)
     group.add_argument("--normalizer_dir", required=True, type=str)
@@ -125,11 +125,11 @@ def read_source_metadata(path: Path) -> dict[str, Any]:
 
 def load_v2_source_with_sensor_valid(path: Path) -> dict[str, np.ndarray]:
     metadata = read_source_metadata(path)
-    schema_name = str(metadata.get("schema_name", REALTIME_POSE_V2_CONTACT_SCHEMA_NAME))
-    if schema_name != REALTIME_POSE_V2_CONTACT_SCHEMA_NAME:
-        raise ValueError(f"{path} schema_name 必须是 {REALTIME_POSE_V2_CONTACT_SCHEMA_NAME}，实际为 {schema_name}")
+    schema_name = str(metadata.get("schema_name", REALTIME_POSE_SCHEMA_NAME))
+    if schema_name != REALTIME_POSE_SCHEMA_NAME:
+        raise ValueError(f"{path} schema_name 必须是 {REALTIME_POSE_SCHEMA_NAME}，实际为 {schema_name}")
 
-    source = load_realtime_source(path, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    source = load_realtime_source(path, schema_name=REALTIME_POSE_SCHEMA_NAME)
     frame_count = int(source["tracker_pos_world"].shape[0])
     with np.load(path, allow_pickle=False) as data:
         if "sensor_valid" in data.files:
@@ -148,7 +148,7 @@ def repeat_source_sequence(source: dict[str, np.ndarray], loop_count: int) -> di
     repeated: dict[str, np.ndarray] = {}
     for key, value in source.items():
         array = np.asarray(value)
-        if key == "joint_offsets_parent":
+        if key in {"joint_offsets_parent", "joint_rest_local_rotations_6d"}:
             repeated[key] = array.astype(np.float32, copy=True)
         elif array.ndim > 0 and array.shape[0] == frame_count:
             repeated[key] = np.concatenate([array] * loops, axis=0).astype(array.dtype, copy=False)
@@ -162,22 +162,26 @@ def decode_features_to_joints(
     root_pos_world: np.ndarray,
     root_yaw: np.ndarray,
     joint_offsets_parent: np.ndarray,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
 ) -> np.ndarray:
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(schema_name)
     values = np.asarray(features, dtype=np.float32)
     roots = np.asarray(root_pos_world, dtype=np.float32).copy()
     yaw = np.asarray(root_yaw, dtype=np.float32)
-    offsets = np.repeat(np.asarray(joint_offsets_parent, dtype=np.float32)[None], values.shape[0], axis=0)
-    roots[:, 1] = 0.0
-    offsets[:, 0, 1] = values[:, schema.root_height_slice()].reshape(-1)
-    with torch.no_grad():
-        joints = fk_root_global_torch(
-            body_pose_root_global_6d=torch.from_numpy(values[:, schema.body_pose_slice()]).float(),
-            root_pos_world=torch.from_numpy(roots).float(),
-            root_yaw=torch.from_numpy(yaw).float(),
-            parent_offsets=torch.from_numpy(offsets).float(),
+    joints = []
+    for frame_index in range(values.shape[0]):
+        joints.append(
+            fk_joints_from_target(
+                target_raw=values[frame_index],
+                root_pos_world=roots[frame_index],
+                root_yaw=float(yaw[frame_index]),
+                joint_offsets_parent=joint_offsets_parent,
+                schema_name=schema.name,
+                joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+            )
         )
-    return joints.numpy().astype(np.float32)
+    return np.stack(joints, axis=0).astype(np.float32)
 
 
 def build_long_sequence_payload(
@@ -214,7 +218,8 @@ def build_long_sequence_payload(
     if warmup_target_source not in WARMUP_TARGET_SOURCE_CHOICES:
         raise ValueError(f"warmup_target_source 必须是 {WARMUP_TARGET_SOURCE_CHOICES} 之一，实际为 {warmup_target_source}")
 
-    reference_features = encode_realtime_pose_features(source, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    reference_features = encode_realtime_pose_features(source, schema_name=schema.name)
     use_reference_history = history_pose_source == HISTORY_POSE_SOURCE_REFERENCE
     warmup_target_raw = (
         None
@@ -229,7 +234,7 @@ def build_long_sequence_payload(
         sensor_valid=source["sensor_valid"],
         device=device,
         use_ddim=use_ddim,
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=schema.name,
         normalizer=normalizer,
         initial_root_yaw=float(source["root_yaw"][0] if initial_root_yaw is None else initial_root_yaw),
         warmup_target_raw=warmup_target_raw,
@@ -238,6 +243,9 @@ def build_long_sequence_payload(
         reference_root_yaw=np.asarray(source["root_yaw"], dtype=np.float32) if use_reference_history else None,
         reference_root_pos_world=np.asarray(source["root_pos_world"], dtype=np.float32) if use_reference_history else None,
         joint_offsets_parent=np.asarray(source["joint_offsets_parent"], dtype=np.float32),
+        joint_rest_local_rotations_6d=np.asarray(source["joint_rest_local_rotations_6d"], dtype=np.float32)
+        if "joint_rest_local_rotations_6d" in source
+        else None,
         root_correction=bool(root_correction),
         tracker_ik=bool(tracker_ik),
         tracker_ik_iterations=int(tracker_ik_iterations),
@@ -263,10 +271,12 @@ def build_long_sequence_payload(
         root_pos_world=root_pos_predicted,
         root_yaw=root_yaw_predicted,
         joint_offsets_parent=source["joint_offsets_parent"],
+        schema_name=schema.name,
+        joint_rest_local_rotations_6d=source.get("joint_rest_local_rotations_6d"),
     )
 
     return {
-        "schema_name": np.asarray(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME),
+        "schema_name": np.asarray(schema.name),
         "feature_space": np.asarray("raw"),
         "input_feature_space": stream_payload["input_feature_space"],
         "reference_features_raw": reference_features[None],
@@ -302,7 +312,7 @@ def build_long_sequence_payload(
         "ik_init_delta_limit": stream_payload["ik_init_delta_limit"],
         "metadata": np.asarray(
             {
-                "schema_name": REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+                "schema_name": schema.name,
                 "frames": frame_count,
                 "warmup_frames": REALTIME_POSE_TARGET_START,
                 "history_pose_source": history_pose_source,
@@ -345,16 +355,16 @@ def write_eval_summary(result_path: Path, output_json: Path) -> dict[str, Any]:
 
 
 def validate_v2_runtime_args(args: argparse.Namespace) -> None:
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"realtime_pose_v2_contact 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {args.seq_len}")
+        raise ValueError(f"{schema.name} 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {args.seq_len}")
     if int(args.input_feats) != schema.feature_dim:
-        raise ValueError(f"realtime_pose_v2_contact input_feats 应为 {schema.feature_dim}，实际为 {args.input_feats}")
+        raise ValueError(f"{schema.name} input_feats 应为 {schema.feature_dim}，实际为 {args.input_feats}")
     checkpoint_args = load_args_json(Path(args.model_path))
     checkpoint_schema = checkpoint_args.get("schema")
-    if checkpoint_schema is not None and checkpoint_schema != REALTIME_POSE_V2_CONTACT_SCHEMA_NAME:
-        raise ValueError(f"checkpoint schema 必须是 {REALTIME_POSE_V2_CONTACT_SCHEMA_NAME}，实际为 {checkpoint_schema}")
-    args.schema = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+    if checkpoint_schema is not None and checkpoint_schema != schema.name:
+        raise ValueError(f"checkpoint schema 必须是 {schema.name}，实际为 {checkpoint_schema}")
+    args.schema = schema.name
 
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
@@ -364,7 +374,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
 
     source = load_v2_source_with_sensor_valid(Path(args.source_path).resolve())
     source = repeat_source_sequence(source, loop_count=int(args.loop_count))
-    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
     if not bool(args.normalize_input):
         normalizer = None
 

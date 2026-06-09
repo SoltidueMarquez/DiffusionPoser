@@ -12,6 +12,7 @@ import numpy as np
 from data_loaders.generate_realtime_pose_tasks import clip_source, load_realtime_source, normalize_slashes, save_task_npz
 from data_loaders.sensor_masking import (
     LEGACY_BODY_POSE_PARENT_KEY,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
@@ -100,7 +101,7 @@ def load_task_npz(path: Path) -> dict[str, np.ndarray]:
         POSE_REPRESENTATION_KEY,
         "root_pos_world",
         "root_yaw",
-        "root_yaw_delta_sincos",
+        schema.root_heading_delta_key,
         "tracker_pos_world",
         "tracker_rot_world_6d",
         "joints_world",
@@ -113,9 +114,11 @@ def load_task_npz(path: Path) -> dict[str, np.ndarray]:
         "seq_len",
     }
     if schema.supports_root_motion:
-        required.update({"root_delta_xz_ref", "root_height"})
+        required.update({"root_delta_xz_ref", schema.pelvis_height_key})
     if schema.supports_contact:
         required.add("foot_contact")
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        required.add("joint_rest_local_rotations_6d")
     missing = sorted(required.difference(task))
     if missing:
         raise KeyError(f"{path} missing realtime_pose_v2 task fields: {missing}")
@@ -144,7 +147,7 @@ def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path |
         schema.body_pose_key: (frame_count, 144),
         "root_pos_world": (frame_count, 3),
         "root_yaw": (frame_count,),
-        "root_yaw_delta_sincos": (frame_count, 2),
+        schema.root_heading_delta_key: (frame_count, 2),
         "tracker_pos_world": (frame_count, 6, 3),
         "tracker_rot_world_6d": (frame_count, 6, 6),
         "joints_world": (frame_count, 24, 3),
@@ -152,9 +155,11 @@ def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path |
     }
     if schema.supports_root_motion:
         expected["root_delta_xz_ref"] = (frame_count, 2)
-        expected["root_height"] = (frame_count, 1)
+        expected[schema.pelvis_height_key] = (frame_count, 1)
     if schema.supports_contact:
         expected["foot_contact"] = (frame_count, 2)
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        expected["joint_rest_local_rotations_6d"] = (24, 6)
     for key, shape in expected.items():
         if key not in payload:
             raise KeyError(f"{label}missing `{key}`")

@@ -11,7 +11,6 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     get_schema_spec,
 )
 from export.export_sentis_denoiser import validate_normalizer_export_contract
@@ -30,10 +29,10 @@ def test_runtime_assets_are_realtime_pose_only(tmp_path):
     assert schema["targetStart"] == 60
     assert schema["targetLength"] == 1
     assert schema["targetFeatureLength"] == schema_spec.target_dim
-    assert schema["bodyPoseRootGlobal6d"] == {"name": schema_spec.body_pose_key, "start": 0, "length": 144}
-    assert schema["rootYawDeltaSinCos"] == {"name": "root_yaw_delta_sincos", "start": 144, "length": 2}
+    assert schema["bodyPoseBodyFbxLocalDelta6d"] == {"name": schema_spec.body_pose_key, "start": 0, "length": 144}
+    assert schema["rootHeadingDeltaSinCos"] == {"name": "root_heading_delta_sincos", "start": 144, "length": 2}
     assert schema["rootDeltaXZReference"] == {"name": "root_delta_xz_ref", "start": 146, "length": 2}
-    assert schema["rootHeight"] == {"name": "root_height", "start": 148, "length": 1}
+    assert schema["pelvisHeight"] == {"name": "pelvis_height", "start": 148, "length": 1}
     assert schema["footContact"] == {"name": "foot_contact", "start": 149, "length": 2}
     assert schema["trackerPositionReference"] == {"name": "tracker_pos_ref", "start": 151, "length": 18}
     assert schema["trackerRotation6dReference"] == {"name": "tracker_rot_ref_6d", "start": 169, "length": 36}
@@ -88,15 +87,16 @@ def test_normalized_runtime_asset_export_requires_normalizer_dir():
         )
 
 
-def test_runtime_assets_default_to_v2_contact(tmp_path):
-    schema_spec = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+def test_runtime_assets_default_to_body_fbx_local(tmp_path):
+    schema_spec = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False)
     schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
-    assert schema["schemaName"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+    assert schema["schemaName"] == REALTIME_POSE_SCHEMA_NAME
     assert schema["poseRepresentation"] == schema_spec.pose_representation
     assert schema["featureDim"] == schema_spec.feature_dim
     assert schema["targetFeatureLength"] == schema_spec.target_dim
     assert schema["rootDeltaXZReference"]["start"] == schema_spec.root_delta_xz_start
+    assert schema["pelvisHeight"]["start"] == schema_spec.root_height_start
     assert schema["footContact"]["start"] == schema_spec.foot_contact_start
 
 

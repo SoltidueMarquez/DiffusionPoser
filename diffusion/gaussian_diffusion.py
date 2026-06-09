@@ -19,6 +19,7 @@ from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, com
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
+    fk_body_fbx_local_torch,
     fk_root_global_torch,
     make_yaw_rotation_torch,
     rotation_6d_forward_up_torch,
@@ -26,6 +27,7 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_TARGET_START,
     get_schema_spec,
 )
@@ -1435,6 +1437,9 @@ class GaussianDiffusion:
         target_joints = y["target_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
         prev_joints = y["prev_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
         offsets = y["joint_offsets_parent"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+        rest_local_rotations_6d = y.get("joint_rest_local_rotations_6d")
+        if rest_local_rotations_6d is not None:
+            rest_local_rotations_6d = rest_local_rotations_6d.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
 
         root_delta_loss = None
         root_height_loss = None
@@ -1469,17 +1474,31 @@ class GaussianDiffusion:
             yaw_rot = make_yaw_rotation_torch(prev_root_yaw)
             target_root_pos = prev_root_pos + torch.einsum("bij,bj->bi", yaw_rot, delta_3d)
             target_root_pos = target_root_pos.clone()
-            target_root_pos[:, 1] = 0.0
-            offsets = offsets.clone()
-            offsets[:, 0, 1] = pred_root_height.view(-1)
+            if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+                root_to_pelvis = torch.einsum("bij,bj->bi", make_yaw_rotation_torch(pred_root_yaw), offsets[:, 0])
+                target_root_pos[:, 1] = pred_root_height.view(-1) - root_to_pelvis[:, 1]
+            else:
+                target_root_pos[:, 1] = 0.0
+                offsets = offsets.clone()
+                offsets[:, 0, 1] = pred_root_height.view(-1)
 
-        pred_joints, pred_global_rot = fk_root_global_torch(
-            body_pose_root_global_6d=pred_pose,
-            root_pos_world=target_root_pos,
-            root_yaw=pred_root_yaw,
-            parent_offsets=offsets,
-            return_global_rot=True,
-        )
+        if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+            pred_joints, pred_global_rot = fk_body_fbx_local_torch(
+                body_pose_local_delta_6d=pred_pose,
+                actor_root_pos_world=target_root_pos,
+                root_heading=pred_root_yaw,
+                rest_local_positions=offsets,
+                rest_local_rotations_6d=rest_local_rotations_6d,
+                return_global_rot=True,
+            )
+        else:
+            pred_joints, pred_global_rot = fk_root_global_torch(
+                body_pose_root_global_6d=pred_pose,
+                root_pos_world=target_root_pos,
+                root_yaw=pred_root_yaw,
+                parent_offsets=offsets,
+                return_global_rot=True,
+            )
 
         fk_loss = ((pred_joints - target_joints) ** 2).flatten(1).mean(dim=1)
         pred_joint_vel = pred_joints - prev_joints

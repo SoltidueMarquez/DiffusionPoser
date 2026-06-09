@@ -17,7 +17,8 @@ from data_loaders.generate_realtime_pose_tasks import (
     main as generate_realtime_pose_tasks_main,
     read_source_entries,
 )
-from data_loaders.realtime_pose_kinematics import fk_root_global_torch
+from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest
+from data_loaders.realtime_pose_kinematics import fk_body_fbx_local_torch
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     encode_realtime_pose_features,
@@ -33,7 +34,6 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     SENSOR_VALID_DIM,
     SENSOR_VALID_START,
     TRACKER_PATTERN_CATEGORIES,
@@ -64,18 +64,24 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     rotations[..., 2, 2] = 1.0
     motion.joint_rotations = rotations
 
-    features = build_realtime_pose_features(motion, schema_name=REALTIME_POSE_SCHEMA_NAME)
+    body_fbx_rest = build_synthetic_body_fbx_rest()
+    features = build_realtime_pose_features(
+        motion,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+        body_fbx_rest=body_fbx_rest,
+    )
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assert features[schema.body_pose_key].shape == (4, 144)
     assert str(features[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
     assert features["root_pos_world"].shape == (4, 3)
-    assert features["root_yaw_delta_sincos"].shape == (4, 2)
+    assert features[schema.root_heading_delta_key].shape == (4, 2)
     assert features["tracker_pos_world"].shape == (4, 6, 3)
     assert features["tracker_rot_world_6d"].shape == (4, 6, 6)
     assert features["joints_world"].shape == (4, 24, 3)
     assert features["root_delta_xz_ref"].shape == (4, 2)
-    assert features["root_height"].shape == (4, 1)
+    assert features[schema.pelvis_height_key].shape == (4, 1)
     assert features["foot_contact"].shape == (4, 2)
+    assert features["joint_rest_local_rotations_6d"].shape == (24, 6)
 
 
 def test_converter_cli_defaults_to_current_recommended_schema():
@@ -104,7 +110,7 @@ def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path)
         output_dir=output_dir,
         target_fps=60.0,
         batch_size=1,
-        schema=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema=REALTIME_POSE_SCHEMA_NAME,
         reuse_source_dir=reuse_dir,
         skip_existing=False,
         overwrite=True,
@@ -116,14 +122,16 @@ def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path)
         mirror_variant=False,
     )
     assert record["status"] == "reused_source"
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     with np.load(output_dir / "ACCAD" / "toy_realtime.npz", allow_pickle=False) as data:
         assert "root_delta_xz_ref" in data.files
-        assert "root_height" in data.files
+        assert schema.pelvis_height_key in data.files
         assert "foot_contact" in data.files
-        assert str(data[POSE_REPRESENTATION_KEY].item()) == get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME).pose_representation
+        assert "joint_rest_local_rotations_6d" in data.files
+        assert str(data[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
         metadata = json.loads(str(data["metadata"].item()))
-    assert metadata["schema_name"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
-    assert metadata["pose_representation"] == get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME).pose_representation
+    assert metadata["schema_name"] == REALTIME_POSE_SCHEMA_NAME
+    assert metadata["pose_representation"] == schema.pose_representation
 
 
 def test_source_manifest_reused_entries_are_usable(tmp_path):
@@ -178,15 +186,20 @@ def test_fk_reconstructs_pelvis_from_ground_root_offset():
     rotations[..., 2, 2] = 1.0
     motion.joint_rotations = rotations
 
-    features = build_realtime_pose_features(motion)
-    assert features["root_pos_world"][0, 1] == 0.0
-    np.testing.assert_allclose(features["joint_offsets_parent"][0], np.asarray([0.0, 0.92, 0.0], dtype=np.float32))
+    body_fbx_rest = build_synthetic_body_fbx_rest()
+    features = build_realtime_pose_features(motion, body_fbx_rest=body_fbx_rest)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    np.testing.assert_allclose(features[schema.pelvis_height_key][0], np.asarray([0.92], dtype=np.float32))
+    expected_root_pos = source["joints_world"][0, 0] - body_fbx_rest.pelvis_local_position
+    np.testing.assert_allclose(features["root_pos_world"][0], expected_root_pos, atol=1e-6)
+    np.testing.assert_allclose(features["joint_offsets_parent"][0], body_fbx_rest.pelvis_local_position)
 
-    pred_joints = fk_root_global_torch(
-        body_pose_root_global_6d=torch.from_numpy(features[get_schema_spec(REALTIME_POSE_SCHEMA_NAME).body_pose_key][:1]).float(),
-        root_pos_world=torch.from_numpy(features["root_pos_world"][:1]).float(),
-        root_yaw=torch.from_numpy(features["root_yaw"][:1]).float(),
-        parent_offsets=torch.from_numpy(features["joint_offsets_parent"][None]).float(),
+    pred_joints = fk_body_fbx_local_torch(
+        body_pose_local_delta_6d=torch.from_numpy(features[schema.body_pose_key][:1]).float(),
+        actor_root_pos_world=torch.from_numpy(features["root_pos_world"][:1]).float(),
+        root_heading=torch.from_numpy(features["root_yaw"][:1]).float(),
+        rest_local_positions=torch.from_numpy(features["joint_offsets_parent"][None]).float(),
+        rest_local_rotations_6d=torch.from_numpy(features["joint_rest_local_rotations_6d"][None]).float(),
     )
     np.testing.assert_allclose(
         pred_joints[0, 0].detach().numpy(),

@@ -6,6 +6,7 @@ import torch
 from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
     REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
@@ -88,7 +89,7 @@ def test_reconstruct_batch_passes_ik_init_image_and_start_timestep():
 
 
 def test_tracker_pose_init_image_only_changes_target_frame_target_channels():
-    schema = get_schema_spec("realtime_pose_v2_contact")
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     conditioned = torch.zeros((1, schema.feature_dim, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
     conditioned[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START - 1] = torch.from_numpy(
         np.tile(IDENTITY_6D, SMPL_JOINT_COUNT)

@@ -1,7 +1,7 @@
 """
 把 AMASS SMPL/SMPL-H 动作转换为 realtime_pose 源数据。
 
-默认生成当前主链路 `realtime_pose_v2_contact`。
+默认生成当前主链路 `realtime_pose_body_fbx_local_v1`。
 """
 
 from __future__ import annotations
@@ -26,6 +26,14 @@ from data_converter.amass_smpl_utils import (
     validate_args as validate_shared_args,
     write_manifest_record,
 )
+from data_loaders.body_fbx_kinematics import (
+    BodyFbxRest,
+    actor_root_positions_from_pelvis,
+    extract_root_heading_from_source_pelvis_up,
+    fk_body_fbx_local_delta,
+    load_body_fbx_rest,
+    source_global_rotations_to_body_fbx_local_delta_6d,
+)
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
@@ -40,6 +48,7 @@ from data_loaders.realtime_pose_kinematics import (
 from data_loaders.sensor_masking import (
     LEGACY_BODY_POSE_PARENT_KEY,
     POSE_REPRESENTATION_KEY,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAMES,
     get_schema_spec,
@@ -62,6 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow_partial", action="store_true")
     parser.add_argument("--reuse_source_dir", default="", type=Path)
     parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
+    parser.add_argument("--body_fbx_rest_json", default="", type=Path)
     # 复用 shared validate_args 所需字段；当前转换链路不实际使用这些可视化参数。
     parser.add_argument("--height_threshold", default=0.04, type=float)
     parser.add_argument("--speed_threshold", default=0.15, type=float)
@@ -80,6 +90,7 @@ def build_realtime_pose_features(
     smpl_motion: SmplMotion,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     target_fps: float = 60.0,
+    body_fbx_rest: BodyFbxRest | None = None,
 ) -> dict[str, np.ndarray]:
     """构建 realtime_pose_v2 源字段。"""
 
@@ -87,45 +98,76 @@ def build_realtime_pose_features(
     joint_positions = smpl_motion.joint_positions.astype(np.float64)
     joint_rotations = smpl_motion.joint_rotations.astype(np.float64)
     pelvis_world = joint_positions[:, JOINT_INDEX["pelvis"]].copy()
-    root_pos_world = pelvis_world.copy()
-    root_pos_world[:, 1] = 0.0
-    root_yaw = extract_yaw_from_rotations(joint_rotations[:, JOINT_INDEX["pelvis"]]).astype(np.float32)
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        if body_fbx_rest is None:
+            raise ValueError("生成 body_fbx_local_delta_6d source 必须提供 body_fbx_rest。")
+        root_yaw = extract_root_heading_from_source_pelvis_up(
+            joint_rotations[:, JOINT_INDEX["pelvis"]],
+        ).astype(np.float32)
+        body_pose_6d = source_global_rotations_to_body_fbx_local_delta_6d(joint_rotations)
+        root_pos_world = actor_root_positions_from_pelvis(
+            pelvis_world=pelvis_world,
+            root_heading=root_yaw,
+            pelvis_rest_local_position=body_fbx_rest.pelvis_local_position,
+        )
+        joints_world, joint_rotations_world = fk_body_fbx_local_delta(
+            body_pose_local_delta_6d=body_pose_6d,
+            actor_root_pos_world=root_pos_world,
+            root_heading=root_yaw,
+            rest=body_fbx_rest,
+        )
+        tracker_pos_world = joints_world[:, body_fbx_rest.tracker_joint_indices].astype(np.float32)
+        tracker_rot_world_6d = rotation_6d_forward_up_np(
+            joint_rotations_world[:, body_fbx_rest.tracker_joint_indices],
+        ).astype(np.float32)
+        joint_offsets_parent = body_fbx_rest.rest_local_positions.astype(np.float32)
+        joint_rest_local_rotations_6d = rotation_6d_forward_up_np(
+            body_fbx_rest.rest_local_rotations,
+        ).astype(np.float32)
+    else:
+        root_pos_world = pelvis_world.copy()
+        root_pos_world[:, 1] = 0.0
+        root_yaw = extract_yaw_from_rotations(joint_rotations[:, JOINT_INDEX["pelvis"]]).astype(np.float32)
+        body_pose_6d = build_body_pose_root_global_6d(
+            global_rotations=joint_rotations,
+            root_yaws=root_yaw.astype(np.float64),
+        )
+        tracker_pos_world = joint_positions[:, TRACKER_JOINT_INDICES].astype(np.float32)
+        tracker_rot_world_6d = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
+        joints_world = joint_positions.astype(np.float32)
+        joint_offsets_parent = estimate_root_global_offsets(
+            joints_world=joints_world,
+            body_pose_root_global_6d=body_pose_6d,
+            root_yaws=root_yaw,
+            root_pos_world=root_pos_world,
+        )
+        joint_rest_local_rotations_6d = None
     yaw_delta = np.zeros_like(root_yaw, dtype=np.float32)
     if root_yaw.shape[0] > 1:
         yaw_delta[1:] = wrap_radians(root_yaw[1:].astype(np.float64) - root_yaw[:-1].astype(np.float64)).astype(np.float32)
-    root_yaw_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
-
-    body_pose_root_global_6d = build_body_pose_root_global_6d(
-        global_rotations=joint_rotations,
-        root_yaws=root_yaw.astype(np.float64),
-    )
-    tracker_pos_world = joint_positions[:, TRACKER_JOINT_INDICES].astype(np.float32)
-    tracker_rot_world_6d = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
-    joints_world = joint_positions.astype(np.float32)
-    joint_offsets_parent = estimate_root_global_offsets(
-        joints_world=joints_world,
-        body_pose_root_global_6d=body_pose_root_global_6d,
-        root_yaws=root_yaw,
-        root_pos_world=root_pos_world,
-    )
+    root_heading_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
 
     features = {
-        schema.body_pose_key: body_pose_root_global_6d,
+        schema.body_pose_key: body_pose_6d,
         POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
         "root_pos_world": root_pos_world.astype(np.float32),
         "root_yaw": root_yaw.astype(np.float32),
-        "root_yaw_delta_sincos": root_yaw_delta_sincos,
+        schema.root_heading_delta_key: root_heading_delta_sincos,
         "tracker_pos_world": tracker_pos_world,
         "tracker_rot_world_6d": tracker_rot_world_6d,
         "joints_world": joints_world,
         "joint_offsets_parent": joint_offsets_parent,
     }
+    if joint_rest_local_rotations_6d is not None:
+        features["joint_rest_local_rotations_6d"] = joint_rest_local_rotations_6d
+    if body_fbx_rest is not None and body_fbx_rest.source_path is not None:
+        features["body_fbx_rest_json"] = np.asarray(str(body_fbx_rest.source_path))
     if schema.supports_root_motion:
         features["root_delta_xz_ref"] = encode_root_delta_xz_ref(
             root_pos_world=root_pos_world.astype(np.float32),
             root_yaw=root_yaw.astype(np.float32),
         )
-        features["root_height"] = pelvis_world[:, 1:2].astype(np.float32)
+        features[schema.pelvis_height_key] = pelvis_world[:, 1:2].astype(np.float32)
     if schema.supports_contact:
         features["foot_contact"] = derive_foot_contact(
             joints_world=joints_world,
@@ -158,6 +200,8 @@ def save_realtime_pose_motion(
         "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D and "body_fbx_rest_json" in features:
+        metadata["body_fbx_rest_json"] = str(features["body_fbx_rest_json"].item())
     np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
 
 
@@ -173,6 +217,20 @@ def load_metadata_from_npz(data: np.lib.npyio.NpzFile) -> dict[str, Any]:
         return json.loads(text)
     except json.JSONDecodeError:
         return {}
+
+
+def resolve_body_fbx_rest_for_schema(args: argparse.Namespace) -> BodyFbxRest | None:
+    schema = get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)))
+    if schema.pose_representation != POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        return None
+    cached = getattr(args, "_body_fbx_rest", None)
+    if cached is not None:
+        return cached
+    rest_arg = getattr(args, "body_fbx_rest_json", "")
+    rest_path = rest_arg if str(rest_arg).strip() else None
+    rest = load_body_fbx_rest(rest_path)
+    setattr(args, "_body_fbx_rest", rest)
+    return rest
 
 
 def source_relative_path_for(path: Path, args: argparse.Namespace, mirror_variant: bool) -> Path:
@@ -250,16 +308,18 @@ def required_source_fields(schema_name: str) -> set[str]:
         POSE_REPRESENTATION_KEY,
         "root_pos_world",
         "root_yaw",
-        "root_yaw_delta_sincos",
+        schema.root_heading_delta_key,
         "tracker_pos_world",
         "tracker_rot_world_6d",
         "joints_world",
         "joint_offsets_parent",
     }
     if schema.supports_root_motion:
-        required.update({"root_delta_xz_ref", "root_height"})
+        required.update({"root_delta_xz_ref", schema.pelvis_height_key})
     if schema.supports_contact:
         required.add("foot_contact")
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        required.add("joint_rest_local_rotations_6d")
     return required
 
 
@@ -400,10 +460,12 @@ def convert_one_motion(
     if mirror_variant:
         source = mirror_motion_source(source)
     smpl_motion = run_smpl_forward(source=source, model_cache=model_cache, batch_size=args.batch_size)
+    body_fbx_rest = resolve_body_fbx_rest_for_schema(args)
     features = build_realtime_pose_features(
         smpl_motion,
         schema_name=str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
         target_fps=float(args.target_fps),
+        body_fbx_rest=body_fbx_rest,
     )
     save_realtime_pose_motion(
         output_path=output_path,

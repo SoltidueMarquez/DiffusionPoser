@@ -77,6 +77,10 @@ def reconstruct_batch(
             "schema_name": schema.name,
         },
     }
+    if "joint_offsets_parent" in batch:
+        model_kwargs["y"]["joint_offsets_parent"] = batch["joint_offsets_parent"].to(device)
+    if "joint_rest_local_rotations_6d" in batch:
+        model_kwargs["y"]["joint_rest_local_rotations_6d"] = batch["joint_rest_local_rotations_6d"].to(device)
     sampler = choose_sampler(diffusion, use_ddim=use_ddim)
     sampler_kwargs = {}
     if init_image is not None:
@@ -121,6 +125,7 @@ def build_ik_init_image_for_batch(
         schema_name=schema_name,
         normalizer=normalizer,
         joint_offsets_parent=batch.get("joint_offsets_parent"),
+        joint_rest_local_rotations_6d=batch.get("joint_rest_local_rotations_6d"),
         iterations=ik_init_iterations,
         lr=ik_init_lr,
         pos_weight=ik_init_pos_weight,

@@ -7,9 +7,9 @@ from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
+    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_TARGET_START,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     SMPL_JOINT_COUNT,
     get_schema_spec,
 )
@@ -63,9 +63,9 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
     sensor_valid = np.ones((70, 6), dtype=bool)
     reference = encode_realtime_pose_features(
         {**source, "sensor_valid": sensor_valid},
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
     )
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     frame_index = 12
 
     encoded = encode_unity_tracker_frame(
@@ -73,7 +73,7 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
         tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
         sensor_valid=sensor_valid[frame_index],
         reference_root_yaw=float(source["root_yaw"][frame_index - 1]),
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
         root_pos_world=source["root_pos_world"][frame_index],
     )
 
@@ -101,13 +101,14 @@ def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
         sensor_valid=sensor_valid,
         device=torch.device("cpu"),
         use_ddim=False,
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
         normalizer=None,
         initial_root_yaw=0.0,
         joint_offsets_parent=source["joint_offsets_parent"],
+        joint_rest_local_rotations_6d=source.get("joint_rest_local_rotations_6d"),
     )
 
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assert diffusion.calls == 3
     assert payload["predicted_features_raw"].shape == (1, 63, schema.feature_dim)
     assert not payload["eval_frame_mask"][0, :REALTIME_POSE_TARGET_START].any()
@@ -131,7 +132,7 @@ def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
 
 
 def test_tracker_ik_pulls_known_hand_joint_toward_tracker():
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     offsets = np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
     offsets[3] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
     offsets[6] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
@@ -187,7 +188,7 @@ def test_tracker_ik_pulls_known_hand_joint_toward_tracker():
 
 
 def test_tracker_pose_init_refines_known_hand_tracker_with_rotation_loss_enabled():
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     offsets = np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
     offsets[3] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
     offsets[6] = np.asarray([0.0, 0.20, 0.0], dtype=np.float32)
@@ -248,7 +249,7 @@ def test_tracker_pose_init_refines_known_hand_tracker_with_rotation_loss_enabled
 
 
 def test_tracker_ik_smoothing_and_delta_clamp_are_bounded():
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     measured = np.zeros((6, 3), dtype=np.float32)
     measured[LEFT_HAND_TRACKER_INDEX] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
     previous = np.zeros((6, 3), dtype=np.float32)
@@ -291,12 +292,12 @@ def test_warmup_window_contains_tracker_history_and_tpose_targets():
         sensor_valid=sensor_valid,
         device=torch.device("cpu"),
         use_ddim=False,
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
         normalizer=None,
         initial_root_yaw=0.0,
     )
 
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     conditioned = diffusion.conditioned_inputs[0][0]
     history_frames = slice(0, REALTIME_POSE_TARGET_START)
     expected_history = np.stack(
@@ -306,7 +307,7 @@ def test_warmup_window_contains_tracker_history_and_tpose_targets():
                 tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
                 sensor_valid=sensor_valid[frame_index],
                 reference_root_yaw=0.0,
-                schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+                schema_name=REALTIME_POSE_SCHEMA_NAME,
             )
             for frame_index in range(REALTIME_POSE_TARGET_START)
         ],
@@ -340,7 +341,7 @@ def test_unity_stream_records_tracker_pose_ik_init_metadata():
         sensor_valid=sensor_valid,
         device=torch.device("cpu"),
         use_ddim=False,
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
         normalizer=None,
         initial_root_yaw=0.0,
         joint_offsets_parent=source["joint_offsets_parent"],

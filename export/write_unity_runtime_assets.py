@@ -22,6 +22,7 @@ from data_loaders.sensor_masking import (  # noqa: E402
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_KEY,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -68,8 +69,9 @@ def build_realtime_pose_feature_schema(
     if int(sequence_length) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
 
+    is_body_fbx_local = schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D
     payload = {
-        "schemaVersion": 2,
+        "schemaVersion": 3 if is_body_fbx_local else 2,
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
         "featureDim": schema.feature_dim,
@@ -84,8 +86,16 @@ def build_realtime_pose_feature_schema(
         "trackerJointIndices": [int(value) for value in TRACKER_JOINT_INDICES.tolist()],
         "hipTrackerIndex": HIP_TRACKER_INDEX,
         "minValidTrackers": MIN_VALID_TRACKERS,
-        "bodyPoseRootGlobal6d": {"name": schema.body_pose_key, "start": BODY_POSE_START, "length": BODY_POSE_DIM},
-        "rootYawDeltaSinCos": {"name": "root_yaw_delta_sincos", "start": ROOT_YAW_DELTA_START, "length": ROOT_YAW_DELTA_DIM},
+        "bodyPoseBodyFbxLocalDelta6d" if is_body_fbx_local else "bodyPoseRootGlobal6d": {
+            "name": schema.body_pose_key,
+            "start": BODY_POSE_START,
+            "length": BODY_POSE_DIM,
+        },
+        "rootHeadingDeltaSinCos" if is_body_fbx_local else "rootYawDeltaSinCos": {
+            "name": schema.root_heading_delta_key,
+            "start": ROOT_YAW_DELTA_START,
+            "length": ROOT_YAW_DELTA_DIM,
+        },
         "trackerPositionReference": {"name": "tracker_pos_ref", "start": schema.tracker_pos_ref_start, "length": TRACKER_POS_DIM},
         "trackerRotation6dReference": {"name": "tracker_rot_ref_6d", "start": schema.tracker_rot_ref_start, "length": TRACKER_ROT_DIM},
         "sensorValid": {"name": "sensor_valid", "start": schema.sensor_valid_start, "length": SENSOR_VALID_DIM},
@@ -93,14 +103,18 @@ def build_realtime_pose_feature_schema(
             "poseRepresentation": schema.pose_representation,
             "requiresHipTracker": True,
             "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
-            "trackerReferenceYaw": "previous_frame_root_yaw",
+            "trackerReferenceYaw": "previous_frame_root_heading" if is_body_fbx_local else "previous_frame_root_yaw",
             "onnxDummyInputShape": [1, schema.feature_dim, REALTIME_POSE_SEQ_LEN],
             "failSafe": "hold_previous_frame_when_tracker_validity_fails",
         },
     }
     if schema.supports_root_motion:
         payload["rootDeltaXZReference"] = {"name": "root_delta_xz_ref", "start": schema.root_delta_xz_start, "length": 2}
-        payload["rootHeight"] = {"name": "root_height", "start": schema.root_height_start, "length": 1}
+        payload["pelvisHeight" if is_body_fbx_local else "rootHeight"] = {
+            "name": schema.pelvis_height_key,
+            "start": schema.root_height_start,
+            "length": 1,
+        }
     if schema.supports_contact:
         payload["footContact"] = {"name": "foot_contact", "start": schema.foot_contact_start, "length": 2}
     return payload

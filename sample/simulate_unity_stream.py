@@ -13,6 +13,7 @@ from data_loaders.realtime_pose_dataset import zero_missing_tracker_channels
 from data_loaders.realtime_pose_kinematics import (
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
+    fk_body_fbx_local_torch,
     fk_root_global_torch,
     integrate_root_delta_xz_ref,
     make_yaw_rotation_np,
@@ -24,6 +25,7 @@ from data_loaders.sensor_masking import (
     FOOT_CONTACT_DIM,
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
@@ -155,8 +157,17 @@ def load_tracker_stream(
             if "joint_offsets_parent" in data.files
             else None
         )
+        joint_rest_local_rotations_6d = (
+            np.asarray(data["joint_rest_local_rotations_6d"], dtype=np.float32)
+            if "joint_rest_local_rotations_6d" in data.files
+            else None
+        )
         if joint_offsets_parent is not None and joint_offsets_parent.shape != (SMPL_JOINT_COUNT, 3):
             raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {joint_offsets_parent.shape}")
+        if joint_rest_local_rotations_6d is not None and joint_rest_local_rotations_6d.shape != (SMPL_JOINT_COUNT, 6):
+            raise ValueError(
+                f"joint_rest_local_rotations_6d 应为 [{SMPL_JOINT_COUNT},6]，实际为 {joint_rest_local_rotations_6d.shape}"
+            )
 
     frame_count = tracker_pos_world.shape[0]
     if int(limit) > 0:
@@ -168,6 +179,8 @@ def load_tracker_stream(
     }
     if joint_offsets_parent is not None:
         stream["joint_offsets_parent"] = joint_offsets_parent
+    if joint_rest_local_rotations_6d is not None:
+        stream["joint_rest_local_rotations_6d"] = joint_rest_local_rotations_6d
     return stream
 
 
@@ -218,30 +231,107 @@ def encode_single_root_delta_xz_ref(
     return delta_ref[[0, 2]].astype(np.float32)
 
 
+def is_body_fbx_local_schema(schema_name: str) -> bool:
+    return get_schema_spec(schema_name).pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D
+
+
+def apply_body_fbx_actor_root_height(
+    target_raw: np.ndarray,
+    actor_root_pos_world: np.ndarray,
+    root_heading: float,
+    rest_local_positions: np.ndarray | None,
+    schema_name: str,
+) -> np.ndarray:
+    """body.fbx-local 中 pelvis_height 是 pelvis 世界 y；actor root y 由 rest pelvis offset 反推。"""
+
+    schema = get_schema_spec(schema_name)
+    root_pos = np.asarray(actor_root_pos_world, dtype=np.float32).copy()
+    if not is_body_fbx_local_schema(schema.name) or rest_local_positions is None or not schema.supports_root_motion:
+        return root_pos
+    offsets = np.asarray(rest_local_positions, dtype=np.float32)
+    if offsets.shape != (SMPL_JOINT_COUNT, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
+    target = np.asarray(target_raw, dtype=np.float32)
+    pelvis_height = float(target[schema.root_height_slice()][0])
+    heading_rot = make_yaw_rotation_np(np.asarray([float(root_heading)], dtype=np.float32))[0]
+    root_to_pelvis = heading_rot @ offsets[0].astype(np.float64)
+    root_pos[1] = pelvis_height - float(root_to_pelvis[1])
+    return root_pos.astype(np.float32)
+
+
+def fk_joints_from_target(
+    target_raw: np.ndarray,
+    root_pos_world: np.ndarray,
+    root_yaw: float,
+    joint_offsets_parent: np.ndarray,
+    schema_name: str,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
+    return_global_rot: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    schema = get_schema_spec(schema_name)
+    target = np.asarray(target_raw, dtype=np.float32)
+    offsets = np.asarray(joint_offsets_parent, dtype=np.float32).copy()
+    if offsets.shape != (SMPL_JOINT_COUNT, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
+
+    with torch.no_grad():
+        if is_body_fbx_local_schema(schema.name):
+            actor_root = apply_body_fbx_actor_root_height(
+                target_raw=target,
+                actor_root_pos_world=root_pos_world,
+                root_heading=float(root_yaw),
+                rest_local_positions=offsets,
+                schema_name=schema.name,
+            )
+            result = fk_body_fbx_local_torch(
+                body_pose_local_delta_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
+                actor_root_pos_world=torch.from_numpy(actor_root[None]).float(),
+                root_heading=torch.tensor([float(root_yaw)], dtype=torch.float32),
+                rest_local_positions=torch.from_numpy(offsets[None]).float(),
+                rest_local_rotations_6d=(
+                    None
+                    if joint_rest_local_rotations_6d is None
+                    else torch.from_numpy(np.asarray(joint_rest_local_rotations_6d, dtype=np.float32)[None]).float()
+                ),
+                return_global_rot=return_global_rot,
+            )
+        else:
+            if schema.supports_root_motion:
+                offsets[0, 1] = float(target[schema.root_height_slice()][0])
+            root_pos = np.asarray(root_pos_world, dtype=np.float32).copy()
+            root_pos[1] = 0.0
+            result = fk_root_global_torch(
+                body_pose_root_global_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
+                root_pos_world=torch.from_numpy(root_pos[None]).float(),
+                root_yaw=torch.tensor([float(root_yaw)], dtype=torch.float32),
+                parent_offsets=torch.from_numpy(offsets[None]).float(),
+                return_global_rot=return_global_rot,
+            )
+    if return_global_rot:
+        joints, global_rot = result
+        return joints.numpy()[0].astype(np.float32), global_rot.numpy()[0].astype(np.float32)
+    return result.numpy()[0].astype(np.float32)
+
+
 def fk_tracker_positions_from_target(
     target_raw: np.ndarray,
     root_pos_world: np.ndarray,
     root_yaw: float,
     joint_offsets_parent: np.ndarray,
     schema_name: str,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
 ) -> np.ndarray:
     """用预测 target 做 FK，返回 6 个 tracker 对应关节的世界位置。"""
 
-    schema = get_schema_spec(schema_name)
-    target = np.asarray(target_raw, dtype=np.float32)
-    offsets = np.asarray(joint_offsets_parent, dtype=np.float32).copy()
-    if offsets.shape != (SMPL_JOINT_COUNT, 3):
-        raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
-    if schema.supports_root_motion:
-        offsets[0, 1] = float(target[schema.root_height_slice()][0])
-    with torch.no_grad():
-        joints = fk_root_global_torch(
-            body_pose_root_global_6d=torch.from_numpy(target[schema.body_pose_slice()][None]).float(),
-            root_pos_world=torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)[None]).float(),
-            root_yaw=torch.tensor([float(root_yaw)], dtype=torch.float32),
-            parent_offsets=torch.from_numpy(offsets[None]).float(),
-        )
-    return joints.numpy()[0, TRACKER_JOINT_INDICES].astype(np.float32)
+    joints = fk_joints_from_target(
+        target_raw=target_raw,
+        root_pos_world=root_pos_world,
+        root_yaw=root_yaw,
+        joint_offsets_parent=joint_offsets_parent,
+        schema_name=schema_name,
+        joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+    )
+    return joints[TRACKER_JOINT_INDICES].astype(np.float32)
 
 
 def tracker_ik_joint_mask(tracker_indices: np.ndarray) -> np.ndarray:
@@ -336,6 +426,7 @@ def apply_tracker_position_ik(
     sensor_valid: np.ndarray,
     joint_offsets_parent: np.ndarray | None,
     schema_name: str,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
     enabled: bool = True,
     iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
     lr: float = DEFAULT_TRACKER_IK_LR,
@@ -375,15 +466,28 @@ def apply_tracker_position_ik(
     if not trainable_joint_mask.any():
         return corrected
 
-    if schema.supports_root_motion:
+    if schema.supports_root_motion and not is_body_fbx_local_schema(schema.name):
         offsets[0, 1] = float(corrected[schema.root_height_slice()][0])
 
     target_joint_indices = torch.as_tensor(TRACKER_JOINT_INDICES[ik_tracker_indices], dtype=torch.long)
     target_positions = torch.from_numpy(tracker_pos[ik_tracker_indices]).float()[None]
-    root_pos = torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)[None]).float()
-    root_pos[:, 1] = 0.0
+    root_pos_np = apply_body_fbx_actor_root_height(
+        target_raw=corrected,
+        actor_root_pos_world=root_pos_world,
+        root_heading=float(root_yaw),
+        rest_local_positions=offsets,
+        schema_name=schema.name,
+    )
+    root_pos = torch.from_numpy(root_pos_np[None]).float()
+    if not is_body_fbx_local_schema(schema.name):
+        root_pos[:, 1] = 0.0
     root_yaw_tensor = torch.tensor([float(root_yaw)], dtype=torch.float32)
     parent_offsets = torch.from_numpy(offsets[None]).float()
+    rest_rot_6d = (
+        None
+        if joint_rest_local_rotations_6d is None
+        else torch.from_numpy(np.asarray(joint_rest_local_rotations_6d, dtype=np.float32)[None]).float()
+    )
     original_body_pose = corrected[schema.body_pose_slice()].copy()
     original_pose = torch.from_numpy(original_body_pose.reshape(1, SMPL_JOINT_COUNT, 6)).float()
     initial_pose = original_pose.clone()
@@ -396,12 +500,21 @@ def apply_tracker_position_ik(
 
     for _ in range(int(iterations)):
         optimizer.zero_grad(set_to_none=True)
-        joints = fk_root_global_torch(
-            body_pose_root_global_6d=pose.reshape(1, -1),
-            root_pos_world=root_pos,
-            root_yaw=root_yaw_tensor,
-            parent_offsets=parent_offsets,
-        )
+        if is_body_fbx_local_schema(schema.name):
+            joints = fk_body_fbx_local_torch(
+                body_pose_local_delta_6d=pose.reshape(1, -1),
+                actor_root_pos_world=root_pos,
+                root_heading=root_yaw_tensor,
+                rest_local_positions=parent_offsets,
+                rest_local_rotations_6d=rest_rot_6d,
+            )
+        else:
+            joints = fk_root_global_torch(
+                body_pose_root_global_6d=pose.reshape(1, -1),
+                root_pos_world=root_pos,
+                root_yaw=root_yaw_tensor,
+                parent_offsets=parent_offsets,
+            )
         error = joints[:, target_joint_indices] - target_positions
         position_loss = error.square().mean()
         regularization = (pose[:, trainable_mask] - original_pose[:, trainable_mask]).square().mean()
@@ -434,6 +547,7 @@ def correct_predicted_root_with_trackers(
     sensor_valid: np.ndarray,
     schema_name: str,
     joint_offsets_parent: np.ndarray | None = None,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
     enabled: bool = True,
 ) -> tuple[np.ndarray, float, np.ndarray]:
     """
@@ -469,10 +583,19 @@ def correct_predicted_root_with_trackers(
             root_yaw=measured_root_yaw,
             joint_offsets_parent=joint_offsets_parent,
             schema_name=schema.name,
+            joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
         )
         hip_correction = tracker_pos[HIP_TRACKER_INDEX] - predicted_tracker_pos[HIP_TRACKER_INDEX]
         root_pos[[0, 2]] += hip_correction[[0, 2]]
-        root_pos[1] = 0.0
+        root_pos = apply_body_fbx_actor_root_height(
+            target_raw=corrected,
+            actor_root_pos_world=root_pos,
+            root_heading=measured_root_yaw,
+            rest_local_positions=joint_offsets_parent,
+            schema_name=schema.name,
+        )
+        if not is_body_fbx_local_schema(schema.name):
+            root_pos[1] = 0.0
     else:
         root_pos = estimate_root_pos_from_hip_tracker(tracker_pos)
 
@@ -680,6 +803,7 @@ class UnityStreamState:
         tracker_rot_world_6d: np.ndarray | None = None,
         sensor_valid: np.ndarray | None = None,
         joint_offsets_parent: np.ndarray | None = None,
+        joint_rest_local_rotations_6d: np.ndarray | None = None,
         root_correction: bool = True,
         tracker_ik: bool = True,
         tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
@@ -709,7 +833,15 @@ class UnityStreamState:
                 prev_root_yaw=np.asarray([prev_root_yaw], dtype=np.float32),
                 root_delta_xz_ref=predicted[self.schema.root_delta_xz_slice()][None],
             )[0]
-            root_pos[1] = 0.0
+            root_pos = apply_body_fbx_actor_root_height(
+                target_raw=predicted,
+                actor_root_pos_world=root_pos,
+                root_heading=self.current_root_yaw,
+                rest_local_positions=joint_offsets_parent,
+                schema_name=self.schema.name,
+            )
+            if not is_body_fbx_local_schema(self.schema.name):
+                root_pos[1] = 0.0
         else:
             root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
 
@@ -725,6 +857,7 @@ class UnityStreamState:
                 sensor_valid=sensor_valid,
                 schema_name=self.schema.name,
                 joint_offsets_parent=joint_offsets_parent,
+                joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
                 enabled=root_correction,
             )
             ik_tracker_pos_world = (
@@ -744,6 +877,7 @@ class UnityStreamState:
                 sensor_valid=sensor_valid,
                 joint_offsets_parent=joint_offsets_parent,
                 schema_name=self.schema.name,
+                joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
                 enabled=tracker_ik,
                 iterations=tracker_ik_iterations,
                 lr=tracker_ik_lr,
@@ -798,6 +932,7 @@ def simulate_unity_stream(
     reference_root_yaw: np.ndarray | None = None,
     reference_root_pos_world: np.ndarray | None = None,
     joint_offsets_parent: np.ndarray | None = None,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
     root_correction: bool = True,
     tracker_ik: bool = True,
     tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
@@ -851,6 +986,13 @@ def simulate_unity_stream(
     joint_offsets = None if joint_offsets_parent is None else np.asarray(joint_offsets_parent, dtype=np.float32)
     if joint_offsets is not None and joint_offsets.shape != (SMPL_JOINT_COUNT, 3):
         raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {joint_offsets.shape}")
+    joint_rest_rotations = (
+        None
+        if joint_rest_local_rotations_6d is None
+        else np.asarray(joint_rest_local_rotations_6d, dtype=np.float32)
+    )
+    if joint_rest_rotations is not None and joint_rest_rotations.shape != (SMPL_JOINT_COUNT, 6):
+        raise ValueError(f"joint_rest_local_rotations_6d 应为 [{SMPL_JOINT_COUNT},6]，实际为 {joint_rest_rotations.shape}")
 
     predicted_features = []
     conditioned_features = []
@@ -934,6 +1076,10 @@ def simulate_unity_stream(
             }
             if joint_offsets is not None:
                 batch["joint_offsets_parent"] = torch.from_numpy(joint_offsets).unsqueeze(0).float().to(device)
+            if joint_rest_rotations is not None:
+                batch["joint_rest_local_rotations_6d"] = (
+                    torch.from_numpy(joint_rest_rotations).unsqueeze(0).float().to(device)
+                )
             ik_init_image = build_ik_init_image_for_batch(
                 batch,
                 device=device,
@@ -970,6 +1116,7 @@ def simulate_unity_stream(
                 tracker_rot_world_6d=tracker_rot_world_6d[frame_index],
                 sensor_valid=frame_valid,
                 joint_offsets_parent=joint_offsets,
+                joint_rest_local_rotations_6d=joint_rest_rotations,
                 root_correction=bool(root_correction),
                 tracker_ik=bool(tracker_ik),
                 tracker_ik_iterations=int(tracker_ik_iterations),
@@ -1070,6 +1217,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         initial_root_yaw=float(args.initial_root_yaw),
         invalid_frame_policy=args.invalid_frame_policy,
         joint_offsets_parent=stream.get("joint_offsets_parent"),
+        joint_rest_local_rotations_6d=stream.get("joint_rest_local_rotations_6d"),
         root_correction=bool(args.root_correction),
         tracker_ik=bool(args.tracker_ik),
         tracker_ik_iterations=int(args.tracker_ik_iterations),

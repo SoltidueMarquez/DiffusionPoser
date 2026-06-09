@@ -12,14 +12,15 @@ from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_S
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
 
 
-def build_toy_realtime_source(frame_count: int = 70) -> dict[str, np.ndarray]:
+def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
+    schema = get_schema_spec(schema_name)
     body_pose = np.tile(IDENTITY_6D, (frame_count, 24)).astype(np.float32)
     root_pos = np.zeros((frame_count, 3), dtype=np.float32)
     root_pos[:, 0] = np.linspace(0.0, 0.3, frame_count, dtype=np.float32)
     root_yaw = np.linspace(0.0, 0.2, frame_count, dtype=np.float32)
     yaw_delta = np.zeros((frame_count,), dtype=np.float32)
     yaw_delta[1:] = root_yaw[1:] - root_yaw[:-1]
-    root_yaw_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
+    root_heading_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
 
     joints = np.zeros((frame_count, 24, 3), dtype=np.float32)
     for frame in range(frame_count):
@@ -34,29 +35,32 @@ def build_toy_realtime_source(frame_count: int = 70) -> dict[str, np.ndarray]:
     tracker_rot = np.tile(IDENTITY_6D, (frame_count, 6, 1)).astype(np.float32)
     offsets = np.zeros((24, 3), dtype=np.float32)
     offsets[:, 1] = 0.05
+    rest_rotations_6d = np.tile(IDENTITY_6D, (24, 1)).astype(np.float32)
     root_delta_xz_ref = encode_root_delta_xz_ref(root_pos_world=root_pos, root_yaw=root_yaw)
-    root_height = joints[:, 0, 1:2].astype(np.float32)
+    pelvis_height = joints[:, 0, 1:2].astype(np.float32)
     foot_contact = derive_foot_contact(joints_world=joints)
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    return {
+    source = {
         schema.body_pose_key: body_pose,
         POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
         "root_pos_world": root_pos,
         "root_yaw": root_yaw,
-        "root_yaw_delta_sincos": root_yaw_delta_sincos,
+        schema.root_heading_delta_key: root_heading_delta_sincos,
         "root_delta_xz_ref": root_delta_xz_ref,
-        "root_height": root_height,
+        schema.pelvis_height_key: pelvis_height,
         "foot_contact": foot_contact,
         "tracker_pos_world": tracker_pos,
         "tracker_rot_world_6d": tracker_rot,
         "joints_world": joints,
         "joint_offsets_parent": offsets,
     }
+    if schema.pose_representation == "body_fbx_local_delta_6d":
+        source["joint_rest_local_rotations_6d"] = rest_rotations_6d
+    return source
 
 
 def write_toy_source_dataset(source_dir: Path, frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> Path:
     source_dir.mkdir(parents=True, exist_ok=True)
-    source = build_toy_realtime_source(frame_count=frame_count)
+    source = build_toy_realtime_source(frame_count=frame_count, schema_name=schema_name)
     source_path = source_dir / "ACCAD" / "toy_realtime.npz"
     source_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(source_path, **source)

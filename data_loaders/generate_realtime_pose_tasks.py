@@ -12,11 +12,11 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.sensor_masking import (
-    BODY_POSE_ROOT_GLOBAL_KEY,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     LEGACY_BODY_POSE_PARENT_KEY,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_KEY,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -39,11 +39,9 @@ from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
 SOURCE_KEYS = {
-    BODY_POSE_ROOT_GLOBAL_KEY,
     POSE_REPRESENTATION_KEY,
     "root_pos_world",
     "root_yaw",
-    "root_yaw_delta_sincos",
     "tracker_pos_world",
     "tracker_rot_world_6d",
     "joints_world",
@@ -565,10 +563,14 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
         if LEGACY_BODY_POSE_PARENT_KEY in data.files:
             raise ValueError(f"{path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate source data.")
         required_keys = set(SOURCE_KEYS)
+        required_keys.add(schema.body_pose_key)
+        required_keys.add(schema.root_heading_delta_key)
         if schema.supports_root_motion:
-            required_keys.update({"root_delta_xz_ref", "root_height"})
+            required_keys.update({"root_delta_xz_ref", schema.pelvis_height_key})
         if schema.supports_contact:
             required_keys.add("foot_contact")
+        if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+            required_keys.add("joint_rest_local_rotations_6d")
         missing = sorted(required_keys.difference(data.files))
         if missing:
             raise KeyError(f"{path} 缺少 {schema.name} 源字段：{missing}")
@@ -584,7 +586,7 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
         schema.body_pose_key: (frame_count, 144),
         "root_pos_world": (frame_count, 3),
         "root_yaw": (frame_count,),
-        "root_yaw_delta_sincos": (frame_count, 2),
+        schema.root_heading_delta_key: (frame_count, 2),
         "tracker_pos_world": (frame_count, 6, 3),
         "tracker_rot_world_6d": (frame_count, 6, 6),
         "joints_world": (frame_count, 24, 3),
@@ -592,9 +594,11 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
     }
     if schema.supports_root_motion:
         expected_shapes["root_delta_xz_ref"] = (frame_count, 2)
-        expected_shapes["root_height"] = (frame_count, 1)
+        expected_shapes[schema.pelvis_height_key] = (frame_count, 1)
     if schema.supports_contact:
         expected_shapes["foot_contact"] = (frame_count, 2)
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        expected_shapes["joint_rest_local_rotations_6d"] = (24, 6)
     for key, shape in expected_shapes.items():
         if tuple(source[key].shape) != shape:
             raise ValueError(f"{path} 字段 {key} 应为 {shape}，实际为 {tuple(source[key].shape)}")
@@ -604,7 +608,9 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
 def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -> dict[str, np.ndarray]:
     end_frame = int(start_frame) + int(seq_len)
     return {
-        key: value.copy() if key in {"joint_offsets_parent", POSE_REPRESENTATION_KEY} else value[start_frame:end_frame].copy()
+        key: value.copy()
+        if key in {"joint_offsets_parent", "joint_rest_local_rotations_6d", POSE_REPRESENTATION_KEY}
+        else value[start_frame:end_frame].copy()
         for key, value in source.items()
     }
 

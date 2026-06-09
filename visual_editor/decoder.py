@@ -55,15 +55,17 @@ class MotionDecoder:
                 POSE_REPRESENTATION_KEY,
                 "root_pos_world",
                 "root_yaw",
-                "root_yaw_delta_sincos",
+                schema.root_heading_delta_key,
                 "root_delta_xz_ref",
-                "root_height",
+                schema.pelvis_height_key,
                 "foot_contact",
                 "tracker_pos_world",
                 "tracker_rot_world_6d",
                 "joints_world",
                 "joint_offsets_parent",
-            )}
+            ) if key in task}
+            if "joint_rest_local_rotations_6d" in task:
+                motion["joint_rest_local_rotations_6d"] = task["joint_rest_local_rotations_6d"]
             return motion, task
         if track.data_key in {"reference_features", "conditioned_features", "reconstructed_features"}:
             raise ValueError("result feature tracks do not contain root/joint arrays for studio FK display yet")

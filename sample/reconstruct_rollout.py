@@ -7,13 +7,14 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
-from data_loaders.realtime_pose_kinematics import fk_root_global_torch, integrate_root_delta_xz_ref
+from data_loaders.realtime_pose_kinematics import integrate_root_delta_xz_ref
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_START,
     SchemaSpec,
     TRACKER_COUNT,
 )
 from sample.reconstruct_stream import build_realtime_inpaint_mask, reconstruct_batch, tensor_bct_to_numpy_btc
+from sample.simulate_unity_stream import fk_joints_from_target
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -44,7 +45,6 @@ def predicted_target_to_joints(
     pred_root_yaw = prev_root_yaw + np.asarray([np.arctan2(yaw_delta[0], yaw_delta[1])], dtype=np.float32)
 
     root_pos = task["root_pos_world"][REALTIME_POSE_TARGET_START:REALTIME_POSE_TARGET_START + 1].astype(np.float32).copy()
-    offsets = task["joint_offsets_parent"][None].astype(np.float32).copy()
     if schema.supports_root_motion:
         root_delta = target_feature[schema.root_delta_xz_slice()][None].astype(np.float32)
         prev_root_pos = task["root_pos_world"][REALTIME_POSE_TARGET_START - 1:REALTIME_POSE_TARGET_START].astype(np.float32)
@@ -53,17 +53,16 @@ def predicted_target_to_joints(
             prev_root_yaw=prev_root_yaw,
             root_delta_xz_ref=root_delta,
         )
-        root_pos[:, 1] = 0.0
-        offsets[:, 0, 1] = float(target_feature[schema.root_height_slice()][0])
 
-    with torch.no_grad():
-        joints = fk_root_global_torch(
-            body_pose_root_global_6d=torch.from_numpy(target_feature[schema.body_pose_slice()][None].astype(np.float32)),
-            root_pos_world=torch.from_numpy(root_pos),
-            root_yaw=torch.from_numpy(pred_root_yaw),
-            parent_offsets=torch.from_numpy(offsets),
-        )
-    return pred_root_yaw.astype(np.float32), joints.numpy()[0].astype(np.float32)
+    joints = fk_joints_from_target(
+        target_raw=target_feature,
+        root_pos_world=root_pos[0],
+        root_yaw=float(pred_root_yaw[0]),
+        joint_offsets_parent=task["joint_offsets_parent"],
+        schema_name=schema.name,
+        joint_rest_local_rotations_6d=task.get("joint_rest_local_rotations_6d"),
+    )
+    return pred_root_yaw.astype(np.float32), joints.astype(np.float32)
 
 
 def sorted_rollout_indices(dataset: RealtimePoseTaskDataset, limit: int = 0) -> list[int]:

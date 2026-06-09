@@ -21,8 +21,8 @@ from data_loaders.realtime_pose_kinematics import (  # noqa: E402
 )
 from data_loaders.sensor_masking import (  # noqa: E402
     BODY_POSE_DIM,
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     FOOT_CONTACT_DIM,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     ROOT_DELTA_XZ_DIM,
     ROOT_HEIGHT_DIM,
     ROOT_YAW_DELTA_DIM,
@@ -37,10 +37,10 @@ DEFAULT_REPLAY_FPS = 60.0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export realtime_pose_v2_contact npz source as a Unity JSON replay stream.")
+    parser = argparse.ArgumentParser(description="Export realtime_pose source as a Unity JSON replay stream.")
     parser.add_argument("--source_npz", required=True, type=str)
     parser.add_argument("--output_json", required=True, type=str)
-    parser.add_argument("--schema", default=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME, type=str)
+    parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, type=str)
     parser.add_argument("--fps", default=DEFAULT_REPLAY_FPS, type=float)
     parser.add_argument("--frame_start", default=0, type=int)
     parser.add_argument("--frame_count", default=0, type=int, help="0 means export until the end of the source.")
@@ -150,24 +150,30 @@ def compute_identity_6d_reference_joints(
     return joints.astype(np.float32)
 
 
-def build_target_features_raw(source: dict[str, np.ndarray], start: int, count: int, target_dim: int) -> np.ndarray:
+def build_target_features_raw(
+    source: dict[str, np.ndarray],
+    start: int,
+    count: int,
+    target_dim: int,
+    schema_name: str,
+) -> np.ndarray:
     target = np.zeros((count, target_dim), dtype=np.float32)
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(schema_name)
 
     body_pose = slice_time(source[schema.body_pose_key], start, count)
-    root_yaw_delta = slice_time(source["root_yaw_delta_sincos"], start, count)
+    root_yaw_delta = slice_time(source[schema.root_heading_delta_key], start, count)
     root_delta = slice_time(source["root_delta_xz_ref"], start, count)
-    root_height = slice_time(source["root_height"], start, count)
+    pelvis_height = slice_time(source[schema.pelvis_height_key], start, count)
     foot_contact = slice_time(source["foot_contact"], start, count)
 
     if body_pose.shape != (count, BODY_POSE_DIM):
         raise ValueError(f"{schema.body_pose_key} should be [{count},{BODY_POSE_DIM}], got {body_pose.shape}")
     if root_yaw_delta.shape != (count, ROOT_YAW_DELTA_DIM):
-        raise ValueError(f"root_yaw_delta_sincos 应为 [{count},{ROOT_YAW_DELTA_DIM}]，实际为 {root_yaw_delta.shape}")
+        raise ValueError(f"{schema.root_heading_delta_key} should be [{count},{ROOT_YAW_DELTA_DIM}], got {root_yaw_delta.shape}")
     if root_delta.shape != (count, ROOT_DELTA_XZ_DIM):
         raise ValueError(f"root_delta_xz_ref 应为 [{count},{ROOT_DELTA_XZ_DIM}]，实际为 {root_delta.shape}")
-    if root_height.shape != (count, ROOT_HEIGHT_DIM):
-        raise ValueError(f"root_height 应为 [{count},{ROOT_HEIGHT_DIM}]，实际为 {root_height.shape}")
+    if pelvis_height.shape != (count, ROOT_HEIGHT_DIM):
+        raise ValueError(f"{schema.pelvis_height_key} should be [{count},{ROOT_HEIGHT_DIM}], got {pelvis_height.shape}")
     if foot_contact.shape != (count, FOOT_CONTACT_DIM):
         raise ValueError(f"foot_contact 应为 [{count},{FOOT_CONTACT_DIM}]，实际为 {foot_contact.shape}")
 
@@ -177,7 +183,7 @@ def build_target_features_raw(source: dict[str, np.ndarray], start: int, count: 
     cursor += ROOT_YAW_DELTA_DIM
     target[:, cursor : cursor + ROOT_DELTA_XZ_DIM] = root_delta
     cursor += ROOT_DELTA_XZ_DIM
-    target[:, cursor : cursor + ROOT_HEIGHT_DIM] = root_height
+    target[:, cursor : cursor + ROOT_HEIGHT_DIM] = pelvis_height
     cursor += ROOT_HEIGHT_DIM
     target[:, cursor : cursor + FOOT_CONTACT_DIM] = foot_contact
     return target
@@ -185,15 +191,13 @@ def build_target_features_raw(source: dict[str, np.ndarray], start: int, count: 
 
 def build_unity_replay_stream_payload(
     source_npz: Path,
-    schema_name: str = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     fps: float = DEFAULT_REPLAY_FPS,
     frame_start: int = 0,
     frame_count: int = 0,
     identity_6d_rotations: bool = False,
 ) -> dict[str, Any]:
     schema = get_schema_spec(schema_name)
-    if schema.name != REALTIME_POSE_V2_CONTACT_SCHEMA_NAME:
-        raise ValueError(f"Unity replay stream 只支持 {REALTIME_POSE_V2_CONTACT_SCHEMA_NAME}，实际为 {schema.name}")
 
     path = Path(source_npz).resolve()
     source = load_realtime_source(path, schema_name=schema.name)
@@ -207,16 +211,16 @@ def build_unity_replay_stream_payload(
     tracker_rotations = slice_time(source["tracker_rot_world_6d"], start, count)
     valid = slice_time(sensor_valid, start, count).astype(np.int32)
     joints = slice_time(source["joints_world"], start, count)
-    root_yaw = slice_time(source["root_yaw"], start, count)
+    root_heading = slice_time(source["root_yaw"], start, count)
     root_pos = slice_time(source["root_pos_world"], start, count)
     foot_contact = slice_time(source["foot_contact"], start, count)
-    target_features_raw = build_target_features_raw(source, start, count, schema.target_dim)
+    target_features_raw = build_target_features_raw(source, start, count, schema.target_dim, schema_name=schema.name)
     if identity_6d_rotations:
         target_features_raw[:, 0:BODY_POSE_DIM] = build_identity_body_pose_6d(count)
         tracker_rotations = build_identity_tracker_rotations_6d(count)
         joints = compute_identity_6d_reference_joints(
             root_pos_world=root_pos,
-            root_yaw=root_yaw,
+            root_yaw=root_heading,
             joint_offsets_parent=np.asarray(source["joint_offsets_parent"], dtype=np.float32),
         )
 
@@ -235,7 +239,7 @@ def build_unity_replay_stream_payload(
         "trackerRotations6d": flatten_float(tracker_rotations),
         "sensorValid": flatten_int(valid),
         "referenceJointsWorld": flatten_float(joints),
-        "rootYaw": flatten_float(root_yaw),
+        "rootHeading": flatten_float(root_heading),
         "rootPosWorld": flatten_float(root_pos),
         "footContact": flatten_float(foot_contact),
         "targetFeatureLength": int(schema.target_dim),
@@ -251,7 +255,7 @@ def build_unity_replay_stream_payload(
             "trackerRotations6dShape": [count, TRACKER_COUNT, 6],
             "sensorValidShape": [count, TRACKER_COUNT],
             "referenceJointsWorldShape": [count, SMPL_JOINT_COUNT, 3],
-            "rootYawShape": [count],
+            "rootHeadingShape": [count],
             "rootPosWorldShape": [count, 3],
             "footContactShape": [count, FOOT_CONTACT_DIM],
             "targetFeaturesRawShape": [count, int(schema.target_dim)],
@@ -262,7 +266,7 @@ def build_unity_replay_stream_payload(
 def write_unity_replay_stream(
     source_npz: Path,
     output_json: Path,
-    schema_name: str = REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     fps: float = DEFAULT_REPLAY_FPS,
     frame_start: int = 0,
     frame_count: int = 0,

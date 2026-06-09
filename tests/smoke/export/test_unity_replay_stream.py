@@ -8,7 +8,7 @@ import pytest
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     FOOT_CONTACT_DIM,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAME,
     ROOT_DELTA_XZ_DIM,
     ROOT_HEIGHT_DIM,
     ROOT_YAW_DELTA_DIM,
@@ -41,14 +41,14 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
 
     payload = build_unity_replay_stream_payload(
         source_npz=source_path,
-        schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
         fps=60.0,
         frame_start=1,
         frame_count=4,
     )
 
-    assert payload["schemaName"] == REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
-    assert payload["poseRepresentation"] == get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME).pose_representation
+    assert payload["schemaName"] == REALTIME_POSE_SCHEMA_NAME
+    assert payload["poseRepresentation"] == get_schema_spec(REALTIME_POSE_SCHEMA_NAME).pose_representation
     assert payload["frameStart"] == 1
     assert payload["frameCount"] == 4
     assert payload["trackerCount"] == TRACKER_COUNT
@@ -56,7 +56,7 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
     assert len(payload["trackerRotations6d"]) == 4 * TRACKER_COUNT * 6
     assert len(payload["sensorValid"]) == 4 * TRACKER_COUNT
     assert len(payload["referenceJointsWorld"]) == 4 * 24 * 3
-    assert len(payload["rootYaw"]) == 4
+    assert len(payload["rootHeading"]) == 4
     assert len(payload["rootPosWorld"]) == 4 * 3
     assert len(payload["footContact"]) == 4 * 2
     assert payload["targetFeatureLength"] == 151
@@ -74,12 +74,12 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
     np.testing.assert_array_equal(valid, source["sensor_valid"][1:5].astype(np.int32))
     np.testing.assert_allclose(joints, source["joints_world"][1:5])
 
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     np.testing.assert_allclose(target_features[:, 0:BODY_POSE_DIM], source[schema.body_pose_key][1:5])
     cursor = BODY_POSE_DIM
     np.testing.assert_allclose(
         target_features[:, cursor : cursor + ROOT_YAW_DELTA_DIM],
-        source["root_yaw_delta_sincos"][1:5],
+        source[schema.root_heading_delta_key][1:5],
     )
     cursor += ROOT_YAW_DELTA_DIM
     np.testing.assert_allclose(
@@ -89,7 +89,7 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
     cursor += ROOT_DELTA_XZ_DIM
     np.testing.assert_allclose(
         target_features[:, cursor : cursor + ROOT_HEIGHT_DIM],
-        source["root_height"][1:5],
+        source[schema.pelvis_height_key][1:5],
     )
     cursor += ROOT_HEIGHT_DIM
     np.testing.assert_allclose(
@@ -115,7 +115,7 @@ def test_unity_replay_stream_writes_json_file(tmp_path):
 def test_unity_replay_stream_can_export_identity_6d_debug_resource(tmp_path):
     source_path = tmp_path / "toy_source.npz"
     source = write_source(source_path, frame_count=5)
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
 
     # 先把源里的 rotation 和 joints 改成非 identity，确保 debug 开关真的覆盖它们。
     source[schema.body_pose_key] = np.full((5, BODY_POSE_DIM), 0.25, dtype=np.float32)

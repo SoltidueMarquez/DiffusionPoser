@@ -379,3 +379,49 @@ def fk_root_global_torch(
     if return_global_rot:
         return stacked_joints, global_rot
     return stacked_joints
+
+
+def fk_body_fbx_local_torch(
+    body_pose_local_delta_6d: torch.Tensor,
+    actor_root_pos_world: torch.Tensor,
+    root_heading: torch.Tensor,
+    rest_local_positions: torch.Tensor,
+    rest_local_rotations_6d: torch.Tensor | None = None,
+    return_global_rot: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """body.fbx local delta FK，输入 `[B,144]`，输出 `[B,24,3]`。"""
+
+    batch_size = body_pose_local_delta_6d.shape[0]
+    delta_rot = rotation_6d_to_matrix_torch(body_pose_local_delta_6d.reshape(batch_size, 24, 6))
+    delta_rot = delta_rot.clone()
+    delta_rot[:, 0] = torch.eye(3, dtype=delta_rot.dtype, device=delta_rot.device)
+    if rest_local_rotations_6d is None:
+        rest_local_rot = torch.eye(3, dtype=delta_rot.dtype, device=delta_rot.device).expand(batch_size, 24, 3, 3)
+    else:
+        rest_6d = rest_local_rotations_6d.to(device=delta_rot.device, dtype=delta_rot.dtype)
+        if rest_6d.ndim == 2:
+            rest_6d = rest_6d.unsqueeze(0).expand(batch_size, -1, -1)
+        rest_local_rot = rotation_6d_to_matrix_torch(rest_6d.reshape(batch_size, 24, 6))
+    local_rot = rest_local_rot @ delta_rot
+    heading_rot = make_yaw_rotation_torch(root_heading)
+
+    offsets = rest_local_positions.to(device=delta_rot.device, dtype=delta_rot.dtype)
+    if offsets.ndim == 2:
+        offsets = offsets.unsqueeze(0).expand(batch_size, -1, -1)
+    global_rot: list[torch.Tensor] = []
+    joints: list[torch.Tensor] = []
+    for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
+        if parent_index < 0:
+            joint_rot = heading_rot @ local_rot[:, joint_index]
+            joint_pos = actor_root_pos_world + torch.einsum("bij,bj->bi", heading_rot, offsets[:, joint_index])
+        else:
+            parent_rot = global_rot[parent_index]
+            joint_rot = parent_rot @ local_rot[:, joint_index]
+            joint_pos = joints[parent_index] + torch.einsum("bij,bj->bi", parent_rot, offsets[:, joint_index])
+        global_rot.append(joint_rot)
+        joints.append(joint_pos)
+    stacked_joints = torch.stack(joints, dim=1)
+    stacked_rot = torch.stack(global_rot, dim=1)
+    if return_global_rot:
+        return stacked_joints, stacked_rot
+    return stacked_joints

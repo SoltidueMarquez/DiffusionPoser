@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 
-from data_loaders.realtime_pose_kinematics import fk_root_global_torch
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     BODY_POSE_START,
@@ -12,6 +10,7 @@ from data_loaders.sensor_masking import (
     ROOT_YAW_DELTA_START,
     get_schema_spec,
 )
+from sample.simulate_unity_stream import fk_joints_from_target
 
 
 def decode_realtime_pose_joints(
@@ -19,6 +18,7 @@ def decode_realtime_pose_joints(
     root_pos_world: np.ndarray,
     root_yaw: np.ndarray,
     joint_offsets_parent: np.ndarray,
+    joint_rest_local_rotations_6d: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     用 realtime_pose_v2 的 root-yaw-relative global 6D pose + root_yaw 做轻量 FK。
@@ -29,14 +29,24 @@ def decode_realtime_pose_joints(
     features = np.asarray(features, dtype=np.float32)
     if features.ndim != 2 or features.shape[1] != schema.feature_dim:
         raise ValueError(f"features 应为 [T,{schema.feature_dim}]，实际为 {features.shape}")
-    pose = torch.from_numpy(features[:, BODY_POSE_START:BODY_POSE_START + BODY_POSE_DIM]).float()
-    root_pos = torch.from_numpy(np.asarray(root_pos_world, dtype=np.float32)).float()
-    yaw = torch.from_numpy(np.asarray(root_yaw, dtype=np.float32)).float()
-    offsets = torch.from_numpy(np.asarray(joint_offsets_parent, dtype=np.float32)).float()
-    offsets = offsets.unsqueeze(0).expand(features.shape[0], -1, -1)
-    with torch.no_grad():
-        joints = fk_root_global_torch(pose, root_pos, yaw, offsets)
-    return joints.cpu().numpy().astype(np.float32)
+    root_pos = np.asarray(root_pos_world, dtype=np.float32)
+    yaw = np.asarray(root_yaw, dtype=np.float32)
+    if root_pos.shape != (features.shape[0], 3):
+        raise ValueError(f"root_pos_world 应为 [T,3]，实际为 {root_pos.shape}")
+    if yaw.shape != (features.shape[0],):
+        raise ValueError(f"root_yaw 应为 [T]，实际为 {yaw.shape}")
+    joints = [
+        fk_joints_from_target(
+            target_raw=features[frame_index],
+            root_pos_world=root_pos[frame_index],
+            root_yaw=float(yaw[frame_index]),
+            joint_offsets_parent=joint_offsets_parent,
+            schema_name=schema.name,
+            joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+        )
+        for frame_index in range(features.shape[0])
+    ]
+    return np.stack(joints, axis=0).astype(np.float32)
 
 
 def decode_root_yaw_from_delta(prev_root_yaw: float, root_yaw_delta_sincos: np.ndarray) -> float:

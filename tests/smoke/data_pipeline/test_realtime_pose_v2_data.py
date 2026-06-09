@@ -14,7 +14,7 @@ from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAME,
     get_schema_spec,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
@@ -29,7 +29,7 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
 
 
 def test_v2_contact_feature_layout_and_root_integration():
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
     assert str(source[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
     source["sensor_valid"] = np.ones((REALTIME_POSE_SEQ_LEN, 6), dtype=bool)
@@ -49,7 +49,7 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
     source_dir = tmp_path / "sources"
     task_dir = tmp_path / "tasks"
     normalizer_dir = tmp_path / "meta"
-    write_toy_source_dataset(source_dir, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    write_toy_source_dataset(source_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
     generate_realtime_pose_tasks_main(
         [
             "--source_dir",
@@ -61,7 +61,7 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
             "--samples_per_file",
             "1",
             "--schema",
-            REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
@@ -70,7 +70,7 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
     task_output_dir = latest_artifact_dir(task_dir, kind="tasks")
     manifest_path = task_output_dir / "train" / "manifest.jsonl"
     entry = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assert entry["feature_dim"] == schema.feature_dim
     assert entry[POSE_REPRESENTATION_KEY] == schema.pose_representation
 
@@ -97,7 +97,7 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
 
 
 def test_realtime_normalizer_does_not_amplify_near_constant_channels(tmp_path):
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     mean = torch.zeros(schema.feature_dim)
     std = torch.ones(schema.feature_dim)
     std[0] = REALTIME_POSE_MIN_NORMALIZER_STD / 10.0
@@ -117,7 +117,7 @@ def test_predicted_history_cache_requires_normalized_feature_space(tmp_path):
     source_dir = tmp_path / "sources"
     task_dir = tmp_path / "tasks"
     cache_dir = tmp_path / "cache"
-    write_toy_source_dataset(source_dir, schema_name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    write_toy_source_dataset(source_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
     generate_realtime_pose_tasks_main(
         [
             "--source_dir",
@@ -129,13 +129,13 @@ def test_predicted_history_cache_requires_normalized_feature_space(tmp_path):
             "--samples_per_file",
             "1",
             "--schema",
-            REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+            REALTIME_POSE_SCHEMA_NAME,
             "--split_dir",
             "",
             "--overwrite",
         ]
     )
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     base_dataset = RealtimePoseTaskDataset(
         task_dir,
         split="train",

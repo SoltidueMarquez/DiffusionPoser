@@ -409,6 +409,8 @@ class TrainLoop:
             "joint_offsets_parent": batch["joint_offsets_parent"],
             "sensor_valid": batch["sensor_valid"],
         }
+        if "joint_rest_local_rotations_6d" in batch:
+            y["joint_rest_local_rotations_6d"] = batch["joint_rest_local_rotations_6d"]
         if self.schema.supports_root_motion:
             y["prev_root_pos_world"] = batch["prev_root_pos_world"]
             y["target_root_delta_xz_ref"] = batch["target_root_delta_xz_ref"]

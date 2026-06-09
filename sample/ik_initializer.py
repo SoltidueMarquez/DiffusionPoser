@@ -9,12 +9,15 @@ import torch
 from data_loaders.realtime_pose_kinematics import (
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
+    fk_body_fbx_local_torch,
     fk_root_global_torch,
+    make_yaw_rotation_torch,
     rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
 )
 from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
@@ -80,6 +83,7 @@ def build_tracker_pose_init_image(
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     normalizer: Any | None = None,
     joint_offsets_parent: torch.Tensor | np.ndarray | None = None,
+    joint_rest_local_rotations_6d: torch.Tensor | np.ndarray | None = None,
     iterations: int = DEFAULT_IK_INIT_ITERATIONS,
     lr: float = DEFAULT_IK_INIT_LR,
     pos_weight: float = DEFAULT_IK_INIT_POS_WEIGHT,
@@ -108,6 +112,12 @@ def build_tracker_pose_init_image(
         device=conditioned_x.device,
         dtype=conditioned_x.dtype,
     )
+    rest_rotations = _batch_joint_rest_rotations(
+        joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+        batch_size=conditioned_x.shape[0],
+        device=conditioned_x.device,
+        dtype=conditioned_x.dtype,
+    )
     raw_init_frames = []
     for batch_index in range(conditioned_x.shape[0]):
         raw_init_frames.append(
@@ -115,6 +125,7 @@ def build_tracker_pose_init_image(
                 previous_frame_raw=raw_btc[batch_index, REALTIME_POSE_TARGET_START - 1],
                 current_frame_raw=raw_btc[batch_index, REALTIME_POSE_TARGET_START],
                 joint_offsets_parent=None if offsets is None else offsets[batch_index],
+                joint_rest_local_rotations_6d=None if rest_rotations is None else rest_rotations[batch_index],
                 schema_name=schema.name,
                 iterations=iterations,
                 lr=lr,
@@ -159,11 +170,48 @@ def _batch_joint_offsets(
     return offsets
 
 
+def _batch_joint_rest_rotations(
+    joint_rest_local_rotations_6d: torch.Tensor | np.ndarray | None,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if joint_rest_local_rotations_6d is None:
+        return None
+    rotations = torch.as_tensor(joint_rest_local_rotations_6d, dtype=dtype, device=device)
+    if rotations.ndim == 2:
+        rotations = rotations.unsqueeze(0).repeat(int(batch_size), 1, 1)
+    if tuple(rotations.shape) != (int(batch_size), SMPL_JOINT_COUNT, 6):
+        raise ValueError(f"joint_rest_local_rotations_6d 应为 [B,24,6] 或 [24,6]，实际为 {tuple(rotations.shape)}")
+    return rotations
+
+
+def _is_body_fbx_local_schema(schema_name: str) -> bool:
+    return get_schema_spec(schema_name).pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D
+
+
+def _actor_root_ref_from_pelvis_height(
+    init_frame: torch.Tensor,
+    root_yaw: torch.Tensor,
+    rest_local_positions: torch.Tensor,
+    schema_name: str,
+) -> torch.Tensor:
+    schema = get_schema_spec(schema_name)
+    root_pos = torch.zeros(1, 3, dtype=init_frame.dtype, device=init_frame.device)
+    if not _is_body_fbx_local_schema(schema.name) or not schema.supports_root_motion:
+        return root_pos
+    heading_rot = make_yaw_rotation_torch(root_yaw.reshape(1))
+    root_to_pelvis = torch.einsum("bij,j->bi", heading_rot, rest_local_positions[0])
+    root_pos[:, 1] = init_frame[schema.root_height_slice()][0] - root_to_pelvis[:, 1]
+    return root_pos
+
+
 def _solve_single_frame_tracker_pose_ik(
     *,
     previous_frame_raw: torch.Tensor,
     current_frame_raw: torch.Tensor,
     joint_offsets_parent: torch.Tensor | None,
+    joint_rest_local_rotations_6d: torch.Tensor | None,
     schema_name: str,
     iterations: int,
     lr: float,
@@ -210,7 +258,7 @@ def _solve_single_frame_tracker_pose_ik(
         return init_frame
 
     offsets = joint_offsets_parent.clone()
-    if schema.supports_root_motion:
+    if schema.supports_root_motion and not _is_body_fbx_local_schema(schema.name):
         offsets[0, 1] = init_frame[schema.root_height_slice()][0]
 
     target_joint_indices = torch.as_tensor(
@@ -224,18 +272,37 @@ def _solve_single_frame_tracker_pose_ik(
     reference_pose = init_frame[schema.body_pose_slice()].reshape(1, SMPL_JOINT_COUNT, 6).clone()
     pose = reference_pose.clone().detach().requires_grad_(True)
     optimizer = torch.optim.Adam([pose], lr=float(lr))
-    root_pos_ref = torch.zeros(1, 3, dtype=current_frame_raw.dtype, device=current_frame_raw.device)
+    root_pos_ref = _actor_root_ref_from_pelvis_height(
+        init_frame=init_frame,
+        root_yaw=yaw_delta,
+        rest_local_positions=offsets,
+        schema_name=schema.name,
+    )
     root_yaw_ref = yaw_delta.reshape(1)
 
     for _ in range(int(iterations)):
         optimizer.zero_grad(set_to_none=True)
-        joints, global_rot = fk_root_global_torch(
-            body_pose_root_global_6d=pose.reshape(1, -1),
-            root_pos_world=root_pos_ref,
-            root_yaw=root_yaw_ref,
-            parent_offsets=offsets.reshape(1, SMPL_JOINT_COUNT, 3),
-            return_global_rot=True,
-        )
+        if _is_body_fbx_local_schema(schema.name):
+            joints, global_rot = fk_body_fbx_local_torch(
+                body_pose_local_delta_6d=pose.reshape(1, -1),
+                actor_root_pos_world=root_pos_ref,
+                root_heading=root_yaw_ref,
+                rest_local_positions=offsets.reshape(1, SMPL_JOINT_COUNT, 3),
+                rest_local_rotations_6d=(
+                    None
+                    if joint_rest_local_rotations_6d is None
+                    else joint_rest_local_rotations_6d.reshape(1, SMPL_JOINT_COUNT, 6)
+                ),
+                return_global_rot=True,
+            )
+        else:
+            joints, global_rot = fk_root_global_torch(
+                body_pose_root_global_6d=pose.reshape(1, -1),
+                root_pos_world=root_pos_ref,
+                root_yaw=root_yaw_ref,
+                parent_offsets=offsets.reshape(1, SMPL_JOINT_COUNT, 3),
+                return_global_rot=True,
+            )
         pos_loss = (joints[:, target_joint_indices] - target_positions[None]).square().mean()
         pred_rot_6d = rotation_6d_forward_up_torch(global_rot[:, target_joint_indices])
         rot_cos = (pred_rot_6d.reshape(1, -1, 2, 3) * target_rot_6d.reshape(1, -1, 2, 3)).sum(dim=-1)

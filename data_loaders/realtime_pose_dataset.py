@@ -19,6 +19,7 @@ from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     LEGACY_BODY_POSE_PARENT_KEY,
     POSE_REPRESENTATION_KEY,
+    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     HIP_TRACKER_INDEX,
     FOOT_CONTACT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
@@ -262,11 +263,15 @@ class RealtimePoseTaskDataset(Dataset):
             "tracker_pattern": applied_tracker_pattern,
             "tracker_mask_policy": self.tracker_mask_policy,
         }
+        if "joint_rest_local_rotations_6d" in arrays:
+            item["joint_rest_local_rotations_6d"] = torch.from_numpy(arrays["joint_rest_local_rotations_6d"]).float()
         if self.schema.supports_root_motion:
             item["target_root_delta_xz_ref"] = torch.from_numpy(
                 arrays["root_delta_xz_ref"][REALTIME_POSE_TARGET_START]
             ).float()
-            item["target_root_height"] = torch.tensor(float(arrays["root_height"][REALTIME_POSE_TARGET_START, 0])).float()
+            item["target_root_height"] = torch.tensor(
+                float(arrays[self.schema.pelvis_height_key][REALTIME_POSE_TARGET_START, 0])
+            ).float()
         if self.schema.supports_contact:
             item["target_foot_contact"] = torch.from_numpy(arrays["foot_contact"][REALTIME_POSE_TARGET_START]).float()
         return item
@@ -462,7 +467,7 @@ def load_materialized_task_npz(
         POSE_REPRESENTATION_KEY,
         "root_pos_world",
         "root_yaw",
-        "root_yaw_delta_sincos",
+        schema.root_heading_delta_key,
         "tracker_pos_world",
         "tracker_rot_world_6d",
         "joints_world",
@@ -475,9 +480,11 @@ def load_materialized_task_npz(
         "seq_len",
     }
     if schema.supports_root_motion:
-        required.update({"root_delta_xz_ref", "root_height"})
+        required.update({"root_delta_xz_ref", schema.pelvis_height_key})
     if schema.supports_contact:
         required.add("foot_contact")
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        required.add("joint_rest_local_rotations_6d")
     missing = sorted(required.difference(task))
     if missing:
         raise KeyError(f"{path} 缺少 {schema.name} 字段：{missing}")
@@ -502,7 +509,11 @@ def load_realtime_task_arrays(
         schema.body_pose_key: array_shape(task[schema.body_pose_key], (seq_len, BODY_POSE_DIM), schema.body_pose_key).astype(np.float32),
         "root_pos_world": array_shape(task["root_pos_world"], (seq_len, 3), "root_pos_world").astype(np.float32),
         "root_yaw": array_shape(task["root_yaw"], (seq_len,), "root_yaw").astype(np.float32),
-        "root_yaw_delta_sincos": array_shape(task["root_yaw_delta_sincos"], (seq_len, ROOT_YAW_DELTA_DIM), "root_yaw_delta_sincos").astype(np.float32),
+        schema.root_heading_delta_key: array_shape(
+            task[schema.root_heading_delta_key],
+            (seq_len, ROOT_YAW_DELTA_DIM),
+            schema.root_heading_delta_key,
+        ).astype(np.float32),
         "tracker_pos_world": array_shape(task["tracker_pos_world"], (seq_len, TRACKER_COUNT, 3), "tracker_pos_world").astype(np.float32),
         "tracker_rot_world_6d": array_shape(task["tracker_rot_world_6d"], (seq_len, TRACKER_COUNT, 6), "tracker_rot_world_6d").astype(np.float32),
         "joints_world": array_shape(task["joints_world"], (seq_len, 24, 3), "joints_world").astype(np.float32),
@@ -516,9 +527,19 @@ def load_realtime_task_arrays(
             (seq_len, ROOT_DELTA_XZ_DIM),
             "root_delta_xz_ref",
         ).astype(np.float32)
-        arrays["root_height"] = array_shape(task["root_height"], (seq_len, ROOT_HEIGHT_DIM), "root_height").astype(np.float32)
+        arrays[schema.pelvis_height_key] = array_shape(
+            task[schema.pelvis_height_key],
+            (seq_len, ROOT_HEIGHT_DIM),
+            schema.pelvis_height_key,
+        ).astype(np.float32)
     if schema.supports_contact:
         arrays["foot_contact"] = array_shape(task["foot_contact"], (seq_len, FOOT_CONTACT_DIM), "foot_contact").astype(np.float32)
+    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
+        arrays["joint_rest_local_rotations_6d"] = array_shape(
+            task["joint_rest_local_rotations_6d"],
+            (24, 6),
+            "joint_rest_local_rotations_6d",
+        ).astype(np.float32)
     validate_sensor_valid(arrays["sensor_valid"])
     expected_mask = np.zeros((seq_len, schema.feature_dim), dtype=bool)
     expected_mask[REALTIME_POSE_TARGET_START, schema.target_slice()] = True
@@ -535,10 +556,10 @@ def encode_realtime_pose_features(
     seq_len = arrays[schema.body_pose_key].shape[0]
     features = np.zeros((seq_len, schema.feature_dim), dtype=np.float32)
     features[:, schema.body_pose_slice()] = arrays[schema.body_pose_key]
-    features[:, schema.root_yaw_delta_slice()] = arrays["root_yaw_delta_sincos"]
+    features[:, schema.root_yaw_delta_slice()] = arrays[schema.root_heading_delta_key]
     if schema.supports_root_motion:
         features[:, schema.root_delta_xz_slice()] = arrays["root_delta_xz_ref"]
-        features[:, schema.root_height_slice()] = arrays["root_height"]
+        features[:, schema.root_height_slice()] = arrays[schema.pelvis_height_key]
     if schema.supports_contact:
         features[:, schema.foot_contact_slice()] = arrays["foot_contact"]
     features[:, schema.tracker_pos_slice()] = encode_tracker_pos_ref(arrays).reshape(seq_len, -1)
