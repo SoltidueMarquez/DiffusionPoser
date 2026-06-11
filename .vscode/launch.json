@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "realtime_pose_v2 | one-stop convert-to-train",
+            "name": "realtime_pose_root_y0 | one-stop convert-to-train",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -16,26 +16,30 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
-                "--reuse_source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
-                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--body_fbx_rest_json", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser/body_fbx_rest.json",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
-                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_body_fbx_local_root_y0_target_dit",
                 "--model_arch", "target_dit",
                 "--num_steps", "${input:realtimePosePipelineNumSteps}",
                 "--train_batch_size", "${input:realtimePosePipelineBatchSize}",
+                "--convert_num_workers", "${input:realtimePoseConvertWorkers}",
+                "--convert_worker_torch_threads", "1",
                 "--samples_per_file", "4",
+                "--short_source_policy", "skip",
+                "--rebuild_source",
                 "--mirror",
                 "--skip_existing",
                 "--overwrite"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 1 convert source fast",
+            "name": "realtime_pose_root_y0 | 1 convert source fast",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -49,20 +53,22 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
-                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
-                "--reuse_source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_60hz",
+                "--body_fbx_rest_json", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser/body_fbx_rest.json",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--target_fps", "60",
                 "--batch_size", "256",
+                "--num_workers", "${input:realtimePoseConvertWorkers}",
+                "--worker_torch_threads", "1",
                 "--mirror",
                 "--skip_existing",
                 "--rebuild_manifest"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 1b rebuild source from AMASS",
+            "name": "realtime_pose_root_y0 | 1b rebuild source from AMASS",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -76,40 +82,21 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--amass_dir", "${workspaceFolder}/dataset/AMASS",
                 "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
-                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
+                "--body_fbx_rest_json", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser/body_fbx_rest.json",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--target_fps", "60",
                 "--batch_size", "256",
+                "--num_workers", "${input:realtimePoseConvertWorkers}",
+                "--worker_torch_threads", "1",
                 "--mirror",
                 "--overwrite"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 3 compute normalizer from tasks",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
-            "module": "data_loaders.compute_realtime_pose_normalizer",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": false,
-            "env": {
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8"
-            },
-            "args": [
-                "--schema", "realtime_pose_v2_contact",
-                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
-                "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
-                "--split", "train",
-                "--overwrite"
-            ]
-        },
-        {
-            "name": "realtime_pose_v2 | 2 generate full-tracker tasks",
+            "name": "realtime_pose_root_y0 | 2 generate full-tracker tasks",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -123,19 +110,42 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
-                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz",
-                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--output_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
                 "--split_dir", "${workspaceFolder}/data_loaders/splits",
                 "--splits", "train", "test",
                 "--seq_len", "61",
                 "--samples_per_file", "4",
                 "--mask_policy", "full",
+                "--short_source_policy", "skip",
                 "--overwrite"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 4 train target_dit",
+            "name": "realtime_pose_root_y0 | 3 compute normalizer from tasks",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
+            "module": "data_loaders.compute_realtime_pose_normalizer",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "args": [
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
+                "--output_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--split", "train",
+                "--overwrite"
+            ]
+        },
+        {
+            "name": "realtime_pose_root_y0 | 4 train target_dit",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -149,12 +159,12 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--model_arch", "target_dit",
-                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_body_fbx_local_root_y0_target_dit",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
                 "--data_split", "train",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
@@ -173,7 +183,7 @@
                 "--gradient_clip",
                 "--lr", "1e-4",
                 "--num_steps", "${input:realtimePosePipelineNumSteps}",
-                "--save_interval", "50000",
+                "--save_interval", "5000",
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
@@ -193,7 +203,7 @@
             ]
         },
         {
-            "name": "realtime_pose_v2 | 4b resume latest",
+            "name": "realtime_pose_root_y0 | 4b resume latest",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -207,12 +217,12 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--model_arch", "target_dit",
-                "--save_dir", "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--save_dir", "${workspaceFolder}/runs/realtime_pose_body_fbx_local_root_y0_target_dit",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
                 "--data_split", "train",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
@@ -233,7 +243,7 @@
                 "--gradient_clip",
                 "--lr", "1e-4",
                 "--num_steps", "${input:realtimePosePipelineNumSteps}",
-                "--save_interval", "50000",
+                "--save_interval", "5000",
                 "--log_interval", "1000",
                 "--checkpoint_max_keep", "3",
                 "--train_platform_type", "TensorboardPlatform",
@@ -252,7 +262,7 @@
             ]
         },
         {
-            "name": "realtime_pose_v2 | 5 reconstruct stream test",
+            "name": "realtime_pose_root_y0 | 5 reconstruct stream test",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -266,13 +276,13 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--model_arch", "target_dit",
-                "--model_path", "${input:realtimePoseV2ModelPath}",
-                "--output_dir", "${workspaceFolder}/output/realtime_pose_v2_stream",
-                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_v2_60hz_tasks",
+                "--model_path", "${input:realtimePoseRootY0ModelPath}",
+                "--output_dir", "${workspaceFolder}/output/realtime_pose_body_fbx_local_root_y0_stream",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
                 "--data_split", "test",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--task_mode", "realtime_pose_reconstruction",
                 "--normalize_input", "true",
                 "--preload_data", "false",
@@ -286,7 +296,7 @@
             ]
         },
         {
-            "name": "realtime_pose_v2 | 6 evaluate stream output",
+            "name": "realtime_pose_root_y0 | 6 evaluate stream output",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -300,12 +310,12 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--input_dir", "${workspaceFolder}/output/realtime_pose_v2_stream",
-                "--output_json", "${workspaceFolder}/output/realtime_pose_v2_stream/realtime_pose_eval_summary.json"
+                "--input_dir", "${workspaceFolder}/output/realtime_pose_body_fbx_local_root_y0_stream",
+                "--output_json", "${workspaceFolder}/output/realtime_pose_body_fbx_local_root_y0_stream/realtime_pose_eval_summary.json"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 7 export Unity runtime assets",
+            "name": "realtime_pose_root_y0 | 7 export Unity runtime assets",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -319,15 +329,15 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--output_dir", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--normalize_input",
                 "--strict_normalizer"
             ]
         },
         {
-            "name": "realtime_pose_v2 | 8 export Sentis denoiser",
+            "name": "realtime_pose_root_y0 | 8 export Sentis denoiser",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -341,11 +351,11 @@
                 "PYTHONIOENCODING": "utf-8"
             },
             "args": [
-                "--schema", "realtime_pose_v2_contact",
+                "--schema", "realtime_pose_body_fbx_local_root_y0_v1",
                 "--model_arch", "target_dit",
-                "--model_path", "${input:realtimePoseV2ModelPath}",
+                "--model_path", "${input:realtimePoseRootY0ModelPath}",
                 "--output_dir", "${workspaceFolder}/../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser",
-                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_v2_60hz",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
                 "--normalize_input", "true",
                 "--strict_normalizer",
                 "--use_ema", "true",
@@ -353,7 +363,7 @@
             ]
         },
         {
-            "name": "realtime_pose_v2 | smoke tests",
+            "name": "realtime_pose_root_y0 | smoke tests",
             "type": "debugpy",
             "request": "launch",
             "python": "C:/Users/Administrator/.conda/envs/diffusionposer5070/python.exe",
@@ -373,21 +383,27 @@
     ],
     "inputs": [
         {
-            "id": "realtimePoseV2ModelPath",
+            "id": "realtimePoseRootY0ModelPath",
             "type": "promptString",
-            "description": "realtime_pose_v2_contact target_dit checkpoint path",
-            "default": "${workspaceFolder}/runs/realtime_pose_v2_contact_target_dit/model000050000.pt"
+            "description": "realtime_pose_body_fbx_local_root_y0_v1 target_dit checkpoint path",
+            "default": "${workspaceFolder}/runs/realtime_pose_body_fbx_local_root_y0_target_dit/model000050000.pt"
         },
         {
             "id": "realtimePosePipelineNumSteps",
             "type": "promptString",
-            "description": "v2 training steps",
+            "description": "root_y0 training steps",
             "default": "1000000"
+        },
+        {
+            "id": "realtimePoseConvertWorkers",
+            "type": "promptString",
+            "description": "source conversion worker processes",
+            "default": "4"
         },
         {
             "id": "realtimePosePipelineBatchSize",
             "type": "promptString",
-            "description": "v2 train batch size",
+            "description": "root_y0 train batch size",
             "default": "64"
         }
     ]

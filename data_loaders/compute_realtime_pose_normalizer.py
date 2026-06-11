@@ -30,8 +30,8 @@ from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compute realtime_pose mean/std normalizer from materialized tasks.")
     group = parser.add_argument_group("paths")
-    group.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_v2_60hz_tasks", type=str)
-    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_v2_60hz", type=str)
+    group.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks", type=str)
+    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
 
     group = parser.add_argument_group("statistics")
     group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
@@ -92,6 +92,8 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     meta = {
         "schema_name": schema.name,
         "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
         "task_dir": str(task_dir),
         "normalizer_root": str(output_root),
         "output_dir": str(output_dir),
@@ -114,6 +116,8 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
             "task_dir": str(task_dir),
             "schema_name": schema.name,
             "pose_representation": schema.pose_representation,
+            "root_y_policy": schema.root_y_policy,
+            "pelvis_height_mode": schema.pelvis_height_mode,
             "split": args.split,
             "matched_tasks": len(task_entries),
         },

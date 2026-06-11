@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
+from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np
 from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
@@ -19,6 +20,7 @@ from sample.simulate_unity_stream import (
     apply_tracker_position_ik,
     clamp_body_pose_delta,
     encode_unity_tracker_frame,
+    estimate_root_pos_from_hip_tracker,
     fk_tracker_positions_from_target,
     initial_target_feature,
     simulate_unity_stream,
@@ -82,6 +84,26 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
     np.testing.assert_array_equal(encoded[schema.sensor_valid_slice()], reference[frame_index, schema.sensor_valid_slice()])
 
 
+def test_hip_tracker_root_estimate_removes_body_fbx_pelvis_offset():
+    root_pos = np.asarray([1.2, 0.0, -0.4], dtype=np.float32)
+    root_yaw = 0.55
+    offsets = np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
+    offsets[0] = np.asarray([0.12, 0.97, 0.08], dtype=np.float32)
+    yaw_rotation = make_yaw_rotation_np(np.asarray([root_yaw], dtype=np.float64))[0]
+
+    tracker_pos = np.zeros((6, 3), dtype=np.float32)
+    tracker_pos[HIP_TRACKER_INDEX] = root_pos + (yaw_rotation @ offsets[0].astype(np.float64)).astype(np.float32)
+
+    estimated = estimate_root_pos_from_hip_tracker(
+        tracker_pos,
+        root_yaw=root_yaw,
+        joint_offsets_parent=offsets,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+    )
+
+    np.testing.assert_allclose(estimated, root_pos, atol=1e-6)
+
+
 def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
     source = build_toy_realtime_source(frame_count=63)
     sensor_valid = np.ones((63, 6), dtype=bool)
@@ -122,6 +144,11 @@ def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
     np.testing.assert_allclose(
         payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, [0, 2]],
         source["root_pos_world"][REALTIME_POSE_TARGET_START:][:, [0, 2]],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, 1],
+        0.0,
         atol=1e-6,
     )
     np.testing.assert_allclose(

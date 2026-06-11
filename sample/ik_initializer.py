@@ -11,7 +11,6 @@ from data_loaders.realtime_pose_kinematics import (
     TRACKER_JOINT_INDICES,
     fk_body_fbx_local_torch,
     fk_root_global_torch,
-    make_yaw_rotation_torch,
     rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
 )
@@ -198,11 +197,6 @@ def _actor_root_ref_from_pelvis_height(
 ) -> torch.Tensor:
     schema = get_schema_spec(schema_name)
     root_pos = torch.zeros(1, 3, dtype=init_frame.dtype, device=init_frame.device)
-    if not _is_body_fbx_local_schema(schema.name) or not schema.supports_root_motion:
-        return root_pos
-    heading_rot = make_yaw_rotation_torch(root_yaw.reshape(1))
-    root_to_pelvis = torch.einsum("bij,j->bi", heading_rot, rest_local_positions[0])
-    root_pos[:, 1] = init_frame[schema.root_height_slice()][0] - root_to_pelvis[:, 1]
     return root_pos
 
 
@@ -258,7 +252,7 @@ def _solve_single_frame_tracker_pose_ik(
         return init_frame
 
     offsets = joint_offsets_parent.clone()
-    if schema.supports_root_motion and not _is_body_fbx_local_schema(schema.name):
+    if schema.supports_root_motion:
         offsets[0, 1] = init_frame[schema.root_height_slice()][0]
 
     target_joint_indices = torch.as_tensor(

@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from argparse import BooleanOptionalAction
+from dataclasses import dataclass
 from pathlib import Path
 
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
+from utils.run_dirs import resolve_latest_or_self
 
 
 PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train")
+SOURCE_USABLE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
+
+
+@dataclass(frozen=True)
+class StageResult:
+    stage: str
+    status: str
+    message: str = ""
+    returncode: int = 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -19,11 +31,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("paths")
     paths.add_argument("--amass_dir", default="dataset/AMASS", type=str)
     paths.add_argument("--smpl_model_dir", default="dataset/body_models", type=str)
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=str)
-    paths.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_v2_60hz", type=str)
-    paths.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_v2_60hz_tasks", type=str)
+    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
+    paths.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
+    paths.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
-    paths.add_argument("--save_dir", default="runs/realtime_pose_v2_contact_target_dit", type=str)
+    paths.add_argument("--save_dir", default="runs/realtime_pose_body_fbx_local_root_y0_target_dit", type=str)
 
     pipeline = parser.add_argument_group("pipeline")
     pipeline.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES)
@@ -32,6 +44,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--dry_run", action="store_true")
     pipeline.add_argument("--run_name", default="auto", type=str)
     pipeline.add_argument("--overwrite", action=BooleanOptionalAction, default=False)
+    pipeline.add_argument(
+        "--continue_on_error",
+        "--keep_going",
+        dest="continue_on_error",
+        action="store_true",
+        help="某个阶段失败后尽量继续后续阶段；最终仍会用非零退出汇总失败。",
+    )
+    pipeline.add_argument(
+        "--resume_pipeline",
+        action="store_true",
+        help="跳过已有可用的 source/task/normalizer 产物；训练阶段仍通过 --resume_latest 控制。",
+    )
 
     convert = parser.add_argument_group("convert")
     convert.add_argument("--skip_convert", action="store_true")
@@ -39,7 +63,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert.add_argument("--reuse_source_dir", default="", type=str)
     convert.add_argument("--target_fps", default=60.0, type=float)
     convert.add_argument("--convert_batch_size", default=256, type=int)
+    convert.add_argument("--convert_num_workers", default=1, type=int)
+    convert.add_argument("--convert_worker_torch_threads", default=1, type=int)
     convert.add_argument("--convert_limit", default=0, type=int)
+    convert.add_argument("--body_fbx_rest_json", default="", type=str)
     convert.add_argument("--mirror", action=BooleanOptionalAction, default=True)
     convert.add_argument("--skip_existing", action=BooleanOptionalAction, default=True)
     convert.add_argument("--allow_partial", action="store_true")
@@ -141,6 +168,122 @@ def normalize_path(path: str) -> str:
     return str(Path(path))
 
 
+def stage_is_disabled(stage: str, args: argparse.Namespace) -> bool:
+    return bool(getattr(args, f"skip_{stage}", False))
+
+
+def build_stage_args(stage: str, args: argparse.Namespace) -> tuple[str, list[str]]:
+    if stage == "convert":
+        return "data_converter.amass_to_realtime_pose", build_convert_args(args)
+    if stage == "tasks":
+        return "data_loaders.generate_realtime_pose_tasks", build_task_args(args)
+    if stage == "normalizer":
+        return "data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args)
+    if stage == "train":
+        return "train.train_diffusionposer", build_train_args(args)
+    raise ValueError(f"未知 pipeline stage: {stage}")
+
+
+def run_stage(stage: str, args: argparse.Namespace) -> None:
+    module, module_args = build_stage_args(stage, args)
+    run_python_module(module, module_args, dry_run=bool(args.dry_run))
+
+
+def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[bool, str]:
+    if not bool(getattr(args, "resume_pipeline", False)):
+        return False, ""
+    if bool(getattr(args, "overwrite", False)):
+        return False, ""
+    if stage == "convert" and not bool(getattr(args, "rebuild_source", False)):
+        source_dir = Path(args.source_dir)
+        if has_usable_source_manifest(source_dir=source_dir, schema_name=str(args.schema)):
+            return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
+    if stage == "tasks":
+        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+        if has_task_manifests(task_dir=task_dir, splits=list(args.splits)):
+            return True, f"复用已有 task 产物: {task_dir}"
+    if stage == "normalizer":
+        normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
+        if has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
+            return True, f"复用已有 normalizer 产物: {normalizer_dir}"
+    return False, ""
+
+
+def dependency_block_message(stage: str, failed_stages: set[str], args: argparse.Namespace) -> str:
+    """阶段失败后只在依赖产物仍可用时继续，避免误用旧的 latest 产物。"""
+
+    if stage == "tasks" and "convert" in failed_stages:
+        if has_usable_source_manifest(source_dir=Path(args.source_dir), schema_name=str(args.schema)):
+            return ""
+        return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
+    if stage == "normalizer" and "tasks" in failed_stages:
+        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+        if has_task_manifests(task_dir=task_dir, splits=[str(args.normalizer_split)]):
+            return ""
+        return "tasks 失败且找不到可用于 normalizer_split 的 task manifest，跳过 normalizer。"
+    if stage == "train":
+        if "tasks" in failed_stages:
+            task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+            if not has_task_manifests(task_dir=task_dir, splits=["train"]):
+                return "tasks 失败且找不到 train task manifest，跳过 train。"
+        if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
+            normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
+            if not has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
+                return "normalizer 失败且找不到可用 normalizer 产物，跳过 train。"
+    return ""
+
+
+def has_usable_source_manifest(source_dir: Path, schema_name: str) -> bool:
+    manifest_path = source_dir / "manifest.jsonl"
+    if not manifest_path.exists():
+        return False
+    try:
+        with manifest_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if entry.get("status") not in SOURCE_USABLE_STATUSES:
+                    continue
+                if str(entry.get("schema_name", schema_name)) != schema_name:
+                    continue
+                return True
+    except (OSError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def has_task_manifests(task_dir: Path, splits: list[str]) -> bool:
+    if not task_dir.exists():
+        return False
+    for split in splits:
+        manifest_path = task_dir / str(split) / "manifest.jsonl"
+        if not manifest_path.exists():
+            return False
+    return True
+
+
+def has_normalizer_artifact(normalizer_dir: Path, schema_name: str) -> bool:
+    mean_path = normalizer_dir / "mean.pt"
+    std_path = normalizer_dir / "std.pt"
+    meta_path = normalizer_dir / "normalizer_meta.json"
+    if not (mean_path.exists() and std_path.exists() and meta_path.exists()):
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return str(meta.get("schema_name", schema_name)) == schema_name
+
+
+def format_pipeline_failures(failures: list[StageResult]) -> str:
+    parts = [
+        f"{failure.stage}(returncode={failure.returncode}): {failure.message}"
+        for failure in failures
+    ]
+    return "realtime_pose pipeline 存在失败阶段：" + "; ".join(parts)
+
+
 def build_convert_args(args: argparse.Namespace) -> list[str]:
     command = [
         "--schema", args.schema,
@@ -149,11 +292,15 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
         "--output_dir", normalize_path(args.source_dir),
         "--target_fps", str(args.target_fps),
         "--batch_size", str(args.convert_batch_size),
+        "--num_workers", str(args.convert_num_workers),
+        "--worker_torch_threads", str(args.convert_worker_torch_threads),
     ]
     if args.reuse_source_dir and not args.rebuild_source:
         command.extend(["--reuse_source_dir", normalize_path(args.reuse_source_dir)])
     if int(args.convert_limit) > 0:
         command.extend(["--limit", str(args.convert_limit)])
+    if args.body_fbx_rest_json:
+        command.extend(["--body_fbx_rest_json", normalize_path(args.body_fbx_rest_json)])
     add_flag(command, bool(args.mirror), "--mirror")
     if args.rebuild_source:
         add_flag(command, bool(args.overwrite), "--overwrite")
@@ -245,14 +392,41 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
 
 def run_pipeline(args: argparse.Namespace) -> None:
     stages = selected_stages(args.start_at, args.stop_after)
-    if "convert" in stages and not args.skip_convert:
-        run_python_module("data_converter.amass_to_realtime_pose", build_convert_args(args), dry_run=args.dry_run)
-    if "tasks" in stages and not args.skip_tasks:
-        run_python_module("data_loaders.generate_realtime_pose_tasks", build_task_args(args), dry_run=args.dry_run)
-    if "normalizer" in stages and not args.skip_normalizer:
-        run_python_module("data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args), dry_run=args.dry_run)
-    if "train" in stages and not args.skip_train:
-        run_python_module("train.train_diffusionposer", build_train_args(args), dry_run=args.dry_run)
+    failures: list[StageResult] = []
+    failed_stages: set[str] = set()
+    for stage in stages:
+        if stage_is_disabled(stage, args):
+            print(f"[realtime_pose_pipeline] skip {stage}: --skip_{stage}", flush=True)
+            continue
+
+        should_skip, skip_message = should_skip_completed_stage(stage, args)
+        if should_skip:
+            print(f"[realtime_pose_pipeline] skip {stage}: {skip_message}", flush=True)
+            continue
+
+        if bool(getattr(args, "continue_on_error", False)):
+            blocked_message = dependency_block_message(stage=stage, failed_stages=failed_stages, args=args)
+            if blocked_message:
+                print(f"[realtime_pose_pipeline] skip {stage}: {blocked_message}", flush=True)
+                continue
+
+        try:
+            run_stage(stage, args)
+        except subprocess.CalledProcessError as exc:
+            failed_stages.add(stage)
+            result = StageResult(
+                stage=stage,
+                status="failed",
+                message=str(exc),
+                returncode=int(exc.returncode),
+            )
+            failures.append(result)
+            print(f"[realtime_pose_pipeline] failed {stage}: {exc}", flush=True)
+            if not bool(getattr(args, "continue_on_error", False)):
+                raise
+
+    if failures:
+        raise RuntimeError(format_pipeline_failures(failures))
 
 
 def main(argv: list[str] | None = None) -> int:

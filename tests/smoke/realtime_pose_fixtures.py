@@ -12,6 +12,21 @@ from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_S
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
 
 
+def build_toy_source_metadata(frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict:
+    schema = get_schema_spec(schema_name)
+    return {
+        "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "status": "converted",
+        "source_relative_path": "ACCAD/toy_realtime.npz",
+        "stablemotion_split_key": "ACCAD/toy_realtime",
+        "output_path": "ACCAD/toy_realtime.npz",
+        "frames": int(frame_count),
+    }
+
+
 def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
     body_pose = np.tile(IDENTITY_6D, (frame_count, 24)).astype(np.float32)
@@ -55,6 +70,7 @@ def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME
     }
     if schema.pose_representation == "body_fbx_local_delta_6d":
         source["joint_rest_local_rotations_6d"] = rest_rotations_6d
+    source["metadata"] = np.asarray(json.dumps(build_toy_source_metadata(frame_count=frame_count, schema_name=schema.name)))
     return source
 
 
@@ -64,16 +80,7 @@ def write_toy_source_dataset(source_dir: Path, frame_count: int = 70, schema_nam
     source_path = source_dir / "ACCAD" / "toy_realtime.npz"
     source_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(source_path, **source)
-    schema = get_schema_spec(schema_name)
-    manifest_entry = {
-        "schema_name": schema.name,
-        "pose_representation": schema.pose_representation,
-        "status": "converted",
-        "source_relative_path": "ACCAD/toy_realtime.npz",
-        "stablemotion_split_key": "ACCAD/toy_realtime",
-        "output_path": "ACCAD/toy_realtime.npz",
-        "frames": frame_count,
-    }
+    manifest_entry = build_toy_source_metadata(frame_count=frame_count, schema_name=schema_name)
     with (source_dir / "manifest.jsonl").open("w", encoding="utf-8") as file:
         file.write(json.dumps(manifest_entry, ensure_ascii=False) + "\n")
     return source_path

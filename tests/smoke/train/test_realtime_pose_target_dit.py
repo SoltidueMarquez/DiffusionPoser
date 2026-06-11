@@ -5,13 +5,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from data_loaders.sensor_masking import REALTIME_POSE_SEQ_LEN, REALTIME_POSE_TARGET_START, REALTIME_POSE_V2_CONTACT_SCHEMA_NAME, get_schema_spec
+from data_loaders.sensor_masking import (
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_START,
+    get_schema_spec,
+)
 from export.export_sentis_denoiser import SentisDenoiserWrapper, export_onnx
 from utils.model_util import create_model_and_diffusion
 
 
 def test_target_dit_predicts_only_target_slice_shape():
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     args = SimpleNamespace(
         model_arch="target_dit",
         schema=schema.name,
@@ -44,9 +50,30 @@ def test_target_dit_predicts_only_target_slice_shape():
     assert torch.allclose(closed[:, schema.target_slice(), REALTIME_POSE_TARGET_START], x[:, schema.target_slice(), REALTIME_POSE_TARGET_START])
 
 
+def test_target_dit_without_schema_uses_current_default_schema():
+    schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    args = SimpleNamespace(
+        model_arch="target_dit",
+        input_feats=schema.feature_dim,
+        latent_dim=32,
+        layers=1,
+        heads=4,
+        dropout=0.0,
+        zero_init=False,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+        diffusion_steps=4,
+        ts_respace="",
+        noise_schedule="cosine",
+        predict_xstart=1,
+        sigma_small=True,
+    )
+    model, _diffusion = create_model_and_diffusion(args)
+    assert model.schema.name == DEFAULT_REALTIME_POSE_SCHEMA_NAME
+
+
 def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
     onnx = pytest.importorskip("onnx")
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     args = SimpleNamespace(
         model_arch="target_dit",
         schema=schema.name,

@@ -120,11 +120,23 @@ class RealtimePoseNormalizer:
         feature_dim = int(meta.get("feature_dim", -1))
         if feature_dim != self.schema.feature_dim:
             raise ValueError(f"normalizer feature_dim={feature_dim}, expected {self.schema.feature_dim}.")
+        if "root_y_policy" not in meta:
+            raise ValueError(f"normalizer metadata 缺少 root_y_policy: {self.meta_path}")
+        if str(meta["root_y_policy"]) != self.schema.root_y_policy:
+            raise ValueError(f"normalizer root_y_policy={meta.get('root_y_policy')!r}, expected {self.schema.root_y_policy!r}.")
+        if "pelvis_height_mode" not in meta:
+            raise ValueError(f"normalizer metadata 缺少 pelvis_height_mode: {self.meta_path}")
+        if str(meta["pelvis_height_mode"]) != self.schema.pelvis_height_mode:
+            raise ValueError(
+                f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {self.schema.pelvis_height_mode!r}."
+            )
 
     def _write_meta(self) -> None:
         meta = {
             "schema_name": self.schema.name,
             POSE_REPRESENTATION_KEY: self.schema.pose_representation,
+            "root_y_policy": self.schema.root_y_policy,
+            "pelvis_height_mode": self.schema.pelvis_height_mode,
             "feature_dim": self.schema.feature_dim,
             "eps": self.eps,
         }

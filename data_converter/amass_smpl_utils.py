@@ -55,9 +55,7 @@ class SmplMotion:
     raw_joint_positions: np.ndarray
     joint_positions: np.ndarray
     joint_rotations: np.ndarray
-    vertices: np.ndarray
     rest_joints: np.ndarray
-    rest_vertices: np.ndarray
     parents: np.ndarray
 
 
@@ -273,7 +271,6 @@ def run_smpl_forward(source: MotionSource, model_cache: SmplModelCache, batch_si
     body_pose = build_body_pose_for_model(source.poses, model_type=model_type)
     left_hand_pose, right_hand_pose = build_hand_poses_for_model(source.poses)
     joints_list: list[np.ndarray] = []
-    vertices_list: list[np.ndarray] = []
 
     with torch.no_grad():
         for start in range(0, frame_count, batch_size):
@@ -284,7 +281,7 @@ def run_smpl_forward(source: MotionSource, model_cache: SmplModelCache, batch_si
                 "body_pose": torch.as_tensor(body_pose[start:end], dtype=torch.float32, device=device),
                 "betas": torch.as_tensor(np.repeat(betas[None], batch_len, axis=0), dtype=torch.float32, device=device),
                 "transl": torch.as_tensor(source.trans[start:end], dtype=torch.float32, device=device),
-                "return_verts": True,
+                "return_verts": False,
             }
             if model_type == "smplh":
                 parameters.update(
@@ -293,14 +290,13 @@ def run_smpl_forward(source: MotionSource, model_cache: SmplModelCache, batch_si
                 )
             output = model(**parameters)
             joints_list.append(extract_smpl_style_joints(output.joints, model_type=model_type))
-            vertices_list.append(output.vertices.detach().cpu().numpy())
 
         rest_parameters = {
             "global_orient": torch.zeros((1, 3), dtype=torch.float32, device=device),
             "body_pose": torch.zeros((1, body_pose.shape[1]), dtype=torch.float32, device=device),
             "betas": torch.as_tensor(betas[None], dtype=torch.float32, device=device),
             "transl": torch.zeros((1, 3), dtype=torch.float32, device=device),
-            "return_verts": True,
+            "return_verts": False,
         }
         if model_type == "smplh":
             rest_parameters.update(
@@ -309,10 +305,8 @@ def run_smpl_forward(source: MotionSource, model_cache: SmplModelCache, batch_si
             )
         rest_output = model(**rest_parameters)
         rest_joints = extract_smpl_style_joints(rest_output.joints, model_type=model_type)[0].astype(np.float64)
-        rest_vertices = rest_output.vertices[0].detach().cpu().numpy().astype(np.float64)
 
     joint_positions_amass = np.concatenate(joints_list, axis=0).astype(np.float64)
-    vertices_amass = np.concatenate(vertices_list, axis=0).astype(np.float64)
     local_rotations = build_smpl_local_rotations(source.poses)
     parents = get_smpl_parents(model)
     joint_rotations_amass = local_to_global_rotations(local_rotations, parents)
@@ -320,9 +314,7 @@ def run_smpl_forward(source: MotionSource, model_cache: SmplModelCache, batch_si
         raw_joint_positions=joint_positions_amass,
         joint_positions=transform_points_to_unity(joint_positions_amass),
         joint_rotations=transform_rotations_to_unity(joint_rotations_amass),
-        vertices=transform_points_to_unity(vertices_amass),
         rest_joints=transform_points_to_unity(rest_joints),
-        rest_vertices=transform_points_to_unity(rest_vertices),
         parents=parents,
     )
 

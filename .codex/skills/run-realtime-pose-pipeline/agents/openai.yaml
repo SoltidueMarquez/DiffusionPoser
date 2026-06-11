@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Realtime Pose Pipeline"
+  short_description: "Run realtime pose pipeline in CMD."
+  default_prompt: "Use $run-realtime-pose-pipeline to run the default realtime pose pipeline in CMD."

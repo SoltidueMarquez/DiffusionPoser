@@ -1,5 +1,6 @@
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
+from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME
 from model.diffusionposer_dit import DiffusionPoserDiT
 from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 
@@ -9,7 +10,7 @@ def create_model_and_diffusion(args):
     if model_arch == "target_dit":
         model = RealtimePoseTargetDiT(
             input_feats=args.input_feats,
-            schema_name=getattr(args, "schema", "realtime_pose_v2_contact"),
+            schema_name=getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME),
             latent_dim=args.latent_dim,
             num_layers=args.layers,
             num_heads=args.heads,

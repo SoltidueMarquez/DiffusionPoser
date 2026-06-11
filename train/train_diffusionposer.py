@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from data_loaders.get_data import get_dataset_loader
+from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from diffusion import logger
 from train.train_platforms import NoPlatform, TensorboardPlatform
 from train.training_loop import TrainLoop, find_resume_checkpoint
@@ -195,8 +196,15 @@ def write_latest_run_pointer(args):
 def save_args(args):
     args_file = "resume_args.json" if args.resume_checkpoint else "args.json"
     args_path = os.path.join(args.save_dir, args_file)
+    payload = vars(args).copy()
+    schema = get_schema_spec(payload.get("schema", REALTIME_POSE_SCHEMA_NAME))
+    payload["schema"] = schema.name
+    payload["schema_name"] = schema.name
+    payload[POSE_REPRESENTATION_KEY] = schema.pose_representation
+    payload["root_y_policy"] = schema.root_y_policy
+    payload["pelvis_height_mode"] = schema.pelvis_height_mode
     with open(args_path, "w", encoding="utf-8") as file:
-        json.dump(vars(args), file, indent=4, sort_keys=True, ensure_ascii=False)
+        json.dump(payload, file, indent=4, sort_keys=True, ensure_ascii=False)
 
 
 if __name__ == "__main__":

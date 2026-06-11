@@ -18,10 +18,28 @@ from export.write_unity_runtime_assets import build_normalizer, write_runtime_as
 from utils.normalizer import RealtimePoseNormalizer
 
 
+def write_legacy_policyless_normalizer(normalizer_dir, schema):
+    normalizer_dir.mkdir()
+    torch.save(torch.zeros(REALTIME_POSE_INPUT_DIM), normalizer_dir / "mean.pt")
+    torch.save(torch.ones(REALTIME_POSE_INPUT_DIM), normalizer_dir / "std.pt")
+    (normalizer_dir / "normalizer_meta.json").write_text(
+        json.dumps(
+            {
+                "schema_name": schema.name,
+                POSE_REPRESENTATION_KEY: schema.pose_representation,
+                "feature_dim": schema.feature_dim,
+                "eps": 1e-8,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_runtime_assets_are_realtime_pose_only(tmp_path):
     assets = write_runtime_assets(output_dir=tmp_path, normalize_input=False, schema_name=REALTIME_POSE_SCHEMA_NAME)
     schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
     schema_spec = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    assert schema["schemaVersion"] == 4
     assert schema["schemaName"] == REALTIME_POSE_SCHEMA_NAME
     assert schema["poseRepresentation"] == schema_spec.pose_representation
     assert schema["featureDim"] == REALTIME_POSE_INPUT_DIM
@@ -38,6 +56,8 @@ def test_runtime_assets_are_realtime_pose_only(tmp_path):
     assert schema["trackerRotation6dReference"] == {"name": "tracker_rot_ref_6d", "start": 169, "length": 36}
     assert schema["sensorValid"] == {"name": "sensor_valid", "start": 205, "length": 6}
     assert schema["runtimeRules"]["poseRepresentation"] == schema_spec.pose_representation
+    assert schema["runtimeRules"]["rootPositionY"] == schema_spec.root_y_policy
+    assert schema["runtimeRules"]["pelvisHeightApplication"] == schema_spec.pelvis_height_mode
     assert schema["runtimeRules"]["onnxDummyInputShape"] == [1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN]
 
 
@@ -58,6 +78,8 @@ def test_realtime_normalizer_requires_schema_dimensions(tmp_path):
     assert payload["enabled"] is True
     assert payload["featureDim"] == REALTIME_POSE_INPUT_DIM
     assert payload["poseRepresentation"] == schema.pose_representation
+    assert payload["rootYPolicy"] == schema.root_y_policy
+    assert payload["pelvisHeightMode"] == schema.pelvis_height_mode
     assert len(payload["mean"]) == REALTIME_POSE_INPUT_DIM
 
 
@@ -73,6 +95,29 @@ def test_realtime_normalizer_rejects_missing_pose_metadata(tmp_path):
             normalize_input=True,
             strict=True,
             schema_name=REALTIME_POSE_SCHEMA_NAME,
+        )
+
+
+def test_realtime_normalizer_rejects_missing_root_y_policy_metadata(tmp_path):
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    normalizer_dir = tmp_path / "old_meta"
+    write_legacy_policyless_normalizer(normalizer_dir, schema)
+
+    with pytest.raises(ValueError, match="root_y_policy"):
+        RealtimePoseNormalizer(normalizer_dir, schema_name=schema.name)
+
+
+def test_runtime_export_rejects_policyless_normalizer(tmp_path):
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    normalizer_dir = tmp_path / "old_meta"
+    write_legacy_policyless_normalizer(normalizer_dir, schema)
+
+    with pytest.raises(ValueError, match="root_y_policy"):
+        write_runtime_assets(
+            output_dir=tmp_path / "assets",
+            normalize_input=True,
+            normalizer_dir=normalizer_dir,
+            schema_name=schema.name,
         )
 
 

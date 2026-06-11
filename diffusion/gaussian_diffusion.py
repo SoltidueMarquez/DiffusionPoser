@@ -1474,13 +1474,10 @@ class GaussianDiffusion:
             yaw_rot = make_yaw_rotation_torch(prev_root_yaw)
             target_root_pos = prev_root_pos + torch.einsum("bij,bj->bi", yaw_rot, delta_3d)
             target_root_pos = target_root_pos.clone()
-            if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-                root_to_pelvis = torch.einsum("bij,bj->bi", make_yaw_rotation_torch(pred_root_yaw), offsets[:, 0])
-                target_root_pos[:, 1] = pred_root_height.view(-1) - root_to_pelvis[:, 1]
-            else:
-                target_root_pos[:, 1] = 0.0
-                offsets = offsets.clone()
-                offsets[:, 0, 1] = pred_root_height.view(-1)
+            # root-y0 schema 中 actor root y 永远为 0，高度通道只驱动 pelvis/root bone 的 local offset y。
+            target_root_pos[:, 1] = 0.0
+            offsets = offsets.clone()
+            offsets[:, 0, 1] = pred_root_height.view(-1)
 
         if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
             pred_joints, pred_global_rot = fk_body_fbx_local_torch(

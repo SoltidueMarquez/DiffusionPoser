@@ -174,6 +174,7 @@ def fk_body_fbx_local_delta(
     actor_root_pos_world: np.ndarray,
     root_heading: np.ndarray,
     rest: BodyFbxRest,
+    local_offsets: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """body.fbx local delta FK，输入 `[T,144]`，输出 world positions/rotations。"""
 
@@ -188,6 +189,12 @@ def fk_body_fbx_local_delta(
         raise ValueError(f"actor_root_pos_world 应为 [T,3]，实际为 {root_pos.shape}")
     if headings.shape != (pose.shape[0],):
         raise ValueError(f"root_heading 应为 [T]，实际为 {headings.shape}")
+    if local_offsets is None:
+        offsets = np.repeat(rest.rest_local_positions.astype(np.float64)[None], pose.shape[0], axis=0)
+    else:
+        offsets = np.asarray(local_offsets, dtype=np.float64)
+        if offsets.shape != (pose.shape[0], SMPL_JOINT_COUNT, 3):
+            raise ValueError(f"local_offsets 应为 [T,{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
 
     delta = rotation_6d_to_matrix_np(pose.reshape(pose.shape[0], SMPL_JOINT_COUNT, 6))
     delta[:, 0] = IDENTITY_3X3
@@ -196,15 +203,49 @@ def fk_body_fbx_local_delta(
     positions = np.zeros((pose.shape[0], SMPL_JOINT_COUNT, 3), dtype=np.float64)
     rotations = np.zeros((pose.shape[0], SMPL_JOINT_COUNT, 3, 3), dtype=np.float64)
     for bone_index, parent_index in enumerate(rest.parents.tolist()):
-        local_offset = rest.rest_local_positions[bone_index].astype(np.float64)
+        local_offset = offsets[:, bone_index]
         if parent_index < 0:
             rotations[:, bone_index] = heading_rot @ local_rot[:, bone_index]
-            positions[:, bone_index] = root_pos + np.einsum("tij,j->ti", heading_rot, local_offset)
+            positions[:, bone_index] = root_pos + np.einsum("tij,tj->ti", heading_rot, local_offset)
         else:
             parent_rot = rotations[:, parent_index]
             rotations[:, bone_index] = parent_rot @ local_rot[:, bone_index]
-            positions[:, bone_index] = positions[:, parent_index] + np.einsum("tij,j->ti", parent_rot, local_offset)
+            positions[:, bone_index] = positions[:, parent_index] + np.einsum("tij,tj->ti", parent_rot, local_offset)
     return positions.astype(np.float32), rotations.astype(np.float32)
+
+
+def fk_body_fbx_local_delta_root_y0(
+    body_pose_local_delta_6d: np.ndarray,
+    actor_root_pos_world: np.ndarray,
+    root_heading: np.ndarray,
+    pelvis_height: np.ndarray,
+    rest: BodyFbxRest,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    root-y0 body.fbx FK。
+
+    `actor_root_pos_world` 的 y 固定为 0；`pelvis_height` 表示 pelvis 世界高度，
+    因此 FK 前把第 0 个 bone 的 local offset y 动态替换为逐帧 pelvis 高度。
+    输入形状：pose `[T,144]`，root `[T,3]`，heading `[T]`，pelvis_height `[T]` 或 `[T,1]`。
+    """
+
+    pose = np.asarray(body_pose_local_delta_6d)
+    root_pos = np.asarray(actor_root_pos_world, dtype=np.float32).copy()
+    height = np.asarray(pelvis_height, dtype=np.float32).reshape(-1)
+    if pose.ndim != 2:
+        raise ValueError(f"body_pose_local_delta_6d 应为 [T,144]，实际为 {pose.shape}")
+    if height.shape != (pose.shape[0],):
+        raise ValueError(f"pelvis_height 应为 [T] 或 [T,1]，实际为 {np.asarray(pelvis_height).shape}")
+    root_pos[:, 1] = 0.0
+    offsets = np.repeat(rest.rest_local_positions.astype(np.float32)[None], pose.shape[0], axis=0)
+    offsets[:, 0, 1] = height
+    return fk_body_fbx_local_delta(
+        body_pose_local_delta_6d=pose,
+        actor_root_pos_world=root_pos,
+        root_heading=root_heading,
+        rest=rest,
+        local_offsets=offsets,
+    )
 
 
 def _read_vec3_array(payload: dict[str, Any], key: str, count: int) -> np.ndarray:

@@ -1,12 +1,12 @@
 """
 把 AMASS SMPL/SMPL-H 动作转换为 realtime_pose 源数据。
-
-默认生成当前主链路 `realtime_pose_body_fbx_local_v1`。
+默认生成当前主链路 `realtime_pose_body_fbx_local_root_y0_v1`。
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ from data_loaders.body_fbx_kinematics import (
     BodyFbxRest,
     actor_root_positions_from_pelvis,
     extract_root_heading_from_source_pelvis_up,
-    fk_body_fbx_local_delta,
+    fk_body_fbx_local_delta_root_y0,
     load_body_fbx_rest,
     source_global_rotations_to_body_fbx_local_delta_6d,
 )
@@ -45,14 +45,19 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_forward_up_np,
     wrap_radians,
 )
+from data_loaders.realtime_pose_contract import (
+    load_source_metadata,
+    required_realtime_source_fields,
+    validate_realtime_source_contract,
+    validate_root_y0_invariants,
+    validate_schema_metadata,
+)
 from data_loaders.sensor_masking import (
-    LEGACY_BODY_POSE_PARENT_KEY,
     POSE_REPRESENTATION_KEY,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAMES,
     get_schema_spec,
-    validate_pose_representation,
 )
 
 
@@ -60,9 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
     parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
-    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=Path)
+    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=Path)
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
+    parser.add_argument("--num_workers", default=1, type=int)
+    parser.add_argument("--worker_torch_threads", default=1, type=int)
     parser.add_argument("--limit", default=0, type=int)
     parser.add_argument("--mirror", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -82,6 +89,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+_WORKER_ARGS: argparse.Namespace | None = None
+_WORKER_MODEL_CACHE: SmplModelCache | None = None
+
+
+def validate_converter_args(args: argparse.Namespace) -> None:
+    validate_shared_args(args)
+    if int(args.num_workers) <= 0:
+        raise ValueError("--num_workers 必须为正整数")
+    if int(args.worker_torch_threads) < 0:
+        raise ValueError("--worker_torch_threads 必须大于等于 0")
+
+
+def build_conversion_work_items(args: argparse.Namespace, motion_files: list[Path]) -> list[tuple[Path, bool]]:
+    mirror_variants = (False, True) if args.mirror else (False,)
+    return [(path, mirror_variant) for path in motion_files for mirror_variant in mirror_variants]
+
+
+def copy_args_for_worker(args: argparse.Namespace) -> argparse.Namespace:
+    payload = dict(vars(args))
+    payload.pop("_body_fbx_rest", None)
+    return argparse.Namespace(**payload)
+
+
+def init_conversion_worker(args: argparse.Namespace, torch_threads: int) -> None:
+    global _WORKER_ARGS, _WORKER_MODEL_CACHE
+    _WORKER_ARGS = args
+    _WORKER_MODEL_CACHE = SmplModelCache(model_dir=args.smpl_model_dir)
+    configure_worker_torch_threads(torch_threads)
+
+
+def configure_worker_torch_threads(torch_threads: int) -> None:
+    if int(torch_threads) <= 0:
+        return
+    import torch
+
+    # Limit per-process Torch threads to avoid CPU oversubscription.
+    torch.set_num_threads(int(torch_threads))
+    try:
+        torch.set_num_interop_threads(max(1, int(torch_threads)))
+    except RuntimeError:
+        pass
+
+
+def convert_work_item_in_worker(item: tuple[Path, bool]) -> dict[str, Any]:
+    global _WORKER_MODEL_CACHE
+    if _WORKER_ARGS is None:
+        raise RuntimeError("converter worker 尚未初始化 args")
+    if _WORKER_MODEL_CACHE is None:
+        _WORKER_MODEL_CACHE = SmplModelCache(model_dir=_WORKER_ARGS.smpl_model_dir)
+    path, mirror_variant = item
+    return convert_one_motion_safely(
+        path=path,
+        args=_WORKER_ARGS,
+        model_cache=_WORKER_MODEL_CACHE,
+        mirror_variant=mirror_variant,
+    )
+
+
 def output_path_for(source: MotionSource, output_dir: Path) -> Path:
     return output_dir / source.relative_path.with_suffix(".npz")
 
@@ -92,7 +157,7 @@ def build_realtime_pose_features(
     target_fps: float = 60.0,
     body_fbx_rest: BodyFbxRest | None = None,
 ) -> dict[str, np.ndarray]:
-    """构建 realtime_pose_v2 源字段。"""
+    """构建当前 realtime_pose source 字段。"""
 
     schema = get_schema_spec(schema_name)
     joint_positions = smpl_motion.joint_positions.astype(np.float64)
@@ -110,10 +175,13 @@ def build_realtime_pose_features(
             root_heading=root_yaw,
             pelvis_rest_local_position=body_fbx_rest.pelvis_local_position,
         )
-        joints_world, joint_rotations_world = fk_body_fbx_local_delta(
+        root_pos_world[:, 1] = 0.0
+        pelvis_height = pelvis_world[:, 1:2].astype(np.float32)
+        joints_world, joint_rotations_world = fk_body_fbx_local_delta_root_y0(
             body_pose_local_delta_6d=body_pose_6d,
             actor_root_pos_world=root_pos_world,
             root_heading=root_yaw,
+            pelvis_height=pelvis_height,
             rest=body_fbx_rest,
         )
         tracker_pos_world = joints_world[:, body_fbx_rest.tracker_joint_indices].astype(np.float32)
@@ -190,6 +258,8 @@ def save_realtime_pose_motion(
     metadata = {
         "schema_name": schema_name,
         "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
         "source_path": str(source.path),
         "source_relative_path": str(source.relative_path),
         "original_source_relative_path": str(source.original_relative_path or source.relative_path),
@@ -260,6 +330,8 @@ def record_for_output(
         "status": status,
         "schema_name": schema.name,
         "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
         "source_path": str(metadata.get("source_path", path)),
         "source_relative_path": str(source_relative_path),
         "original_source_relative_path": str(metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
@@ -284,43 +356,22 @@ def load_reusable_realtime_features(
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     schema = get_schema_spec(schema_name)
     with np.load(reuse_path, allow_pickle=False) as data:
-        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
-            raise ValueError(f"{reuse_path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate source data.")
+        validate_realtime_source_contract(data, schema=schema, source=str(reuse_path))
+        metadata = load_source_metadata(data, source=str(reuse_path))
+        validate_schema_metadata(metadata, schema=schema, source=str(reuse_path))
         required = required_source_fields(schema_name)
-        missing = sorted(required.difference(data.files))
-        if missing:
-            raise KeyError(f"{reuse_path} 不能作为 realtime source 复用，缺少字段：{missing}")
-        validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(reuse_path))
         features = {
             key: np.asarray(data[key]).astype(np.float32, copy=True)
             for key in required
             if key != POSE_REPRESENTATION_KEY
         }
         features[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
-        metadata = load_metadata_from_npz(data)
+        validate_root_y0_invariants(features, schema=schema, source=str(reuse_path))
     return features, metadata
 
 
 def required_source_fields(schema_name: str) -> set[str]:
-    schema = get_schema_spec(schema_name)
-    required = {
-        schema.body_pose_key,
-        POSE_REPRESENTATION_KEY,
-        "root_pos_world",
-        "root_yaw",
-        schema.root_heading_delta_key,
-        "tracker_pos_world",
-        "tracker_rot_world_6d",
-        "joints_world",
-        "joint_offsets_parent",
-    }
-    if schema.supports_root_motion:
-        required.update({"root_delta_xz_ref", schema.pelvis_height_key})
-    if schema.supports_contact:
-        required.add("foot_contact")
-    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-        required.add("joint_rest_local_rotations_6d")
-    return required
+    return required_realtime_source_fields(schema_name)
 
 
 def realtime_source_has_schema(path: Path, schema_name: str) -> bool:
@@ -328,13 +379,9 @@ def realtime_source_has_schema(path: Path, schema_name: str) -> bool:
         return False
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
-        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
-            return False
-        if not required_source_fields(schema_name).issubset(data.files):
-            return False
         try:
-            validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
-        except ValueError:
+            validate_realtime_source_contract(data, schema=schema, source=str(path))
+        except (KeyError, ValueError):
             return False
         return True
 
@@ -350,11 +397,15 @@ def save_reused_realtime_source(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
     schema = get_schema_spec(str(args.schema))
+    validate_schema_metadata(metadata, schema=schema, source=str(output_path))
+    validate_root_y0_invariants(features, schema=schema, source=str(output_path))
     next_metadata = dict(metadata)
     next_metadata.update(
         {
             "schema_name": schema.name,
             "pose_representation": schema.pose_representation,
+            "root_y_policy": schema.root_y_policy,
+            "pelvis_height_mode": schema.pelvis_height_mode,
             "source_path": str(next_metadata.get("source_path", path)),
             "source_relative_path": str(next_metadata.get("source_relative_path", relative_path)),
             "original_source_relative_path": str(next_metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
@@ -443,9 +494,9 @@ def convert_one_motion(
                 mirror_variant=mirror_variant,
                 status="upgraded_existing_source",
             )
-        raise ValueError(f"已有 source 不满足 {args.schema}：{output_path}，请使用 --overwrite 或 --rebuild_manifest。")
+        raise ValueError(f"已有 source 不满足 {args.schema}: {output_path}，请使用 --overwrite 或 --rebuild_manifest。")
     elif output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"输出文件已存在：{output_path}，请使用 --overwrite 或 --skip_existing。")
+        raise FileExistsError(f"输出文件已存在: {output_path}，请使用 --overwrite 或 --skip_existing。")
 
     reused_record = try_reuse_existing_realtime_source(
         path=path,
@@ -483,9 +534,89 @@ def convert_one_motion(
     )
 
 
+def failed_record_for_exception(
+    path: Path,
+    args: argparse.Namespace,
+    mirror_variant: bool,
+    exc: Exception,
+) -> dict[str, Any]:
+    source_relative_path = path.relative_to(args.amass_dir)
+    if mirror_variant:
+        source_relative_path = Path(MIRROR_DIR_NAME) / source_relative_path
+    schema = get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)))
+    return {
+        "status": "failed",
+        "schema_name": schema.name,
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "source_path": str(path),
+        "source_relative_path": str(source_relative_path),
+        "stablemotion_split_key": str(source_relative_path.with_suffix(".npy")).replace("\\", "/"),
+        "is_mirrored": bool(mirror_variant),
+        "error": repr(exc),
+    }
+
+
+def convert_one_motion_safely(
+    path: Path,
+    args: argparse.Namespace,
+    model_cache: SmplModelCache,
+    mirror_variant: bool = False,
+) -> dict[str, Any]:
+    try:
+        return convert_one_motion(
+            path=path,
+            args=args,
+            model_cache=model_cache,
+            mirror_variant=mirror_variant,
+        )
+    except Exception as exc:
+        return failed_record_for_exception(
+            path=path,
+            args=args,
+            mirror_variant=mirror_variant,
+            exc=exc,
+        )
+
+
+def iter_conversion_records(
+    args: argparse.Namespace,
+    work_items: list[tuple[Path, bool]],
+):
+    progress = tqdm(
+        total=len(work_items),
+        desc=f"Converting AMASS to {args.schema}",
+    )
+    try:
+        if int(args.num_workers) <= 1:
+            model_cache = SmplModelCache(model_dir=args.smpl_model_dir)
+            for path, mirror_variant in work_items:
+                yield convert_one_motion_safely(
+                    path=path,
+                    args=args,
+                    model_cache=model_cache,
+                    mirror_variant=mirror_variant,
+                )
+                progress.update(1)
+            return
+
+        worker_args = copy_args_for_worker(args)
+        with ProcessPoolExecutor(
+            max_workers=int(args.num_workers),
+            initializer=init_conversion_worker,
+            initargs=(worker_args, int(args.worker_torch_threads)),
+        ) as executor:
+            for record in executor.map(convert_work_item_in_worker, work_items, chunksize=1):
+                yield record
+                progress.update(1)
+    finally:
+        progress.close()
+
+
 def main(argv: list[str] | None = None) -> dict[str, int]:
     args = parse_args(argv)
-    validate_shared_args(args)
+    validate_converter_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "manifest.jsonl"
     if (args.overwrite or args.rebuild_manifest) and manifest_path.exists():
@@ -494,42 +625,24 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
     motion_files = iter_amass_motion_files(args.amass_dir)
     if args.limit:
         motion_files = motion_files[: args.limit]
-    model_cache = SmplModelCache(model_dir=args.smpl_model_dir)
+    work_items = build_conversion_work_items(args=args, motion_files=motion_files)
 
     converted = reused = skipped = failed = 0
     failed_records: list[dict[str, Any]] = []
-    for path in tqdm(motion_files, desc=f"Converting AMASS to {args.schema}"):
-        mirror_variants = (False, True) if args.mirror else (False,)
-        for mirror_variant in mirror_variants:
-            try:
-                record = convert_one_motion(path=path, args=args, model_cache=model_cache, mirror_variant=mirror_variant)
-            except Exception as exc:
-                failed += 1
-                source_relative_path = path.relative_to(args.amass_dir)
-                if mirror_variant:
-                    source_relative_path = Path(MIRROR_DIR_NAME) / source_relative_path
-                record = {
-                    "status": "failed",
-                    "schema_name": str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
-                    "pose_representation": get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))).pose_representation,
-                    "source_path": str(path),
-                    "source_relative_path": str(source_relative_path),
-                    "stablemotion_split_key": str(source_relative_path.with_suffix(".npy")).replace("\\", "/"),
-                    "is_mirrored": bool(mirror_variant),
-                    "error": repr(exc),
-                }
-                failed_records.append(record)
-            else:
-                if record["status"] == "converted":
-                    converted += 1
-                elif record["status"] in {"reused_source", "upgraded_existing_source"}:
-                    reused += 1
-                else:
-                    skipped += 1
-            write_manifest_record(manifest_path, record)
+    for record in iter_conversion_records(args=args, work_items=work_items):
+        if record["status"] == "converted":
+            converted += 1
+        elif record["status"] in {"reused_source", "upgraded_existing_source"}:
+            reused += 1
+        elif record["status"] == "failed":
+            failed += 1
+            failed_records.append(record)
+        else:
+            skipped += 1
+        write_manifest_record(manifest_path, record)
 
     print(
-        f"完成 AMASS -> {args.schema} 转换：converted={converted}, "
+        f"完成 AMASS -> {args.schema} 转换: converted={converted}, "
         f"reused={reused}, skipped={skipped}, failed={failed}, manifest={manifest_path}"
     )
     if failed_records and not args.allow_partial:
@@ -539,7 +652,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         )
         raise RuntimeError(
             f"AMASS 转换存在 {len(failed_records)} 个失败样本，默认停止以避免下游使用部分数据。"
-            f"示例：{preview}。如确认可接受部分数据，请添加 --allow_partial。"
+            f"示例: {preview}。如确认可接受部分数据，请添加 --allow_partial。"
         )
     return {"converted": converted, "reused": reused, "skipped": skipped, "failed": failed}
 

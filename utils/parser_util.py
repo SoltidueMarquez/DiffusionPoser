@@ -6,7 +6,6 @@ from pathlib import Path
 
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     TASK_MODE_REALTIME_POSE,
     TASK_MODES,
@@ -16,8 +15,11 @@ from data_loaders.sensor_masking import (
 )
 
 
+TRAIN_REALTIME_POSE_SCHEMA_NAMES = (DEFAULT_REALTIME_POSE_SCHEMA_NAME,)
+
+
 def train_args():
-    parser = ArgumentParser(description="Train a realtime_pose_v2 diffusion reconstruction model.")
+    parser = ArgumentParser(description="Train a realtime_pose_body_fbx_local_root_y0_v1 diffusion reconstruction model.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -71,10 +73,10 @@ def add_data_options(parser: ArgumentParser):
     group = parser.add_argument_group("dataset")
     default_schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
     group.add_argument("--task_mode", default=TASK_MODE_REALTIME_POSE, choices=TASK_MODES, type=str)
-    group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
+    group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=TRAIN_REALTIME_POSE_SCHEMA_NAMES, type=str)
     group.add_argument("--data_dir", required=True, type=str, help="realtime_pose materialized task 目录。")
     group.add_argument("--data_split", default="train", type=str)
-    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_v2_60hz", type=str)
+    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
     group.add_argument("--normalize_input", default=True, type=str2bool)
     group.add_argument("--preload_data", default=False, type=str2bool)
     group.add_argument("--input_feats", default=default_schema.feature_dim, type=int)

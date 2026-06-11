@@ -11,12 +11,14 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
+from data_loaders.realtime_pose_contract import (
+    required_realtime_source_fields,
+    validate_realtime_source_contract,
+)
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    LEGACY_BODY_POSE_PARENT_KEY,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_KEY,
-    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -38,15 +40,6 @@ from data_loaders.sensor_masking import (
 from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
-SOURCE_KEYS = {
-    POSE_REPRESENTATION_KEY,
-    "root_pos_world",
-    "root_yaw",
-    "tracker_pos_world",
-    "tracker_rot_world_6d",
-    "joints_world",
-    "joint_offsets_parent",
-}
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
 USABLE_SOURCE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
 SHORT_SOURCE_POLICY_SKIP = "skip"
@@ -77,8 +70,8 @@ class TaskGenerationPlan:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_v2_60hz", type=str)
-    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_v2_60hz_tasks", type=str)
+    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
+    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
 
     task = parser.add_argument_group("task")
@@ -125,7 +118,6 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
 
     这样 split 配错、source 不存在或没有匹配样本时，不会留下空 output_dir 或 marker。
     """
-
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
@@ -137,7 +129,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     output_dir = timestamped_child_dir(output_root, resolve_task_run_label(args))
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     if not source_dir.exists():
-        raise FileNotFoundError(f"{args.schema} 源目录不存在：{source_dir}")
+        raise FileNotFoundError(f"{args.schema} 源目录不存在: {source_dir}")
 
     source_entries = read_source_entries(source_dir, schema_name=str(args.schema))
     if not source_entries:
@@ -203,6 +195,8 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             "task_root": str(plan.output_root),
             "schema_name": str(args.schema),
             "pose_representation": get_schema_spec(str(args.schema)).pose_representation,
+            "root_y_policy": get_schema_spec(str(args.schema)).root_y_policy,
+            "pelvis_height_mode": get_schema_spec(str(args.schema)).pelvis_height_mode,
             "source_dir": str(plan.source_dir),
             "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
             "splits": [split_plan.split for split_plan in plan.split_plans],
@@ -236,32 +230,30 @@ def prepare_task_output_dir(
 
 
 def validate_task_output_root_available(source_dir: Path, output_root: Path) -> None:
-    """校验时间戳产物根目录，避免把源数据目录或陌生非空目录当作 task root。"""
+    """校验 task 根目录，避免把源数据目录或陌生非空目录当作 task root。"""
 
     if output_root == source_dir:
-        raise ValueError(f"output_dir 不能与 source_dir 相同：{output_root}")
+        raise ValueError(f"output_dir 不能和 source_dir 相同: {output_root}")
     try:
         source_inside_output_root = source_dir.is_relative_to(output_root)
     except AttributeError:
         source_inside_output_root = str(source_dir).startswith(str(output_root))
     if source_inside_output_root:
-        raise ValueError(
-            f"output_dir 根目录不能包含 source_dir：output_dir={output_root}, source_dir={source_dir}"
-        )
+        raise ValueError(f"output_dir 根目录不能包含 source_dir: output_dir={output_root}, source_dir={source_dir}")
     protected_names = {"dataset", "runs", "save", "output"}
     if output_root.name in protected_names:
-        raise ValueError(f"拒绝把仓库级产物目录直接作为 task 根目录：{output_root}")
+        raise ValueError(f"拒绝把仓库级产物目录直接作为 task 根目录: {output_root}")
     if not output_root.exists():
         return
     if not output_root.is_dir():
-        raise NotADirectoryError(f"output_dir 必须是目录：{output_root}")
+        raise NotADirectoryError(f"output_dir 必须是目录: {output_root}")
     children = list(output_root.iterdir())
     if not children:
         return
     if (output_root / "latest_tasks.json").exists() or (output_root / "latest_tasks.txt").exists():
         return
     raise ValueError(
-        f"拒绝使用非空且没有 latest_tasks 指针的 output_dir 根目录：{output_root}。"
+        f"拒绝使用非空且没有 latest_tasks 指针的 output_dir 根目录: {output_root}。"
         "请换一个目录，或先确认并清理旧内容。"
     )
 
@@ -272,25 +264,25 @@ def validate_task_output_dir_available(source_dir: Path, output_dir: Path, overw
     if not output_dir.exists():
         return
     if not overwrite:
-        raise FileExistsError(f"输出目录已存在：{output_dir}，如需重建请添加 --overwrite")
+        raise FileExistsError(f"输出目录已存在: {output_dir}，如需重建请添加 --overwrite")
     validate_task_output_dir_for_overwrite(source_dir=source_dir, output_dir=output_dir)
 
 
 def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -> None:
-    """禁止 `--overwrite` 删除源数据目录、仓库级目录或未知非空目录。"""
+    """禁止 --overwrite 删除源数据目录、仓库级目录或未知非空目录。"""
 
     if output_dir == source_dir:
-        raise ValueError(f"output_dir 不能与 source_dir 相同：{output_dir}")
+        raise ValueError(f"output_dir 不能和 source_dir 相同: {output_dir}")
     try:
         source_inside_output = source_dir.is_relative_to(output_dir)
     except AttributeError:
         source_inside_output = str(source_dir).startswith(str(output_dir))
     if source_inside_output:
-        raise ValueError(f"output_dir 不能是 source_dir 的上级目录：output_dir={output_dir}, source_dir={source_dir}")
+        raise ValueError(f"output_dir 不能是 source_dir 的上级目录: output_dir={output_dir}, source_dir={source_dir}")
 
     protected_names = {"dataset", "runs", "save", "output"}
     if output_dir.name in protected_names:
-        raise ValueError(f"拒绝覆盖仓库级产物目录：{output_dir}")
+        raise ValueError(f"拒绝覆盖仓库级产物目录: {output_dir}")
 
     children = list(output_dir.iterdir())
     if not children:
@@ -298,13 +290,13 @@ def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -
     marker_path = output_dir / TASK_OUTPUT_MARKER
     if not marker_path.exists():
         raise ValueError(
-            f"拒绝覆盖没有 {TASK_OUTPUT_MARKER} 标记的非空目录：{output_dir}。"
+            f"拒绝覆盖没有 {TASK_OUTPUT_MARKER} 标记的非空目录: {output_dir}。"
             "请确认路径无误后手动清理，或选择新的 output_dir。"
         )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     schema = get_schema_spec(marker.get("schema_name"))
     if marker.get("task_format") != schema.task_format:
-        raise ValueError(f"output_dir 标记不是合法 realtime_pose task 目录：{marker_path}")
+        raise ValueError(f"output_dir 标记不是合法 realtime_pose task 目录: {marker_path}")
     validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
 
 
@@ -314,6 +306,8 @@ def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path
         "schema_name": schema.name,
         "task_format": schema.task_format,
         POSE_REPRESENTATION_KEY: schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
         "source_dir": str(source_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
@@ -387,7 +381,7 @@ def read_split_keys(split_dir: Path | None, split: str) -> set[str] | None:
         return None
     path = split_dir / f"{split}.txt"
     if not path.exists():
-        raise FileNotFoundError(f"找不到 split 文件：{path}")
+        raise FileNotFoundError(f"找不到 split 文件: {path}")
     return {normalize_split_key(line) for line in path.read_text(encoding="utf-8").splitlines() if normalize_split_key(line)}
 
 
@@ -450,6 +444,16 @@ def generate_split_tasks(
             for sample_index in range(int(args.samples_per_file)):
                 start_frame = int(rng.integers(0, source_frames - REALTIME_POSE_SEQ_LEN + 1))
                 clip = clip_source(source, start_frame=start_frame, seq_len=REALTIME_POSE_SEQ_LEN)
+                task_arrays = dict(clip)
+                task_arrays.update(
+                    {
+                        "schema_name": np.asarray(schema.name),
+                        "task_format": np.asarray(schema.task_format),
+                        POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
+                        "root_y_policy": np.asarray(schema.root_y_policy),
+                        "pelvis_height_mode": np.asarray(schema.pelvis_height_mode),
+                    }
+                )
                 patterns = build_window_patterns(rng=rng, args=args)
                 for pattern_index, pattern in enumerate(patterns):
                     sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=REALTIME_POSE_SEQ_LEN)
@@ -466,10 +470,12 @@ def generate_split_tasks(
                     save_task_npz(
                         task_path=task_path,
                         compress=bool(args.compress_tasks),
-                        **clip,
+                        **task_arrays,
                         sensor_valid=sensor_valid,
                         inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
                         start_frame=np.int64(start_frame),
+                        target_start=np.int64(REALTIME_POSE_TARGET_START),
+                        target_length=np.int64(REALTIME_POSE_TARGET_LENGTH),
                         valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
                         source_frames=np.int64(source_frames),
                         seq_len=np.int64(REALTIME_POSE_SEQ_LEN),
@@ -489,6 +495,8 @@ def generate_split_tasks(
                         "task_format": schema.task_format,
                         "schema_name": schema.name,
                         POSE_REPRESENTATION_KEY: schema.pose_representation,
+                        "root_y_policy": schema.root_y_policy,
+                        "pelvis_height_mode": schema.pelvis_height_mode,
                         "task_mode": TASK_MODE_REALTIME_POSE,
                         "target_start": REALTIME_POSE_TARGET_START,
                         "target_length": REALTIME_POSE_TARGET_LENGTH,
@@ -560,48 +568,14 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
 def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
-        if LEGACY_BODY_POSE_PARENT_KEY in data.files:
-            raise ValueError(f"{path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate source data.")
-        required_keys = set(SOURCE_KEYS)
-        required_keys.add(schema.body_pose_key)
-        required_keys.add(schema.root_heading_delta_key)
-        if schema.supports_root_motion:
-            required_keys.update({"root_delta_xz_ref", schema.pelvis_height_key})
-        if schema.supports_contact:
-            required_keys.add("foot_contact")
-        if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-            required_keys.add("joint_rest_local_rotations_6d")
-        missing = sorted(required_keys.difference(data.files))
-        if missing:
-            raise KeyError(f"{path} 缺少 {schema.name} 源字段：{missing}")
-        validate_pose_representation(data[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
+        validate_realtime_source_contract(data, schema=schema, source=str(path))
+        required_keys = required_realtime_source_fields(schema)
         source = {
             key: data[key].astype(np.float32, copy=True)
             for key in required_keys
             if key != POSE_REPRESENTATION_KEY
         }
         source[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
-    frame_count = source[schema.body_pose_key].shape[0]
-    expected_shapes = {
-        schema.body_pose_key: (frame_count, 144),
-        "root_pos_world": (frame_count, 3),
-        "root_yaw": (frame_count,),
-        schema.root_heading_delta_key: (frame_count, 2),
-        "tracker_pos_world": (frame_count, 6, 3),
-        "tracker_rot_world_6d": (frame_count, 6, 6),
-        "joints_world": (frame_count, 24, 3),
-        "joint_offsets_parent": (24, 3),
-    }
-    if schema.supports_root_motion:
-        expected_shapes["root_delta_xz_ref"] = (frame_count, 2)
-        expected_shapes[schema.pelvis_height_key] = (frame_count, 1)
-    if schema.supports_contact:
-        expected_shapes["foot_contact"] = (frame_count, 2)
-    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-        expected_shapes["joint_rest_local_rotations_6d"] = (24, 6)
-    for key, shape in expected_shapes.items():
-        if tuple(source[key].shape) != shape:
-            raise ValueError(f"{path} 字段 {key} 应为 {shape}，实际为 {tuple(source[key].shape)}")
     return source
 
 

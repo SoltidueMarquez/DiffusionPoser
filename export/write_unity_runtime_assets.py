@@ -71,7 +71,7 @@ def build_realtime_pose_feature_schema(
 
     is_body_fbx_local = schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D
     payload = {
-        "schemaVersion": 3 if is_body_fbx_local else 2,
+        "schemaVersion": 4 if is_body_fbx_local else 2,
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
         "featureDim": schema.feature_dim,
@@ -101,6 +101,8 @@ def build_realtime_pose_feature_schema(
         "sensorValid": {"name": "sensor_valid", "start": schema.sensor_valid_start, "length": SENSOR_VALID_DIM},
         "runtimeRules": {
             "poseRepresentation": schema.pose_representation,
+            "rootPositionY": schema.root_y_policy,
+            "pelvisHeightApplication": schema.pelvis_height_mode,
             "requiresHipTracker": True,
             "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
             "trackerReferenceYaw": "previous_frame_root_heading" if is_body_fbx_local else "previous_frame_root_yaw",
@@ -139,6 +141,8 @@ def build_ddim_schedule(
         "schemaVersion": 1,
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
+        "rootYPolicy": schema.root_y_policy,
+        "pelvisHeightMode": schema.pelvis_height_mode,
         "trainStepCount": int(diffusion_steps),
         "noiseSchedule": str(noise_schedule),
         "predictXStart": True,
@@ -161,6 +165,16 @@ def validate_normalizer_metadata(normalizer_dir: Path, schema_name: str) -> dict
     feature_dim = int(meta.get("feature_dim", -1))
     if feature_dim != schema.feature_dim:
         raise ValueError(f"normalizer feature_dim={feature_dim}, expected {schema.feature_dim}.")
+    if "root_y_policy" not in meta:
+        raise ValueError(f"normalizer metadata 缺少 root_y_policy: {meta_path}")
+    if str(meta["root_y_policy"]) != schema.root_y_policy:
+        raise ValueError(f"normalizer root_y_policy={meta.get('root_y_policy')!r}, expected {schema.root_y_policy!r}.")
+    if "pelvis_height_mode" not in meta:
+        raise ValueError(f"normalizer metadata 缺少 pelvis_height_mode: {meta_path}")
+    if str(meta["pelvis_height_mode"]) != schema.pelvis_height_mode:
+        raise ValueError(
+            f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {schema.pelvis_height_mode!r}."
+        )
     return meta
 
 
@@ -206,6 +220,8 @@ def build_normalizer(
         "enabled": True,
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
+        "rootYPolicy": schema.root_y_policy,
+        "pelvisHeightMode": schema.pelvis_height_mode,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [float(value) for value in mean.astype(np.float32).tolist()],
@@ -223,6 +239,8 @@ def disabled_normalizer(
         "enabled": False,
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
+        "rootYPolicy": schema.root_y_policy,
+        "pelvisHeightMode": schema.pelvis_height_mode,
         "featureDim": int(feature_dim),
         "epsilon": float(epsilon),
         "mean": [0.0] * int(feature_dim),

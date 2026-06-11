@@ -190,6 +190,31 @@ def test_sensor_reprojection_pos_loss_ignores_hip_tracker_error():
     assert torch.allclose(losses["sensor_reprojection_pos_loss"], torch.zeros(1))
 
 
+def test_sensor_reprojection_uses_root_y0_pelvis_height_offset():
+    diffusion = _make_loss_test_diffusion()
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    target_tracker_pos_ref = torch.zeros(1, TRACKER_COUNT, 3)
+    target_tracker_pos_ref[:, 0] = torch.tensor([0.0, 0.9, 0.0])
+    target_sensor_valid = torch.zeros(1, TRACKER_COUNT, dtype=torch.bool)
+    target_sensor_valid[:, [HIP_TRACKER_INDEX, 0]] = True
+    pred_xstart, x_start, model_kwargs = _make_sensor_reprojection_aux_inputs(
+        target_tracker_pos_ref=target_tracker_pos_ref,
+        target_sensor_valid=target_sensor_valid,
+    )
+    pred_xstart[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.9
+    x_start[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.9
+    model_kwargs["y"]["joint_offsets_parent"][:, 0, 1] = 0.2
+
+    losses = diffusion._realtime_pose_aux_losses(
+        pred_xstart,
+        x_start,
+        model_kwargs,
+        timesteps=torch.zeros(1, dtype=torch.long),
+    )
+
+    assert torch.allclose(losses["sensor_reprojection_pos_loss"], torch.zeros(1), atol=1e-6)
+
+
 def test_sensor_reprojection_pos_loss_is_larger_at_low_noise_timestep():
     diffusion = _make_loss_test_diffusion()
     target_tracker_pos_ref = torch.zeros(1, TRACKER_COUNT, 3)

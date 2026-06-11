@@ -4,8 +4,8 @@ import torch
 
 from data_loaders.sensor_masking import (
     REALTIME_POSE_INPUT_DIM,
+    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_TARGET_START,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     get_schema_spec,
 )
 from model.causal_attention import build_frame_causal_mask, build_target_dit_causal_mask
@@ -83,7 +83,7 @@ def test_diffusionposer_dit_prefix_output_does_not_depend_on_future_frames():
 
 def test_target_dit_target_output_does_not_depend_on_future_frames():
     torch.manual_seed(11)
-    schema = get_schema_spec(REALTIME_POSE_V2_CONTACT_SCHEMA_NAME)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     seq_len = REALTIME_POSE_TARGET_START + 5
     model = RealtimePoseTargetDiT(
         input_feats=schema.feature_dim,

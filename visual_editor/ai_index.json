@@ -1,13 +1,13 @@
 {
   "schema_name": "realtime_pose_studio_ai_index_v3",
-  "purpose": "Local realtime_pose_body_fbx_local_v1 source/task/result 3D viewer and task exporter.",
+  "purpose": "Local realtime_pose_body_fbx_local_root_y0_v1 source/task/result 3D viewer and task exporter.",
   "entrypoints": {
-    "api": "python -m visual_editor.server --source_dir dataset/AMASS_realtime_pose_body_fbx_local_60hz --data_dir dataset/AMASS_realtime_pose_body_fbx_local_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports",
+    "api": "python -m visual_editor.server --source_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz --data_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports",
     "frontend": "npm --prefix visual_editor run viewer:dev"
   },
   "data_contract": {
-    "source": "realtime_pose_body_fbx_local_v1 source npz contains body_pose_body_fbx_local_delta_6d, pose_representation=body_fbx_local_delta_6d, root_pos_world, root_yaw, root_heading_delta_sincos, root_delta_xz_ref, pelvis_height, foot_contact, tracker_pos_world, tracker_rot_world_6d, joints_world, joint_offsets_parent, joint_rest_local_rotations_6d.",
-    "task": "materialized_realtime_pose_body_fbx_local_v1 task defaults to full-tracker sensor_valid and contains source arrays plus inpaint_mask, start_frame, valid_length, source_frames, seq_len; fixed sparse patterns are export-only for eval/debug.",
+    "source": "realtime_pose_body_fbx_local_root_y0_v1 source npz contains body_pose_body_fbx_local_delta_6d, pose_representation=body_fbx_local_delta_6d, root_pos_world, root_yaw, root_heading_delta_sincos, root_delta_xz_ref, pelvis_height, foot_contact, tracker_pos_world, tracker_rot_world_6d, joints_world, joint_offsets_parent, joint_rest_local_rotations_6d.",
+    "task": "materialized_realtime_pose_body_fbx_local_root_y0_v1 task defaults to full-tracker sensor_valid and contains source arrays plus inpaint_mask, start_frame, valid_length, source_frames, seq_len; fixed sparse patterns are export-only for eval/debug.",
     "feature_dim": 211,
     "sequence_length": 61
   }

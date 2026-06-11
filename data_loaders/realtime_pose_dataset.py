@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from data_loaders.manifest_utils import filter_entries_by_folder_path
+from data_loaders.realtime_pose_contract import validate_realtime_task_contract
 from data_loaders.realtime_pose_kinematics import (
     make_yaw_rotation_np,
     rotation_6d_forward_up_np,
@@ -17,7 +18,6 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
-    LEGACY_BODY_POSE_PARENT_KEY,
     POSE_REPRESENTATION_KEY,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     HIP_TRACKER_INDEX,
@@ -60,7 +60,7 @@ class RandomContext:
 
 
 class RealtimePoseTaskDataset(Dataset):
-    """读取 realtime_pose materialized task 并输出 `[C,T]` 训练样本。"""
+    """读取 realtime_pose materialized task，并输出 `[C,T]` 训练样本。"""
 
     def __init__(
         self,
@@ -119,7 +119,7 @@ class RealtimePoseTaskDataset(Dataset):
         self.tracker_mask_seed = int(tracker_mask_seed)
         self.tracker_mask_fill = str(tracker_mask_fill)
         if self.tracker_mask_fill not in TRACKER_MASK_FILL_MODES:
-            raise ValueError(f"tracker_mask_fill 目前只支持 {TRACKER_MASK_FILL_MODES}，实际为 {tracker_mask_fill}")
+            raise ValueError(f"tracker_mask_fill 当前只支持 {TRACKER_MASK_FILL_MODES}，实际为 {tracker_mask_fill}")
         self.tracker_mask_categories = normalize_tracker_pattern_categories(tracker_mask_categories)
         self.epoch = 0
         self.access_index = 0
@@ -291,14 +291,7 @@ class RealtimePoseTaskDataset(Dataset):
         entry: dict,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """
-        用离线 rollout 预测 history 替换 GT history。
-
-        cache 文件以 `task_id.npz` 命名，只接受归一化空间的
-        `predicted_features_normalized`。这里故意不自动兼容 raw/features 字段，
-        避免把不同特征空间混进 `conditioned_x`。
-        """
-
+        """用离线 rollout 预测 history 替换 GT history，只接受 normalized 特征缓存。"""
         if self.predicted_history_cache_dir is None or self.predicted_history_prob <= 0:
             return conditioned
         if rng.random() >= self.predicted_history_prob:
@@ -308,7 +301,7 @@ class RealtimePoseTaskDataset(Dataset):
             raise KeyError("predicted history cache 需要 manifest entry 包含 task_id。")
         cache_path = self.predicted_history_cache_dir / f"{task_id}.npz"
         if not cache_path.exists():
-            raise FileNotFoundError(f"predicted history cache 不存在：{cache_path}")
+            raise FileNotFoundError(f"predicted history cache 不存在: {cache_path}")
         with np.load(cache_path, allow_pickle=False) as data:
             if "predicted_features_normalized" not in data.files:
                 raise KeyError(f"{cache_path} 缺少 predicted_features_normalized 字段。")
@@ -334,13 +327,11 @@ class RealtimePoseTaskDataset(Dataset):
         self.access_index = 0
 
     def next_random_context(self) -> RandomContext:
-        """
-        返回当前 Dataset 实例内的随机上下文。
+        """返回当前 Dataset 实例内的随机上下文。
 
         DataLoader 多 worker 会复制 Dataset 实例，因此把 worker_id 放进随机种子里，
-        可以避免每个 worker 生成完全相同的动态遮盖和增强序列。
+        避免每个 worker 生成完全相同的动态遮盖和增强序列。
         """
-
         worker_info = torch.utils.data.get_worker_info()
         worker_id = int(worker_info.id) if worker_info is not None else 0
         access_index = self.access_index
@@ -387,7 +378,7 @@ class RealtimePoseTaskDataset(Dataset):
         return result, pattern.category
 
     def dynamic_mask_category(self, entry: dict, index: int, random_context: RandomContext) -> str:
-        # 动态遮盖按“洗牌后的类别轮转”采样，既覆盖所有类别，又能由 seed 复现实验。
+        # 动态遮盖按“洗牌后的类别轮转”采样，既覆盖所有类别，又能用 seed 复现实验。
         categories = np.asarray(self.tracker_mask_categories, dtype=object)
         cycle_index = random_context.access_index // len(categories)
         position = random_context.access_index % len(categories)
@@ -437,7 +428,8 @@ def find_manifest_path(data_dir: Path, split: str) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"找不到 realtime_pose manifest，已尝试：{', '.join(str(path) for path in candidates)}")
+    tried = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"找不到 realtime_pose manifest，已尝试: {tried}")
 
 
 def read_task_manifest(manifest_path: Path) -> list[dict]:
@@ -456,41 +448,12 @@ def load_materialized_task_npz(
 ) -> dict[str, np.ndarray]:
     path = manifest_dir / task_path
     if not path.exists():
-        raise FileNotFoundError(f"realtime_pose task 文件不存在：{path}")
+        raise FileNotFoundError(f"realtime_pose task 文件不存在: {path}")
     with np.load(path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
     schema = get_schema_spec(schema_name)
-    if LEGACY_BODY_POSE_PARENT_KEY in task:
-        raise ValueError(f"{path} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate realtime_pose tasks.")
-    required = {
-        schema.body_pose_key,
-        POSE_REPRESENTATION_KEY,
-        "root_pos_world",
-        "root_yaw",
-        schema.root_heading_delta_key,
-        "tracker_pos_world",
-        "tracker_rot_world_6d",
-        "joints_world",
-        "joint_offsets_parent",
-        "sensor_valid",
-        "inpaint_mask",
-        "start_frame",
-        "valid_length",
-        "source_frames",
-        "seq_len",
-    }
-    if schema.supports_root_motion:
-        required.update({"root_delta_xz_ref", schema.pelvis_height_key})
-    if schema.supports_contact:
-        required.add("foot_contact")
-    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-        required.add("joint_rest_local_rotations_6d")
-    missing = sorted(required.difference(task))
-    if missing:
-        raise KeyError(f"{path} 缺少 {schema.name} 字段：{missing}")
-    validate_pose_representation(task[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path))
+    validate_realtime_task_contract(task, schema=schema, source=str(path))
     return task
-
 
 def load_realtime_task_arrays(
     task: dict[str, np.ndarray],
@@ -624,7 +587,7 @@ def augment_realtime_arrays(
     history_yaw_noise_std: float = 0.0,
     root_yaw_ref_noise_std: float = 0.0,
 ) -> dict[str, np.ndarray]:
-    """训练增强只改 tracker 条件；history pose/yaw 污染在 `conditioned_x` 上单独做。"""
+    """训练增强只改 tracker 条件，history pose/yaw 污染在 `conditioned_x` 上单独做。"""
 
     result = {key: value.copy() for key, value in arrays.items()}
     sensor_valid = result["sensor_valid"].copy()

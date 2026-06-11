@@ -5,6 +5,7 @@ import unittest
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
+from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from utils.parser_util import add_data_options, add_training_options
 
@@ -16,6 +17,7 @@ class TrainEntrypointTest(unittest.TestCase):
 
         args = parser.parse_args(["--data_dir", "dataset/tasks"])
 
+        self.assertEqual(args.schema, REALTIME_POSE_SCHEMA_NAME)
         self.assertEqual(args.history_pose_noise_std, 0.02)
         self.assertEqual(args.history_yaw_noise_std, 0.02)
         self.assertEqual(args.history_pose_dropout_prob, 0.05)
@@ -23,6 +25,13 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertEqual(args.tracker_latency_max_frames, 2)
         self.assertEqual(args.tracker_burst_dropout_prob, 0.05)
         self.assertEqual(args.tracker_outlier_prob, 0.01)
+
+    def test_data_options_reject_legacy_training_schema(self):
+        parser = ArgumentParser()
+        add_data_options(parser)
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--data_dir", "dataset/tasks", "--schema", REALTIME_POSE_V2_CONTACT_SCHEMA_NAME])
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -90,7 +99,7 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="debug run",
-                schema="realtime_pose_body_fbx_local_v1",
+                schema=REALTIME_POSE_SCHEMA_NAME,
                 model_arch="target_dit",
                 seed=123,
             )
@@ -112,7 +121,7 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="same",
-                schema="realtime_pose_body_fbx_local_v1",
+                schema=REALTIME_POSE_SCHEMA_NAME,
                 model_arch="target_dit",
                 seed=123,
             )

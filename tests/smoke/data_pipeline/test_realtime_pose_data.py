@@ -10,14 +10,16 @@ import torch
 
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_to_realtime_pose import build_realtime_pose_features
+from data_converter.amass_smpl_utils import MotionSource, SMPL_JOINT_COUNT, SMPL_PARENTS, run_smpl_forward
 from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
 from data_loaders.generate_realtime_pose_tasks import (
     make_task_id,
     load_realtime_source,
     main as generate_realtime_pose_tasks_main,
     read_source_entries,
+    resolve_manifest_file,
 )
-from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest
+from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest, fk_body_fbx_local_delta
 from data_loaders.realtime_pose_kinematics import fk_body_fbx_local_torch
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
@@ -33,6 +35,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
     SENSOR_VALID_DIM,
     SENSOR_VALID_START,
@@ -41,7 +44,7 @@ from data_loaders.sensor_masking import (
     TRACKER_ROT_REF_START,
     get_schema_spec,
 )
-from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
+from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, build_toy_source_metadata, write_toy_source_dataset
 from utils.run_dirs import read_latest_pointer
 
 
@@ -49,6 +52,41 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
     latest = read_latest_pointer(root, kind=kind)
     assert latest is not None
     return latest
+
+
+def write_task_variant(source_task: Path, output_task: Path, drop_keys: set[str] | None = None, **overrides) -> None:
+    drop_keys = drop_keys or set()
+    with np.load(source_task, allow_pickle=False) as data:
+        payload = {key: data[key].copy() for key in data.files if key not in drop_keys}
+    payload.update(overrides)
+    np.savez(output_task, **payload)
+
+
+def generate_single_task_manifest(tmp_path: Path) -> tuple[Path, dict]:
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(output_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+    task_output_dir = latest_artifact_dir(output_dir, kind="tasks")
+    manifest_path = task_output_dir / "train" / "manifest.jsonl"
+    entry = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
+    return manifest_path, entry
 
 
 def test_converter_feature_builder_outputs_realtime_schema_shapes():
@@ -82,14 +120,97 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     assert features[schema.pelvis_height_key].shape == (4, 1)
     assert features["foot_contact"].shape == (4, 2)
     assert features["joint_rest_local_rotations_6d"].shape == (24, 6)
+    np.testing.assert_allclose(features["root_pos_world"][:, 1], 0.0, atol=1e-6)
+    np.testing.assert_allclose(features[schema.pelvis_height_key][:, 0], features["joints_world"][:, 0, 1], atol=1e-6)
 
 
 def test_converter_cli_defaults_to_current_recommended_schema():
     args = amass_converter.parse_args([])
     assert args.schema == DEFAULT_REALTIME_POSE_SCHEMA_NAME
+    args = amass_converter.parse_args(["--height_threshold", "0.03"])
+    assert args.height_threshold == pytest.approx(0.03)
+    args = amass_converter.parse_args(["--num_workers", "3", "--worker_torch_threads", "2"])
+    assert args.num_workers == 3
+    assert args.worker_torch_threads == 2
 
 
-def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path):
+def test_converter_parallel_work_items_include_mirror_variants():
+    motion_files = [Path("a.npz"), Path("b.npz")]
+    args = SimpleNamespace(mirror=True)
+
+    items = amass_converter.build_conversion_work_items(args=args, motion_files=motion_files)
+
+    assert items == [
+        (Path("a.npz"), False),
+        (Path("a.npz"), True),
+        (Path("b.npz"), False),
+        (Path("b.npz"), True),
+    ]
+
+
+def test_run_smpl_forward_does_not_request_mesh_vertices():
+    class FakeSmplModel:
+        diffusionposer_model_type = "smpl"
+        num_betas = 10
+
+        def __init__(self):
+            self.parents = torch.as_tensor(SMPL_PARENTS, dtype=torch.long)
+            self.parameter = torch.nn.Parameter(torch.zeros(()))
+            self.return_verts_values = []
+
+        def parameters(self):
+            yield self.parameter
+
+        def __call__(self, **kwargs):
+            self.return_verts_values.append(kwargs["return_verts"])
+            assert kwargs["return_verts"] is False
+            batch_size = int(kwargs["global_orient"].shape[0])
+            joints = torch.zeros((batch_size, SMPL_JOINT_COUNT, 3), dtype=torch.float32)
+            joints[:, :, 0] = kwargs["transl"][:, :1]
+            return SimpleNamespace(joints=joints)
+
+    class FakeModelCache:
+        def __init__(self, model):
+            self.model = model
+
+        def get(self, gender):
+            return self.model
+
+    frame_count = 3
+    source = MotionSource(
+        path=Path("toy.npz"),
+        relative_path=Path("toy.npz"),
+        poses=np.zeros((frame_count, 66), dtype=np.float64),
+        trans=np.zeros((frame_count, 3), dtype=np.float64),
+        betas=np.zeros(10, dtype=np.float64),
+        gender="neutral",
+        source_fps=60.0,
+    )
+    model = FakeSmplModel()
+
+    motion = run_smpl_forward(source=source, model_cache=FakeModelCache(model), batch_size=2)
+
+    assert model.return_verts_values == [False, False, False]
+    assert motion.joint_positions.shape == (frame_count, SMPL_JOINT_COUNT, 3)
+    assert motion.joint_rotations.shape == (frame_count, SMPL_JOINT_COUNT, 3, 3)
+    assert motion.rest_joints.shape == (SMPL_JOINT_COUNT, 3)
+    assert not hasattr(motion, "vertices")
+    assert not hasattr(motion, "rest_vertices")
+
+
+def test_resolve_manifest_file_prefers_existing_repo_relative_path(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    repo_relative_path = Path("dataset") / "toy_source.npz"
+    repo_relative_path.parent.mkdir()
+    repo_relative_path.write_bytes(b"exists")
+
+    assert resolve_manifest_file(source_dir, repo_relative_path.as_posix()) == repo_relative_path
+    assert resolve_manifest_file(source_dir, "missing/toy_source.npz") == source_dir / "missing" / "toy_source.npz"
+
+
+def test_converter_reuses_existing_root_y0_source_without_smpl(monkeypatch, tmp_path):
     amass_dir = tmp_path / "AMASS"
     reuse_dir = tmp_path / "reuse_v2"
     output_dir = tmp_path / "converted_v2"
@@ -132,6 +253,77 @@ def test_converter_reuses_existing_v2_source_without_smpl(monkeypatch, tmp_path)
         metadata = json.loads(str(data["metadata"].item()))
     assert metadata["schema_name"] == REALTIME_POSE_SCHEMA_NAME
     assert metadata["pose_representation"] == schema.pose_representation
+    assert metadata["root_y_policy"] == schema.root_y_policy
+    assert metadata["pelvis_height_mode"] == schema.pelvis_height_mode
+
+
+def test_converter_rejects_legacy_body_fbx_source_reuse(monkeypatch, tmp_path):
+    amass_dir = tmp_path / "AMASS"
+    reuse_dir = tmp_path / "reuse_old_body_fbx"
+    output_dir = tmp_path / "converted"
+    fake_amass_path = amass_dir / "ACCAD" / "toy_realtime.npz"
+    fake_amass_path.parent.mkdir(parents=True)
+    fake_amass_path.write_bytes(b"reuse path does not load this file")
+
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    source["root_pos_world"][:, 1] = 1.25
+    source["metadata"] = np.asarray(
+        json.dumps(
+            {
+                "schema_name": "realtime_pose_body_fbx_local_v1",
+                "pose_representation": "body_fbx_local_delta_6d",
+                "root_y_policy": "actor_root_from_pelvis",
+                "pelvis_height_mode": "actor_root_y",
+            }
+        )
+    )
+    reuse_path = reuse_dir / "ACCAD" / "toy_realtime.npz"
+    reuse_path.parent.mkdir(parents=True)
+    np.savez(reuse_path, **source)
+
+    monkeypatch.setattr(amass_converter, "run_smpl_forward", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no smpl")))
+    args = SimpleNamespace(
+        amass_dir=amass_dir,
+        output_dir=output_dir,
+        target_fps=60.0,
+        batch_size=1,
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        reuse_source_dir=reuse_dir,
+        skip_existing=False,
+        overwrite=True,
+    )
+    with pytest.raises(ValueError, match="schema_name"):
+        amass_converter.convert_one_motion(path=fake_amass_path, args=args, model_cache=object(), mirror_variant=False)
+
+
+def test_converter_rejects_root_y0_reuse_with_nonzero_root_y(monkeypatch, tmp_path):
+    amass_dir = tmp_path / "AMASS"
+    reuse_dir = tmp_path / "reuse_bad_root_y"
+    output_dir = tmp_path / "converted"
+    fake_amass_path = amass_dir / "ACCAD" / "toy_realtime.npz"
+    fake_amass_path.parent.mkdir(parents=True)
+    fake_amass_path.write_bytes(b"reuse path does not load this file")
+
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    source["root_pos_world"][:, 1] = 0.5
+    source["metadata"] = np.asarray(json.dumps(build_toy_source_metadata(frame_count=REALTIME_POSE_SEQ_LEN)))
+    reuse_path = reuse_dir / "ACCAD" / "toy_realtime.npz"
+    reuse_path.parent.mkdir(parents=True)
+    np.savez(reuse_path, **source)
+
+    monkeypatch.setattr(amass_converter, "run_smpl_forward", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no smpl")))
+    args = SimpleNamespace(
+        amass_dir=amass_dir,
+        output_dir=output_dir,
+        target_fps=60.0,
+        batch_size=1,
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        reuse_source_dir=reuse_dir,
+        skip_existing=False,
+        overwrite=True,
+    )
+    with pytest.raises(ValueError, match="root-y0"):
+        amass_converter.convert_one_motion(path=fake_amass_path, args=args, model_cache=object(), mirror_variant=False)
 
 
 def test_source_manifest_reused_entries_are_usable(tmp_path):
@@ -172,6 +364,44 @@ def test_realtime_source_loader_rejects_legacy_parent_local_pose(tmp_path):
         load_realtime_source(legacy_path, schema_name=schema.name)
 
 
+def test_task_generation_scan_rejects_old_body_fbx_source_without_manifest(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    source_path = source_dir / "ACCAD" / "old_body_fbx.npz"
+    source_path.parent.mkdir(parents=True)
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    source["metadata"] = np.asarray(
+        json.dumps(
+            {
+                "schema_name": "realtime_pose_body_fbx_local_v1",
+                "pose_representation": "body_fbx_local_delta_6d",
+                "root_y_policy": "actor_root_from_pelvis",
+                "pelvis_height_mode": "actor_root_y",
+            }
+        )
+    )
+    np.savez(source_path, **source)
+
+    with pytest.raises(ValueError, match="schema_name"):
+        generate_realtime_pose_tasks_main(
+            [
+                "--source_dir",
+                str(source_dir),
+                "--output_dir",
+                str(output_dir),
+                "--splits",
+                "train",
+                "--samples_per_file",
+                "1",
+                "--schema",
+                REALTIME_POSE_SCHEMA_NAME,
+                "--split_dir",
+                "",
+                "--overwrite",
+            ]
+        )
+
+
 def test_fk_reconstructs_pelvis_from_ground_root_offset():
     class SmplMotion:
         pass
@@ -191,14 +421,17 @@ def test_fk_reconstructs_pelvis_from_ground_root_offset():
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     np.testing.assert_allclose(features[schema.pelvis_height_key][0], np.asarray([0.92], dtype=np.float32))
     expected_root_pos = source["joints_world"][0, 0] - body_fbx_rest.pelvis_local_position
+    expected_root_pos[1] = 0.0
     np.testing.assert_allclose(features["root_pos_world"][0], expected_root_pos, atol=1e-6)
     np.testing.assert_allclose(features["joint_offsets_parent"][0], body_fbx_rest.pelvis_local_position)
 
+    fk_offsets = features["joint_offsets_parent"].copy()
+    fk_offsets[0, 1] = features[schema.pelvis_height_key][0, 0]
     pred_joints = fk_body_fbx_local_torch(
         body_pose_local_delta_6d=torch.from_numpy(features[schema.body_pose_key][:1]).float(),
         actor_root_pos_world=torch.from_numpy(features["root_pos_world"][:1]).float(),
         root_heading=torch.from_numpy(features["root_yaw"][:1]).float(),
-        rest_local_positions=torch.from_numpy(features["joint_offsets_parent"][None]).float(),
+        rest_local_positions=torch.from_numpy(fk_offsets[None]).float(),
         rest_local_rotations_6d=torch.from_numpy(features["joint_rest_local_rotations_6d"][None]).float(),
     )
     np.testing.assert_allclose(
@@ -206,6 +439,40 @@ def test_fk_reconstructs_pelvis_from_ground_root_offset():
         source["joints_world"][0, 0],
         atol=1e-6,
     )
+    arrays = dict(features)
+    arrays["sensor_valid"] = np.ones((4, 6), dtype=bool)
+    encoded = encode_realtime_pose_features(arrays, schema_name=REALTIME_POSE_SCHEMA_NAME)
+    tracker_ref = encoded[:, schema.tracker_pos_slice()].reshape(4, 6, 3)
+    np.testing.assert_allclose(tracker_ref[:, :, 1], features["tracker_pos_world"][:, :, 1], atol=1e-6)
+
+
+def test_body_fbx_numpy_fk_matches_torch_fk():
+    source = build_toy_realtime_source(frame_count=4)
+    rest = build_synthetic_body_fbx_rest()
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    offsets = np.repeat(source["joint_offsets_parent"][None], 4, axis=0).astype(np.float32)
+    offsets[:, 0, 1] = source[schema.pelvis_height_key][:, 0]
+
+    numpy_joints, numpy_rotations = fk_body_fbx_local_delta(
+        body_pose_local_delta_6d=source[schema.body_pose_key],
+        actor_root_pos_world=source["root_pos_world"],
+        root_heading=source["root_yaw"],
+        rest=rest,
+        local_offsets=offsets,
+    )
+    torch_joints, torch_rotations = fk_body_fbx_local_torch(
+        body_pose_local_delta_6d=torch.from_numpy(source[schema.body_pose_key]).float(),
+        actor_root_pos_world=torch.from_numpy(source["root_pos_world"]).float(),
+        root_heading=torch.from_numpy(source["root_yaw"]).float(),
+        rest_local_positions=torch.from_numpy(offsets).float(),
+        rest_local_rotations_6d=torch.from_numpy(
+            np.repeat(source["joint_rest_local_rotations_6d"][None], 4, axis=0)
+        ).float(),
+        return_global_rot=True,
+    )
+
+    np.testing.assert_allclose(numpy_joints, torch_joints.detach().numpy(), atol=1e-6)
+    np.testing.assert_allclose(numpy_rotations, torch_rotations.detach().numpy(), atol=1e-6)
 
 
 def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
@@ -248,6 +515,49 @@ def test_task_generator_defaults_to_full_tracker_tasks(tmp_path):
         assert task["inpaint_mask"].shape == (REALTIME_POSE_SEQ_LEN, REALTIME_POSE_INPUT_DIM)
         assert task["inpaint_mask"][REALTIME_POSE_TARGET_START, :REALTIME_POSE_TARGET_DIM].all()
         assert not task["inpaint_mask"][:, REALTIME_POSE_TARGET_DIM:].any()
+        assert int(np.asarray(task["target_start"]).item()) == REALTIME_POSE_TARGET_START
+        assert int(np.asarray(task["target_length"]).item()) == REALTIME_POSE_TARGET_LENGTH
+
+
+def test_task_loader_rejects_missing_root_y_policy(tmp_path):
+    manifest_path, entry = generate_single_task_manifest(tmp_path)
+    broken_task = manifest_path.parent / "missing_root_y_policy.npz"
+    write_task_variant(manifest_path.parent / entry["task_path"], broken_task, drop_keys={"root_y_policy"})
+
+    with pytest.raises(KeyError, match="root_y_policy"):
+        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=broken_task.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+
+
+def test_task_loader_rejects_missing_or_wrong_target_contract(tmp_path):
+    manifest_path, entry = generate_single_task_manifest(tmp_path)
+    source_task = manifest_path.parent / entry["task_path"]
+    missing_target = manifest_path.parent / "missing_target_start.npz"
+    write_task_variant(source_task, missing_target, drop_keys={"target_start"})
+    with pytest.raises(KeyError, match="target_start"):
+        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=missing_target.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+
+    wrong_target = manifest_path.parent / "wrong_target_start.npz"
+    write_task_variant(source_task, wrong_target, target_start=np.int64(0))
+    with pytest.raises(ValueError, match="target_start"):
+        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=wrong_target.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+
+    missing_length = manifest_path.parent / "missing_target_length.npz"
+    write_task_variant(source_task, missing_length, drop_keys={"target_length"})
+    with pytest.raises(KeyError, match="target_length"):
+        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=missing_length.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+
+
+def test_task_loader_rejects_root_y0_invariant_error(tmp_path):
+    manifest_path, entry = generate_single_task_manifest(tmp_path)
+    source_task = manifest_path.parent / entry["task_path"]
+    with np.load(source_task, allow_pickle=False) as data:
+        bad_root_pos = data["root_pos_world"].copy()
+    bad_root_pos[:, 1] = 0.25
+    broken_task = manifest_path.parent / "bad_root_y0.npz"
+    write_task_variant(source_task, broken_task, root_pos_world=bad_root_pos)
+
+    with pytest.raises(ValueError, match="root-y0"):
+        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=broken_task.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
 
 
 def test_task_id_stays_short_for_long_amass_paths():

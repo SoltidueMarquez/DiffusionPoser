@@ -7,18 +7,22 @@ import numpy as np
 
 REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
 REALTIME_POSE_V2_CONTACT_SCHEMA_NAME = "realtime_pose_v2_contact"
-REALTIME_POSE_BODY_FBX_LOCAL_SCHEMA_NAME = "realtime_pose_body_fbx_local_v1"
-REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_BODY_FBX_LOCAL_SCHEMA_NAME
+REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
+REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
 DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
 POSE_REPRESENTATION_KEY = "pose_representation"
 POSE_REPRESENTATION_ROOT_YAW_GLOBAL_6D = "root_yaw_global_6d"
 POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D = "body_fbx_local_delta_6d"
+ROOT_Y_POLICY_ACTOR_ROOT_FROM_PELVIS = "actor_root_from_pelvis"
+ROOT_Y_POLICY_FIXED_ZERO = "fixed_zero"
+PELVIS_HEIGHT_MODE_ACTOR_ROOT_Y = "actor_root_y"
+PELVIS_HEIGHT_MODE_PELVIS_LOCAL_OFFSET_Y = "pelvis_local_offset_y"
 BODY_POSE_ROOT_GLOBAL_KEY = "body_pose_root_global_6d"
 BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY = "body_pose_body_fbx_local_delta_6d"
 LEGACY_BODY_POSE_PARENT_KEY = "body_pose_parent_6d"
 TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
 TASK_FORMAT_REALTIME_POSE_V2_CONTACT = "materialized_realtime_pose_v2_contact"
-TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL = "materialized_realtime_pose_body_fbx_local_v1"
+TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0 = "materialized_realtime_pose_body_fbx_local_root_y0_v1"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
 TASK_MODES = (TASK_MODE_REALTIME_POSE,)
 
@@ -158,6 +162,8 @@ class SchemaSpec:
     root_delta_xz_start: int | None = None
     root_height_start: int | None = None
     foot_contact_start: int | None = None
+    root_y_policy: str = ROOT_Y_POLICY_ACTOR_ROOT_FROM_PELVIS
+    pelvis_height_mode: str = PELVIS_HEIGHT_MODE_ACTOR_ROOT_Y
 
     @property
     def supports_root_motion(self) -> bool:
@@ -241,9 +247,9 @@ SCHEMA_SPECS: dict[str, SchemaSpec] = {
         tracker_rot_ref_start=V2_CONTACT_TRACKER_ROT_REF_START,
         sensor_valid_start=V2_CONTACT_SENSOR_VALID_START,
     ),
-    REALTIME_POSE_BODY_FBX_LOCAL_SCHEMA_NAME: SchemaSpec(
-        name=REALTIME_POSE_BODY_FBX_LOCAL_SCHEMA_NAME,
-        task_format=TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL,
+    REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME: SchemaSpec(
+        name=REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
+        task_format=TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0,
         feature_dim=REALTIME_POSE_BODY_FBX_LOCAL_INPUT_DIM,
         target_dim=REALTIME_POSE_BODY_FBX_LOCAL_TARGET_DIM,
         body_pose_start=BODY_POSE_START,
@@ -258,6 +264,8 @@ SCHEMA_SPECS: dict[str, SchemaSpec] = {
         body_pose_key=BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
         root_heading_delta_key="root_heading_delta_sincos",
         pelvis_height_key="pelvis_height",
+        root_y_policy=ROOT_Y_POLICY_FIXED_ZERO,
+        pelvis_height_mode=PELVIS_HEIGHT_MODE_PELVIS_LOCAL_OFFSET_Y,
     ),
 }
 REALTIME_POSE_SCHEMA_NAMES = tuple(SCHEMA_SPECS.keys())
