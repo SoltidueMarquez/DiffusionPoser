@@ -101,6 +101,7 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--tracker_outlier_prob", default=0.01, type=float)
     group.add_argument("--predicted_history_cache_dir", default="", type=str)
     group.add_argument("--predicted_history_prob", default=0.0, type=float)
+    group.add_argument("--rollout_steps", default=1, type=int)
 
 
 def add_sampling_options(parser: ArgumentParser):
@@ -174,6 +175,9 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--tracker_pos_timestep_min_weight", default=0.1, type=float)
     group.add_argument("--tracker_pos_timestep_gamma", default=2.0, type=float)
     group.add_argument("--tracker_rot_loss_weight", default=2.0, type=float)
+    group.add_argument("--rollout_loss_weight", default=0.0, type=float)
+    group.add_argument("--rollout_prob", default=0.0, type=float)
+    group.add_argument("--detach_rollout_history", default=True, type=str2bool)
     group.add_argument("--model_ema", default=True, action=BooleanOptionalAction)
     group.add_argument("--model_ema_steps", type=int, default=10)
     group.add_argument("--model_ema_decay", type=float, default=0.995)

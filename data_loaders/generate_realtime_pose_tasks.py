@@ -79,6 +79,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     task.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     task.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     task.add_argument("--samples_per_file", default=4, type=int)
+    task.add_argument("--rollout_steps", default=1, type=int)
     task.add_argument("--mask_policy", default=TASK_MASK_POLICY_FULL, choices=TASK_MASK_POLICIES, type=str)
     task.add_argument("--fixed_tracker_patterns", nargs="+", default=["all"], type=str)
     task.add_argument("--patterns_per_window", default=len(TRACKER_PATTERN_CATEGORIES), type=int)
@@ -120,6 +121,8 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     """
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
+    if int(getattr(args, "rollout_steps", 1)) < 1:
+        raise ValueError(f"rollout_steps must be >= 1, got {args.rollout_steps}")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
         raise ValueError(f"min_valid_trackers 至少为 {MIN_VALID_TRACKERS}")
 
@@ -200,6 +203,7 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             "source_dir": str(plan.source_dir),
             "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
             "splits": [split_plan.split for split_plan in plan.split_plans],
+            "max_rollout_steps": int(getattr(args, "rollout_steps", 1)),
             "counts": counts,
         },
     )
@@ -209,6 +213,8 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
 def resolve_task_run_label(args: argparse.Namespace) -> str:
     run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
     if run_name.lower() in {"", "auto"}:
+        if int(getattr(args, "rollout_steps", 1)) > 1:
+            return f"rtp_rollout_tasks_seed{getattr(args, 'seed', 0)}"
         return f"rtp_tasks_seed{getattr(args, 'seed', 0)}"
     return run_name
 
@@ -419,41 +425,63 @@ def generate_split_tasks(
     manifest_path = output_split_dir / "manifest.jsonl"
     written = 0
     skipped_short_sources: list[dict] = []
+    rollout_steps = int(getattr(args, "rollout_steps", 1))
+    required_frames = REALTIME_POSE_SEQ_LEN + rollout_steps - 1
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         progress = tqdm(total=len(entries) * int(args.samples_per_file), desc=f"生成 {split} realtime tasks", unit="window")
         for entry in entries:
             source_path = Path(entry["source_path"])
             known_frames = int(entry.get("frames") or 0)
-            if 0 < known_frames < REALTIME_POSE_SEQ_LEN:
+            if 0 < known_frames < required_frames:
                 if should_raise_for_short_source(args):
-                    raise ValueError(format_short_source_error(source_path=source_path, source_frames=known_frames))
-                skipped_short_sources.append(make_short_source_record(entry, source_path, known_frames))
+                    raise ValueError(
+                        format_short_source_error(
+                            source_path=source_path,
+                            source_frames=known_frames,
+                            required_frames=required_frames,
+                        )
+                    )
+                skipped_short_sources.append(make_short_source_record(entry, source_path, known_frames, required_frames))
                 progress.update(int(args.samples_per_file))
                 continue
 
             schema = get_schema_spec(args.schema)
             source = load_realtime_source(source_path, schema_name=schema.name)
             source_frames = int(source[schema.body_pose_key].shape[0])
-            if source_frames < REALTIME_POSE_SEQ_LEN:
+            if source_frames < required_frames:
                 if should_raise_for_short_source(args):
-                    raise ValueError(format_short_source_error(source_path=source_path, source_frames=source_frames))
-                skipped_short_sources.append(make_short_source_record(entry, source_path, source_frames))
+                    raise ValueError(
+                        format_short_source_error(
+                            source_path=source_path,
+                            source_frames=source_frames,
+                            required_frames=required_frames,
+                        )
+                    )
+                skipped_short_sources.append(make_short_source_record(entry, source_path, source_frames, required_frames))
                 progress.update(int(args.samples_per_file))
                 continue
 
             for sample_index in range(int(args.samples_per_file)):
-                start_frame = int(rng.integers(0, source_frames - REALTIME_POSE_SEQ_LEN + 1))
-                clip = clip_source(source, start_frame=start_frame, seq_len=REALTIME_POSE_SEQ_LEN)
-                task_arrays = dict(clip)
-                task_arrays.update(
-                    {
-                        "schema_name": np.asarray(schema.name),
-                        "task_format": np.asarray(schema.task_format),
-                        POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
-                        "root_y_policy": np.asarray(schema.root_y_policy),
-                        "pelvis_height_mode": np.asarray(schema.pelvis_height_mode),
-                    }
-                )
+                start_frame = int(rng.integers(0, source_frames - required_frames + 1))
+                window_task_arrays = []
+                for rollout_step in range(rollout_steps):
+                    task_arrays = dict(
+                        clip_source(
+                            source,
+                            start_frame=start_frame + rollout_step,
+                            seq_len=REALTIME_POSE_SEQ_LEN,
+                        )
+                    )
+                    task_arrays.update(
+                        {
+                            "schema_name": np.asarray(schema.name),
+                            "task_format": np.asarray(schema.task_format),
+                            POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
+                            "root_y_policy": np.asarray(schema.root_y_policy),
+                            "pelvis_height_mode": np.asarray(schema.pelvis_height_mode),
+                        }
+                    )
+                    window_task_arrays.append(task_arrays)
                 patterns = build_window_patterns(rng=rng, args=args)
                 for pattern_index, pattern in enumerate(patterns):
                     sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=REALTIME_POSE_SEQ_LEN)
@@ -466,20 +494,31 @@ def generate_split_tasks(
                         pattern_category=pattern.category,
                     )
                     task_rel_path = Path("tasks") / f"{task_id}.npz"
-                    task_path = output_split_dir / task_rel_path
-                    save_task_npz(
-                        task_path=task_path,
-                        compress=bool(args.compress_tasks),
-                        **task_arrays,
-                        sensor_valid=sensor_valid,
-                        inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
-                        start_frame=np.int64(start_frame),
-                        target_start=np.int64(REALTIME_POSE_TARGET_START),
-                        target_length=np.int64(REALTIME_POSE_TARGET_LENGTH),
-                        valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
-                        source_frames=np.int64(source_frames),
-                        seq_len=np.int64(REALTIME_POSE_SEQ_LEN),
-                    )
+                    rollout_task_paths = []
+                    for rollout_step, task_arrays in enumerate(window_task_arrays):
+                        window_task_rel_path = (
+                            task_rel_path
+                            if rollout_step == 0
+                            else Path("tasks") / f"{task_id}_r{rollout_step:02d}.npz"
+                        )
+                        if rollout_step > 0:
+                            rollout_task_paths.append(window_task_rel_path.as_posix())
+                        save_task_npz(
+                            task_path=output_split_dir / window_task_rel_path,
+                            compress=bool(args.compress_tasks),
+                            **task_arrays,
+                            source_path=np.asarray(str(source_path)),
+                            sensor_valid=sensor_valid,
+                            inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
+                            start_frame=np.int64(start_frame + rollout_step),
+                            target_start=np.int64(REALTIME_POSE_TARGET_START),
+                            target_length=np.int64(REALTIME_POSE_TARGET_LENGTH),
+                            valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
+                            source_frames=np.int64(source_frames),
+                            seq_len=np.int64(REALTIME_POSE_SEQ_LEN),
+                            rollout_step=np.int64(rollout_step),
+                            max_rollout_steps=np.int64(rollout_steps),
+                        )
                     manifest_entry = {
                         "task_id": task_id,
                         "task_path": task_rel_path.as_posix(),
@@ -492,6 +531,8 @@ def generate_split_tasks(
                         "source_frames": source_frames,
                         "seq_len": REALTIME_POSE_SEQ_LEN,
                         "feature_dim": schema.feature_dim,
+                        "max_rollout_steps": rollout_steps,
+                        "rollout_task_paths": rollout_task_paths,
                         "task_format": schema.task_format,
                         "schema_name": schema.name,
                         POSE_REPRESENTATION_KEY: schema.pose_representation,
@@ -519,17 +560,22 @@ def should_raise_for_short_source(args: argparse.Namespace) -> bool:
     return str(getattr(args, "short_source_policy", SHORT_SOURCE_POLICY_SKIP)) == SHORT_SOURCE_POLICY_ERROR
 
 
-def format_short_source_error(source_path: Path, source_frames: int) -> str:
-    return f"{source_path} 至少需要 {REALTIME_POSE_SEQ_LEN} 帧，实际为 {source_frames}"
+def format_short_source_error(source_path: Path, source_frames: int, required_frames: int = REALTIME_POSE_SEQ_LEN) -> str:
+    return f"{source_path} 至少需要 {required_frames} 帧，实际为 {source_frames}"
 
 
-def make_short_source_record(entry: dict, source_path: Path, source_frames: int) -> dict:
+def make_short_source_record(
+    entry: dict,
+    source_path: Path,
+    source_frames: int,
+    required_frames: int = REALTIME_POSE_SEQ_LEN,
+) -> dict:
     return {
         "source_path": str(source_path),
         "source_relative_path": normalize_slashes(entry.get("source_relative_path", "")),
         "stablemotion_split_key": normalize_slashes(entry.get("stablemotion_split_key", "")),
         "source_frames": int(source_frames),
-        "required_frames": REALTIME_POSE_SEQ_LEN,
+        "required_frames": int(required_frames),
     }
 
 

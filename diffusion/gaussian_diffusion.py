@@ -1588,7 +1588,18 @@ class GaussianDiffusion:
             result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
         return result
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, feature_w=None, snr_gamma=5, use_l1=False):
+    def training_losses(
+        self,
+        model,
+        x_start,
+        t,
+        model_kwargs=None,
+        noise=None,
+        feature_w=None,
+        snr_gamma=5,
+        use_l1=False,
+        return_pred_xstart=False,
+    ):
         """
         计算单个时间步的训练损失。
 
@@ -1623,6 +1634,7 @@ class GaussianDiffusion:
         x_t = torch.where(inpaint_cond, x_t, conditioning_motion)
 
         terms = {}
+        pred_xstart = None
 
         # 会在每个时间步调用传入的模型 model(x_t, timestep, **model_kwargs) 获取预测，用它与目标（噪声或 x0）计算 loss。
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL: # 计算 KL 损失
@@ -1719,6 +1731,10 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
 
+        if return_pred_xstart:
+            if pred_xstart is None:
+                raise ValueError("return_pred_xstart=True 只支持可恢复 pred_xstart 的训练目标。")
+            terms["pred_xstart"] = pred_xstart
         return terms
 
     def _prior_bpd(self, x_start):

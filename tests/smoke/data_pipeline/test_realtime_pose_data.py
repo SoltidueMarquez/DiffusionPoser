@@ -790,6 +790,64 @@ def test_dataset_outputs_schema_dim_by_61_and_reference_uses_previous_yaw(tmp_pa
         )
 
 
+def test_rollout_task_generation_and_dataset_shapes(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN + 1)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(output_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "3",
+            "--rollout_steps",
+            "2",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+
+    task_run_dir = latest_artifact_dir(output_dir, "tasks")
+    manifest_path = task_run_dir / "train" / "manifest.jsonl"
+    entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
+    assert entries
+    for entry in entries:
+        assert entry["max_rollout_steps"] == 2
+        assert len(entry["rollout_task_paths"]) == 1
+        assert entry["start_frame"] == 0
+        base_task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"])
+        rollout_task = load_materialized_task_npz(
+            manifest_dir=manifest_path.parent,
+            task_path=entry["rollout_task_paths"][0],
+        )
+        assert int(np.asarray(base_task["start_frame"]).item()) == 0
+        assert int(np.asarray(rollout_task["start_frame"]).item()) == 1
+        assert int(np.asarray(rollout_task["start_frame"]).item()) + REALTIME_POSE_SEQ_LEN <= int(
+            np.asarray(rollout_task["source_frames"]).item()
+        )
+
+    dataset = RealtimePoseTaskDataset(
+        output_dir,
+        split="train",
+        normalize_input=False,
+        enable_rollout=True,
+        rollout_steps=2,
+    )
+    item = dataset[0]
+    assert tuple(item["x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+    assert tuple(item["conditioned_x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+    assert len(item["rollout"]) == 1
+    assert tuple(item["rollout"][0]["x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+    assert tuple(item["rollout"][0]["conditioned_x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+
+
 def test_dataset_dynamic_tracker_mask_samples_legal_categories(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"

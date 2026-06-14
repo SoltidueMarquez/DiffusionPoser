@@ -38,6 +38,11 @@ def main():
     try:
         train_platform.report_args(args, name="Args")
         save_args(args)
+        enable_rollout_training = (
+            args.rollout_steps > 1
+            and args.rollout_loss_weight > 0.0
+            and args.rollout_prob > 0.0
+        )
 
         print("creating data loader...")
         data = get_dataset_loader(
@@ -67,6 +72,8 @@ def main():
             tracker_outlier_prob=args.tracker_outlier_prob,
             predicted_history_cache_dir=args.predicted_history_cache_dir or None,
             predicted_history_prob=args.predicted_history_prob,
+            enable_rollout=enable_rollout_training,
+            rollout_steps=args.rollout_steps,
             tracker_mask_policy=args.tracker_mask_policy,
             tracker_mask_seed=args.tracker_mask_seed,
             tracker_mask_fill=args.tracker_mask_fill,
@@ -102,6 +109,8 @@ def main():
                 tracker_outlier_prob=args.tracker_outlier_prob,
                 predicted_history_cache_dir=args.predicted_history_cache_dir or None,
                 predicted_history_prob=args.predicted_history_prob,
+                enable_rollout=False,
+                rollout_steps=1,
                 tracker_mask_policy=args.tracker_mask_policy,
                 tracker_mask_seed=args.tracker_mask_seed,
                 tracker_mask_fill=args.tracker_mask_fill,

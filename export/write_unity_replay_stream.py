@@ -196,15 +196,23 @@ def build_unity_replay_stream_payload(
     frame_start: int = 0,
     frame_count: int = 0,
     identity_6d_rotations: bool = False,
+    source_override: dict[str, np.ndarray] | None = None,
+    source_metadata_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     schema = get_schema_spec(schema_name)
 
     path = Path(source_npz).resolve()
-    source = load_realtime_source(path, schema_name=schema.name)
+    source = source_override if source_override is not None else load_realtime_source(path, schema_name=schema.name)
     total_frames = int(source["tracker_pos_world"].shape[0])
-    sensor_valid = load_sensor_valid(path, total_frames)
+    if "sensor_valid" in source:
+        sensor_valid = np.asarray(source["sensor_valid"], dtype=bool)
+        expected_shape = (total_frames, TRACKER_COUNT)
+        if sensor_valid.shape != expected_shape:
+            raise ValueError(f"sensor_valid 应为 {expected_shape}，实际为 {sensor_valid.shape}")
+    else:
+        sensor_valid = load_sensor_valid(path, total_frames)
     start, count = select_frame_range(total_frames, frame_start, frame_count)
-    metadata = read_source_metadata(path)
+    metadata = source_metadata_override if source_metadata_override is not None else read_source_metadata(path)
 
     # Unity JsonUtility 对嵌套数组支持很弱，所以所有逐帧张量都按 frame-major 展平成一维数组。
     tracker_positions = slice_time(source["tracker_pos_world"], start, count)
@@ -271,6 +279,8 @@ def write_unity_replay_stream(
     frame_start: int = 0,
     frame_count: int = 0,
     identity_6d_rotations: bool = False,
+    source_override: dict[str, np.ndarray] | None = None,
+    source_metadata_override: dict[str, Any] | None = None,
 ) -> Path:
     payload = build_unity_replay_stream_payload(
         source_npz=source_npz,
@@ -279,6 +289,8 @@ def write_unity_replay_stream(
         frame_start=frame_start,
         frame_count=frame_count,
         identity_6d_rotations=identity_6d_rotations,
+        source_override=source_override,
+        source_metadata_override=source_metadata_override,
     )
     path = Path(output_json).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)

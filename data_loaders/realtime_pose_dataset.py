@@ -91,6 +91,8 @@ class RealtimePoseTaskDataset(Dataset):
         tracker_outlier_prob: float = 0.0,
         predicted_history_cache_dir: str | Path | None = None,
         predicted_history_prob: float = 0.0,
+        enable_rollout: bool = False,
+        rollout_steps: int = 1,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
@@ -115,6 +117,10 @@ class RealtimePoseTaskDataset(Dataset):
         self.tracker_outlier_prob = float(tracker_outlier_prob)
         self.predicted_history_cache_dir = Path(predicted_history_cache_dir) if predicted_history_cache_dir else None
         self.predicted_history_prob = float(predicted_history_prob)
+        self.rollout_steps = int(rollout_steps)
+        if self.rollout_steps < 1:
+            raise ValueError(f"rollout_steps must be >= 1, got {rollout_steps}")
+        self.enable_rollout = bool(enable_rollout) and self.rollout_steps > 1
         self.tracker_mask_policy = self.resolve_tracker_mask_policy(tracker_mask_policy)
         self.tracker_mask_seed = int(tracker_mask_seed)
         self.tracker_mask_fill = str(tracker_mask_fill)
@@ -152,6 +158,19 @@ class RealtimePoseTaskDataset(Dataset):
             if int(entry.get("seq_len", -1)) != self.seq_len:
                 raise ValueError(f"任务 {entry.get('task_id')} 的 seq_len 不等于 {self.seq_len}。")
             validate_realtime_target(int(entry.get("target_start", -1)), int(entry.get("target_length", -1)))
+            if self.enable_rollout:
+                max_rollout_steps = int(entry.get("max_rollout_steps", 1))
+                rollout_task_paths = entry.get("rollout_task_paths", [])
+                if max_rollout_steps < self.rollout_steps:
+                    raise ValueError(
+                        f"任务 {entry.get('task_id')} max_rollout_steps={max_rollout_steps}，"
+                        f"不足以返回 rollout_steps={self.rollout_steps}"
+                    )
+                if not isinstance(rollout_task_paths, list) or len(rollout_task_paths) < self.rollout_steps - 1:
+                    raise ValueError(
+                        f"任务 {entry.get('task_id')} 缺少 rollout_task_paths，"
+                        f"需要 {self.rollout_steps - 1} 个相邻窗口"
+                    )
 
         self.task_cache = None
         if self.preload_data:
@@ -255,6 +274,149 @@ class RealtimePoseTaskDataset(Dataset):
             "joint_offsets_parent": torch.from_numpy(arrays["joint_offsets_parent"]).float(),
             "length": self.seq_len,
             "keyid": entry.get("task_id", ""),
+            "source_path": entry.get("source_path", ""),
+            "task_mode": entry.get("task_mode", ""),
+            "schema_name": self.schema.name,
+            "target_start": REALTIME_POSE_TARGET_START,
+            "target_length": REALTIME_POSE_TARGET_LENGTH,
+            "tracker_pattern": applied_tracker_pattern,
+            "tracker_mask_policy": self.tracker_mask_policy,
+        }
+        if "joint_rest_local_rotations_6d" in arrays:
+            item["joint_rest_local_rotations_6d"] = torch.from_numpy(arrays["joint_rest_local_rotations_6d"]).float()
+        if self.schema.supports_root_motion:
+            item["target_root_delta_xz_ref"] = torch.from_numpy(
+                arrays["root_delta_xz_ref"][REALTIME_POSE_TARGET_START]
+            ).float()
+            item["target_root_height"] = torch.tensor(
+                float(arrays[self.schema.pelvis_height_key][REALTIME_POSE_TARGET_START, 0])
+            ).float()
+        if self.schema.supports_contact:
+            item["target_foot_contact"] = torch.from_numpy(arrays["foot_contact"][REALTIME_POSE_TARGET_START]).float()
+        if self.enable_rollout:
+            item["rollout"] = self.build_rollout_items(
+                entry=entry,
+                index=index,
+                random_context=random_context,
+            )
+        return item
+
+    def build_rollout_items(
+        self,
+        entry: dict,
+        index: int,
+        random_context: RandomContext,
+    ) -> list[dict]:
+        rollout_paths = entry.get("rollout_task_paths", [])
+        items = []
+        for rollout_step in range(1, self.rollout_steps):
+            task_path = rollout_paths[rollout_step - 1]
+            task = load_materialized_task_npz(
+                manifest_dir=self.manifest_dir,
+                task_path=task_path,
+                schema_name=self.schema.name,
+            )
+            items.append(
+                self.materialize_item_from_task(
+                    task=task,
+                    entry=entry,
+                    index=index,
+                    random_context=random_context,
+                    keyid_suffix=f":rollout{rollout_step}",
+                )
+            )
+        return items
+
+    def materialize_item_from_task(
+        self,
+        task: dict[str, np.ndarray],
+        entry: dict,
+        index: int,
+        random_context: RandomContext,
+        keyid_suffix: str = "",
+    ) -> dict:
+        """把相邻 rollout 窗口转换成和主窗口一致的训练 batch 字段。"""
+
+        arrays = load_realtime_task_arrays(task=task, seq_len=self.seq_len, schema_name=self.schema.name)
+        arrays, applied_tracker_pattern = self.apply_tracker_mask_policy(
+            arrays=arrays,
+            entry=entry,
+            index=index,
+            random_context=random_context,
+        )
+        if self.is_train_split:
+            rng = self.stable_rng(
+                entry=entry,
+                index=index,
+                salt=f"augment:{keyid_suffix}:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
+            )
+            arrays = augment_realtime_arrays(
+                arrays=arrays,
+                rng=rng,
+                tracker_pos_noise_std=self.tracker_pos_noise_std,
+                tracker_rot_noise_std=self.tracker_rot_noise_std,
+                non_hip_tracker_dropout_prob=self.non_hip_tracker_dropout_prob,
+                tracker_latency_max_frames=self.tracker_latency_max_frames,
+                tracker_burst_dropout_prob=self.tracker_burst_dropout_prob,
+                tracker_outlier_prob=self.tracker_outlier_prob,
+                history_pose_noise_std=self.history_pose_noise_std,
+                history_yaw_noise_std=self.history_yaw_noise_std,
+                root_yaw_ref_noise_std=self.root_yaw_ref_noise_std,
+            )
+
+        sensor_valid = arrays["sensor_valid"]
+        raw_features = encode_realtime_pose_features(arrays, schema_name=self.schema.name)
+        features = raw_features.copy()
+        if self.normalizer is not None:
+            features = self.normalizer.normalize(features)
+            zero_missing_tracker_channels(features=features, sensor_valid=sensor_valid, schema_name=self.schema.name)
+
+        conditioned = features.copy()
+        if self.is_train_split:
+            rng = self.stable_rng(
+                entry=entry,
+                index=index,
+                salt=f"history_condition:{keyid_suffix}:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
+            )
+            # rollout 子窗口的预测历史由训练循环实时回灌，避免复用离线 cache 泄漏到相邻窗口。
+            apply_history_condition_corruption(
+                conditioned=conditioned,
+                schema=self.schema,
+                rng=rng,
+                history_pose_noise_std=self.history_pose_noise_std,
+                history_yaw_noise_std=self.history_yaw_noise_std,
+                history_pose_dropout_prob=self.history_pose_dropout_prob,
+                history_pose_replace_prob=self.history_pose_replace_prob,
+                history_yaw_replace_prob=self.history_yaw_replace_prob,
+                history_root_yaw_drift_std=self.history_root_yaw_drift_std,
+            )
+        conditioned[REALTIME_POSE_TARGET_START, self.schema.target_slice()] = 0.0
+        inpaint_mask = np.asarray(arrays["inpaint_mask"], dtype=bool)
+        valid_frame_mask = np.ones(self.seq_len, dtype=bool)
+
+        item = {
+            "x": torch.from_numpy(features.T).float(),
+            "conditioned_x": torch.from_numpy(conditioned.T).float(),
+            "valid_frame_mask": torch.from_numpy(valid_frame_mask).bool(),
+            "attention_mask": torch.from_numpy(valid_frame_mask).bool(),
+            "sensor_valid": torch.from_numpy(sensor_valid.T).bool(),
+            "inpaint_mask": torch.from_numpy(inpaint_mask.T).bool(),
+            "target_joints_world": torch.from_numpy(arrays["joints_world"][REALTIME_POSE_TARGET_START]).float(),
+            "prev_joints_world": torch.from_numpy(arrays["joints_world"][REALTIME_POSE_TARGET_START - 1]).float(),
+            "target_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START]).float(),
+            "prev_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START - 1]).float(),
+            "prev_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START - 1])).float(),
+            "target_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START])).float(),
+            "target_tracker_pos_ref": torch.from_numpy(
+                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_pos_slice()].reshape(TRACKER_COUNT, 3)
+            ).float(),
+            "target_tracker_rot_ref_6d": torch.from_numpy(
+                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_rot_slice()].reshape(TRACKER_COUNT, 6)
+            ).float(),
+            "target_sensor_valid": torch.from_numpy(sensor_valid[REALTIME_POSE_TARGET_START]).bool(),
+            "joint_offsets_parent": torch.from_numpy(arrays["joint_offsets_parent"]).float(),
+            "length": self.seq_len,
+            "keyid": f"{entry.get('task_id', '')}{keyid_suffix}",
             "source_path": entry.get("source_path", ""),
             "task_mode": entry.get("task_mode", ""),
             "schema_name": self.schema.name,

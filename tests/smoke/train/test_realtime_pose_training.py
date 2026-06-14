@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import torch
 import pytest
 
@@ -12,6 +13,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
     TRACKER_COUNT,
     get_schema_spec,
@@ -168,6 +170,114 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
     del model_kwargs_missing_contact["y"]["target_foot_contact"]
     with pytest.raises(KeyError, match="target_foot_contact"):
         diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_contact)
+
+
+def test_rollout_training_loss_reinjects_predicted_target_and_backprops(tmp_path):
+    source_dir = tmp_path / "sources"
+    task_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN + 1)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(task_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--rollout_steps",
+            "2",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+    loader = get_dataset_loader(
+        data_dir=str(task_dir),
+        batch_size=1,
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        seq_len=REALTIME_POSE_SEQ_LEN,
+        split="train",
+        normalize_input=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+        enable_rollout=True,
+        rollout_steps=2,
+    )
+    batch = next(iter(loader))
+    dist_util.setup_dist(-1)
+    model = DiffusionPoserDiT(
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+    )
+    betas = gd.get_named_beta_schedule("cosine", 4, scale_betas=1.0)
+    diffusion = SpacedDiffusion(
+        use_timesteps=space_timesteps(4, [4]),
+        betas=betas,
+        model_mean_type=gd.ModelMeanType.START_X,
+        model_var_type=gd.ModelVarType.FIXED_SMALL,
+        loss_type=gd.LossType.MSE,
+        rescale_timesteps=False,
+    )
+    args = argparse.Namespace(
+        batch_size=1,
+        lr=1e-4,
+        log_interval=1,
+        save_interval=0,
+        resume_checkpoint="",
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        gradient_clip=False,
+        snr_gamma=0.0,
+        l1_loss=False,
+        task_mode="realtime_pose_reconstruction",
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        checkpoint_max_keep=0,
+        save_dir=str(tmp_path / "run"),
+        num_steps=1,
+        eval_during_training=False,
+        eval_num_batches=1,
+        weighted_loss=False,
+        normalizer_dir="",
+        feature_w_file="feature_w.pt",
+        model_ema=False,
+        rollout_steps=2,
+        rollout_loss_weight=0.25,
+        rollout_prob=1.0,
+        detach_rollout_history=True,
+    )
+    loop = TrainLoop(args, train_platform=NoopPlatform(), model=model, diffusion=diffusion, data=loader)
+
+    rollout_batch = batch["rollout"][0]
+    pred_xstart = torch.randn_like(batch["x"], requires_grad=True)
+    next_conditioned = loop.build_one_step_rollout_conditioned_x(
+        rollout_batch=rollout_batch,
+        pred_xstart=pred_xstart,
+    )
+    original_conditioned = rollout_batch["conditioned_x"]
+    np.testing.assert_allclose(
+        next_conditioned[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START - 1].detach().numpy(),
+        pred_xstart[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START].detach().numpy(),
+    )
+    unchanged_mask = torch.ones_like(original_conditioned, dtype=torch.bool)
+    unchanged_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START - 1] = False
+    assert torch.allclose(next_conditioned[unchanged_mask], original_conditioned[unchanged_mask])
+    assert torch.allclose(
+        next_conditioned[:, REALTIME_POSE_TARGET_DIM:, REALTIME_POSE_TARGET_START - 1],
+        original_conditioned[:, REALTIME_POSE_TARGET_DIM:, REALTIME_POSE_TARGET_START - 1],
+    )
+
+    t = torch.zeros(1, dtype=torch.long)
+    losses = loop.compute_losses(batch=batch, timesteps=t)
+    assert {"loss", "base_loss", "rollout_loss", "rollout_loss_weighted"}.issubset(losses)
+    assert torch.allclose(losses["loss"], losses["base_loss"] + 0.25 * losses["rollout_loss"])
+    losses["loss"].mean().backward()
+    assert any(param.grad is not None for param in model.parameters())
 
 
 def test_sensor_reprojection_pos_loss_ignores_hip_tracker_error():

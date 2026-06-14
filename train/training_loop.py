@@ -14,6 +14,7 @@ from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_START,
     TASK_MODE_REALTIME_POSE,
     get_schema_spec,
 )
@@ -128,6 +129,18 @@ class TrainLoop:
         self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
         self.schema = validate_root_y0_training_args(args)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
+        self.rollout_steps = int(getattr(args, "rollout_steps", 1))
+        self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
+        self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
+        self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
+        if self.rollout_steps < 1:
+            raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
+        if self.rollout_steps > 2:
+            raise ValueError("第一版训练只支持 rollout_steps<=2，避免提前引入长 rollout 变量。")
+        if self.rollout_loss_weight < 0.0:
+            raise ValueError(f"rollout_loss_weight must be >= 0, got {self.rollout_loss_weight}")
+        if not 0.0 <= self.rollout_prob <= 1.0:
+            raise ValueError(f"rollout_prob must be in [0, 1], got {self.rollout_prob}")
 
         self.save_dir = Path(args.save_dir)
         self.step = 0
@@ -151,6 +164,10 @@ class TrainLoop:
 
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
+        logger.log(
+            f"rollout: steps={self.rollout_steps}, prob={self.rollout_prob}, "
+            f"weight={self.rollout_loss_weight}, detach_history={self.detach_rollout_history}"
+        )
         if self.task_mode != TASK_MODE_REALTIME_POSE:
             raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
         if self.device.type == "cuda":
@@ -421,8 +438,9 @@ class TrainLoop:
             raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
 
         feature_w = self._feature_weights_for_batch(batch_size, seq_len)
+        do_rollout = self.should_compute_rollout_loss(batch)
         model_kwargs = self.mask_manager(batch, sample)
-        return self.diffusion.training_losses(
+        losses = self.diffusion.training_losses(
             self.model,
             sample,
             timesteps,
@@ -430,7 +448,84 @@ class TrainLoop:
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
+            return_pred_xstart=do_rollout,
         )
+        pred_xstart = losses.pop("pred_xstart", None)
+        if not do_rollout:
+            return losses
+
+        rollout_losses = self.compute_one_step_rollout_losses(
+            batch=batch,
+            pred_xstart=pred_xstart,
+            timesteps=timesteps,
+        )
+        base_loss = losses["loss"]
+        rollout_loss = rollout_losses["loss"]
+        rollout_loss_weighted = rollout_loss * self.rollout_loss_weight
+        losses["base_loss"] = base_loss
+        losses["rollout_loss"] = rollout_loss
+        losses["rollout_loss_weighted"] = rollout_loss_weighted
+        losses["loss"] = base_loss + rollout_loss_weighted
+        for key, value in rollout_losses.items():
+            if key == "loss":
+                continue
+            losses[f"rollout_{key}"] = value
+        return losses
+
+    def should_compute_rollout_loss(self, batch: dict) -> bool:
+        if self.rollout_steps <= 1 or self.rollout_loss_weight <= 0.0 or self.rollout_prob <= 0.0:
+            return False
+        if not self.model.training or not torch.is_grad_enabled():
+            return False
+        rollout = batch.get("rollout")
+        if not isinstance(rollout, (list, tuple)) or len(rollout) < self.rollout_steps - 1:
+            raise ValueError(
+                f"rollout_steps={self.rollout_steps} 需要 Dataset 返回 rollout 子窗口，"
+                "请先生成 rollout task 并启用 enable_rollout。"
+            )
+        return bool(torch.rand((), device=self.device).item() < self.rollout_prob)
+
+    def compute_one_step_rollout_losses(
+        self,
+        batch: dict,
+        pred_xstart: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> dict:
+        if pred_xstart is None:
+            raise ValueError("rollout loss 需要第一步 diffusion.training_losses 返回 pred_xstart。")
+        rollout_batch = batch["rollout"][0]
+        next_sample = rollout_batch["x"]  # [B, C, 61]
+        if next_sample.shape != batch["x"].shape:
+            raise ValueError(f"rollout[0]['x'] 应为 {tuple(batch['x'].shape)}，实际为 {tuple(next_sample.shape)}")
+
+        next_batch = dict(rollout_batch)
+        next_conditioned = self.build_one_step_rollout_conditioned_x(
+            rollout_batch=rollout_batch,
+            pred_xstart=pred_xstart,
+        )
+        next_batch["conditioned_x"] = next_conditioned
+
+        batch_size, _, seq_len = next_sample.shape
+        feature_w = self._feature_weights_for_batch(batch_size, seq_len)
+        model_kwargs = self.mask_manager(next_batch, next_sample)
+        return self.diffusion.training_losses(
+            self.model,
+            next_sample,
+            timesteps,
+            model_kwargs=model_kwargs,
+            feature_w=feature_w,
+            snr_gamma=self.snr_gamma,
+            use_l1=self.use_l1,
+        )
+
+    def build_one_step_rollout_conditioned_x(self, rollout_batch: dict, pred_xstart: torch.Tensor) -> torch.Tensor:
+        next_conditioned = rollout_batch["conditioned_x"].clone()
+        pred_target_t = pred_xstart[:, : self.schema.target_dim, REALTIME_POSE_TARGET_START]
+        if self.detach_rollout_history:
+            pred_target_t = pred_target_t.detach()
+        # 下一窗口的 frame 59 对应上一窗口刚预测的 frame t；frame 60 仍然保持 target 置零。
+        next_conditioned[:, : self.schema.target_dim, REALTIME_POSE_TARGET_START - 1] = pred_target_t
+        return next_conditioned
 
     def _anneal_lr(self):
         if self.lr_anneal_steps <= 0:
@@ -591,10 +686,15 @@ class TrainLoop:
 
 
 def move_batch_to_device(batch, device):
-    return {
-        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-        for key, value in batch.items()
-    }
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, list):
+        return [move_batch_to_device(value, device) for value in batch]
+    if isinstance(batch, tuple):
+        return tuple(move_batch_to_device(value, device) for value in batch)
+    return batch
 
 
 def parse_resume_step_from_filename(filename):

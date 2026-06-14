@@ -427,6 +427,145 @@
             "problemMatcher": []
         },
         {
+            "label": "realtime_pose_root_y0: 9 build longseq stress eval set",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "data_loaders.build_realtime_longseq_eval_set",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks",
+                "--output_root", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_longseq_eval",
+                "--preset", "stress_long",
+                "--split", "test",
+                "--min_frames", "2000",
+                "--overwrite"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_root_y0: 10 export longseq Unity replays",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "export.write_longseq_eval_unity_replays",
+                "--eval_root", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_longseq_eval",
+                "--eval_set", "latest",
+                "--also_write_unity"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_root_y0: 10b export longseq Unity replays dropout",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "export.write_longseq_eval_unity_replays",
+                "--eval_root", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_longseq_eval",
+                "--eval_set", "latest",
+                "--dropout_preset", "train_default",
+                "--also_write_unity"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_root_y0: 11 evaluate longseq checkpoint",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "sample.evaluate_longseq_eval_set",
+                "--eval_root", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_longseq_eval",
+                "--eval_set", "latest",
+                "--model_arch", "target_dit",
+                "--model_path", "${input:realtimePoseRootY0ModelPath}",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--normalize_input", "true",
+                "--cuda", "true",
+                "--seq_len", "61",
+                "--input_feats", "211",
+                "--max_seq_len", "61",
+                "--layers", "8",
+                "--heads", "8",
+                "--latent_dim", "512",
+                "--diffusion_steps", "50",
+                "--noise_schedule", "cosine",
+                "--predict_xstart", "1",
+                "--use_ema", "true",
+                "--render_mp4", "true"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "realtime_pose_root_y0: 11b evaluate longseq checkpoint dropout",
+            "type": "shell",
+            "command": "conda",
+            "args": [
+                "run", "--no-capture-output", "-n", "diffusionposer5070",
+                "python", "-m", "sample.evaluate_longseq_eval_set",
+                "--eval_root", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_longseq_eval",
+                "--eval_set", "latest",
+                "--model_arch", "target_dit",
+                "--model_path", "${input:realtimePoseRootY0ModelPath}",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz",
+                "--normalize_input", "true",
+                "--cuda", "true",
+                "--seq_len", "61",
+                "--input_feats", "211",
+                "--max_seq_len", "61",
+                "--layers", "8",
+                "--heads", "8",
+                "--latent_dim", "512",
+                "--diffusion_steps", "50",
+                "--noise_schedule", "cosine",
+                "--predict_xstart", "1",
+                "--ts_respace", "ddim10",
+                "--use_ema", "true",
+                "--history_pose_source", "predicted",
+                "--warmup_target_source", "identity",
+                "--no-tracker_ik",
+                "--dropout_preset", "train_default",
+                "--render_mp4", "false"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "realtime_pose_root_y0: smoke tests",
             "type": "shell",
             "command": "conda",
