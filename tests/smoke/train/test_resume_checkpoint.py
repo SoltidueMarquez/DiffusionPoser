@@ -12,7 +12,6 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_INPUT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
     TASK_MODE_REALTIME_POSE,
 )
 from train.training_loop import (
@@ -126,7 +125,7 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
                 json.dumps(
                     {
                         "task_mode": TASK_MODE_REALTIME_POSE,
-                        "schema": REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
+                        "schema": "realtime_pose_v2_contact",
                         "input_feats": REALTIME_POSE_INPUT_DIM,
                         "seq_len": REALTIME_POSE_SEQ_LEN,
                         "max_seq_len": REALTIME_POSE_SEQ_LEN,

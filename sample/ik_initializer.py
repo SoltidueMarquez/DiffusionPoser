@@ -231,8 +231,8 @@ def _solve_single_frame_tracker_pose_ik(
     if schema.supports_root_motion:
         init_frame[schema.root_delta_xz_slice()] = previous_frame_raw[schema.root_delta_xz_slice()]
         init_frame[schema.root_height_slice()] = tracker_pos_ref[HIP_TRACKER_INDEX, 1:2]
-    if schema.supports_contact:
-        init_frame[schema.foot_contact_slice()] = previous_frame_raw[schema.foot_contact_slice()]
+    if schema.supports_stationary_prob:
+        init_frame[schema.stationary_prob_slice()] = previous_frame_raw[schema.stationary_prob_slice()]
 
     valid_nonhip = sensor_valid.clone()
     valid_nonhip[HIP_TRACKER_INDEX] = False

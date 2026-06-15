@@ -32,7 +32,7 @@ class FixedLongseqDiffusion:
         )
         sample[:, schema.root_delta_xz_slice(), REALTIME_POSE_TARGET_START] = 0.0
         sample[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.0
-        sample[:, schema.foot_contact_slice(), REALTIME_POSE_TARGET_START] = 0.0
+        sample[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START] = 0.0
         return sample
 
 

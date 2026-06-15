@@ -30,6 +30,9 @@ from data_loaders.sensor_masking import (  # noqa: E402
     ROOT_YAW_DELTA_DIM,
     ROOT_YAW_DELTA_START,
     SENSOR_VALID_DIM,
+    STATIONARY_JOINT_INDICES,
+    STATIONARY_JOINT_NAMES,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     TRACKER_NAMES,
     TRACKER_POS_DIM,
@@ -49,7 +52,7 @@ def default_unity_model_dir() -> Path:
         / "Projects"
         / "RealtimePose"
         / "Models"
-        / "DiffusionPoser"
+        / "DiffusionPoserStationary5"
     )
 
 
@@ -117,8 +120,14 @@ def build_realtime_pose_feature_schema(
             "start": schema.root_height_start,
             "length": 1,
         }
-    if schema.supports_contact:
-        payload["footContact"] = {"name": "foot_contact", "start": schema.foot_contact_start, "length": 2}
+    if schema.supports_stationary_prob:
+        payload["stationaryProb5"] = {
+            "name": "stationary_prob_5",
+            "start": schema.stationary_prob_start,
+            "length": STATIONARY_PROB_DIM,
+            "jointIndices": [int(value) for value in STATIONARY_JOINT_INDICES],
+            "jointNames": list(STATIONARY_JOINT_NAMES),
+        }
     return payload
 
 

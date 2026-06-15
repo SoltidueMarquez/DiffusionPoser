@@ -5,6 +5,11 @@ import math
 import numpy as np
 import torch
 
+from data_loaders.sensor_masking import (
+    STATIONARY_JOINT_INDICES,
+    STATIONARY_PROB_DIM,
+)
+
 
 SMPL_JOINT_NAMES = (
     "pelvis",
@@ -129,30 +134,55 @@ def integrate_root_delta_xz_ref(
     return result.reshape(prev_pos.shape).astype(np.float32)
 
 
-def derive_foot_contact(
+
+def derive_stationary_prob_5(
     joints_world: np.ndarray,
     fps: float = 60.0,
-    height_threshold: float = 0.05,
-    speed_threshold: float = 0.05,
+    speed_full_motion: float = 0.25,
+    median_window: int = 5,
 ) -> np.ndarray:
-    """
-    从 GT joints 派生左右脚接触标签 `[T,2]`。
+    """从 5 个 GlobalPose 候选接触关节的世界速度派生静止概率 `[T,5]`。
 
-    `speed_threshold` 使用 m/frame 语义；保留 fps 参数是为了调用处能显式记录数据帧率。
+    概率只表达“近似静止”，后续物理模块可以再结合接触可行性决定最终 contact set。
     """
 
-    del fps
     joints = np.asarray(joints_world, dtype=np.float64)
     if joints.ndim != 3 or joints.shape[1:] != (24, 3):
         raise ValueError(f"joints_world 应为 [T,24,3]，实际为 {joints.shape}")
-    foot_indices = [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]]
-    foot_pos = joints[:, foot_indices]
-    velocity_xz = np.zeros((joints.shape[0], 2), dtype=np.float64)
+    if float(fps) <= 0.0:
+        raise ValueError(f"fps 必须为正数，实际为 {fps}")
+    if float(speed_full_motion) <= 0.0:
+        raise ValueError(f"speed_full_motion 必须为正数，实际为 {speed_full_motion}")
+
+    joint_indices = np.asarray(STATIONARY_JOINT_INDICES, dtype=np.int64)
+    if joint_indices.shape != (STATIONARY_PROB_DIM,):
+        raise ValueError(f"stationary joint 数量必须为 {STATIONARY_PROB_DIM}，实际为 {joint_indices.shape}")
+    joint_pos = joints[:, joint_indices]
+    speed = np.zeros((joints.shape[0], STATIONARY_PROB_DIM), dtype=np.float64)
     if joints.shape[0] > 1:
-        velocity_xz[1:] = np.linalg.norm(foot_pos[1:, :, [0, 2]] - foot_pos[:-1, :, [0, 2]], axis=-1)
-    low = foot_pos[:, :, 1] < float(height_threshold)
-    still = velocity_xz < float(speed_threshold)
-    return (low & still).astype(np.float32)
+        speed[1:] = np.linalg.norm(joint_pos[1:] - joint_pos[:-1], axis=-1) * float(fps)
+        speed[0] = speed[1]
+
+    smoothed_speed = median_filter_time(speed, window=int(median_window))
+    stationary_prob = np.clip(1.0 - smoothed_speed / float(speed_full_motion), 0.0, 1.0)
+    return stationary_prob.astype(np.float32)
+
+
+def median_filter_time(values: np.ndarray, window: int) -> np.ndarray:
+    """沿时间维做 edge-padded median filter，保持 `[T,D]` 形状不变。"""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError(f"median_filter_time 输入应为 [T,D]，实际为 {array.shape}")
+    window = int(window)
+    if window <= 1 or array.shape[0] <= 1:
+        return array.copy()
+    if window % 2 == 0:
+        raise ValueError(f"median_window 必须为奇数，实际为 {window}")
+    radius = window // 2
+    padded = np.pad(array, ((radius, radius), (0, 0)), mode="edge")
+    stacked = np.stack([padded[offset : offset + array.shape[0]] for offset in range(window)], axis=0)
+    return np.median(stacked, axis=0)
 
 
 def rotation_6d_forward_up_np(rotations: np.ndarray) -> np.ndarray:

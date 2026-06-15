@@ -38,7 +38,7 @@ from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
     build_body_pose_root_global_6d,
-    derive_foot_contact,
+    derive_stationary_prob_5,
     encode_root_delta_xz_ref,
     estimate_root_global_offsets,
     extract_yaw_from_rotations,
@@ -57,6 +57,8 @@ from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAMES,
+    STATIONARY_JOINT_INDICES,
+    STATIONARY_JOINT_NAMES,
     get_schema_spec,
 )
 
@@ -65,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
     parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
-    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=Path)
+    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=Path)
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=1, type=int)
@@ -236,12 +238,10 @@ def build_realtime_pose_features(
             root_yaw=root_yaw.astype(np.float32),
         )
         features[schema.pelvis_height_key] = pelvis_world[:, 1:2].astype(np.float32)
-    if schema.supports_contact:
-        features["foot_contact"] = derive_foot_contact(
+    if schema.supports_stationary_prob:
+        features["stationary_prob_5"] = derive_stationary_prob_5(
             joints_world=joints_world,
             fps=float(target_fps),
-            height_threshold=0.05,
-            speed_threshold=0.05,
         )
     return features
 
@@ -270,6 +270,9 @@ def save_realtime_pose_motion(
         "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
+    if schema.supports_stationary_prob:
+        metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
+        metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D and "body_fbx_rest_json" in features:
         metadata["body_fbx_rest_json"] = str(features["body_fbx_rest_json"].item())
     np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
@@ -416,6 +419,9 @@ def save_reused_realtime_source(
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
+    if schema.supports_stationary_prob:
+        next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
+        next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
     np.savez(output_path, **features, metadata=json.dumps(next_metadata, ensure_ascii=False))
 
 

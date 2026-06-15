@@ -70,7 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq = parser.add_argument_group("longseq_eval")
     longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     longseq.add_argument("--eval_set", default="latest", type=str)
-    longseq.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
+    longseq.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
     longseq.add_argument("--input_feats", default=schema.feature_dim, type=int)
     longseq.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)

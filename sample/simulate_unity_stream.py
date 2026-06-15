@@ -22,7 +22,6 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    FOOT_CONTACT_DIM,
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
@@ -31,6 +30,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_START,
     ROOT_DELTA_XZ_DIM,
     SMPL_JOINT_COUNT,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     get_schema_spec,
 )
@@ -671,8 +671,8 @@ def initial_target_feature(schema_name: str, root_height: float = 0.0) -> np.nda
     if schema.supports_root_motion:
         features[schema.root_delta_xz_slice()] = np.zeros((ROOT_DELTA_XZ_DIM,), dtype=np.float32)
         features[schema.root_height_slice()] = np.asarray([float(root_height)], dtype=np.float32)
-    if schema.supports_contact:
-        features[schema.foot_contact_slice()] = np.zeros((FOOT_CONTACT_DIM,), dtype=np.float32)
+    if schema.supports_stationary_prob:
+        features[schema.stationary_prob_slice()] = np.zeros((STATIONARY_PROB_DIM,), dtype=np.float32)
     return features
 
 

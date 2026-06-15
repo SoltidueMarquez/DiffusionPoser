@@ -22,7 +22,7 @@ from utils.parser_util import add_base_options, add_data_options, add_diffusion_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run realtime_pose_v2 rollout reconstruction.")
+    parser = argparse.ArgumentParser(description="Run realtime_pose_body_fbx_local_root_y0_v1 stationary5 rollout reconstruction.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -256,7 +256,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         use_ddim=str(args.ts_respace).startswith("ddim"),
         limit=int(args.rollout_limit),
     )
-    output_dir = Path(args.output_dir or "output/realtime_pose_v2_rollout").resolve()
+    output_dir = Path(args.output_dir or "output/realtime_pose_body_fbx_local_root_y0_stationary5_rollout").resolve()
     output_path = output_dir / "rollout_result.npz"
     save_rollout(output_path, payload)
     print(f"[reconstruct_rollout] weights={source} output={output_path}")

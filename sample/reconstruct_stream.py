@@ -30,7 +30,7 @@ from utils.parser_util import add_base_options, add_data_options, add_diffusion_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample realtime_pose_v2 single-frame reconstruction tasks.")
+    parser = argparse.ArgumentParser(description="Sample realtime_pose_body_fbx_local_root_y0_v1 stationary5 single-frame reconstruction tasks.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)

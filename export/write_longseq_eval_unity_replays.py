@@ -27,7 +27,7 @@ from export.write_unity_replay_stream import DEFAULT_REPLAY_FPS, load_sensor_val
 
 
 DEFAULT_UNITY_REPLAY_DIR = (
-    "../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser/Replays/"
+    "../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoserStationary5/Replays/"
     "root_y0_longseq_eval_stress_long"
 )
 

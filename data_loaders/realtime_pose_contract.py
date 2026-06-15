@@ -8,7 +8,6 @@ import numpy as np
 
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
-    FOOT_CONTACT_DIM,
     LEGACY_BODY_POSE_PARENT_KEY,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     POSE_REPRESENTATION_KEY,
@@ -17,6 +16,7 @@ from data_loaders.sensor_masking import (
     ROOT_Y_POLICY_FIXED_ZERO,
     ROOT_YAW_DELTA_DIM,
     SENSOR_VALID_DIM,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     SchemaSpec,
     get_schema_spec,
@@ -152,8 +152,8 @@ def required_realtime_source_fields(schema: SchemaSpec | str) -> set[str]:
     required.add(schema.root_heading_delta_key)
     if schema.supports_root_motion:
         required.update({"root_delta_xz_ref", schema.pelvis_height_key})
-    if schema.supports_contact:
-        required.add("foot_contact")
+    if schema.supports_stationary_prob:
+        required.add("stationary_prob_5")
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         required.add("joint_rest_local_rotations_6d")
     return required
@@ -192,8 +192,8 @@ def expected_realtime_source_shapes(schema: SchemaSpec, frame_count: int) -> dic
     if schema.supports_root_motion:
         shapes["root_delta_xz_ref"] = (frame_count, ROOT_DELTA_XZ_DIM)
         shapes[schema.pelvis_height_key] = (frame_count, ROOT_HEIGHT_DIM)
-    if schema.supports_contact:
-        shapes["foot_contact"] = (frame_count, FOOT_CONTACT_DIM)
+    if schema.supports_stationary_prob:
+        shapes["stationary_prob_5"] = (frame_count, STATIONARY_PROB_DIM)
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         shapes["joint_rest_local_rotations_6d"] = (24, 6)
     return shapes

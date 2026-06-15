@@ -13,11 +13,14 @@ from data_converter.amass_to_realtime_pose import build_realtime_pose_features
 from data_converter.amass_smpl_utils import MotionSource, SMPL_JOINT_COUNT, SMPL_PARENTS, run_smpl_forward
 from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
 from data_loaders.generate_realtime_pose_tasks import (
+    TASK_OUTPUT_MARKER,
     make_task_id,
     load_realtime_source,
     main as generate_realtime_pose_tasks_main,
     read_source_entries,
     resolve_manifest_file,
+    save_task_npz,
+    temporary_task_path,
 )
 from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest, fk_body_fbx_local_delta
 from data_loaders.realtime_pose_kinematics import fk_body_fbx_local_torch
@@ -118,7 +121,8 @@ def test_converter_feature_builder_outputs_realtime_schema_shapes():
     assert features["joints_world"].shape == (4, 24, 3)
     assert features["root_delta_xz_ref"].shape == (4, 2)
     assert features[schema.pelvis_height_key].shape == (4, 1)
-    assert features["foot_contact"].shape == (4, 2)
+    assert features["stationary_prob_5"].shape == (4, 5)
+    assert np.all((features["stationary_prob_5"] >= 0.0) & (features["stationary_prob_5"] <= 1.0))
     assert features["joint_rest_local_rotations_6d"].shape == (24, 6)
     np.testing.assert_allclose(features["root_pos_world"][:, 1], 0.0, atol=1e-6)
     np.testing.assert_allclose(features[schema.pelvis_height_key][:, 0], features["joints_world"][:, 0, 1], atol=1e-6)
@@ -247,7 +251,7 @@ def test_converter_reuses_existing_root_y0_source_without_smpl(monkeypatch, tmp_
     with np.load(output_dir / "ACCAD" / "toy_realtime.npz", allow_pickle=False) as data:
         assert "root_delta_xz_ref" in data.files
         assert schema.pelvis_height_key in data.files
-        assert "foot_contact" in data.files
+        assert "stationary_prob_5" in data.files
         assert "joint_rest_local_rotations_6d" in data.files
         assert str(data[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
         metadata = json.loads(str(data["metadata"].item()))
@@ -579,6 +583,22 @@ def test_task_id_stays_short_for_long_amass_paths():
     assert all(char in "0123456789abcdef" for char in digest)
 
 
+def test_task_npz_temp_path_does_not_exceed_final_path_length(tmp_path):
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    target_len = 259
+    stem_len = target_len - len(str(task_dir)) - 1 - len(".npz")
+    if stem_len < 8:
+        pytest.skip("临时目录路径过长，无法构造接近 Windows MAX_PATH 的最终文件名")
+    task_path = task_dir / (("x" * stem_len) + ".npz")
+    temp_path = temporary_task_path(task_path)
+
+    assert len(str(temp_path)) <= len(str(task_path))
+    save_task_npz(task_path, compress=False, value=np.asarray([1], dtype=np.float32))
+    assert task_path.exists()
+    assert not temp_path.exists()
+
+
 def test_task_generator_skips_short_sources_by_default(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
@@ -696,6 +716,48 @@ def test_task_generator_overwrite_rejects_unsafe_directories(tmp_path):
             ]
         )
     assert (output_dir / "keep.txt").exists()
+
+
+def test_task_generator_accepts_legacy_marked_task_root_without_latest_pointer(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir)
+    legacy_run = output_dir / "20240101_000000_rtp_tasks_seed10"
+    legacy_run.mkdir(parents=True)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    marker = {
+        "schema_name": schema.name,
+        "task_format": schema.task_format,
+        POSE_REPRESENTATION_KEY: schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "source_dir": str(source_dir),
+        "split_dir": "",
+    }
+    (legacy_run / TASK_OUTPUT_MARKER).write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+
+    counts = generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(output_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+
+    assert counts["train"] == 1
+    assert legacy_run.exists()
+    assert (output_dir / "latest_tasks.json").exists()
+    assert latest_artifact_dir(output_dir, kind="tasks") != legacy_run
 
 
 def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(tmp_path):

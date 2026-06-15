@@ -6,7 +6,6 @@ import numpy as np
 
 
 REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
-REALTIME_POSE_V2_CONTACT_SCHEMA_NAME = "realtime_pose_v2_contact"
 REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
 DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
@@ -21,7 +20,6 @@ BODY_POSE_ROOT_GLOBAL_KEY = "body_pose_root_global_6d"
 BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY = "body_pose_body_fbx_local_delta_6d"
 LEGACY_BODY_POSE_PARENT_KEY = "body_pose_parent_6d"
 TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
-TASK_FORMAT_REALTIME_POSE_V2_CONTACT = "materialized_realtime_pose_v2_contact"
 TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0 = "materialized_realtime_pose_body_fbx_local_root_y0_v1"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
 TASK_MODES = (TASK_MODE_REALTIME_POSE,)
@@ -35,7 +33,9 @@ BODY_POSE_DIM = SMPL_JOINT_COUNT * 6
 ROOT_YAW_DELTA_DIM = 2
 ROOT_DELTA_XZ_DIM = 2
 ROOT_HEIGHT_DIM = 1
-FOOT_CONTACT_DIM = 2
+STATIONARY_PROB_DIM = 5
+STATIONARY_JOINT_INDICES = (0, 10, 11, 22, 23)
+STATIONARY_JOINT_NAMES = ("pelvis", "left_foot", "right_foot", "left_hand", "right_hand")
 TRACKER_COUNT = 6
 TRACKER_POS_DIM = TRACKER_COUNT * 3
 TRACKER_ROT_DIM = TRACKER_COUNT * 6
@@ -52,25 +52,15 @@ V2_MOTION_SENSOR_VALID_START = V2_MOTION_TRACKER_ROT_REF_START + TRACKER_ROT_DIM
 REALTIME_POSE_V2_MOTION_INPUT_DIM = V2_MOTION_SENSOR_VALID_START + SENSOR_VALID_DIM
 REALTIME_POSE_V2_MOTION_TARGET_DIM = BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM
 
-V2_CONTACT_ROOT_DELTA_XZ_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
-V2_CONTACT_ROOT_HEIGHT_START = V2_CONTACT_ROOT_DELTA_XZ_START + ROOT_DELTA_XZ_DIM
-V2_CONTACT_FOOT_CONTACT_START = V2_CONTACT_ROOT_HEIGHT_START + ROOT_HEIGHT_DIM
-V2_CONTACT_TRACKER_POS_REF_START = V2_CONTACT_FOOT_CONTACT_START + FOOT_CONTACT_DIM
-V2_CONTACT_TRACKER_ROT_REF_START = V2_CONTACT_TRACKER_POS_REF_START + TRACKER_POS_DIM
-V2_CONTACT_SENSOR_VALID_START = V2_CONTACT_TRACKER_ROT_REF_START + TRACKER_ROT_DIM
-REALTIME_POSE_V2_CONTACT_INPUT_DIM = V2_CONTACT_SENSOR_VALID_START + SENSOR_VALID_DIM
-REALTIME_POSE_V2_CONTACT_TARGET_DIM = (
-    BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM + FOOT_CONTACT_DIM
-)
 BODY_FBX_LOCAL_ROOT_DELTA_XZ_START = ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM
 BODY_FBX_LOCAL_PELVIS_HEIGHT_START = BODY_FBX_LOCAL_ROOT_DELTA_XZ_START + ROOT_DELTA_XZ_DIM
-BODY_FBX_LOCAL_FOOT_CONTACT_START = BODY_FBX_LOCAL_PELVIS_HEIGHT_START + ROOT_HEIGHT_DIM
-BODY_FBX_LOCAL_TRACKER_POS_REF_START = BODY_FBX_LOCAL_FOOT_CONTACT_START + FOOT_CONTACT_DIM
+BODY_FBX_LOCAL_STATIONARY_PROB_START = BODY_FBX_LOCAL_PELVIS_HEIGHT_START + ROOT_HEIGHT_DIM
+BODY_FBX_LOCAL_TRACKER_POS_REF_START = BODY_FBX_LOCAL_STATIONARY_PROB_START + STATIONARY_PROB_DIM
 BODY_FBX_LOCAL_TRACKER_ROT_REF_START = BODY_FBX_LOCAL_TRACKER_POS_REF_START + TRACKER_POS_DIM
 BODY_FBX_LOCAL_SENSOR_VALID_START = BODY_FBX_LOCAL_TRACKER_ROT_REF_START + TRACKER_ROT_DIM
 REALTIME_POSE_BODY_FBX_LOCAL_INPUT_DIM = BODY_FBX_LOCAL_SENSOR_VALID_START + SENSOR_VALID_DIM
 REALTIME_POSE_BODY_FBX_LOCAL_TARGET_DIM = (
-    BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM + FOOT_CONTACT_DIM
+    BODY_POSE_DIM + ROOT_YAW_DELTA_DIM + ROOT_DELTA_XZ_DIM + ROOT_HEIGHT_DIM + STATIONARY_PROB_DIM
 )
 TRACKER_POS_REF_START = BODY_FBX_LOCAL_TRACKER_POS_REF_START
 TRACKER_ROT_REF_START = BODY_FBX_LOCAL_TRACKER_ROT_REF_START
@@ -161,7 +151,7 @@ class SchemaSpec:
     pelvis_height_key: str = "root_height"
     root_delta_xz_start: int | None = None
     root_height_start: int | None = None
-    foot_contact_start: int | None = None
+    stationary_prob_start: int | None = None
     root_y_policy: str = ROOT_Y_POLICY_ACTOR_ROOT_FROM_PELVIS
     pelvis_height_mode: str = PELVIS_HEIGHT_MODE_ACTOR_ROOT_Y
 
@@ -170,8 +160,8 @@ class SchemaSpec:
         return self.root_delta_xz_start is not None and self.root_height_start is not None
 
     @property
-    def supports_contact(self) -> bool:
-        return self.foot_contact_start is not None
+    def supports_stationary_prob(self) -> bool:
+        return self.stationary_prob_start is not None
 
     def target_slice(self) -> slice:
         return slice(BODY_POSE_START, self.target_dim)
@@ -198,10 +188,10 @@ class SchemaSpec:
     def pelvis_height_slice(self) -> slice:
         return self.root_height_slice()
 
-    def foot_contact_slice(self) -> slice:
-        if self.foot_contact_start is None:
-            raise ValueError(f"{self.name} 不包含 foot_contact。")
-        return slice(self.foot_contact_start, self.foot_contact_start + FOOT_CONTACT_DIM)
+    def stationary_prob_slice(self) -> slice:
+        if self.stationary_prob_start is None:
+            raise ValueError(f"{self.name} 不包含 stationary_prob_5。")
+        return slice(self.stationary_prob_start, self.stationary_prob_start + STATIONARY_PROB_DIM)
 
     def tracker_pos_slice(self, tracker_index: int | None = None) -> slice:
         if tracker_index is None:
@@ -233,20 +223,6 @@ SCHEMA_SPECS: dict[str, SchemaSpec] = {
         tracker_rot_ref_start=V2_MOTION_TRACKER_ROT_REF_START,
         sensor_valid_start=V2_MOTION_SENSOR_VALID_START,
     ),
-    REALTIME_POSE_V2_CONTACT_SCHEMA_NAME: SchemaSpec(
-        name=REALTIME_POSE_V2_CONTACT_SCHEMA_NAME,
-        task_format=TASK_FORMAT_REALTIME_POSE_V2_CONTACT,
-        feature_dim=REALTIME_POSE_V2_CONTACT_INPUT_DIM,
-        target_dim=REALTIME_POSE_V2_CONTACT_TARGET_DIM,
-        body_pose_start=BODY_POSE_START,
-        root_yaw_delta_start=ROOT_YAW_DELTA_START,
-        root_delta_xz_start=V2_CONTACT_ROOT_DELTA_XZ_START,
-        root_height_start=V2_CONTACT_ROOT_HEIGHT_START,
-        foot_contact_start=V2_CONTACT_FOOT_CONTACT_START,
-        tracker_pos_ref_start=V2_CONTACT_TRACKER_POS_REF_START,
-        tracker_rot_ref_start=V2_CONTACT_TRACKER_ROT_REF_START,
-        sensor_valid_start=V2_CONTACT_SENSOR_VALID_START,
-    ),
     REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME: SchemaSpec(
         name=REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
         task_format=TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0,
@@ -256,7 +232,7 @@ SCHEMA_SPECS: dict[str, SchemaSpec] = {
         root_yaw_delta_start=ROOT_YAW_DELTA_START,
         root_delta_xz_start=BODY_FBX_LOCAL_ROOT_DELTA_XZ_START,
         root_height_start=BODY_FBX_LOCAL_PELVIS_HEIGHT_START,
-        foot_contact_start=BODY_FBX_LOCAL_FOOT_CONTACT_START,
+        stationary_prob_start=BODY_FBX_LOCAL_STATIONARY_PROB_START,
         tracker_pos_ref_start=BODY_FBX_LOCAL_TRACKER_POS_REF_START,
         tracker_rot_ref_start=BODY_FBX_LOCAL_TRACKER_ROT_REF_START,
         sensor_valid_start=BODY_FBX_LOCAL_SENSOR_VALID_START,

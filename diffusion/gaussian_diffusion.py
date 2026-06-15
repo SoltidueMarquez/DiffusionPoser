@@ -1408,8 +1408,9 @@ class GaussianDiffusion:
             "target_root_pos_world",
             "prev_root_yaw",
             "joint_offsets_parent",
-            "target_foot_contact",
         )
+        if schema.supports_stationary_prob:
+            required = (*required, "target_stationary_prob_5")
         missing = [name for name in required if name not in y]
         if missing:
             raise KeyError(f"{schema.name} auxiliary loss 缺少 batch 字段：{missing}")
@@ -1507,12 +1508,16 @@ class GaussianDiffusion:
             device=pred_xstart.device,
             dtype=torch.long,
         )
-        contact_mask = y["target_foot_contact"].to(device=pred_xstart.device, dtype=pred_xstart.dtype) > 0.5
-        if tuple(contact_mask.shape) != (pred_xstart.shape[0], 2):
-            raise ValueError(f"target_foot_contact 应为 [B, 2]，实际为 {tuple(contact_mask.shape)}")
+        if schema.supports_stationary_prob:
+            stationary_prob = y["target_stationary_prob_5"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            if tuple(stationary_prob.shape) != (pred_xstart.shape[0], 5):
+                raise ValueError(f"target_stationary_prob_5 应为 [B, 5]，实际为 {tuple(stationary_prob.shape)}")
+            foot_lock_weight = stationary_prob[:, 1:3].clamp(0.0, 1.0)
+        else:
+            foot_lock_weight = torch.zeros((pred_xstart.shape[0], 2), device=pred_xstart.device, dtype=pred_xstart.dtype)
         pred_foot_delta_xz = pred_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
-        foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * contact_mask.float()
-        foot_lock_count = contact_mask.float().sum(dim=1).clamp_min(1.0)
+        foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * foot_lock_weight
+        foot_lock_count = foot_lock_weight.sum(dim=1).clamp_min(1.0)
         foot_lock_loss = foot_lock_raw.sum(dim=1) / foot_lock_count
 
         result = {
@@ -1524,14 +1529,6 @@ class GaussianDiffusion:
         if root_delta_loss is not None and root_height_loss is not None:
             result["root_delta_loss"] = root_delta_loss
             result["root_height_loss"] = root_height_loss
-        if schema.supports_contact:
-            contact_slice = schema.foot_contact_slice()
-            pred_contact = pred_xstart[:, contact_slice, frame]
-            gt_contact = x_start[:, contact_slice, frame]
-            pred_contact = self._realtime_pose_slice_to_raw(pred_contact, y, contact_slice.start, contact_slice.stop)
-            gt_contact = self._realtime_pose_slice_to_raw(gt_contact, y, contact_slice.start, contact_slice.stop)
-            result["contact_loss"] = torch.abs(pred_contact - gt_contact).mean(dim=1)
-
         target_tracker_pos_ref = y.get("target_tracker_pos_ref")
         target_tracker_rot_ref = y.get("target_tracker_rot_ref_6d")
         target_sensor_valid = y.get("target_sensor_valid")

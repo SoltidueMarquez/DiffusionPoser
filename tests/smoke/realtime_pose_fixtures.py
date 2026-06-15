@@ -5,8 +5,19 @@ from pathlib import Path
 
 import numpy as np
 
-from data_loaders.realtime_pose_kinematics import JOINT_INDEX, TRACKER_JOINT_INDICES, derive_foot_contact, encode_root_delta_xz_ref
-from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.realtime_pose_kinematics import (
+    JOINT_INDEX,
+    TRACKER_JOINT_INDICES,
+    derive_stationary_prob_5,
+    encode_root_delta_xz_ref,
+)
+from data_loaders.sensor_masking import (
+    POSE_REPRESENTATION_KEY,
+    REALTIME_POSE_SCHEMA_NAME,
+    STATIONARY_JOINT_INDICES,
+    STATIONARY_JOINT_NAMES,
+    get_schema_spec,
+)
 
 
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -14,7 +25,7 @@ IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
 
 def build_toy_source_metadata(frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict:
     schema = get_schema_spec(schema_name)
-    return {
+    metadata = {
         "schema_name": schema.name,
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
@@ -25,6 +36,10 @@ def build_toy_source_metadata(frame_count: int = 70, schema_name: str = REALTIME
         "output_path": "ACCAD/toy_realtime.npz",
         "frames": int(frame_count),
     }
+    if schema.supports_stationary_prob:
+        metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
+        metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+    return metadata
 
 
 def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
@@ -53,7 +68,6 @@ def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME
     rest_rotations_6d = np.tile(IDENTITY_6D, (24, 1)).astype(np.float32)
     root_delta_xz_ref = encode_root_delta_xz_ref(root_pos_world=root_pos, root_yaw=root_yaw)
     pelvis_height = joints[:, 0, 1:2].astype(np.float32)
-    foot_contact = derive_foot_contact(joints_world=joints)
     source = {
         schema.body_pose_key: body_pose,
         POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
@@ -62,12 +76,13 @@ def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME
         schema.root_heading_delta_key: root_heading_delta_sincos,
         "root_delta_xz_ref": root_delta_xz_ref,
         schema.pelvis_height_key: pelvis_height,
-        "foot_contact": foot_contact,
         "tracker_pos_world": tracker_pos,
         "tracker_rot_world_6d": tracker_rot,
         "joints_world": joints,
         "joint_offsets_parent": offsets,
     }
+    if schema.supports_stationary_prob:
+        source["stationary_prob_5"] = derive_stationary_prob_5(joints_world=joints)
     if schema.pose_representation == "body_fbx_local_delta_6d":
         source["joint_rest_local_rotations_6d"] = rest_rotations_6d
     source["metadata"] = np.asarray(json.dumps(build_toy_source_metadata(frame_count=frame_count, schema_name=schema.name)))

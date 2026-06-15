@@ -128,8 +128,8 @@ def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path |
     if schema.supports_root_motion:
         expected["root_delta_xz_ref"] = (frame_count, 2)
         expected[schema.pelvis_height_key] = (frame_count, 1)
-    if schema.supports_contact:
-        expected["foot_contact"] = (frame_count, 2)
+    if schema.supports_stationary_prob:
+        expected["stationary_prob_5"] = (frame_count, 5)
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         expected["joint_rest_local_rotations_6d"] = (24, 6)
     for key, shape in expected.items():

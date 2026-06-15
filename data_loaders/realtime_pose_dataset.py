@@ -21,7 +21,6 @@ from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_KEY,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     HIP_TRACKER_INDEX,
-    FOOT_CONTACT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
@@ -31,6 +30,7 @@ from data_loaders.sensor_masking import (
     ROOT_YAW_DELTA_DIM,
     SENSOR_VALID_DIM,
     SchemaSpec,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     TRACKER_MASK_FILL_MODES,
     TRACKER_MASK_FILL_ZERO,
@@ -291,8 +291,10 @@ class RealtimePoseTaskDataset(Dataset):
             item["target_root_height"] = torch.tensor(
                 float(arrays[self.schema.pelvis_height_key][REALTIME_POSE_TARGET_START, 0])
             ).float()
-        if self.schema.supports_contact:
-            item["target_foot_contact"] = torch.from_numpy(arrays["foot_contact"][REALTIME_POSE_TARGET_START]).float()
+        if self.schema.supports_stationary_prob:
+            item["target_stationary_prob_5"] = torch.from_numpy(
+                arrays["stationary_prob_5"][REALTIME_POSE_TARGET_START]
+            ).float()
         if self.enable_rollout:
             item["rollout"] = self.build_rollout_items(
                 entry=entry,
@@ -434,8 +436,10 @@ class RealtimePoseTaskDataset(Dataset):
             item["target_root_height"] = torch.tensor(
                 float(arrays[self.schema.pelvis_height_key][REALTIME_POSE_TARGET_START, 0])
             ).float()
-        if self.schema.supports_contact:
-            item["target_foot_contact"] = torch.from_numpy(arrays["foot_contact"][REALTIME_POSE_TARGET_START]).float()
+        if self.schema.supports_stationary_prob:
+            item["target_stationary_prob_5"] = torch.from_numpy(
+                arrays["stationary_prob_5"][REALTIME_POSE_TARGET_START]
+            ).float()
         return item
 
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:
@@ -657,8 +661,12 @@ def load_realtime_task_arrays(
             (seq_len, ROOT_HEIGHT_DIM),
             schema.pelvis_height_key,
         ).astype(np.float32)
-    if schema.supports_contact:
-        arrays["foot_contact"] = array_shape(task["foot_contact"], (seq_len, FOOT_CONTACT_DIM), "foot_contact").astype(np.float32)
+    if schema.supports_stationary_prob:
+        arrays["stationary_prob_5"] = array_shape(
+            task["stationary_prob_5"],
+            (seq_len, STATIONARY_PROB_DIM),
+            "stationary_prob_5",
+        ).astype(np.float32)
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         arrays["joint_rest_local_rotations_6d"] = array_shape(
             task["joint_rest_local_rotations_6d"],
@@ -685,8 +693,8 @@ def encode_realtime_pose_features(
     if schema.supports_root_motion:
         features[:, schema.root_delta_xz_slice()] = arrays["root_delta_xz_ref"]
         features[:, schema.root_height_slice()] = arrays[schema.pelvis_height_key]
-    if schema.supports_contact:
-        features[:, schema.foot_contact_slice()] = arrays["foot_contact"]
+    if schema.supports_stationary_prob:
+        features[:, schema.stationary_prob_slice()] = arrays["stationary_prob_5"]
     features[:, schema.tracker_pos_slice()] = encode_tracker_pos_ref(arrays).reshape(seq_len, -1)
     features[:, schema.tracker_rot_slice()] = encode_tracker_rot_ref(arrays).reshape(seq_len, -1)
     features[:, schema.sensor_valid_slice()] = arrays["sensor_valid"].astype(np.float32)

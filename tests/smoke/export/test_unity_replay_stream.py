@@ -7,11 +7,11 @@ import pytest
 
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
-    FOOT_CONTACT_DIM,
     REALTIME_POSE_SCHEMA_NAME,
     ROOT_DELTA_XZ_DIM,
     ROOT_HEIGHT_DIM,
     ROOT_YAW_DELTA_DIM,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     get_schema_spec,
 )
@@ -58,17 +58,20 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
     assert len(payload["referenceJointsWorld"]) == 4 * 24 * 3
     assert len(payload["rootHeading"]) == 4
     assert len(payload["rootPosWorld"]) == 4 * 3
-    assert len(payload["footContact"]) == 4 * 2
-    assert payload["targetFeatureLength"] == 151
-    assert len(payload["targetFeaturesRaw"]) == 4 * 151
-    assert payload["metadata"]["targetFeaturesRawShape"] == [4, 151]
+    assert payload["stationaryProbDim"] == STATIONARY_PROB_DIM
+    assert payload["stationaryProbJointIndices"] == [0, 10, 11, 22, 23]
+    assert len(payload["stationaryProb5"]) == 4 * STATIONARY_PROB_DIM
+    assert payload["targetFeatureLength"] == 154
+    assert len(payload["targetFeaturesRaw"]) == 4 * 154
+    assert payload["metadata"]["targetFeaturesRawShape"] == [4, 154]
     assert payload["metadata"]["poseRepresentation"] == payload["poseRepresentation"]
 
     positions = np.asarray(payload["trackerPositions"], dtype=np.float32).reshape(4, TRACKER_COUNT, 3)
     rotations = np.asarray(payload["trackerRotations6d"], dtype=np.float32).reshape(4, TRACKER_COUNT, 6)
     valid = np.asarray(payload["sensorValid"], dtype=np.int32).reshape(4, TRACKER_COUNT)
     joints = np.asarray(payload["referenceJointsWorld"], dtype=np.float32).reshape(4, 24, 3)
-    target_features = np.asarray(payload["targetFeaturesRaw"], dtype=np.float32).reshape(4, 151)
+    stationary = np.asarray(payload["stationaryProb5"], dtype=np.float32).reshape(4, STATIONARY_PROB_DIM)
+    target_features = np.asarray(payload["targetFeaturesRaw"], dtype=np.float32).reshape(4, 154)
     np.testing.assert_allclose(positions, source["tracker_pos_world"][1:5])
     np.testing.assert_allclose(rotations, source["tracker_rot_world_6d"][1:5])
     np.testing.assert_array_equal(valid, source["sensor_valid"][1:5].astype(np.int32))
@@ -93,10 +96,11 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
     )
     cursor += ROOT_HEIGHT_DIM
     np.testing.assert_allclose(
-        target_features[:, cursor : cursor + FOOT_CONTACT_DIM],
-        source["foot_contact"][1:5],
+        target_features[:, cursor : cursor + STATIONARY_PROB_DIM],
+        source["stationary_prob_5"][1:5],
     )
-    assert cursor + FOOT_CONTACT_DIM == schema.target_dim
+    np.testing.assert_allclose(stationary, source["stationary_prob_5"][1:5])
+    assert cursor + STATIONARY_PROB_DIM == schema.target_dim
 
 
 def test_unity_replay_stream_writes_json_file(tmp_path):

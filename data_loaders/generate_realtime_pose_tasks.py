@@ -70,8 +70,8 @@ class TaskGenerationPlan:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz", type=str)
-    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_60hz_tasks", type=str)
+    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
 
     task = parser.add_argument_group("task")
@@ -258,10 +258,36 @@ def validate_task_output_root_available(source_dir: Path, output_root: Path) -> 
         return
     if (output_root / "latest_tasks.json").exists() or (output_root / "latest_tasks.txt").exists():
         return
+    if output_root_contains_only_marked_task_runs(output_root):
+        return
     raise ValueError(
         f"拒绝使用非空且没有 latest_tasks 指针的 output_dir 根目录: {output_root}。"
         "请换一个目录，或先确认并清理旧内容。"
     )
+
+
+def output_root_contains_only_marked_task_runs(output_root: Path) -> bool:
+    """兼容旧版 task 根目录：只要子目录都是带 marker 的 task run，就允许继续追加新 run。"""
+
+    children = list(output_root.iterdir())
+    return bool(children) and all(child.is_dir() and is_marked_task_output_dir(child) for child in children)
+
+
+def is_marked_task_output_dir(path: Path) -> bool:
+    marker_path = path / TASK_OUTPUT_MARKER
+    if not marker_path.exists():
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not isinstance(marker, dict):
+            return False
+        schema = get_schema_spec(marker.get("schema_name"))
+        if marker.get("task_format") != schema.task_format:
+            return False
+        validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def validate_task_output_dir_available(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
@@ -637,7 +663,7 @@ def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -
 
 def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
     task_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = task_path.with_name(task_path.name + ".tmp")
+    temp_path = temporary_task_path(task_path)
     if temp_path.exists():
         temp_path.unlink()
     with temp_path.open("wb") as file:
@@ -646,6 +672,12 @@ def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
         else:
             np.savez(file, **arrays)
     temp_path.replace(task_path)
+
+
+def temporary_task_path(task_path: Path) -> Path:
+    """临时文件名不能比最终 .npz 更长，避免 Windows 长路径边界下写入失败。"""
+
+    return task_path.with_suffix(".tmp")
 
 
 def make_task_id(split: str, stablemotion_split_key: str, sample_index: int, pattern_index: int, pattern_category: str) -> str:

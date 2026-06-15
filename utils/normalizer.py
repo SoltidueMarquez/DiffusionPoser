@@ -36,10 +36,10 @@ def enforce_realtime_pose_normalizer_contract(
         sensor_slice = schema.sensor_valid_slice()
         mean[sensor_slice] = 0.0
         std[sensor_slice] = 1.0
-        if schema.supports_contact:
-            contact_slice = schema.foot_contact_slice()
-            mean[contact_slice] = 0.0
-            std[contact_slice] = 1.0
+        if schema.supports_stationary_prob:
+            stationary_slice = schema.stationary_prob_slice()
+            mean[stationary_slice] = 0.0
+            std[stationary_slice] = 1.0
     return mean, std
 
 

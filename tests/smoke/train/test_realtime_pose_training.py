@@ -45,7 +45,7 @@ def _make_sensor_reprojection_aux_inputs(target_tracker_pos_ref: torch.Tensor, t
             "prev_root_pos_world": torch.zeros(batch_size, 3),
             "prev_root_yaw": torch.zeros(batch_size),
             "joint_offsets_parent": torch.zeros(batch_size, 24, 3),
-            "target_foot_contact": torch.zeros(batch_size, 2),
+            "target_stationary_prob_5": torch.zeros(batch_size, 5),
             "target_tracker_pos_ref": target_tracker_pos_ref,
             "target_sensor_valid": target_sensor_valid,
         }
@@ -162,14 +162,14 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
     assert torch.allclose(losses["loss"], losses["simple_loss"] + losses["aux_loss"])
     losses["loss"].mean().backward()
 
-    model_kwargs["y"]["target_foot_contact"] = torch.zeros_like(model_kwargs["y"]["target_foot_contact"])
+    model_kwargs["y"]["target_stationary_prob_5"] = torch.zeros_like(model_kwargs["y"]["target_stationary_prob_5"])
     aux_terms = diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs)
     assert torch.allclose(aux_terms["foot_lock_loss"], torch.zeros_like(aux_terms["foot_lock_loss"]))
 
-    model_kwargs_missing_contact = loop.mask_manager(batch, batch["x"])
-    del model_kwargs_missing_contact["y"]["target_foot_contact"]
-    with pytest.raises(KeyError, match="target_foot_contact"):
-        diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_contact)
+    model_kwargs_missing_stationary = loop.mask_manager(batch, batch["x"])
+    del model_kwargs_missing_stationary["y"]["target_stationary_prob_5"]
+    with pytest.raises(KeyError, match="target_stationary_prob_5"):
+        diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_stationary)
 
 
 def test_rollout_training_loss_reinjects_predicted_target_and_backprops(tmp_path):

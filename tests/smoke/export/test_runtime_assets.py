@@ -51,10 +51,13 @@ def test_runtime_assets_are_realtime_pose_only(tmp_path):
     assert schema["rootHeadingDeltaSinCos"] == {"name": "root_heading_delta_sincos", "start": 144, "length": 2}
     assert schema["rootDeltaXZReference"] == {"name": "root_delta_xz_ref", "start": 146, "length": 2}
     assert schema["pelvisHeight"] == {"name": "pelvis_height", "start": 148, "length": 1}
-    assert schema["footContact"] == {"name": "foot_contact", "start": 149, "length": 2}
-    assert schema["trackerPositionReference"] == {"name": "tracker_pos_ref", "start": 151, "length": 18}
-    assert schema["trackerRotation6dReference"] == {"name": "tracker_rot_ref_6d", "start": 169, "length": 36}
-    assert schema["sensorValid"] == {"name": "sensor_valid", "start": 205, "length": 6}
+    assert schema["stationaryProb5"]["name"] == "stationary_prob_5"
+    assert schema["stationaryProb5"]["start"] == 149
+    assert schema["stationaryProb5"]["length"] == 5
+    assert schema["stationaryProb5"]["jointIndices"] == [0, 10, 11, 22, 23]
+    assert schema["trackerPositionReference"] == {"name": "tracker_pos_ref", "start": 154, "length": 18}
+    assert schema["trackerRotation6dReference"] == {"name": "tracker_rot_ref_6d", "start": 172, "length": 36}
+    assert schema["sensorValid"] == {"name": "sensor_valid", "start": 208, "length": 6}
     assert schema["runtimeRules"]["poseRepresentation"] == schema_spec.pose_representation
     assert schema["runtimeRules"]["rootPositionY"] == schema_spec.root_y_policy
     assert schema["runtimeRules"]["pelvisHeightApplication"] == schema_spec.pelvis_height_mode
@@ -142,7 +145,7 @@ def test_runtime_assets_default_to_body_fbx_local(tmp_path):
     assert schema["targetFeatureLength"] == schema_spec.target_dim
     assert schema["rootDeltaXZReference"]["start"] == schema_spec.root_delta_xz_start
     assert schema["pelvisHeight"]["start"] == schema_spec.root_height_start
-    assert schema["footContact"]["start"] == schema_spec.foot_contact_start
+    assert schema["stationaryProb5"]["start"] == schema_spec.stationary_prob_start
 
 
 def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():

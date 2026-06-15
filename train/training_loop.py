@@ -595,8 +595,8 @@ class TrainLoop:
             y["prev_root_pos_world"] = batch["prev_root_pos_world"]
             y["target_root_delta_xz_ref"] = batch["target_root_delta_xz_ref"]
             y["target_root_height"] = batch["target_root_height"]
-        if self.schema.supports_contact:
-            y["target_foot_contact"] = batch["target_foot_contact"]
+        if self.schema.supports_stationary_prob:
+            y["target_stationary_prob_5"] = batch["target_stationary_prob_5"]
         if self.normalizer_mean is not None and self.normalizer_std is not None:
             y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
             y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)

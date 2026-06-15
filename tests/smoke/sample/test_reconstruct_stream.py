@@ -95,7 +95,7 @@ def test_tracker_pose_init_image_only_changes_target_frame_target_channels():
         np.tile(IDENTITY_6D, SMPL_JOINT_COUNT)
     )
     conditioned[:, schema.root_yaw_delta_slice(), REALTIME_POSE_TARGET_START - 1] = torch.tensor([0.0, 1.0])
-    conditioned[:, schema.foot_contact_slice(), REALTIME_POSE_TARGET_START - 1] = torch.tensor([1.0, 0.0])
+    conditioned[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START - 1] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
     conditioned[:, schema.tracker_pos_slice(HIP_TRACKER_INDEX), REALTIME_POSE_TARGET_START] = torch.tensor([0.0, 0.9, 0.0])
     conditioned[:, schema.tracker_rot_slice(HIP_TRACKER_INDEX), REALTIME_POSE_TARGET_START] = torch.from_numpy(IDENTITY_6D)
     conditioned[:, schema.sensor_valid_slice(), REALTIME_POSE_TARGET_START] = 1.0

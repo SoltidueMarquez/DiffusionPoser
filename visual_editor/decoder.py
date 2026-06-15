@@ -58,7 +58,7 @@ class MotionDecoder:
                 schema.root_heading_delta_key,
                 "root_delta_xz_ref",
                 schema.pelvis_height_key,
-                "foot_contact",
+                "stationary_prob_5",
                 "tracker_pos_world",
                 "tracker_rot_world_6d",
                 "joints_world",

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import tempfile
+import sys
+import types
 import unittest
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from unittest.mock import patch
 
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_V2_CONTACT_SCHEMA_NAME
+from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
+from train.train_platforms import TensorboardPlatform
 from utils.parser_util import add_data_options, add_training_options
 
 
@@ -31,7 +35,7 @@ class TrainEntrypointTest(unittest.TestCase):
         add_data_options(parser)
 
         with self.assertRaises(SystemExit):
-            parser.parse_args(["--data_dir", "dataset/tasks", "--schema", REALTIME_POSE_V2_CONTACT_SCHEMA_NAME])
+            parser.parse_args(["--data_dir", "dataset/tasks", "--schema", "realtime_pose_v2_contact"])
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -161,6 +165,58 @@ class TrainEntrypointTest(unittest.TestCase):
             prepare_save_dir(args)
 
             self.assertTrue(save_dir.exists())
+
+    def test_tensorboard_platform_falls_back_when_run_path_cannot_be_opened(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir = Path(tmp_dir) / "run"
+            save_dir.mkdir()
+            writer_log_dirs = []
+
+            class FakeSummaryWriter:
+                def __init__(self, log_dir):
+                    writer_log_dirs.append(str(log_dir))
+                    if len(writer_log_dirs) == 1:
+                        raise FileNotFoundError("bad tensorboard path")
+
+                def close(self):
+                    pass
+
+            fake_tensorboard = types.ModuleType("torch.utils.tensorboard")
+            fake_tensorboard.SummaryWriter = FakeSummaryWriter
+            with patch.dict(sys.modules, {"torch.utils.tensorboard": fake_tensorboard}):
+                platform = TensorboardPlatform(str(save_dir))
+                platform.close()
+
+            fallback_path = Path((save_dir / "tensorboard_log_dir.txt").read_text(encoding="utf-8"))
+            self.assertEqual(writer_log_dirs[0], str(save_dir))
+            self.assertEqual(writer_log_dirs[1], str(fallback_path))
+            self.assertTrue(fallback_path.exists())
+            self.assertTrue(str(fallback_path).isascii())
+
+    def test_tensorboard_platform_uses_fallback_for_windows_non_ascii_run_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir = Path(tmp_dir) / "中文_run"
+            save_dir.mkdir()
+            writer_log_dirs = []
+
+            class FakeSummaryWriter:
+                def __init__(self, log_dir):
+                    writer_log_dirs.append(str(log_dir))
+
+                def close(self):
+                    pass
+
+            fake_tensorboard = types.ModuleType("torch.utils.tensorboard")
+            fake_tensorboard.SummaryWriter = FakeSummaryWriter
+            with patch.dict(sys.modules, {"torch.utils.tensorboard": fake_tensorboard}):
+                platform = TensorboardPlatform(str(save_dir))
+                platform.close()
+
+            fallback_path = Path((save_dir / "tensorboard_log_dir.txt").read_text(encoding="utf-8"))
+            expected_first_log_dir = str(fallback_path) if sys.platform.startswith("win") else str(save_dir)
+            self.assertEqual(writer_log_dirs[0], expected_first_log_dir)
+            if sys.platform.startswith("win"):
+                self.assertTrue(str(fallback_path).isascii())
 
 
 if __name__ == "__main__":

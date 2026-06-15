@@ -28,7 +28,7 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
     return latest
 
 
-def test_v2_contact_feature_layout_and_root_integration():
+def test_stationary5_feature_layout_and_root_integration():
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
     assert str(source[POSE_REPRESENTATION_KEY].item()) == schema.pose_representation
@@ -36,7 +36,9 @@ def test_v2_contact_feature_layout_and_root_integration():
     features = encode_realtime_pose_features(source, schema_name=schema.name)
     assert features.shape == (REALTIME_POSE_SEQ_LEN, schema.feature_dim)
     assert features[:, schema.root_delta_xz_slice()].shape == (REALTIME_POSE_SEQ_LEN, 2)
-    assert set(np.unique(features[:, schema.foot_contact_slice()]).tolist()).issubset({0.0, 1.0})
+    stationary = features[:, schema.stationary_prob_slice()]
+    assert stationary.shape == (REALTIME_POSE_SEQ_LEN, 5)
+    assert np.all((stationary >= 0.0) & (stationary <= 1.0))
 
     prev_pos = source["root_pos_world"][REALTIME_POSE_TARGET_START - 1:REALTIME_POSE_TARGET_START]
     prev_yaw = source["root_yaw"][REALTIME_POSE_TARGET_START - 1:REALTIME_POSE_TARGET_START]
@@ -45,7 +47,7 @@ def test_v2_contact_feature_layout_and_root_integration():
     np.testing.assert_allclose(integrated[0, [0, 2]], source["root_pos_world"][REALTIME_POSE_TARGET_START, [0, 2]], atol=1e-6)
 
 
-def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
+def test_stationary5_task_dataset_and_normalizer_contract(tmp_path):
     source_dir = tmp_path / "sources"
     task_dir = tmp_path / "tasks"
     normalizer_dir = tmp_path / "meta"
@@ -91,7 +93,8 @@ def test_v2_contact_task_dataset_and_normalizer_contract(tmp_path):
     assert tuple(item["x"].shape) == (schema.feature_dim, REALTIME_POSE_SEQ_LEN)
     assert item["inpaint_mask"][:schema.target_dim, REALTIME_POSE_TARGET_START].all()
     assert "target_root_delta_xz_ref" in item
-    assert "target_foot_contact" in item
+    assert "target_stationary_prob_5" in item
+    assert tuple(item["target_stationary_prob_5"].shape) == (5,)
     assert item["target_tracker_pos_ref"].shape == (6, 3)
     assert item["target_sensor_valid"].shape == (6,)
 

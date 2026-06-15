@@ -22,11 +22,13 @@ from data_loaders.realtime_pose_kinematics import (  # noqa: E402
 from data_loaders.sensor_masking import (  # noqa: E402
     BODY_POSE_DIM,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    FOOT_CONTACT_DIM,
     ROOT_DELTA_XZ_DIM,
     ROOT_HEIGHT_DIM,
     ROOT_YAW_DELTA_DIM,
     SMPL_JOINT_COUNT,
+    STATIONARY_JOINT_INDICES,
+    STATIONARY_JOINT_NAMES,
+    STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     TRACKER_NAMES,
     get_schema_spec,
@@ -164,7 +166,7 @@ def build_target_features_raw(
     root_yaw_delta = slice_time(source[schema.root_heading_delta_key], start, count)
     root_delta = slice_time(source["root_delta_xz_ref"], start, count)
     pelvis_height = slice_time(source[schema.pelvis_height_key], start, count)
-    foot_contact = slice_time(source["foot_contact"], start, count)
+    stationary_prob = slice_time(source["stationary_prob_5"], start, count) if schema.supports_stationary_prob else None
 
     if body_pose.shape != (count, BODY_POSE_DIM):
         raise ValueError(f"{schema.body_pose_key} should be [{count},{BODY_POSE_DIM}], got {body_pose.shape}")
@@ -174,8 +176,8 @@ def build_target_features_raw(
         raise ValueError(f"root_delta_xz_ref 应为 [{count},{ROOT_DELTA_XZ_DIM}]，实际为 {root_delta.shape}")
     if pelvis_height.shape != (count, ROOT_HEIGHT_DIM):
         raise ValueError(f"{schema.pelvis_height_key} should be [{count},{ROOT_HEIGHT_DIM}], got {pelvis_height.shape}")
-    if foot_contact.shape != (count, FOOT_CONTACT_DIM):
-        raise ValueError(f"foot_contact 应为 [{count},{FOOT_CONTACT_DIM}]，实际为 {foot_contact.shape}")
+    if stationary_prob is not None and stationary_prob.shape != (count, STATIONARY_PROB_DIM):
+        raise ValueError(f"stationary_prob_5 应为 [{count},{STATIONARY_PROB_DIM}]，实际为 {stationary_prob.shape}")
 
     target[:, 0:BODY_POSE_DIM] = body_pose
     cursor = BODY_POSE_DIM
@@ -185,7 +187,11 @@ def build_target_features_raw(
     cursor += ROOT_DELTA_XZ_DIM
     target[:, cursor : cursor + ROOT_HEIGHT_DIM] = pelvis_height
     cursor += ROOT_HEIGHT_DIM
-    target[:, cursor : cursor + FOOT_CONTACT_DIM] = foot_contact
+    if stationary_prob is not None:
+        target[:, cursor : cursor + STATIONARY_PROB_DIM] = stationary_prob
+        cursor += STATIONARY_PROB_DIM
+    if cursor != target_dim:
+        raise ValueError(f"target_dim={target_dim} 与 schema target cursor={cursor} 不一致")
     return target
 
 
@@ -221,7 +227,7 @@ def build_unity_replay_stream_payload(
     joints = slice_time(source["joints_world"], start, count)
     root_heading = slice_time(source["root_yaw"], start, count)
     root_pos = slice_time(source["root_pos_world"], start, count)
-    foot_contact = slice_time(source["foot_contact"], start, count)
+    stationary_prob = slice_time(source["stationary_prob_5"], start, count) if schema.supports_stationary_prob else None
     target_features_raw = build_target_features_raw(source, start, count, schema.target_dim, schema_name=schema.name)
     if identity_6d_rotations:
         target_features_raw[:, 0:BODY_POSE_DIM] = build_identity_body_pose_6d(count)
@@ -232,7 +238,7 @@ def build_unity_replay_stream_payload(
             joint_offsets_parent=np.asarray(source["joint_offsets_parent"], dtype=np.float32),
         )
 
-    return {
+    payload = {
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
         "fps": float(fps),
@@ -242,14 +248,12 @@ def build_unity_replay_stream_payload(
         "trackerCount": TRACKER_COUNT,
         "trackerNames": list(TRACKER_NAMES),
         "jointCount": SMPL_JOINT_COUNT,
-        "footContactDim": FOOT_CONTACT_DIM,
         "trackerPositions": flatten_float(tracker_positions),
         "trackerRotations6d": flatten_float(tracker_rotations),
         "sensorValid": flatten_int(valid),
         "referenceJointsWorld": flatten_float(joints),
         "rootHeading": flatten_float(root_heading),
         "rootPosWorld": flatten_float(root_pos),
-        "footContact": flatten_float(foot_contact),
         "targetFeatureLength": int(schema.target_dim),
         "targetFeaturesRaw": flatten_float(target_features_raw),
         "metadata": {
@@ -265,10 +269,16 @@ def build_unity_replay_stream_payload(
             "referenceJointsWorldShape": [count, SMPL_JOINT_COUNT, 3],
             "rootHeadingShape": [count],
             "rootPosWorldShape": [count, 3],
-            "footContactShape": [count, FOOT_CONTACT_DIM],
             "targetFeaturesRawShape": [count, int(schema.target_dim)],
         },
     }
+    if stationary_prob is not None:
+        payload["stationaryProbDim"] = STATIONARY_PROB_DIM
+        payload["stationaryProbJointIndices"] = [int(value) for value in STATIONARY_JOINT_INDICES]
+        payload["stationaryProbJointNames"] = list(STATIONARY_JOINT_NAMES)
+        payload["stationaryProb5"] = flatten_float(stationary_prob)
+        payload["metadata"]["stationaryProb5Shape"] = [count, STATIONARY_PROB_DIM]
+    return payload
 
 
 def write_unity_replay_stream(

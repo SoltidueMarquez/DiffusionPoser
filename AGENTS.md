@@ -63,21 +63,21 @@ conda run -n diffusionposer5070 pytest tests/smoke/visual_editor
 
 - 固定为 60 帧历史条件 + 第 61 帧单帧补全。
 - `seq_len = 61`，`target_start = 60`，`target_length = 1`。
-- `feature_dim = 211`，模型输入输出均为 `[B, 211, 61]`。
+- `feature_dim = 214`，模型输入输出均为 `[B, 214, 61]`。
 - source/task/normalizer/runtime asset 必须包含 `schema_name="realtime_pose_body_fbx_local_root_y0_v1"` 和 `pose_representation="body_fbx_local_delta_6d"`。
 - source/task/normalizer/runtime asset 必须显式包含 `root_y_policy="fixed_zero"` 和 `pelvis_height_mode="pelvis_local_offset_y"`。
 - actor root 的 world y 固定为 0；`root_pos_world[:, 1]` 必须全为 0。
 - `pelvis_height` 表示 pelvis bone 的 local offset y，必须等于 `joints_world[:, 0, 1]`。
 - 通道 `0:144` 是 `body_pose_body_fbx_local_delta_6d`，`144:146` 是 `root_heading_delta_sincos`。
-- 通道 `146:148` 是 `root_delta_xz_ref`，`148:149` 是 `pelvis_height`，`149:151` 是 `foot_contact`。
-- 通道 `151:169` 是 `tracker_pos_ref`，`169:205` 是 `tracker_rot_ref_6d`，`205:211` 是 `sensor_valid`。
-- `inpaint_mask` 只允许覆盖第 61 帧的 `0:151`。
+- 通道 `146:148` 是 `root_delta_xz_ref`，`148:149` 是 `pelvis_height`，`149:154` 是 `stationary_prob_5`。
+- 通道 `154:172` 是 `tracker_pos_ref`，`172:208` 是 `tracker_rot_ref_6d`，`208:214` 是 `sensor_valid`。
+- `inpaint_mask` 只允许覆盖第 61 帧的 `0:154`。
 - hip/waist tracker 必须始终 valid；每帧至少 3 个 tracker valid。
 - 默认 task generator 每个窗口只写 full-tracker task；训练随机遮盖在 `RealtimePoseTaskDataset` 中动态发生。
 - invalid tracker 的 `tracker_pos_ref/tracker_rot_ref_6d` 在归一化后置零，不使用 GT 或上一帧 stale fill。
 - 当前帧 tracker 只能用 `root_yaw_{t-1}` 转到参考局部系，不能使用 GT `root_yaw_t`。
-- 必须保存 `foot_contact`，由转换阶段从 `joints_world` 派生。
-- 不兼容旧 `realtime_pose_v2_contact` / `root_yaw_global_6d`、上一代 body_fbx local、X277/current277 数据、task、normalizer、checkpoint、Unity schema。
+- 必须保存 `stationary_prob_5`，由转换阶段从 `joints_world` 的 pelvis、左右脚、左右手速度派生。
+- 不兼容且不再保留旧 `realtime_pose_v2_contact` / `root_yaw_global_6d`、上一代 body_fbx local、X277/current277 数据、task、normalizer、checkpoint、Unity schema。
 
 ## 变更原则
 
