@@ -14,6 +14,8 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     TASK_MODE_REALTIME_POSE,
 )
+import train.training_loop as training_loop
+from schemas.registry import get_schema_spec
 from train.training_loop import (
     TrainLoop,
     find_latest_model_checkpoint,
@@ -21,6 +23,10 @@ from train.training_loop import (
     find_resume_checkpoint,
     validate_resume_checkpoint_contract,
 )
+
+
+CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
+LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 
 
 class DummyModel:
@@ -138,6 +144,76 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
             args = Namespace(schema=REALTIME_POSE_SCHEMA_NAME, model_arch="full_feature_dit")
 
             with self.assertRaisesRegex(ValueError, "schema"):
+                validate_resume_checkpoint_contract(checkpoint, args)
+
+    def test_realtime_pose_training_args_accept_trainable_legacy_schema_name(self):
+        schema = get_schema_spec(LEGACY_SCHEMA_NAME)
+        args = Namespace(
+            schema=LEGACY_SCHEMA_NAME,
+            input_feats=schema.feature_dim,
+            seq_len=schema.seq_len,
+            max_seq_len=schema.seq_len,
+        )
+
+        validator = getattr(training_loop, "validate_realtime_pose_training_args", None)
+
+        self.assertIsNotNone(validator)
+        self.assertEqual(validator(args).name, LEGACY_SCHEMA_NAME)
+
+    def test_resume_contract_rejects_canonical_cli_with_legacy_checkpoint_schema(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir = Path(tmp_dir)
+            checkpoint = save_dir / "model000000010.pt"
+            checkpoint.write_bytes(b"")
+            canonical = get_schema_spec(CANONICAL_SCHEMA_NAME)
+            legacy = get_schema_spec(LEGACY_SCHEMA_NAME)
+            (save_dir / "args.json").write_text(
+                json.dumps(
+                    {
+                        "task_mode": TASK_MODE_REALTIME_POSE,
+                        "schema": LEGACY_SCHEMA_NAME,
+                        "schema_name": LEGACY_SCHEMA_NAME,
+                        "schema_canonical_name": legacy.canonical_name,
+                        "input_feats": canonical.feature_dim,
+                        "seq_len": canonical.seq_len,
+                        "max_seq_len": canonical.seq_len,
+                        "model_arch": "full_feature_dit",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(schema=CANONICAL_SCHEMA_NAME, model_arch="full_feature_dit")
+
+            with self.assertRaisesRegex(ValueError, "schema=.*expected"):
+                validate_resume_checkpoint_contract(checkpoint, args)
+
+    def test_resume_contract_rejects_legacy_cli_with_canonical_checkpoint_schema(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir = Path(tmp_dir)
+            checkpoint = save_dir / "model000000010.pt"
+            checkpoint.write_bytes(b"")
+            canonical = get_schema_spec(CANONICAL_SCHEMA_NAME)
+            legacy = get_schema_spec(LEGACY_SCHEMA_NAME)
+            (save_dir / "args.json").write_text(
+                json.dumps(
+                    {
+                        "task_mode": TASK_MODE_REALTIME_POSE,
+                        "schema": CANONICAL_SCHEMA_NAME,
+                        "schema_name": CANONICAL_SCHEMA_NAME,
+                        "schema_canonical_name": canonical.canonical_name,
+                        "input_feats": legacy.feature_dim,
+                        "seq_len": legacy.seq_len,
+                        "max_seq_len": legacy.seq_len,
+                        "model_arch": "full_feature_dit",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(schema=LEGACY_SCHEMA_NAME, model_arch="full_feature_dit")
+
+            with self.assertRaisesRegex(ValueError, "schema=.*expected"):
                 validate_resume_checkpoint_contract(checkpoint, args)
 
 

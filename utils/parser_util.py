@@ -13,9 +13,10 @@ from data_loaders.sensor_masking import (
     TRACKER_MASK_POLICIES,
     get_schema_spec,
 )
+from schemas.registry import list_schema_names
 
 
-TRAIN_REALTIME_POSE_SCHEMA_NAMES = (DEFAULT_REALTIME_POSE_SCHEMA_NAME,)
+TRAIN_REALTIME_POSE_SCHEMA_NAMES = tuple(list_schema_names(trainable_only=True))
 
 
 def train_args():

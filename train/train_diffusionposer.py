@@ -186,13 +186,19 @@ def write_latest_run_pointer(args):
 
     run_root = Path(getattr(args, "run_root", Path(args.save_dir).parent)).resolve()
     save_dir = Path(args.save_dir).resolve()
+    schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
     run_root.mkdir(parents=True, exist_ok=True)
     payload = {
         "save_dir": str(save_dir),
         "run_root": str(run_root),
         "run_id": getattr(args, "run_id", ""),
         "run_name": getattr(args, "run_name", "auto"),
-        "schema": getattr(args, "schema", ""),
+        "schema": schema.name,
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        POSE_REPRESENTATION_KEY: schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
         "model_arch": getattr(args, "model_arch", ""),
         "seed": getattr(args, "seed", None),
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -209,6 +215,7 @@ def save_args(args):
     schema = get_schema_spec(payload.get("schema", REALTIME_POSE_SCHEMA_NAME))
     payload["schema"] = schema.name
     payload["schema_name"] = schema.name
+    payload["schema_canonical_name"] = str(schema.canonical_name)
     payload[POSE_REPRESENTATION_KEY] = schema.pose_representation
     payload["root_y_policy"] = schema.root_y_policy
     payload["pelvis_height_mode"] = schema.pelvis_height_mode

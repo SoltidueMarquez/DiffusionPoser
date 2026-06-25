@@ -11,9 +11,8 @@ from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
 from data_loaders.sensor_masking import (
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     POSE_REPRESENTATION_KEY,
-    REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     TASK_MODE_REALTIME_POSE,
     get_schema_spec,
@@ -26,30 +25,34 @@ CHECKPOINT_CONTRACT_KEYS = ("task_mode", "schema", "input_feats", "seq_len", "ma
 CHECKPOINT_INT_CONTRACT_KEYS = {"input_feats", "seq_len", "max_seq_len"}
 
 
-def validate_root_y0_training_args(args):
-    """训练入口只接受当前 root-y0 schema，避免旧 211 维 schema 静默混入。"""
+def validate_realtime_pose_training_args(args):
+    """校验 realtime_pose 训练入口和所选 schema 的固定契约。"""
 
-    schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
-    if schema.name != REALTIME_POSE_SCHEMA_NAME:
-        raise ValueError(f"当前训练脚本只支持 {REALTIME_POSE_SCHEMA_NAME}，实际为 {schema.name}。")
+    schema = get_schema_spec(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
 
     input_feats = int(getattr(args, "input_feats", schema.feature_dim))
     if input_feats != schema.feature_dim:
         raise ValueError(f"{schema.name} 训练输入维度必须为 {schema.feature_dim}，实际为 {input_feats}。")
 
-    seq_len = int(getattr(args, "seq_len", REALTIME_POSE_SEQ_LEN))
-    if seq_len != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{schema.name} 固定使用 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {seq_len}。")
+    seq_len = int(getattr(args, "seq_len", schema.seq_len))
+    if seq_len != schema.seq_len:
+        raise ValueError(f"{schema.name} 固定使用 seq_len={schema.seq_len}，实际为 {seq_len}。")
 
-    max_seq_len = int(getattr(args, "max_seq_len", REALTIME_POSE_SEQ_LEN))
-    if max_seq_len != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{schema.name} 固定使用 max_seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {max_seq_len}。")
+    max_seq_len = int(getattr(args, "max_seq_len", schema.seq_len))
+    if max_seq_len != schema.seq_len:
+        raise ValueError(f"{schema.name} 固定使用 max_seq_len={schema.seq_len}，实际为 {max_seq_len}。")
 
     return schema
 
 
+def validate_root_y0_training_args(args):
+    """旧导入名保留为别名，实际校验由通用 realtime_pose schema 入口负责。"""
+
+    return validate_realtime_pose_training_args(args)
+
+
 def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, schema_name: str | None = None) -> None:
-    """恢复训练前校验 checkpoint 的 schema 契约，防止旧 contact/root-y schema 权重被误加载。"""
+    """恢复训练前校验 checkpoint 的 exact schema 契约，防止权重被误加载。"""
 
     checkpoint_path = Path(resume_checkpoint)
     args_path = checkpoint_path.with_name("args.json")
@@ -61,19 +64,19 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
     if not isinstance(checkpoint_args, dict):
         raise ValueError(f"{args_path} 必须是 JSON object。")
 
-    schema = get_schema_spec(schema_name or getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
+    schema = get_schema_spec(schema_name or getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
     expected_contract = {
         "task_mode": TASK_MODE_REALTIME_POSE,
         "schema": schema.name,
         "input_feats": schema.feature_dim,
-        "seq_len": REALTIME_POSE_SEQ_LEN,
-        "max_seq_len": REALTIME_POSE_SEQ_LEN,
+        "seq_len": schema.seq_len,
+        "max_seq_len": schema.seq_len,
         "model_arch": str(getattr(args, "model_arch", "full_feature_dit")),
     }
 
     missing = [key for key in CHECKPOINT_CONTRACT_KEYS if key not in checkpoint_args]
     if missing:
-        raise ValueError(f"{args_path} 缺少 checkpoint 训练契约字段：{missing}。旧 checkpoint 不能直接恢复到 root-y0 训练。")
+        raise ValueError(f"{args_path} 缺少 checkpoint 训练契约字段：{missing}，不能恢复到 {schema.name} 训练。")
 
     mismatches: list[str] = []
     for key, expected in expected_contract.items():
@@ -91,6 +94,7 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
 
     optional_schema_metadata = {
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         POSE_REPRESENTATION_KEY: schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
@@ -101,11 +105,11 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
 
     if mismatches:
         joined = "; ".join(mismatches)
-        raise ValueError(f"{args_path} 与当前 root-y0 训练配置不兼容：{joined}")
+        raise ValueError(f"{args_path} 与当前 {schema.name} 训练配置不兼容：{joined}")
 
 
 class TrainLoop:
-    """root-y0 realtime_pose 扩散训练循环。"""
+    """realtime_pose 扩散训练循环。"""
 
     def __init__(self, args, train_platform, model, diffusion, data, eval_data=None):
         self.args = args
@@ -127,7 +131,7 @@ class TrainLoop:
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
         self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
-        self.schema = validate_root_y0_training_args(args)
+        self.schema = validate_realtime_pose_training_args(args)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
         self.rollout_steps = int(getattr(args, "rollout_steps", 1))
         self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
@@ -248,7 +252,7 @@ class TrainLoop:
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if missing_keys or unexpected_keys:
             raise RuntimeError(
-                "checkpoint 与当前 root-y0 realtime_pose 模型结构不匹配，已停止恢复。"
+                f"checkpoint 与当前 {self.schema.name} realtime_pose 模型结构不匹配，已停止恢复。"
                 f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
             )
 

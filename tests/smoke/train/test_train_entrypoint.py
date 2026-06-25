@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import sys
 import types
@@ -8,10 +9,14 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from unittest.mock import patch
 
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME
+from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
 from utils.parser_util import add_data_options, add_training_options
+
+
+CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
+LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 
 
 class TrainEntrypointTest(unittest.TestCase):
@@ -21,6 +26,7 @@ class TrainEntrypointTest(unittest.TestCase):
 
         args = parser.parse_args(["--data_dir", "dataset/tasks"])
 
+        self.assertEqual(args.schema, CANONICAL_SCHEMA_NAME)
         self.assertEqual(args.schema, REALTIME_POSE_SCHEMA_NAME)
         self.assertEqual(args.history_pose_noise_std, 0.02)
         self.assertEqual(args.history_yaw_noise_std, 0.02)
@@ -36,6 +42,15 @@ class TrainEntrypointTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             parser.parse_args(["--data_dir", "dataset/tasks", "--schema", "realtime_pose_v2_contact"])
+
+    def test_data_options_accept_trainable_realtime_pose_schemas(self):
+        for schema_name in (CANONICAL_SCHEMA_NAME, LEGACY_SCHEMA_NAME):
+            parser = ArgumentParser()
+            add_data_options(parser)
+
+            args = parser.parse_args(["--data_dir", "dataset/tasks", "--schema", schema_name])
+
+            self.assertEqual(args.schema, schema_name)
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -94,6 +109,28 @@ class TrainEntrypointTest(unittest.TestCase):
 
             self.assertEqual(original.read_text(encoding="utf-8"), '{"old": true}')
             self.assertTrue((save_dir / "resume_args.json").exists())
+
+    def test_save_args_writes_exact_schema_and_canonical_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir = Path(tmp_dir) / "run"
+            save_dir.mkdir()
+            args = Namespace(
+                save_dir=str(save_dir),
+                resume_checkpoint="",
+                schema=LEGACY_SCHEMA_NAME,
+                lr=1e-4,
+            )
+            schema = get_schema_spec(LEGACY_SCHEMA_NAME)
+
+            save_args(args)
+
+            payload = json.loads((save_dir / "args.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema"], LEGACY_SCHEMA_NAME)
+            self.assertEqual(payload["schema_name"], LEGACY_SCHEMA_NAME)
+            self.assertEqual(payload["schema_canonical_name"], schema.canonical_name)
+            self.assertEqual(payload[POSE_REPRESENTATION_KEY], schema.pose_representation)
+            self.assertEqual(payload["root_y_policy"], schema.root_y_policy)
+            self.assertEqual(payload["pelvis_height_mode"], schema.pelvis_height_mode)
 
     def test_fresh_training_resolves_save_dir_to_unique_run_child_and_latest_pointer(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
