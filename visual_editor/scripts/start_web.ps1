@@ -16,8 +16,6 @@ $RepoRoot = Resolve-Path (Join-Path $EditorRoot "..")
 $RuntimeDir = Join-Path $EditorRoot ".runtime"
 $DefaultOutputDir = Join-Path $RuntimeDir "exports"
 $PreferredAmassDir = Join-Path $RepoRoot "dataset\AMASS"
-$PreferredDataDir = Join-Path $RepoRoot "dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_tasks"
-$PreferredSourceDir = Join-Path $RepoRoot "dataset\generated\sources\realtime_pose_stationary5_v1\amass_60hz"
 $PreferredResultDir = Join-Path $RepoRoot "output"
 $PreferredSmplModelDir = Join-Path $RepoRoot "dataset\body_models"
 $VenvPython = Join-Path $EditorRoot ".venv\Scripts\python.exe"
@@ -73,9 +71,7 @@ if (-not (Test-Path $NodeModules)) {
     throw "Missing Node dependencies: $NodeModules"
 }
 
-if ($DataDir.Trim() -eq "") {
-    $DataDir = $PreferredDataDir
-} else {
+if ($DataDir.Trim() -ne "") {
     $DataDir = Resolve-LaunchPath $DataDir
 }
 if ($AmassDir.Trim() -eq "") {
@@ -83,9 +79,7 @@ if ($AmassDir.Trim() -eq "") {
 } else {
     $AmassDir = Resolve-LaunchPath $AmassDir
 }
-if ($SourceDir.Trim() -eq "") {
-    $SourceDir = $PreferredSourceDir
-} else {
+if ($SourceDir.Trim() -ne "") {
     $SourceDir = Resolve-LaunchPath $SourceDir
 }
 if ($ResultDir.Trim() -eq "") {
@@ -110,16 +104,30 @@ if ($Rebuild) {
 
 $env:PYTHONPATH = [string]$RepoRoot
 $env:REALTIME_POSE_EDITOR_AMASS_DIR = [string]$AmassDir
-$env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
-$env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
+if ($DataDir.Trim() -ne "") {
+    $env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
+}
+if ($SourceDir.Trim() -ne "") {
+    $env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
+}
 $env:REALTIME_POSE_EDITOR_RESULT_DIR = [string]$ResultDir
 $env:REALTIME_POSE_EDITOR_OUTPUT_DIR = [string]$OutputDir
 $env:REALTIME_POSE_EDITOR_RUNTIME_DIR = [string]$RuntimeDir
 $env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
 
-Write-Host "[visual_editor_web] data_dir=$DataDir"
+if ($DataDir.Trim() -ne "") {
+    $DisplayDataDir = $DataDir
+} else {
+    $DisplayDataDir = "<data_roots default>"
+}
+if ($SourceDir.Trim() -ne "") {
+    $DisplaySourceDir = $SourceDir
+} else {
+    $DisplaySourceDir = "<data_roots default>"
+}
+Write-Host "[visual_editor_web] data_dir=$DisplayDataDir"
 Write-Host "[visual_editor_web] amass_dir=$AmassDir"
-Write-Host "[visual_editor_web] source_dir=$SourceDir"
+Write-Host "[visual_editor_web] source_dir=$DisplaySourceDir"
 Write-Host "[visual_editor_web] result_dir=$ResultDir"
 Write-Host "[visual_editor_web] output_dir=$OutputDir"
 Write-Host "[visual_editor_web] smpl_model_dir=$SmplModelDir"
@@ -129,18 +137,23 @@ if ($PrepareOnly) {
 }
 Write-Host "[visual_editor_web] starting local API and browser UI..."
 
-$api = Start-Process -FilePath $VenvPython -ArgumentList @(
+$ApiArgs = @(
     "-m", "visual_editor.server",
     "--host", "127.0.0.1",
     "--port", "8765",
     "--runtime_dir", $RuntimeDir,
     "--amass_dir", $AmassDir,
-    "--data_dir", $DataDir,
-    "--source_dir", $SourceDir,
     "--result_dir", $ResultDir,
     "--output_dir", $OutputDir,
     "--smpl_model_dir", $SmplModelDir
-) -WorkingDirectory $RepoRoot -RedirectStandardOutput $ApiLog -RedirectStandardError (Join-Path $RuntimeDir "api-web.err.log") -WindowStyle Hidden -PassThru
+)
+if ($DataDir.Trim() -ne "") {
+    $ApiArgs += @("--data_dir", $DataDir)
+}
+if ($SourceDir.Trim() -ne "") {
+    $ApiArgs += @("--source_dir", $SourceDir)
+}
+$api = Start-Process -FilePath $VenvPython -ArgumentList $ApiArgs -WorkingDirectory $RepoRoot -RedirectStandardOutput $ApiLog -RedirectStandardError (Join-Path $RuntimeDir "api-web.err.log") -WindowStyle Hidden -PassThru
 
 $vite = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "npm.cmd --prefix `"$EditorRoot`" run viewer:dev > `"$ViteLog`" 2>&1") -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
 

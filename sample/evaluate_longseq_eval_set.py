@@ -52,7 +52,7 @@ from sample.simulate_unity_stream import (
 )
 from sample.utils import load_checkpoint_model
 from utils import dist_util
-from utils.default_artifact_paths import default_realtime_pose_normalizer_root
+from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root, default_realtime_pose_normalizer_root
 from utils.model_util import create_model_and_diffusion
 from utils.normalizer import RealtimePoseNormalizer
 from utils.parser_util import (
@@ -60,6 +60,7 @@ from utils.parser_util import (
     add_diffusion_options,
     add_model_options,
     add_sampling_options,
+    has_explicit_option_arg,
     parse_and_load_from_model,
     str2bool,
 )
@@ -81,7 +82,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     longseq.add_argument("--eval_set", default="latest", type=str)
     longseq.add_argument("--schema", default=None, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    longseq.add_argument("--normalizer_dir", default=str(default_realtime_pose_normalizer_root()), type=str)
+    longseq.add_argument("--normalizer_dir", default="", type=str)
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
     longseq.add_argument("--input_feats", default=schema.feature_dim, type=int)
     longseq.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
@@ -118,7 +119,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
     stream.add_argument("--tracker_ik_target_smoothing", default=DEFAULT_TRACKER_IK_TARGET_SMOOTHING, type=float)
     stream.add_argument("--tracker_ik_delta_limit", default=DEFAULT_TRACKER_IK_DELTA_LIMIT, type=float)
     add_longseq_dropout_options(parser)
+    install_longseq_path_default_parser(parser)
     return parser
+
+
+EVAL_ROOT_ARG = "--eval_root"
+NORMALIZER_DIR_ARG = "--normalizer_dir"
+
+
+def install_longseq_path_default_parser(parser: argparse.ArgumentParser) -> None:
+    original_parse_args = parser.parse_args
+
+    def parse_args_with_longseq_defaults(args=None, namespace=None):
+        parsed = original_parse_args(args, namespace)
+        return apply_longseq_path_defaults(
+            parsed,
+            eval_root_explicit=has_explicit_option_arg(args, EVAL_ROOT_ARG),
+            normalizer_dir_explicit=has_explicit_option_arg(args, NORMALIZER_DIR_ARG),
+        )
+
+    parser.parse_args = parse_args_with_longseq_defaults
+
+
+def apply_longseq_path_defaults(
+    args: argparse.Namespace,
+    *,
+    eval_root_explicit: bool = False,
+    normalizer_dir_explicit: bool = False,
+    force_eval_root: bool = False,
+    force_normalizer_dir: bool = False,
+) -> argparse.Namespace:
+    schema_name = str(getattr(args, "schema", None) or REALTIME_POSE_SCHEMA_NAME)
+    if not eval_root_explicit and (force_eval_root or not str(getattr(args, "eval_root", "") or "").strip()):
+        args.eval_root = str(default_realtime_pose_longseq_eval_root(schema_name=schema_name))
+        setattr(args, "_eval_root_auto_default", True)
+    else:
+        setattr(args, "_eval_root_auto_default", False)
+    if not normalizer_dir_explicit and (
+        force_normalizer_dir or not str(getattr(args, "normalizer_dir", "") or "").strip()
+    ):
+        args.normalizer_dir = str(default_realtime_pose_normalizer_root(schema_name=schema_name))
+        setattr(args, "_normalizer_dir_auto_default", True)
+    else:
+        setattr(args, "_normalizer_dir_auto_default", False)
+    return args
 
 
 def evaluate_longseq_entries(
@@ -310,8 +354,22 @@ def build_default_output_dir(
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser = build_arg_parser()
     cli_schema_explicit = has_explicit_schema_arg(argv)
-    args = parse_and_load_from_model(parser, argv=argv)
+    eval_root_explicit = has_explicit_option_arg(argv, EVAL_ROOT_ARG)
+    normalizer_dir_explicit = has_explicit_option_arg(argv, NORMALIZER_DIR_ARG)
+    ignore_keys = set()
+    if not eval_root_explicit:
+        ignore_keys.add("eval_root")
+    if not normalizer_dir_explicit:
+        ignore_keys.add("normalizer_dir")
+    args = parse_and_load_from_model(parser, argv=argv, ignore_keys=ignore_keys)
     validate_v2_runtime_args(args, cli_schema_explicit=cli_schema_explicit)
+    apply_longseq_path_defaults(
+        args,
+        eval_root_explicit=eval_root_explicit,
+        normalizer_dir_explicit=normalizer_dir_explicit,
+        force_eval_root=not eval_root_explicit,
+        force_normalizer_dir=not normalizer_dir_explicit,
+    )
 
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     entries = read_longseq_manifest(eval_set_dir)

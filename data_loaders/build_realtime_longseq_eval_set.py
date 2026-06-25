@@ -15,11 +15,14 @@ import numpy as np
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root, default_realtime_pose_task_root
+from utils.parser_util import has_explicit_option_arg
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
-DEFAULT_TASK_ROOT = str(default_realtime_pose_task_root())
-DEFAULT_LONGSEQ_EVAL_ROOT = str(default_realtime_pose_longseq_eval_root())
+TASK_DIR_ARG = "--task_dir"
+OUTPUT_ROOT_ARG = "--output_root"
+DEFAULT_TASK_ROOT = ""
+DEFAULT_LONGSEQ_EVAL_ROOT = ""
 DEFAULT_LONGSEQ_RUN_NAME = "v1_test_stress_long_seed10"
 LONGSEQ_LATEST_KIND = "longseq_eval"
 PRESET_STRESS_LONG = "stress_long"
@@ -44,7 +47,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--overwrite", default=False, action=BooleanOptionalAction)
+    install_schema_path_default_parser(parser)
     return parser
+
+
+def install_schema_path_default_parser(parser: argparse.ArgumentParser) -> None:
+    original_parse_args = parser.parse_args
+
+    def parse_args_with_schema_defaults(args=None, namespace=None):
+        parsed = original_parse_args(args, namespace)
+        return apply_schema_path_defaults(
+            parsed,
+            task_dir_explicit=has_explicit_option_arg(args, TASK_DIR_ARG),
+            output_root_explicit=has_explicit_option_arg(args, OUTPUT_ROOT_ARG),
+        )
+
+    parser.parse_args = parse_args_with_schema_defaults
+
+
+def apply_schema_path_defaults(
+    args: argparse.Namespace,
+    *,
+    task_dir_explicit: bool = False,
+    output_root_explicit: bool = False,
+    force_task_dir: bool = False,
+    force_output_root: bool = False,
+) -> argparse.Namespace:
+    schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME) or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    if not task_dir_explicit and (force_task_dir or not str(getattr(args, "task_dir", "") or "").strip()):
+        args.task_dir = str(default_realtime_pose_task_root(schema_name=schema_name))
+        setattr(args, "_task_dir_auto_default", True)
+    else:
+        setattr(args, "_task_dir_auto_default", False)
+    if not output_root_explicit and (force_output_root or not str(getattr(args, "output_root", "") or "").strip()):
+        args.output_root = str(default_realtime_pose_longseq_eval_root(schema_name=schema_name))
+        setattr(args, "_output_root_auto_default", True)
+    else:
+        setattr(args, "_output_root_auto_default", False)
+    return args
 
 
 def resolve_task_run_dir(task_dir: str | Path, task_run: str = "latest") -> Path:
@@ -112,6 +152,7 @@ def build_sequence_output_dir_name(entry: dict[str, Any]) -> str:
 
 def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
     schema = get_schema_spec(str(args.schema))
+    apply_schema_path_defaults(args)
     task_run_dir = resolve_task_run_dir(task_dir=args.task_dir, task_run=args.task_run)
     manifest_path = task_run_dir / str(args.split) / "manifest.jsonl"
     if not manifest_path.exists():

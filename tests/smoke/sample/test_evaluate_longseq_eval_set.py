@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -13,8 +14,8 @@ from sample.simulate_unity_stream import IDENTITY_6D
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
 
 
-GENERATED_NORMALIZER_ROOT = "dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train"
-GENERATED_LONGSEQ_EVAL_ROOT = "dataset/generated/longseq_eval/realtime_pose_stationary5_v1/amass_60hz_test_stress_long"
+CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
+LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 LEGACY_PARENT_LOCAL_MARKERS = (
     "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
     "dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
@@ -27,9 +28,27 @@ def normalized_path_text(value) -> str:
 
 def assert_generated_layout_path(value, expected_suffix: str) -> None:
     text = normalized_path_text(value)
-    assert text.endswith(expected_suffix)
+    expected = normalized_path_text(expected_suffix)
+    assert text.endswith(expected)
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in text
+
+
+def patch_generated_root(monkeypatch, tmp_path):
+    generated_root = tmp_path / "configured_generated"
+    monkeypatch.setattr(
+        "utils.default_artifact_paths.load_data_roots",
+        lambda: SimpleNamespace(generated_root=generated_root),
+    )
+    return generated_root
+
+
+def expected_normalizer_root(generated_root, schema_name: str):
+    return generated_root / "normalizers" / schema_name / "amass_60hz_train"
+
+
+def expected_longseq_root(generated_root, schema_name: str):
+    return generated_root / "longseq_eval" / schema_name / "amass_60hz_test_stress_long"
 
 
 class FixedLongseqDiffusion:
@@ -55,11 +74,27 @@ class FixedLongseqDiffusion:
         return sample
 
 
-def test_evaluate_longseq_parser_defaults_use_generated_artifact_layout():
+def test_evaluate_longseq_parser_defaults_use_generated_artifact_layout(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
     args = build_arg_parser().parse_args(["--model_path", "model000000000.pt"])
 
-    assert_generated_layout_path(args.eval_root, GENERATED_LONGSEQ_EVAL_ROOT)
-    assert_generated_layout_path(args.normalizer_dir, GENERATED_NORMALIZER_ROOT)
+    assert_generated_layout_path(args.eval_root, str(expected_longseq_root(generated_root, CANONICAL_SCHEMA_NAME)))
+    assert_generated_layout_path(args.normalizer_dir, str(expected_normalizer_root(generated_root, CANONICAL_SCHEMA_NAME)))
+
+
+def test_evaluate_longseq_parser_defaults_follow_explicit_legacy_schema(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
+    args = build_arg_parser().parse_args(
+        [
+            "--model_path",
+            "model000000000.pt",
+            "--schema",
+            LEGACY_SCHEMA_NAME,
+        ]
+    )
+
+    assert_generated_layout_path(args.eval_root, str(expected_longseq_root(generated_root, LEGACY_SCHEMA_NAME)))
+    assert_generated_layout_path(args.normalizer_dir, str(expected_normalizer_root(generated_root, LEGACY_SCHEMA_NAME)))
 
 
 def test_evaluate_longseq_parser_preserves_explicit_path_overrides():

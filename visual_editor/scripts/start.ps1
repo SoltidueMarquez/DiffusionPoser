@@ -15,12 +15,8 @@ $ErrorActionPreference = "Stop"
 $EditorRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RepoRoot = Resolve-Path (Join-Path $EditorRoot "..")
 $RuntimeDir = Join-Path $EditorRoot ".runtime"
-$DefaultDataDir = Join-Path $RuntimeDir "missing_tasks"
-$DefaultSourceDir = Join-Path $RuntimeDir "sources"
 $DefaultOutputDir = Join-Path $RuntimeDir "exports"
 $PreferredAmassDir = Join-Path $RepoRoot "dataset\AMASS"
-$PreferredDataDir = Join-Path $RepoRoot "dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_tasks"
-$PreferredSourceDir = Join-Path $RepoRoot "dataset\generated\sources\realtime_pose_stationary5_v1\amass_60hz"
 $PreferredResultDir = Join-Path $RepoRoot "output"
 $PreferredSmplModelDir = Join-Path $RepoRoot "dataset\body_models"
 $VenvPython = Join-Path $EditorRoot ".venv\Scripts\python.exe"
@@ -28,8 +24,6 @@ $NodeModules = Join-Path $EditorRoot "node_modules"
 $DistIndex = Join-Path $EditorRoot "dist\index.html"
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
-New-Item -ItemType Directory -Force -Path $DefaultDataDir | Out-Null
-New-Item -ItemType Directory -Force -Path $DefaultSourceDir | Out-Null
 New-Item -ItemType Directory -Force -Path $DefaultOutputDir | Out-Null
 
 function Resolve-LaunchPath {
@@ -54,13 +48,7 @@ if (-not (Test-Path $NodeModules)) {
     throw "Missing Node dependencies: $NodeModules. Run visual_editor/scripts/bootstrap.ps1."
 }
 
-if ($DataDir.Trim() -eq "") {
-    if (Test-Path $PreferredDataDir) {
-        $DataDir = $PreferredDataDir
-    } else {
-        $DataDir = $DefaultDataDir
-    }
-} else {
+if ($DataDir.Trim() -ne "") {
     $DataDir = Resolve-LaunchPath $DataDir
 }
 if ($AmassDir.Trim() -eq "") {
@@ -72,13 +60,7 @@ if ($AmassDir.Trim() -eq "") {
 } else {
     $AmassDir = Resolve-LaunchPath $AmassDir
 }
-if ($SourceDir.Trim() -eq "") {
-    if (Test-Path $PreferredSourceDir) {
-        $SourceDir = $PreferredSourceDir
-    } else {
-        $SourceDir = $DefaultSourceDir
-    }
-} else {
+if ($SourceDir.Trim() -ne "") {
     $SourceDir = Resolve-LaunchPath $SourceDir
 }
 if ($ResultDir.Trim() -eq "") {
@@ -116,13 +98,17 @@ $env:REALTIME_POSE_EDITOR_AMASS_DIR = [string](Resolve-Path -LiteralPath $AmassD
 if (-not $env:REALTIME_POSE_EDITOR_AMASS_DIR) {
     $env:REALTIME_POSE_EDITOR_AMASS_DIR = [string]$AmassDir
 }
-$env:REALTIME_POSE_EDITOR_DATA_DIR = [string](Resolve-Path -LiteralPath $DataDir -ErrorAction SilentlyContinue)
-if (-not $env:REALTIME_POSE_EDITOR_DATA_DIR) {
-    $env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
+if ($DataDir.Trim() -ne "") {
+    $env:REALTIME_POSE_EDITOR_DATA_DIR = [string](Resolve-Path -LiteralPath $DataDir -ErrorAction SilentlyContinue)
+    if (-not $env:REALTIME_POSE_EDITOR_DATA_DIR) {
+        $env:REALTIME_POSE_EDITOR_DATA_DIR = [string]$DataDir
+    }
 }
-$env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string](Resolve-Path -LiteralPath $SourceDir -ErrorAction SilentlyContinue)
-if (-not $env:REALTIME_POSE_EDITOR_SOURCE_DIR) {
-    $env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
+if ($SourceDir.Trim() -ne "") {
+    $env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string](Resolve-Path -LiteralPath $SourceDir -ErrorAction SilentlyContinue)
+    if (-not $env:REALTIME_POSE_EDITOR_SOURCE_DIR) {
+        $env:REALTIME_POSE_EDITOR_SOURCE_DIR = [string]$SourceDir
+    }
 }
 $env:REALTIME_POSE_EDITOR_RESULT_DIR = [string](Resolve-Path -LiteralPath $ResultDir -ErrorAction SilentlyContinue)
 if (-not $env:REALTIME_POSE_EDITOR_RESULT_DIR) {
@@ -140,8 +126,18 @@ if (-not $env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR) {
 
 Write-Host "[visual_editor] Starting RealtimePose Studio..."
 Write-Host "[visual_editor] amass_dir=$env:REALTIME_POSE_EDITOR_AMASS_DIR"
-Write-Host "[visual_editor] data_dir=$env:REALTIME_POSE_EDITOR_DATA_DIR"
-Write-Host "[visual_editor] source_dir=$env:REALTIME_POSE_EDITOR_SOURCE_DIR"
+if ($env:REALTIME_POSE_EDITOR_DATA_DIR) {
+    $DisplayDataDir = $env:REALTIME_POSE_EDITOR_DATA_DIR
+} else {
+    $DisplayDataDir = "<data_roots default>"
+}
+if ($env:REALTIME_POSE_EDITOR_SOURCE_DIR) {
+    $DisplaySourceDir = $env:REALTIME_POSE_EDITOR_SOURCE_DIR
+} else {
+    $DisplaySourceDir = "<data_roots default>"
+}
+Write-Host "[visual_editor] data_dir=$DisplayDataDir"
+Write-Host "[visual_editor] source_dir=$DisplaySourceDir"
 Write-Host "[visual_editor] result_dir=$env:REALTIME_POSE_EDITOR_RESULT_DIR"
 Write-Host "[visual_editor] output_dir=$env:REALTIME_POSE_EDITOR_OUTPUT_DIR"
 Write-Host "[visual_editor] smpl_model_dir=$env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR"

@@ -5,8 +5,10 @@
 ## 启动 API
 
 ```powershell
-conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server --source_dir dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz --data_dir dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports
+conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server --result_dir output --output_dir visual_editor/.runtime/exports
 ```
+
+未显式传 `--source_dir/--data_dir` 时，API 会根据 `configs/data_roots.local.json` 或 `configs/data_roots.example.json` 的 `generated_root` 解析默认 source/task 目录。
 
 ## 数据
 

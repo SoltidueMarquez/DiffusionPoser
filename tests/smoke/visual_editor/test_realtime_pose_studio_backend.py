@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -32,12 +34,34 @@ def normalized_path_text(value) -> str:
 
 def assert_generated_layout_path(value, expected_suffix: str) -> None:
     text = normalized_path_text(value)
-    assert text.endswith(expected_suffix)
+    expected = normalized_path_text(expected_suffix)
+    assert text.endswith(expected)
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in text
 
 
-def import_server_with_optional_dependency_stubs(monkeypatch):
+def patch_generated_root(monkeypatch, tmp_path):
+    generated_root = tmp_path / "configured_generated"
+    monkeypatch.setattr(
+        "utils.default_artifact_paths.load_data_roots",
+        lambda: SimpleNamespace(generated_root=generated_root),
+    )
+    return generated_root
+
+
+def expected_source_root(generated_root):
+    return generated_root / "sources" / REALTIME_POSE_SCHEMA_NAME / "amass_60hz"
+
+
+def expected_task_root(generated_root):
+    return generated_root / "tasks" / REALTIME_POSE_SCHEMA_NAME / "amass_60hz_tasks"
+
+
+MISSING_MODULE = object()
+
+
+@contextmanager
+def import_server_with_optional_dependency_stubs():
     class FakeFastAPI:
         def __init__(self, *args, **kwargs):
             self.state = types.SimpleNamespace()
@@ -77,24 +101,60 @@ def import_server_with_optional_dependency_stubs(monkeypatch):
             return default_factory()
         return default
 
-    fake_fastapi = types.ModuleType("fastapi")
-    fake_fastapi.FastAPI = FakeFastAPI
-    fake_fastapi.HTTPException = FakeHTTPException
-    fake_middleware = types.ModuleType("fastapi.middleware")
-    fake_cors = types.ModuleType("fastapi.middleware.cors")
-    fake_cors.CORSMiddleware = object
-    fake_pydantic = types.ModuleType("pydantic")
-    fake_pydantic.BaseModel = FakeBaseModel
-    fake_pydantic.Field = fake_field
-    monkeypatch.setitem(sys.modules, "fastapi", fake_fastapi)
-    monkeypatch.setitem(sys.modules, "fastapi.middleware", fake_middleware)
-    monkeypatch.setitem(sys.modules, "fastapi.middleware.cors", fake_cors)
-    monkeypatch.setitem(sys.modules, "pydantic", fake_pydantic)
-    sys.modules.pop("visual_editor.server", None)
+    module_names = (
+        "fastapi",
+        "fastapi.middleware",
+        "fastapi.middleware.cors",
+        "pydantic",
+        "visual_editor.server",
+    )
+    original_modules = {name: sys.modules.get(name, MISSING_MODULE) for name in module_names}
+    visual_editor_package = sys.modules.get("visual_editor")
+    original_server_attr = (
+        getattr(visual_editor_package, "server")
+        if visual_editor_package is not None and hasattr(visual_editor_package, "server")
+        else MISSING_MODULE
+    )
 
-    from visual_editor import server
+    def remove_cached_server() -> None:
+        sys.modules.pop("visual_editor.server", None)
+        if visual_editor_package is not None and hasattr(visual_editor_package, "server"):
+            delattr(visual_editor_package, "server")
 
-    return server
+    try:
+        remove_cached_server()
+        try:
+            from visual_editor import server
+        except ModuleNotFoundError:
+            fake_fastapi = types.ModuleType("fastapi")
+            fake_fastapi.FastAPI = FakeFastAPI
+            fake_fastapi.HTTPException = FakeHTTPException
+            fake_middleware = types.ModuleType("fastapi.middleware")
+            fake_cors = types.ModuleType("fastapi.middleware.cors")
+            fake_cors.CORSMiddleware = object
+            fake_pydantic = types.ModuleType("pydantic")
+            fake_pydantic.BaseModel = FakeBaseModel
+            fake_pydantic.Field = fake_field
+            sys.modules["fastapi"] = fake_fastapi
+            sys.modules["fastapi.middleware"] = fake_middleware
+            sys.modules["fastapi.middleware.cors"] = fake_cors
+            sys.modules["pydantic"] = fake_pydantic
+            remove_cached_server()
+            from visual_editor import server
+        yield server
+    finally:
+        remove_cached_server()
+        for name, original in original_modules.items():
+            if original is MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+        if visual_editor_package is not None:
+            if original_server_attr is MISSING_MODULE:
+                if hasattr(visual_editor_package, "server"):
+                    delattr(visual_editor_package, "server")
+            else:
+                setattr(visual_editor_package, "server", original_server_attr)
 
 
 def write_task_variant(source_task: Path, output_task: Path, drop_keys: set[str] | None = None, **overrides) -> None:
@@ -134,32 +194,32 @@ def generate_first_task(tmp_path: Path) -> Path:
 
 
 def test_visual_editor_server_defaults_use_generated_artifact_layout(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
     monkeypatch.setenv("REALTIME_POSE_EDITOR_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("REALTIME_POSE_EDITOR_OUTPUT_DIR", str(tmp_path / "exports"))
     monkeypatch.delenv("REALTIME_POSE_EDITOR_SOURCE_DIR", raising=False)
     monkeypatch.delenv("REALTIME_POSE_EDITOR_DATA_DIR", raising=False)
 
-    server = import_server_with_optional_dependency_stubs(monkeypatch)
+    with import_server_with_optional_dependency_stubs() as server:
+        config = server.config_from_env()
+        args = server.build_argument_parser().parse_args([])
 
-    config = server.config_from_env()
-    args = server.build_argument_parser().parse_args([])
-
-    assert_generated_layout_path(config.source_dir, GENERATED_SOURCE_ROOT)
-    assert_generated_layout_path(config.data_dir, GENERATED_TASK_ROOT)
-    assert_generated_layout_path(args.source_dir, GENERATED_SOURCE_ROOT)
-    assert_generated_layout_path(args.data_dir, GENERATED_TASK_ROOT)
+    assert_generated_layout_path(config.source_dir, str(expected_source_root(generated_root)))
+    assert_generated_layout_path(config.data_dir, str(expected_task_root(generated_root)))
+    assert_generated_layout_path(args.source_dir, str(expected_source_root(generated_root)))
+    assert_generated_layout_path(args.data_dir, str(expected_task_root(generated_root)))
 
 
 def test_visual_editor_server_preserves_env_path_overrides(monkeypatch, tmp_path):
+    patch_generated_root(monkeypatch, tmp_path)
     monkeypatch.setenv("REALTIME_POSE_EDITOR_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("REALTIME_POSE_EDITOR_OUTPUT_DIR", str(tmp_path / "exports"))
     monkeypatch.setenv("REALTIME_POSE_EDITOR_SOURCE_DIR", "custom/source")
     monkeypatch.setenv("REALTIME_POSE_EDITOR_DATA_DIR", "custom/tasks")
 
-    server = import_server_with_optional_dependency_stubs(monkeypatch)
-
-    config = server.config_from_env()
-    args = server.build_argument_parser().parse_args([])
+    with import_server_with_optional_dependency_stubs() as server:
+        config = server.config_from_env()
+        args = server.build_argument_parser().parse_args([])
 
     assert normalized_path_text(config.source_dir) == "custom/source"
     assert normalized_path_text(config.data_dir) == "custom/tasks"
@@ -167,12 +227,22 @@ def test_visual_editor_server_preserves_env_path_overrides(monkeypatch, tmp_path
     assert normalized_path_text(args.data_dir) == "custom/tasks"
 
 
+def test_visual_editor_server_import_stub_does_not_leak_modules(monkeypatch, tmp_path):
+    patch_generated_root(monkeypatch, tmp_path)
+    original_server = sys.modules.get("visual_editor.server")
+
+    with import_server_with_optional_dependency_stubs():
+        assert sys.modules.get("visual_editor.server") is not original_server
+
+    assert sys.modules.get("visual_editor.server") is original_server
+
+
 def test_visual_editor_ai_index_defaults_to_generated_layout():
     index_path = Path("visual_editor/ai_index.json")
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     api = payload["entrypoints"]["api"]
-    assert GENERATED_SOURCE_ROOT in api
-    assert GENERATED_TASK_ROOT in api
+    assert "--source_dir" not in api
+    assert "--data_dir" not in api
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in api
     assert "body_fbx_local_root_y0" in payload["data_contract"]["source"]
@@ -182,8 +252,9 @@ def test_visual_editor_ai_index_defaults_to_generated_layout():
 def test_visual_editor_readme_examples_use_generated_layout():
     readme = Path("visual_editor/README.md").read_text(encoding="utf-8")
 
-    assert GENERATED_SOURCE_ROOT in readme
-    assert GENERATED_TASK_ROOT in readme
+    assert "--source_dir " not in readme
+    assert "--data_dir " not in readme
+    assert "data_roots" in readme
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in readme
 
@@ -197,10 +268,25 @@ def test_visual_editor_launcher_defaults_use_generated_layout():
 
     for path in launcher_paths:
         text = normalized_path_text(path.read_text(encoding="utf-8"))
-        assert GENERATED_SOURCE_ROOT in text
-        assert GENERATED_TASK_ROOT in text
+        assert GENERATED_SOURCE_ROOT not in text
+        assert GENERATED_TASK_ROOT not in text
         for marker in LEGACY_PARENT_LOCAL_MARKERS:
             assert marker not in text
+
+    electron = normalized_path_text(Path("visual_editor/electron/main.cjs").read_text(encoding="utf-8"))
+    assert "--data_dir" not in electron
+    assert "--source_dir" not in electron
+    assert "REALTIME_POSE_EDITOR_DATA_DIR" not in electron
+    assert "REALTIME_POSE_EDITOR_SOURCE_DIR" not in electron
+
+    for path in (Path("visual_editor/scripts/start.ps1"), Path("visual_editor/scripts/start_web.ps1")):
+        text = normalized_path_text(path.read_text(encoding="utf-8"))
+        assert "$PreferredDataDir" not in text
+        assert "$PreferredSourceDir" not in text
+        assert "$DefaultDataDir" not in text
+        assert "$DefaultSourceDir" not in text
+        assert 'if ($DataDir.Trim() -ne "")' in text
+        assert 'if ($SourceDir.Trim() -ne "")' in text
 
     root_launcher = normalized_path_text(Path("open_realtime_pose_studio.cmd").read_text(encoding="utf-8"))
     assert "visual_editor/scripts/start.ps1" in root_launcher

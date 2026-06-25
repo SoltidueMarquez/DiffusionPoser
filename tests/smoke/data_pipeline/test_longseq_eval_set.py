@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from types import SimpleNamespace
 
 from data_loaders.build_realtime_longseq_eval_set import (
     build_arg_parser,
@@ -11,14 +12,20 @@ from data_loaders.build_realtime_longseq_eval_set import (
 )
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.generate_realtime_pose_tasks import DEFAULT_SOURCE_SET_NAME, DEFAULT_TASK_SET_NAME
+from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
-from utils.parser_util import add_data_options
+from utils.default_artifact_paths import (
+    DEFAULT_REALTIME_POSE_NORMALIZER_NAME,
+    DEFAULT_REALTIME_POSE_SOURCE_SET_NAME,
+    DEFAULT_REALTIME_POSE_TASK_SET_NAME,
+)
+from utils.parser_util import add_data_options, parse_and_load_runtime_schema_from_model
 from utils.run_dirs import read_latest_pointer
 
 
-GENERATED_TASK_ROOT = "dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks"
-GENERATED_NORMALIZER_ROOT = "dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train"
-GENERATED_LONGSEQ_EVAL_ROOT = "dataset/generated/longseq_eval/realtime_pose_stationary5_v1/amass_60hz_test_stress_long"
+CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
+LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 LEGACY_PARENT_LOCAL_MARKERS = (
     "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
     "dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
@@ -31,16 +38,53 @@ def normalized_path_text(value) -> str:
 
 def assert_generated_layout_path(value, expected_suffix: str) -> None:
     text = normalized_path_text(value)
-    assert text.endswith(expected_suffix)
+    expected = normalized_path_text(expected_suffix)
+    assert text.endswith(expected)
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in text
 
 
-def test_longseq_eval_builder_defaults_use_generated_artifact_layout():
+def patch_generated_root(monkeypatch, tmp_path):
+    generated_root = tmp_path / "configured_generated"
+    monkeypatch.setattr(
+        "utils.default_artifact_paths.load_data_roots",
+        lambda: SimpleNamespace(generated_root=generated_root),
+    )
+    return generated_root
+
+
+def expected_task_root(generated_root, schema_name: str):
+    return generated_root / "tasks" / schema_name / "amass_60hz_tasks"
+
+
+def expected_normalizer_root(generated_root, schema_name: str):
+    return generated_root / "normalizers" / schema_name / "amass_60hz_train"
+
+
+def expected_longseq_root(generated_root, schema_name: str):
+    return generated_root / "longseq_eval" / schema_name / "amass_60hz_test_stress_long"
+
+
+def test_default_artifact_path_names_match_pipeline_entrypoints():
+    assert DEFAULT_REALTIME_POSE_SOURCE_SET_NAME == DEFAULT_SOURCE_SET_NAME
+    assert DEFAULT_REALTIME_POSE_TASK_SET_NAME == DEFAULT_TASK_SET_NAME
+    assert DEFAULT_REALTIME_POSE_NORMALIZER_NAME == DEFAULT_NORMALIZER_NAME
+
+
+def test_longseq_eval_builder_defaults_use_generated_artifact_layout(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
     args = build_arg_parser().parse_args([])
 
-    assert_generated_layout_path(args.task_dir, GENERATED_TASK_ROOT)
-    assert_generated_layout_path(args.output_root, GENERATED_LONGSEQ_EVAL_ROOT)
+    assert_generated_layout_path(args.task_dir, str(expected_task_root(generated_root, CANONICAL_SCHEMA_NAME)))
+    assert_generated_layout_path(args.output_root, str(expected_longseq_root(generated_root, CANONICAL_SCHEMA_NAME)))
+
+
+def test_longseq_eval_builder_defaults_follow_explicit_legacy_schema(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
+    args = build_arg_parser().parse_args(["--schema", LEGACY_SCHEMA_NAME])
+
+    assert_generated_layout_path(args.task_dir, str(expected_task_root(generated_root, LEGACY_SCHEMA_NAME)))
+    assert_generated_layout_path(args.output_root, str(expected_longseq_root(generated_root, LEGACY_SCHEMA_NAME)))
 
 
 def test_longseq_eval_builder_preserves_explicit_path_overrides():
@@ -57,12 +101,22 @@ def test_longseq_eval_builder_preserves_explicit_path_overrides():
     assert normalized_path_text(args.output_root) == "custom/longseq_eval"
 
 
-def test_data_options_default_normalizer_uses_generated_artifact_layout():
+def test_data_options_default_normalizer_uses_generated_artifact_layout(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
     parser = argparse.ArgumentParser()
     add_data_options(parser)
     args = parser.parse_args(["--data_dir", "custom/tasks"])
 
-    assert_generated_layout_path(args.normalizer_dir, GENERATED_NORMALIZER_ROOT)
+    assert_generated_layout_path(args.normalizer_dir, str(expected_normalizer_root(generated_root, CANONICAL_SCHEMA_NAME)))
+
+
+def test_data_options_default_normalizer_follows_explicit_legacy_schema(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
+    parser = argparse.ArgumentParser()
+    add_data_options(parser)
+    args = parser.parse_args(["--data_dir", "custom/tasks", "--schema", LEGACY_SCHEMA_NAME])
+
+    assert_generated_layout_path(args.normalizer_dir, str(expected_normalizer_root(generated_root, LEGACY_SCHEMA_NAME)))
 
 
 def test_data_options_preserves_explicit_normalizer_override():
@@ -77,6 +131,53 @@ def test_data_options_preserves_explicit_normalizer_override():
         ]
     )
 
+    assert normalized_path_text(args.normalizer_dir) == "custom/normalizer"
+
+
+def test_runtime_schema_parse_updates_default_normalizer_after_checkpoint_schema(monkeypatch, tmp_path):
+    generated_root = patch_generated_root(monkeypatch, tmp_path)
+    model_path = tmp_path / "model000000000.pt"
+    (tmp_path / "args.json").write_text(
+        json.dumps({"schema": LEGACY_SCHEMA_NAME, "schema_name": LEGACY_SCHEMA_NAME}),
+        encoding="utf-8",
+    )
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    add_data_options(parser)
+    parser.add_argument("--model_path", required=True)
+
+    args = parse_and_load_runtime_schema_from_model(
+        parser,
+        argv=["--data_dir", "custom/tasks", "--model_path", str(model_path)],
+    )
+
+    assert args.schema == LEGACY_SCHEMA_NAME
+    assert_generated_layout_path(args.normalizer_dir, str(expected_normalizer_root(generated_root, LEGACY_SCHEMA_NAME)))
+
+
+def test_runtime_schema_parse_preserves_explicit_normalizer_override(monkeypatch, tmp_path):
+    patch_generated_root(monkeypatch, tmp_path)
+    model_path = tmp_path / "model000000000.pt"
+    (tmp_path / "args.json").write_text(
+        json.dumps({"schema": LEGACY_SCHEMA_NAME, "schema_name": LEGACY_SCHEMA_NAME}),
+        encoding="utf-8",
+    )
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    add_data_options(parser)
+    parser.add_argument("--model_path", required=True)
+
+    args = parse_and_load_runtime_schema_from_model(
+        parser,
+        argv=[
+            "--data_dir",
+            "custom/tasks",
+            "--model_path",
+            str(model_path),
+            "--normalizer_dir",
+            "custom/normalizer",
+        ],
+    )
+
+    assert args.schema == LEGACY_SCHEMA_NAME
     assert normalized_path_text(args.normalizer_dir) == "custom/normalizer"
 
 
