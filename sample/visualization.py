@@ -21,7 +21,7 @@ def decode_realtime_pose_joints(
     joint_rest_local_rotations_6d: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    按 registry 默认 schema 的目标 pose feature + root_yaw 做轻量 FK。
+    按默认 schema realtime_pose_stationary5_v1 的目标 pose feature + root_yaw 做轻量 FK。
     输入特征为 `[T,C]`，输出 joints 为 `[T,24,3]`，供可视化和 smoke test 使用。
     """
 
