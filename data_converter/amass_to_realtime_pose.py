@@ -67,6 +67,14 @@ from utils.data_roots import load_data_roots
 
 DEFAULT_SOURCE_SET_NAME = "amass_60hz"
 DEFAULT_SMPL_MODEL_DIR = Path("dataset/body_models")
+SOURCE_PROVENANCE_FIELDS = (
+    "schema_canonical_name",
+    "raw_dataset",
+    "raw_root_key",
+    "raw_relative_path",
+    "source_set_name",
+    "converter_args",
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -171,6 +179,20 @@ def build_path_provenance(raw_relative_path: Path | str, args: argparse.Namespac
         "raw_relative_path": Path(raw_relative_path).as_posix(),
         "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
         "converter_args": build_converter_args_metadata(args),
+    }
+
+
+def build_source_provenance_from_metadata(
+    metadata: dict[str, Any],
+    raw_relative_path: Path | str,
+    args: argparse.Namespace,
+    schema,
+) -> dict[str, object]:
+    fallback = build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema)
+    # 已有 source 的来源记录代表当时生成数据的真实输入；重建 manifest 时不能用本次 CLI 覆盖。
+    return {
+        field: metadata[field] if field in metadata else fallback[field]
+        for field in SOURCE_PROVENANCE_FIELDS
     }
 
 
@@ -424,7 +446,12 @@ def record_for_output(
         "raw_relative_path",
         metadata.get("original_source_relative_path", path.relative_to(args.amass_dir)),
     )
-    provenance = build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema)
+    provenance = build_source_provenance_from_metadata(
+        metadata=metadata,
+        raw_relative_path=raw_relative_path,
+        args=args,
+        schema=schema,
+    )
     stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
     return {
         "status": status,
@@ -523,7 +550,14 @@ def save_reused_realtime_source(
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
-    next_metadata.update(build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema))
+    next_metadata.update(
+        build_source_provenance_from_metadata(
+            metadata=next_metadata,
+            raw_relative_path=raw_relative_path,
+            args=args,
+            schema=schema,
+        )
+    )
     if schema.supports_stationary_prob:
         next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)

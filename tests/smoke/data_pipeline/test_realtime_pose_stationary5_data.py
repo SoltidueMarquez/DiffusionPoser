@@ -66,6 +66,111 @@ def test_converter_resolves_schema_aware_source_root_from_data_roots(tmp_path):
     assert resolved.output_dir == generated_root / "sources" / "realtime_pose_stationary5_v1" / "toy_source"
 
 
+def test_converter_explicit_paths_override_data_roots_config(tmp_path):
+    config_path = tmp_path / "data_roots.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "amass_root": str(tmp_path / "config_AMASS"),
+                "smpl_model_dir": str(tmp_path / "config_body_models"),
+                "body_fbx_rest_json": str(tmp_path / "config_body_fbx_rest.json"),
+                "generated_root": str(tmp_path / "config_generated"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    explicit_amass_dir = tmp_path / "explicit_AMASS"
+    explicit_smpl_model_dir = tmp_path / "explicit_body_models"
+    explicit_output_dir = tmp_path / "explicit_sources"
+    explicit_body_fbx_rest_json = tmp_path / "explicit_body_fbx_rest.json"
+
+    args = amass_converter.parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--amass_dir",
+            str(explicit_amass_dir),
+            "--smpl_model_dir",
+            str(explicit_smpl_model_dir),
+            "--output_dir",
+            str(explicit_output_dir),
+            "--body_fbx_rest_json",
+            str(explicit_body_fbx_rest_json),
+            "--source_set_name",
+            "toy_source",
+            "--schema",
+            "realtime_pose_stationary5_v1",
+        ]
+    )
+    resolved = amass_converter.resolve_converter_paths(args)
+
+    assert resolved.amass_dir == explicit_amass_dir
+    assert resolved.smpl_model_dir == explicit_smpl_model_dir
+    assert resolved.output_dir == explicit_output_dir
+    assert resolved.body_fbx_rest_json == explicit_body_fbx_rest_json
+
+
+def test_converter_manifest_record_preserves_existing_source_provenance(tmp_path):
+    schema = get_schema_spec("realtime_pose_stationary5_v1")
+    amass_dir = tmp_path / "AMASS"
+    raw_motion_path = amass_dir / "ACCAD" / "toy_motion.npz"
+    output_path = tmp_path / "sources" / "ACCAD" / "toy_motion.npz"
+    output_path.parent.mkdir(parents=True)
+
+    source_payload = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN, schema_name=schema.name)
+    old_converter_args = {
+        "target_fps": 30.0,
+        "mirror": False,
+        "schema": schema.name,
+        "source_set_name": "old_source_set",
+    }
+    metadata = json.loads(str(source_payload["metadata"].item()))
+    metadata.update(
+        {
+            "schema_canonical_name": str(schema.canonical_name),
+            "raw_dataset": "AMASS",
+            "raw_root_key": "amass_root",
+            "raw_relative_path": "ACCAD/raw_original_motion.npz",
+            "source_set_name": "old_source_set",
+            "converter_args": old_converter_args,
+        }
+    )
+    source_payload["metadata"] = np.asarray(json.dumps(metadata, ensure_ascii=False))
+    np.savez(output_path, **source_payload)
+
+    args = amass_converter.resolve_converter_paths(
+        amass_converter.parse_args(
+            [
+                "--amass_dir",
+                str(amass_dir),
+                "--smpl_model_dir",
+                str(tmp_path / "body_models"),
+                "--output_dir",
+                str(tmp_path / "sources"),
+                "--schema",
+                schema.name,
+                "--source_set_name",
+                "current_source_set",
+                "--target_fps",
+                "120",
+            ]
+        )
+    )
+
+    record = amass_converter.record_for_output(
+        path=raw_motion_path,
+        output_path=output_path,
+        args=args,
+        mirror_variant=False,
+        status="skipped_existing",
+    )
+
+    assert record["source_set_name"] == "old_source_set"
+    assert record["converter_args"] == old_converter_args
+    assert record["raw_relative_path"] == "ACCAD/raw_original_motion.npz"
+    assert record["schema_canonical_name"] == str(schema.canonical_name)
+
+
 def test_converter_source_provenance_is_json_safe_and_portable(tmp_path):
     schema = get_schema_spec("realtime_pose_stationary5_v1")
     source = MotionSource(
