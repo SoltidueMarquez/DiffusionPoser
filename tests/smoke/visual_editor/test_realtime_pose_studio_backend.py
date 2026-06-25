@@ -202,6 +202,13 @@ def test_visual_editor_launcher_defaults_use_generated_layout():
         for marker in LEGACY_PARENT_LOCAL_MARKERS:
             assert marker not in text
 
+    root_launcher = normalized_path_text(Path("open_realtime_pose_studio.cmd").read_text(encoding="utf-8"))
+    assert "visual_editor/scripts/start.ps1" in root_launcher
+    assert "-DataDir" not in root_launcher
+    assert "-SourceDir" not in root_launcher
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in root_launcher
+
 
 def test_visual_editor_task_loader_rejects_missing_contract_metadata(tmp_path):
     source_task = generate_first_task(tmp_path)
