@@ -12,12 +12,12 @@ from data_converter.amass_to_realtime_pose import DEFAULT_SOURCE_SET_NAME
 from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
 from data_loaders.generate_realtime_pose_tasks import DEFAULT_TASK_SET_NAME
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
-from utils.artifact_paths import normalizer_root, source_root, task_root
+from utils.artifact_paths import export_root, normalizer_root, run_root, source_root, task_root
 from utils.data_roots import load_data_roots
 from utils.run_dirs import resolve_latest_or_self
 
 
-PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train")
+PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train", "export")
 SOURCE_USABLE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
 
 
@@ -44,7 +44,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     paths.add_argument("--normalizer_dir", default="", type=str)
     paths.add_argument("--task_dir", default="", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
-    paths.add_argument("--save_dir", default="runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit", type=str)
+    paths.add_argument("--save_dir", default="", type=str)
     paths.add_argument("--export_dir", default="", type=str)
 
     pipeline = parser.add_argument_group("pipeline")
@@ -200,6 +200,14 @@ def load_pipeline_data_roots(args: argparse.Namespace):
     return load_data_roots(getattr(args, "data_roots_config", "") or None)
 
 
+def first_non_empty(*values: object, default: str = "auto") -> str:
+    for value in values:
+        text = str(value).strip() if value is not None else ""
+        if text:
+            return text
+    return default
+
+
 def resolve_pipeline_source_dir(args: argparse.Namespace) -> Path:
     if not path_arg_is_empty(getattr(args, "source_dir", "")):
         return Path(args.source_dir)
@@ -231,6 +239,24 @@ def resolve_pipeline_normalizer_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def resolve_pipeline_save_dir(args: argparse.Namespace) -> Path:
+    if not path_arg_is_empty(getattr(args, "save_dir", "")):
+        return Path(args.save_dir)
+    experiment_name = first_non_empty(getattr(args, "experiment_name", ""), getattr(args, "run_name", ""))
+    return run_root(schema_name=str(args.schema), experiment_name=experiment_name)
+
+
+def resolve_pipeline_export_dir(args: argparse.Namespace) -> Path:
+    if not path_arg_is_empty(getattr(args, "export_dir", "")):
+        return Path(args.export_dir)
+    export_name = first_non_empty(
+        getattr(args, "export_name", ""),
+        getattr(args, "experiment_name", ""),
+        getattr(args, "run_name", ""),
+    )
+    return export_root(schema_name=str(args.schema), export_name=export_name)
+
+
 def stage_is_disabled(stage: str, args: argparse.Namespace) -> bool:
     return bool(getattr(args, f"skip_{stage}", False))
 
@@ -244,6 +270,8 @@ def build_stage_args(stage: str, args: argparse.Namespace) -> tuple[str, list[st
         return "data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args)
     if stage == "train":
         return "train.train_diffusionposer", build_train_args(args)
+    if stage == "export":
+        return "export.write_unity_runtime_assets", build_export_args(args)
     raise ValueError(f"未知 pipeline stage: {stage}")
 
 
@@ -411,6 +439,18 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def build_export_args(args: argparse.Namespace) -> list[str]:
+    schema = get_schema_spec(args.schema)
+    command = [
+        "--schema", schema.name,
+        "--output_dir", normalize_path(resolve_pipeline_export_dir(args)),
+        "--diffusion_steps", str(args.diffusion_steps),
+        "--normalizer_dir", normalize_path(resolve_pipeline_normalizer_dir(args)),
+        "--normalize_input",
+    ]
+    return command
+
+
 def build_train_args(args: argparse.Namespace) -> list[str]:
     schema = get_schema_spec(args.schema)
     command = [
@@ -420,7 +460,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--data_dir", normalize_path(resolve_pipeline_task_dir(args)),
         "--data_split", "train",
         "--normalizer_dir", normalize_path(resolve_pipeline_normalizer_dir(args)),
-        "--save_dir", normalize_path(args.save_dir),
+        "--save_dir", normalize_path(resolve_pipeline_save_dir(args)),
         "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
         "--num_workers", str(args.num_workers),

@@ -17,6 +17,7 @@ from utils.run_dirs import read_latest_pointer, write_latest_pointer
 CONVERT_MODULE = "data_converter.amass_to_realtime_pose"
 TASK_MODULE = "data_loaders.generate_realtime_pose_tasks"
 NORMALIZER_MODULE = "data_loaders.compute_realtime_pose_normalizer"
+EXPORT_MODULE = "export.write_unity_runtime_assets"
 
 
 def write_data_roots_config(tmp_path: Path) -> tuple[Path, Path]:
@@ -263,6 +264,78 @@ def test_pipeline_explicit_paths_override_schema_aware_resolvers(tmp_path):
 
     assert_arg_value(normalizer_args, "--task_dir", str(explicit_task_dir))
     assert_arg_value(normalizer_args, "--output_dir", str(explicit_normalizer_dir))
+
+
+def test_pipeline_stages_include_export_without_changing_default_stop_after():
+    args = pipeline.build_arg_parser().parse_args([])
+
+    assert "export" in pipeline.PIPELINE_STAGES
+    assert args.stop_after == "train"
+    assert pipeline.selected_stages("convert", "export") == ("convert", "tasks", "normalizer", "train", "export")
+    assert pipeline.selected_stages("export", "export") == ("export",)
+
+
+def test_pipeline_train_save_dir_uses_schema_and_experiment_name(tmp_path):
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--schema",
+        "realtime_pose_stationary5_v1",
+        "--experiment_name",
+        "toy_exp",
+    )
+
+    train_args = pipeline.build_train_args(args)
+
+    assert_arg_value(train_args, "--save_dir", str(Path("runs") / "realtime_pose_stationary5_v1" / "toy_exp"))
+
+
+def test_pipeline_explicit_save_dir_overrides_experiment_name(tmp_path):
+    explicit_save_dir = tmp_path / "explicit_runs"
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--save_dir",
+        str(explicit_save_dir),
+        "--experiment_name",
+        "toy_exp",
+    )
+
+    train_args = pipeline.build_train_args(args)
+
+    assert_arg_value(train_args, "--save_dir", str(explicit_save_dir))
+
+
+def test_pipeline_export_command_uses_schema_and_export_name(tmp_path):
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--schema",
+        "realtime_pose_stationary5_v1",
+        "--export_name",
+        "toy_export",
+    )
+
+    module, export_args = pipeline.build_stage_args("export", args)
+
+    assert module == EXPORT_MODULE
+    assert_arg_value(export_args, "--schema", "realtime_pose_stationary5_v1")
+    assert_arg_value(export_args, "--output_dir", str(Path("output") / "realtime_pose_stationary5_v1" / "toy_export"))
+    assert_arg_value(export_args, "--diffusion_steps", str(args.diffusion_steps))
+    assert_arg_value(export_args, "--normalizer_dir", str(pipeline.resolve_pipeline_normalizer_dir(args)))
+    assert "--normalize_input" in export_args
+
+
+def test_pipeline_explicit_export_dir_overrides_export_name(tmp_path):
+    explicit_export_dir = tmp_path / "explicit_export"
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--export_dir",
+        str(explicit_export_dir),
+        "--export_name",
+        "toy_export",
+    )
+
+    export_args = pipeline.build_export_args(args)
+
+    assert_arg_value(export_args, "--output_dir", str(explicit_export_dir))
 
 
 def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):
