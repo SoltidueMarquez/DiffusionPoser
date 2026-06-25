@@ -68,6 +68,13 @@ def parse_and_load_runtime_schema_from_model(
     argv: list[str] | None = None,
     ignore_keys: set[str] | None = None,
 ):
+    """
+    解析采样/运行时入口参数，并按 checkpoint exact schema 修正 args.schema。
+
+    调用方 parser 必须使用 allow_abbrev=False；否则 argparse 可能接受
+    --sche 这类缩写，而 has_explicit_schema_arg 只把精确的 --schema 形式
+    视为用户显式指定 schema。
+    """
     cli_schema_explicit = has_explicit_schema_arg(argv)
     effective_ignore_keys = set(ignore_keys or set())
     if cli_schema_explicit:

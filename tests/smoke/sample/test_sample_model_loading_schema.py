@@ -20,10 +20,10 @@ SAMPLE_ENTRYPOINTS = (
 )
 
 
-def write_checkpoint_args(tmp_path: Path, schema_name: str) -> Path:
+def write_checkpoint_args(tmp_path: Path, schema_name: str, schema_key: str = "schema") -> Path:
     model_path = tmp_path / "model000000000.pt"
     model_path.write_bytes(b"")
-    (tmp_path / "args.json").write_text(json.dumps({"schema": schema_name}), encoding="utf-8")
+    (tmp_path / "args.json").write_text(json.dumps({schema_key: schema_name}), encoding="utf-8")
     return model_path
 
 
@@ -33,6 +33,8 @@ def minimal_model_args(tmp_path: Path, model_path: Path, *extra_args: str) -> li
         str(model_path),
         "--data_dir",
         str(tmp_path / "data"),
+        "--output_dir",
+        str(tmp_path / "out"),
         "--cuda",
         "false",
         *extra_args,
@@ -87,13 +89,19 @@ def test_sample_model_loader_rejects_canonical_checkpoint_with_explicit_legacy_s
         )
 
 
+@pytest.mark.parametrize("schema_key", ("schema", "schema_name"))
 @pytest.mark.parametrize("module", SAMPLE_ENTRYPOINTS)
 def test_sample_model_loader_uses_checkpoint_exact_schema_when_cli_schema_omitted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     module,
+    schema_key: str,
 ) -> None:
-    model_path = write_checkpoint_args(tmp_path, REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME)
+    model_path = write_checkpoint_args(
+        tmp_path,
+        REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
+        schema_key=schema_key,
+    )
     captured: dict[str, str] = {}
 
     class StopAfterDatasetSchema:
@@ -110,6 +118,33 @@ def test_sample_model_loader_uses_checkpoint_exact_schema_when_cli_schema_omitte
         module.main(minimal_model_args(tmp_path, model_path))
 
     assert captured["schema_name"] == REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
+
+
+def test_build_predicted_history_cache_omitted_schema_uses_temp_output_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = write_checkpoint_args(tmp_path, REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME)
+    created_dirs: list[Path] = []
+
+    def record_mkdir(self, *args, **kwargs):
+        del args, kwargs
+        created_dirs.append(self.resolve())
+
+    class StopAfterDatasetSchema:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("stop after output dir capture")
+
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+    monkeypatch.setattr(build_predicted_history_cache.dist_util, "setup_dist", lambda *args, **kwargs: None)
+    monkeypatch.setattr(build_predicted_history_cache.dist_util, "dev", lambda: torch.device("cpu"))
+    monkeypatch.setattr(build_predicted_history_cache, "RealtimePoseTaskDataset", StopAfterDatasetSchema)
+
+    with pytest.raises(RuntimeError, match="stop after output dir capture"):
+        build_predicted_history_cache.main(minimal_model_args(tmp_path, model_path))
+
+    assert created_dirs == [(tmp_path / "out").resolve()]
 
 
 @pytest.mark.parametrize("module", SAMPLE_ENTRYPOINTS)
