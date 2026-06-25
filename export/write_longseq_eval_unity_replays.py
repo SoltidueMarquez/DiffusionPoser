@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from data_loaders.build_realtime_longseq_eval_set import (
-    DEFAULT_LONGSEQ_EVAL_ROOT,
     build_replay_filename,
     read_longseq_manifest,
     resolve_longseq_eval_dir,
@@ -24,8 +23,12 @@ from data_loaders.longseq_eval_dropout import (
 )
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME
 from export.write_unity_replay_stream import DEFAULT_REPLAY_FPS, load_sensor_valid, write_unity_replay_stream
+from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root
+from utils.parser_util import has_explicit_option_arg
 
 
+EVAL_ROOT_ARG = "--eval_root"
+DEFAULT_EVAL_ROOT = ""
 DEFAULT_UNITY_REPLAY_DIR = (
     "../SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoserStationary5/Replays/"
     "root_y0_longseq_eval_stress_long"
@@ -35,7 +38,7 @@ DEFAULT_UNITY_REPLAY_DIR = (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export Unity replay JSON files for a fixed longseq eval set.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
+    paths.add_argument("--eval_root", default=DEFAULT_EVAL_ROOT, type=str)
     paths.add_argument("--eval_set", default="latest", type=str)
     paths.add_argument("--output_dir", default="", type=str)
     paths.add_argument("--also_write_unity", default=False, action=BooleanOptionalAction)
@@ -48,7 +51,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     replay.add_argument("--frame_count", default=0, type=int)
     replay.add_argument("--identity_6d_rotations", default=False, action=BooleanOptionalAction)
     add_longseq_dropout_options(parser)
+    install_eval_root_default_parser(parser)
     return parser
+
+
+def install_eval_root_default_parser(parser: argparse.ArgumentParser) -> None:
+    original_parse_args = parser.parse_args
+
+    def parse_args_with_eval_root_default(args=None, namespace=None):
+        parsed = original_parse_args(args, namespace)
+        return apply_eval_root_default(
+            parsed,
+            eval_root_explicit=has_explicit_option_arg(args, EVAL_ROOT_ARG),
+        )
+
+    parser.parse_args = parse_args_with_eval_root_default
+
+
+def apply_eval_root_default(
+    args: argparse.Namespace,
+    *,
+    eval_root_explicit: bool = False,
+    force_eval_root: bool = False,
+) -> argparse.Namespace:
+    schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME) or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    if not eval_root_explicit and (force_eval_root or not str(getattr(args, "eval_root", "") or "").strip()):
+        args.eval_root = str(default_realtime_pose_longseq_eval_root(schema_name=schema_name))
+        setattr(args, "_eval_root_auto_default", True)
+    else:
+        setattr(args, "_eval_root_auto_default", False)
+    return args
 
 
 def export_longseq_eval_unity_replays(
