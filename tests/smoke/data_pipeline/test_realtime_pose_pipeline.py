@@ -58,6 +58,36 @@ def parse_pipeline_args(tmp_path: Path, *extra: str):
     )
 
 
+def parse_schema_aware_pipeline_args(tmp_path: Path, *extra: str):
+    config_path, _ = write_data_roots_config(tmp_path)
+    return pipeline.build_arg_parser().parse_args(
+        [
+            "--amass_dir",
+            str(tmp_path / "AMASS"),
+            "--smpl_model_dir",
+            str(tmp_path / "body_models"),
+            "--data_roots_config",
+            str(config_path),
+            "--source_set_name",
+            "toy_sources",
+            "--task_set_name",
+            "toy_tasks",
+            "--normalizer_name",
+            "toy_norm",
+            "--split_dir",
+            "",
+            "--splits",
+            "train",
+            *extra,
+        ]
+    )
+
+
+def assert_arg_value(command: list[str], flag: str, expected: str) -> None:
+    assert flag in command
+    assert command[command.index(flag) + 1] == expected
+
+
 def write_usable_source_manifest(source_dir: Path) -> None:
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +198,71 @@ def test_pipeline_passes_parallel_converter_args(tmp_path):
 
     assert convert_args[convert_args.index("--num_workers") + 1] == "3"
     assert convert_args[convert_args.index("--worker_torch_threads") + 1] == "2"
+
+
+def test_pipeline_default_schema_is_stationary5():
+    args = pipeline.build_arg_parser().parse_args([])
+
+    assert args.schema == "realtime_pose_stationary5_v1"
+
+
+def test_pipeline_schema_aware_commands_defer_paths_to_resolvers(tmp_path):
+    config_path = tmp_path / "data_roots.json"
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--schema",
+        "realtime_pose_stationary5_v1",
+    )
+
+    convert_args = pipeline.build_convert_args(args)
+    task_args = pipeline.build_task_args(args)
+    normalizer_args = pipeline.build_normalizer_args(args)
+
+    for command in (convert_args, task_args, normalizer_args):
+        assert_arg_value(command, "--schema", "realtime_pose_stationary5_v1")
+        assert_arg_value(command, "--data_roots_config", str(config_path))
+
+    assert_arg_value(convert_args, "--source_set_name", "toy_sources")
+    assert "--output_dir" not in convert_args
+
+    assert_arg_value(task_args, "--source_set_name", "toy_sources")
+    assert_arg_value(task_args, "--task_set_name", "toy_tasks")
+    assert "--source_dir" not in task_args
+    assert "--output_dir" not in task_args
+
+    assert_arg_value(normalizer_args, "--task_set_name", "toy_tasks")
+    assert_arg_value(normalizer_args, "--normalizer_name", "toy_norm")
+    assert "--task_dir" not in normalizer_args
+    assert "--output_dir" not in normalizer_args
+
+
+def test_pipeline_explicit_paths_override_schema_aware_resolvers(tmp_path):
+    explicit_source_dir = tmp_path / "explicit_sources"
+    explicit_task_dir = tmp_path / "explicit_tasks"
+    explicit_normalizer_dir = tmp_path / "explicit_normalizer"
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--source_dir",
+        str(explicit_source_dir),
+        "--task_dir",
+        str(explicit_task_dir),
+        "--normalizer_dir",
+        str(explicit_normalizer_dir),
+        "--schema",
+        "realtime_pose_stationary5_v1",
+    )
+
+    convert_args = pipeline.build_convert_args(args)
+    task_args = pipeline.build_task_args(args)
+    normalizer_args = pipeline.build_normalizer_args(args)
+
+    assert_arg_value(convert_args, "--output_dir", str(explicit_source_dir))
+
+    assert_arg_value(task_args, "--source_dir", str(explicit_source_dir))
+    assert_arg_value(task_args, "--output_dir", str(explicit_task_dir))
+
+    assert_arg_value(normalizer_args, "--task_dir", str(explicit_task_dir))
+    assert_arg_value(normalizer_args, "--output_dir", str(explicit_normalizer_dir))
 
 
 def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):

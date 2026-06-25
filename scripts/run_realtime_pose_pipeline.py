@@ -8,7 +8,12 @@ from argparse import BooleanOptionalAction
 from dataclasses import dataclass
 from pathlib import Path
 
+from data_converter.amass_to_realtime_pose import DEFAULT_SOURCE_SET_NAME
+from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
+from data_loaders.generate_realtime_pose_tasks import DEFAULT_TASK_SET_NAME
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
+from utils.artifact_paths import normalizer_root, source_root, task_root
+from utils.data_roots import load_data_roots
 from utils.run_dirs import resolve_latest_or_self
 
 
@@ -29,13 +34,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run realtime_pose data conversion, task generation, normalizer, and training in one command."
     )
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--amass_dir", default="dataset/AMASS", type=str)
-    paths.add_argument("--smpl_model_dir", default="dataset/body_models", type=str)
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-    paths.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-    paths.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
+    paths.add_argument("--data_roots_config", default="", type=str)
+    paths.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
+    paths.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
+    paths.add_argument("--normalizer_name", default=DEFAULT_NORMALIZER_NAME, type=str)
+    paths.add_argument("--amass_dir", default="", type=str)
+    paths.add_argument("--smpl_model_dir", default="", type=str)
+    paths.add_argument("--source_dir", default="", type=str)
+    paths.add_argument("--normalizer_dir", default="", type=str)
+    paths.add_argument("--task_dir", default="", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
     paths.add_argument("--save_dir", default="runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit", type=str)
+    paths.add_argument("--export_dir", default="", type=str)
 
     pipeline = parser.add_argument_group("pipeline")
     pipeline.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES)
@@ -43,6 +53,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--stop_after", default="train", choices=PIPELINE_STAGES)
     pipeline.add_argument("--dry_run", action="store_true")
     pipeline.add_argument("--run_name", default="auto", type=str)
+    pipeline.add_argument("--experiment_name", default="", type=str)
+    pipeline.add_argument("--export_name", default="", type=str)
     pipeline.add_argument("--overwrite", action=BooleanOptionalAction, default=False)
     pipeline.add_argument(
         "--continue_on_error",
@@ -168,6 +180,57 @@ def normalize_path(path: str) -> str:
     return str(Path(path))
 
 
+def path_arg_is_empty(value: object) -> bool:
+    if value is None:
+        return True
+    return not str(value).strip()
+
+
+def add_optional_path_arg(command: list[str], flag: str, value: object) -> None:
+    if not path_arg_is_empty(value):
+        command.extend([flag, normalize_path(str(value))])
+
+
+def add_data_roots_arg(command: list[str], args: argparse.Namespace) -> None:
+    if not path_arg_is_empty(getattr(args, "data_roots_config", "")):
+        command.extend(["--data_roots_config", normalize_path(str(args.data_roots_config))])
+
+
+def load_pipeline_data_roots(args: argparse.Namespace):
+    return load_data_roots(getattr(args, "data_roots_config", "") or None)
+
+
+def resolve_pipeline_source_dir(args: argparse.Namespace) -> Path:
+    if not path_arg_is_empty(getattr(args, "source_dir", "")):
+        return Path(args.source_dir)
+    # 与 converter/task resolver 使用同一套 schema 和 set 名，避免 pipeline 检查旧目录。
+    return source_root(
+        load_pipeline_data_roots(args),
+        schema_name=str(args.schema),
+        source_set_name=str(args.source_set_name),
+    )
+
+
+def resolve_pipeline_task_dir(args: argparse.Namespace) -> Path:
+    if not path_arg_is_empty(getattr(args, "task_dir", "")):
+        return Path(args.task_dir)
+    return task_root(
+        load_pipeline_data_roots(args),
+        schema_name=str(args.schema),
+        task_set_name=str(args.task_set_name),
+    )
+
+
+def resolve_pipeline_normalizer_dir(args: argparse.Namespace) -> Path:
+    if not path_arg_is_empty(getattr(args, "normalizer_dir", "")):
+        return Path(args.normalizer_dir)
+    return normalizer_root(
+        load_pipeline_data_roots(args),
+        schema_name=str(args.schema),
+        normalizer_name=str(args.normalizer_name),
+    )
+
+
 def stage_is_disabled(stage: str, args: argparse.Namespace) -> bool:
     return bool(getattr(args, f"skip_{stage}", False))
 
@@ -195,15 +258,15 @@ def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[b
     if bool(getattr(args, "overwrite", False)):
         return False, ""
     if stage == "convert" and not bool(getattr(args, "rebuild_source", False)):
-        source_dir = Path(args.source_dir)
+        source_dir = resolve_pipeline_source_dir(args)
         if has_usable_source_manifest(source_dir=source_dir, schema_name=str(args.schema)):
             return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
     if stage == "tasks":
-        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+        task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
         if has_task_manifests(task_dir=task_dir, splits=list(args.splits)):
             return True, f"复用已有 task 产物: {task_dir}"
     if stage == "normalizer":
-        normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
+        normalizer_dir = resolve_latest_or_self(resolve_pipeline_normalizer_dir(args), kind="normalizer")
         if has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
             return True, f"复用已有 normalizer 产物: {normalizer_dir}"
     return False, ""
@@ -213,21 +276,21 @@ def dependency_block_message(stage: str, failed_stages: set[str], args: argparse
     """阶段失败后只在依赖产物仍可用时继续，避免误用旧的 latest 产物。"""
 
     if stage == "tasks" and "convert" in failed_stages:
-        if has_usable_source_manifest(source_dir=Path(args.source_dir), schema_name=str(args.schema)):
+        if has_usable_source_manifest(source_dir=resolve_pipeline_source_dir(args), schema_name=str(args.schema)):
             return ""
         return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
     if stage == "normalizer" and "tasks" in failed_stages:
-        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+        task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
         if has_task_manifests(task_dir=task_dir, splits=[str(args.normalizer_split)]):
             return ""
         return "tasks 失败且找不到可用于 normalizer_split 的 task manifest，跳过 normalizer。"
     if stage == "train":
         if "tasks" in failed_stages:
-            task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+            task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
             if not has_task_manifests(task_dir=task_dir, splits=["train"]):
                 return "tasks 失败且找不到 train task manifest，跳过 train。"
         if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
-            normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
+            normalizer_dir = resolve_latest_or_self(resolve_pipeline_normalizer_dir(args), kind="normalizer")
             if not has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
                 return "normalizer 失败且找不到可用 normalizer 产物，跳过 train。"
     return ""
@@ -286,15 +349,17 @@ def format_pipeline_failures(failures: list[StageResult]) -> str:
 
 def build_convert_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
-        "--amass_dir", normalize_path(args.amass_dir),
-        "--smpl_model_dir", normalize_path(args.smpl_model_dir),
-        "--output_dir", normalize_path(args.source_dir),
+        "--schema", str(args.schema),
+        "--source_set_name", str(args.source_set_name),
         "--target_fps", str(args.target_fps),
         "--batch_size", str(args.convert_batch_size),
         "--num_workers", str(args.convert_num_workers),
         "--worker_torch_threads", str(args.convert_worker_torch_threads),
     ]
+    add_data_roots_arg(command, args)
+    add_optional_path_arg(command, "--amass_dir", getattr(args, "amass_dir", ""))
+    add_optional_path_arg(command, "--smpl_model_dir", getattr(args, "smpl_model_dir", ""))
+    add_optional_path_arg(command, "--output_dir", getattr(args, "source_dir", ""))
     if args.reuse_source_dir and not args.rebuild_source:
         command.extend(["--reuse_source_dir", normalize_path(args.reuse_source_dir)])
     if int(args.convert_limit) > 0:
@@ -313,21 +378,24 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
 
 def build_normalizer_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
-        "--task_dir", normalize_path(args.task_dir),
-        "--output_dir", normalize_path(args.normalizer_dir),
+        "--schema", str(args.schema),
+        "--task_set_name", str(args.task_set_name),
+        "--normalizer_name", str(args.normalizer_name),
         "--split", args.normalizer_split,
         "--run_name", args.run_name,
     ]
+    add_data_roots_arg(command, args)
+    add_optional_path_arg(command, "--task_dir", getattr(args, "task_dir", ""))
+    add_optional_path_arg(command, "--output_dir", getattr(args, "normalizer_dir", ""))
     add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
 
 def build_task_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
-        "--source_dir", normalize_path(args.source_dir),
-        "--output_dir", normalize_path(args.task_dir),
+        "--schema", str(args.schema),
+        "--source_set_name", str(args.source_set_name),
+        "--task_set_name", str(args.task_set_name),
         "--split_dir", normalize_path(args.split_dir),
         "--splits", *[str(split) for split in args.splits],
         "--samples_per_file", str(args.samples_per_file),
@@ -336,6 +404,9 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
     ]
+    add_data_roots_arg(command, args)
+    add_optional_path_arg(command, "--source_dir", getattr(args, "source_dir", ""))
+    add_optional_path_arg(command, "--output_dir", getattr(args, "task_dir", ""))
     add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
@@ -346,9 +417,9 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--schema", schema.name,
         "--model_arch", args.model_arch,
         "--input_feats", str(schema.feature_dim),
-        "--data_dir", normalize_path(args.task_dir),
+        "--data_dir", normalize_path(resolve_pipeline_task_dir(args)),
         "--data_split", "train",
-        "--normalizer_dir", normalize_path(args.normalizer_dir),
+        "--normalizer_dir", normalize_path(resolve_pipeline_normalizer_dir(args)),
         "--save_dir", normalize_path(args.save_dir),
         "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
