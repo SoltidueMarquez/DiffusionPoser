@@ -35,10 +35,11 @@ def export_root(schema_name: str, export_name: str, base_dir: str | Path = "outp
 
 
 def _validate_path_name(value: str, field_name: str) -> str:
-    # schema/name 只允许作为单级目录名，避免把上层路径拼进产物目录。
     normalized = str(value).strip()
     if not normalized:
         raise ValueError(f"{field_name} must not be empty")
+    if normalized in {".", ".."}:
+        raise ValueError(f"{field_name} must not be a relative directory marker: {normalized}")
     if "/" in normalized or "\\" in normalized:
         raise ValueError(f"{field_name} must not contain path separators: {normalized}")
     return normalized

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,8 +30,8 @@ def load_data_roots(config_path: str | Path | None = None, project_root: str | P
 
     return DataRoots(
         amass_root=_required_path(payload, "amass_root", project_root_path),
-        smpl_model_dir=_optional_path(payload.get("smpl_model_dir"), project_root_path),
-        body_fbx_rest_json=_optional_path(payload.get("body_fbx_rest_json"), project_root_path),
+        smpl_model_dir=_optional_path(payload.get("smpl_model_dir"), "smpl_model_dir", project_root_path),
+        body_fbx_rest_json=_optional_path(payload.get("body_fbx_rest_json"), "body_fbx_rest_json", project_root_path),
         generated_root=_required_path(payload, "generated_root", project_root_path),
     )
 
@@ -61,17 +62,19 @@ def _read_json_object(config_path: Path) -> dict[str, Any]:
 def _required_path(payload: dict[str, Any], field_name: str, project_root: Path) -> Path:
     if field_name not in payload:
         raise ValueError(f"Missing required data root field: {field_name}")
-    path = _optional_path(payload[field_name], project_root)
+    path = _optional_path(payload[field_name], field_name, project_root)
     if path is None:
         raise ValueError(f"Missing required data root field: {field_name}")
     return path
 
 
-def _optional_path(value: Any, project_root: Path) -> Path | None:
+def _optional_path(value: Any, field_name: str, project_root: Path) -> Path | None:
     if value is None:
         return None
+    if not isinstance(value, (str, os.PathLike)):
+        raise ValueError(f"Data root field must be a string path: {field_name}")
 
-    path_text = str(value).strip()
+    path_text = os.fspath(value).strip()
     if not path_text:
         return None
 

@@ -80,6 +80,37 @@ def test_load_data_roots_parses_relative_paths_and_empty_optional_path(tmp_path)
     assert roots.generated_root == tmp_path / "generated"
 
 
+def test_load_data_roots_prefers_explicit_then_local_then_example(tmp_path):
+    _, load_data_roots, *_ = _load_path_helpers()
+    configs_dir = tmp_path / "configs"
+    configs_dir.mkdir()
+    example_path = configs_dir / "data_roots.example.json"
+    local_path = configs_dir / "data_roots.local.json"
+    explicit_path = tmp_path / "explicit.json"
+
+    example_path.write_text(
+        json.dumps({"amass_root": "AMASS", "generated_root": "generated_from_example"}),
+        encoding="utf-8",
+    )
+    local_path.write_text(
+        json.dumps({"amass_root": "AMASS", "generated_root": "generated_from_local"}),
+        encoding="utf-8",
+    )
+    explicit_path.write_text(
+        json.dumps({"amass_root": "AMASS", "generated_root": "generated_from_explicit"}),
+        encoding="utf-8",
+    )
+
+    explicit_roots = load_data_roots(config_path=explicit_path, project_root=tmp_path)
+    local_roots = load_data_roots(project_root=tmp_path)
+    local_path.unlink()
+    example_roots = load_data_roots(project_root=tmp_path)
+
+    assert explicit_roots.generated_root == tmp_path / "generated_from_explicit"
+    assert local_roots.generated_root == tmp_path / "generated_from_local"
+    assert example_roots.generated_root == tmp_path / "generated_from_example"
+
+
 @pytest.mark.parametrize("missing_field", ["amass_root", "generated_root"])
 def test_load_data_roots_requires_required_fields(tmp_path, missing_field):
     _, load_data_roots, *_ = _load_path_helpers()
@@ -95,7 +126,23 @@ def test_load_data_roots_requires_required_fields(tmp_path, missing_field):
         load_data_roots(config_path=config_path, project_root=tmp_path)
 
 
-@pytest.mark.parametrize("bad_value", ["", "   ", "schema/name", r"schema\name"])
+@pytest.mark.parametrize("field_name", ["amass_root", "smpl_model_dir", "body_fbx_rest_json", "generated_root"])
+@pytest.mark.parametrize("bad_value", [["AMASS"], {"path": "AMASS"}])
+def test_load_data_roots_rejects_non_string_path_fields(tmp_path, field_name, bad_value):
+    _, load_data_roots, *_ = _load_path_helpers()
+    payload = {
+        "amass_root": "AMASS",
+        "generated_root": "generated",
+    }
+    payload[field_name] = bad_value
+    config_path = tmp_path / f"bad_{field_name}.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field_name):
+        load_data_roots(config_path=config_path, project_root=tmp_path)
+
+
+@pytest.mark.parametrize("bad_value", ["", "   ", ".", "..", "schema/name", r"schema\name"])
 def test_artifact_paths_reject_empty_or_path_like_schema_and_names(tmp_path, bad_value):
     DataRoots, _, source_root, task_root, normalizer_root, run_root, export_root = _load_path_helpers()
     roots = DataRoots(amass_root=tmp_path / "AMASS", generated_root=tmp_path / "generated")
