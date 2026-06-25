@@ -64,14 +64,17 @@ def _install_data_path_default_parser(parser: ArgumentParser) -> None:
     setattr(parser, "_realtime_pose_data_path_defaults_installed", True)
 
 
-def train_args():
-    parser = ArgumentParser(description="Train a realtime_pose_stationary5_v1 diffusion reconstruction model.")
+def train_args(argv: list[str] | None = None):
+    parser = ArgumentParser(
+        description="Train a realtime_pose_stationary5_v1 diffusion reconstruction model.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
     add_training_options(parser)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def str2bool(value):

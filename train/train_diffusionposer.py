@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -14,8 +15,15 @@ from train.training_loop import TrainLoop, find_resume_checkpoint
 from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
-from utils.parser_util import train_args
+from utils.parser_util import (
+    NORMALIZER_DIR_ARG,
+    apply_data_path_defaults,
+    has_explicit_option_arg,
+    load_args_json,
+    train_args,
+)
 from utils.run_dirs import resolve_latest_or_self
+from utils.schema_resolution import has_explicit_schema_arg, resolve_runtime_schema
 
 
 TRAIN_PLATFORMS = {
@@ -24,10 +32,17 @@ TRAIN_PLATFORMS = {
 }
 
 
-def main():
-    args = train_args()
+def main(argv: list[str] | None = None):
+    argv_values = sys.argv[1:] if argv is None else list(argv)
+    cli_schema_explicit = has_explicit_schema_arg(argv_values)
+    normalizer_dir_explicit = has_explicit_option_arg(argv_values, NORMALIZER_DIR_ARG)
+    args = train_args(argv_values)
     fixseed(args.seed)
-    resolve_save_dir(args)
+    resolve_save_dir(
+        args,
+        cli_schema_explicit=cli_schema_explicit,
+        normalizer_dir_explicit=normalizer_dir_explicit,
+    )
     resolve_input_artifact_dirs(args)
     prepare_save_dir(args)
     dist_util.setup_dist(args.device if args.cuda else -1)
@@ -141,15 +156,15 @@ def prepare_save_dir(args):
         write_latest_run_pointer(args)
 
 
-def resolve_save_dir(args):
+def resolve_save_dir(args, *, cli_schema_explicit: bool = False, normalizer_dir_explicit: bool = False):
     """把用户给的 save_dir 解析成本次训练实际写入的 run 目录。"""
 
     if args.resume_checkpoint:
-        args.resume_checkpoint = find_resume_checkpoint(
-            save_dir=args.save_dir,
-            requested_checkpoint=args.resume_checkpoint,
+        resolve_resume_schema_and_paths(
+            args,
+            cli_schema_explicit=cli_schema_explicit,
+            normalizer_dir_explicit=normalizer_dir_explicit,
         )
-        args.save_dir = str(Path(args.resume_checkpoint).resolve().parent)
         return
 
     run_root = Path(args.save_dir).resolve()
@@ -163,6 +178,56 @@ def resolve_save_dir(args):
     args.run_root = str(run_root)
     args.run_id = run_id
     args.save_dir = str(candidate)
+
+
+def resolve_resume_schema_and_paths(
+    args,
+    *,
+    cli_schema_explicit: bool = False,
+    normalizer_dir_explicit: bool = False,
+):
+    """恢复训练时从 checkpoint 同目录 args.json 继承 exact schema 和自动路径。"""
+
+    if not getattr(args, "resume_checkpoint", ""):
+        return args
+
+    checkpoint_path = Path(
+        find_resume_checkpoint(
+            save_dir=args.save_dir,
+            requested_checkpoint=args.resume_checkpoint,
+        )
+    ).resolve()
+    checkpoint_args = load_args_json(checkpoint_path)
+    previous_schema = getattr(args, "schema", None)
+    resolved_schema = resolve_runtime_schema(
+        cli_schema=previous_schema,
+        checkpoint_args=checkpoint_args,
+        cli_schema_explicit=cli_schema_explicit,
+    )
+
+    args.resume_checkpoint = str(checkpoint_path)
+    args.save_dir = str(checkpoint_path.parent)
+    args.schema = resolved_schema
+    if _should_recompute_resume_normalizer_dir(
+        args,
+        previous_schema=previous_schema,
+        normalizer_dir_explicit=normalizer_dir_explicit,
+    ):
+        apply_data_path_defaults(
+            args,
+            normalizer_dir_explicit=False,
+            force_normalizer_dir=True,
+        )
+    return args
+
+
+def _should_recompute_resume_normalizer_dir(args, *, previous_schema: str | None, normalizer_dir_explicit: bool) -> bool:
+    if normalizer_dir_explicit or not hasattr(args, "normalizer_dir"):
+        return False
+    if str(previous_schema or "") == str(getattr(args, "schema", "") or ""):
+        return False
+    normalizer_dir = str(getattr(args, "normalizer_dir", "") or "").strip()
+    return bool(getattr(args, "_normalizer_dir_auto_default", False)) or not normalizer_dir
 
 
 def resolve_input_artifact_dirs(args):

@@ -28,6 +28,9 @@ from utils.parser_util import (
 )
 
 
+DEFAULT_ROLLOUT_OUTPUT_DIR = "output/realtime_pose_stationary5_rollout"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run realtime_pose_stationary5_v1 rollout reconstruction.",
@@ -266,7 +269,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         use_ddim=str(args.ts_respace).startswith("ddim"),
         limit=int(args.rollout_limit),
     )
-    output_dir = Path(args.output_dir or "output/realtime_pose_body_fbx_local_root_y0_stationary5_rollout").resolve()
+    output_dir = Path(args.output_dir or DEFAULT_ROLLOUT_OUTPUT_DIR).resolve()
     output_path = output_dir / "rollout_result.npz"
     save_rollout(output_path, payload)
     print(f"[reconstruct_rollout] weights={source} output={output_path}")

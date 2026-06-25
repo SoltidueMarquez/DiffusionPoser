@@ -10,9 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+import train.train_diffusionposer as train_entrypoint
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
-from utils.parser_util import add_data_options, add_training_options
+from utils.parser_util import add_data_options, add_training_options, train_args
 
 
 CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
@@ -20,6 +21,115 @@ LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 
 
 class TrainEntrypointTest(unittest.TestCase):
+    def _write_resume_checkpoint(self, tmp_dir: str, schema_name: str) -> tuple[Path, Path]:
+        save_dir = Path(tmp_dir) / "run"
+        save_dir.mkdir()
+        checkpoint = save_dir / "model000000010.pt"
+        checkpoint.write_bytes(b"")
+        schema = get_schema_spec(schema_name)
+        (save_dir / "args.json").write_text(
+            json.dumps(
+                {
+                    "task_mode": "realtime_pose_reconstruction",
+                    "schema": schema.name,
+                    "schema_name": schema.name,
+                    "schema_canonical_name": schema.canonical_name,
+                    "input_feats": schema.feature_dim,
+                    "seq_len": schema.seq_len,
+                    "max_seq_len": schema.seq_len,
+                    "model_arch": "full_feature_dit",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return save_dir, checkpoint
+
+    def test_resume_without_cli_schema_inherits_checkpoint_exact_schema_and_default_normalizer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir, checkpoint = self._write_resume_checkpoint(tmp_dir, LEGACY_SCHEMA_NAME)
+            args = Namespace(
+                save_dir=str(save_dir),
+                resume_checkpoint=str(checkpoint),
+                schema=CANONICAL_SCHEMA_NAME,
+                normalizer_dir=str(Path("dataset/generated/normalizers") / CANONICAL_SCHEMA_NAME / "amass_60hz_train"),
+                _normalizer_dir_auto_default=True,
+            )
+
+            with patch(
+                "utils.default_artifact_paths.load_data_roots",
+                return_value=Namespace(generated_root=Path("dataset/generated")),
+            ):
+                train_entrypoint.resolve_resume_schema_and_paths(
+                    args,
+                    cli_schema_explicit=False,
+                    normalizer_dir_explicit=False,
+                )
+
+            self.assertEqual(args.schema, LEGACY_SCHEMA_NAME)
+            self.assertEqual(Path(args.save_dir), save_dir.resolve())
+            self.assertEqual(Path(args.resume_checkpoint), checkpoint.resolve())
+            self.assertEqual(
+                Path(args.normalizer_dir).as_posix(),
+                f"dataset/generated/normalizers/{LEGACY_SCHEMA_NAME}/amass_60hz_train",
+            )
+
+    def test_resume_rejects_explicit_canonical_schema_for_legacy_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir, checkpoint = self._write_resume_checkpoint(tmp_dir, LEGACY_SCHEMA_NAME)
+            args = Namespace(
+                save_dir=str(save_dir),
+                resume_checkpoint=str(checkpoint),
+                schema=CANONICAL_SCHEMA_NAME,
+                normalizer_dir="",
+                _normalizer_dir_auto_default=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "checkpoint schema"):
+                train_entrypoint.resolve_resume_schema_and_paths(
+                    args,
+                    cli_schema_explicit=True,
+                    normalizer_dir_explicit=False,
+                )
+
+    def test_resume_rejects_explicit_legacy_schema_for_canonical_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir, checkpoint = self._write_resume_checkpoint(tmp_dir, CANONICAL_SCHEMA_NAME)
+            args = Namespace(
+                save_dir=str(save_dir),
+                resume_checkpoint=str(checkpoint),
+                schema=LEGACY_SCHEMA_NAME,
+                normalizer_dir="",
+                _normalizer_dir_auto_default=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "checkpoint schema"):
+                train_entrypoint.resolve_resume_schema_and_paths(
+                    args,
+                    cli_schema_explicit=True,
+                    normalizer_dir_explicit=False,
+                )
+
+    def test_resume_inherits_schema_but_preserves_explicit_normalizer_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_dir, checkpoint = self._write_resume_checkpoint(tmp_dir, LEGACY_SCHEMA_NAME)
+            args = Namespace(
+                save_dir=str(save_dir),
+                resume_checkpoint=str(checkpoint),
+                schema=CANONICAL_SCHEMA_NAME,
+                normalizer_dir="custom/normalizer",
+                _normalizer_dir_auto_default=False,
+            )
+
+            train_entrypoint.resolve_resume_schema_and_paths(
+                args,
+                cli_schema_explicit=False,
+                normalizer_dir_explicit=True,
+            )
+
+            self.assertEqual(args.schema, LEGACY_SCHEMA_NAME)
+            self.assertEqual(args.normalizer_dir, "custom/normalizer")
+
     def test_data_options_default_to_previous_history_and_tracker_augmentation(self):
         parser = ArgumentParser()
         add_data_options(parser)
@@ -42,6 +152,19 @@ class TrainEntrypointTest(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             parser.parse_args(["--data_dir", "dataset/tasks", "--schema", "realtime_pose_v2_contact"])
+
+    def test_train_args_rejects_schema_abbreviation(self):
+        with self.assertRaises(SystemExit):
+            train_args(
+                [
+                    "--data_dir",
+                    "dataset/tasks",
+                    "--save_dir",
+                    "save/test_run",
+                    "--sche",
+                    CANONICAL_SCHEMA_NAME,
+                ]
+            )
 
     def test_data_options_accept_trainable_realtime_pose_schemas(self):
         for schema_name in (CANONICAL_SCHEMA_NAME, LEGACY_SCHEMA_NAME):

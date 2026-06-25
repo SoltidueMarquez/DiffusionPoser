@@ -62,7 +62,7 @@ def build_app(service: MotionStudioService) -> FastAPI:
     app = FastAPI(
         title="RealtimePose Studio API",
         version="1.0.0",
-        description="Local realtime_pose_v2 source/task/result viewer and task export API.",
+        description="Local realtime_pose_stationary5 source/task/result viewer and task export API.",
     )
     app.state.service = service
     app.add_middleware(

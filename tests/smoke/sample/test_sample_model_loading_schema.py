@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -145,6 +146,49 @@ def test_build_predicted_history_cache_omitted_schema_uses_temp_output_dir(
         build_predicted_history_cache.main(minimal_model_args(tmp_path, model_path))
 
     assert created_dirs == [(tmp_path / "out").resolve()]
+
+
+def test_reconstruct_rollout_default_output_dir_uses_generic_stationary5_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = write_checkpoint_args(tmp_path, REALTIME_POSE_SCHEMA_NAME)
+    saved_paths: list[Path] = []
+
+    class DummyDataset:
+        pass
+
+    monkeypatch.setattr(reconstruct_rollout.dist_util, "setup_dist", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reconstruct_rollout.dist_util, "dev", lambda: torch.device("cpu"))
+    monkeypatch.setattr(reconstruct_rollout, "RealtimePoseTaskDataset", lambda *args, **kwargs: DummyDataset())
+    monkeypatch.setattr(reconstruct_rollout, "create_model_and_diffusion", lambda args: (object(), object()))
+    monkeypatch.setattr(
+        reconstruct_rollout,
+        "load_checkpoint_model",
+        lambda model, model_path, device, use_ema: (model, "checkpoint"),
+    )
+    monkeypatch.setattr(
+        reconstruct_rollout,
+        "rollout_dataset",
+        lambda **kwargs: {"metadata": np.asarray({"schema_name": REALTIME_POSE_SCHEMA_NAME}, dtype=object)},
+    )
+    monkeypatch.setattr(reconstruct_rollout, "save_rollout", lambda path, payload: saved_paths.append(path))
+
+    result = reconstruct_rollout.main(
+        [
+            "--model_path",
+            str(model_path),
+            "--data_dir",
+            str(tmp_path / "data"),
+            "--cuda",
+            "false",
+        ]
+    )
+
+    expected_path = (Path("output/realtime_pose_stationary5_rollout") / "rollout_result.npz").resolve()
+    assert saved_paths == [expected_path]
+    assert result["output_path"] == expected_path
+    assert "body_fbx_local_root_y0" not in expected_path.as_posix()
 
 
 @pytest.mark.parametrize("module", SAMPLE_ENTRYPOINTS)

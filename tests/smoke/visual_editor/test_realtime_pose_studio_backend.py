@@ -64,6 +64,8 @@ MISSING_MODULE = object()
 def import_server_with_optional_dependency_stubs():
     class FakeFastAPI:
         def __init__(self, *args, **kwargs):
+            del args
+            self.description = kwargs.get("description", "")
             self.state = types.SimpleNamespace()
 
         def add_middleware(self, *args, **kwargs):
@@ -235,6 +237,16 @@ def test_visual_editor_server_import_stub_does_not_leak_modules(monkeypatch, tmp
         assert sys.modules.get("visual_editor.server") is not original_server
 
     assert sys.modules.get("visual_editor.server") is original_server
+
+
+def test_visual_editor_server_description_uses_stationary5_name(monkeypatch, tmp_path):
+    patch_generated_root(monkeypatch, tmp_path)
+
+    with import_server_with_optional_dependency_stubs() as server:
+        app = server.build_app(SimpleNamespace())
+
+    assert "realtime_pose_v2" not in app.description
+    assert "realtime_pose_stationary5" in app.description
 
 
 def test_visual_editor_ai_index_defaults_to_generated_layout():
