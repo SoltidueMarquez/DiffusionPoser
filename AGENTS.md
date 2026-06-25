@@ -63,9 +63,10 @@ conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/schemas
 ## Schema 契约
 
 - 当前默认 schema 是 `realtime_pose_stationary5_v1`；legacy exact name `realtime_pose_body_fbx_local_root_y0_v1` 仍在 registry 中注册，可继续训练和导出。
-- 仓库允许维护 registry 中明确注册的 legacy schema。未注册的旧数据、task、normalizer、checkpoint 或 Unity runtime asset 不应新增兼容入口。
+- 仓库允许维护 registry 中明确注册的 legacy schema alias。未注册的旧数据、task、normalizer、checkpoint 或 Unity runtime asset 不应新增兼容入口。
 - `schema_name` 只表达数据产物和 Unity runtime 必须共同理解的稳定契约。实验名、模型结构、loss、训练超参、ablation 变化不进入 `schema_name`，应放在 run/config/experiment name 中。
-- 每个 trainable/exportable schema 必须有 `schemas/<schema>/README.md`、adapter、contract smoke test、最小训练测试和最小导出测试。
+- 每个 trainable/exportable canonical schema 必须有 `schemas/<canonical_schema>/README.md`、adapter、contract smoke test、最小训练测试和最小导出测试。
+- legacy alias 可以共享 canonical adapter 和 README，但 canonical README 与 registry 文档必须记录 alias 关系；alias 仍必须有最小训练测试和最小导出测试覆盖 exact `schema_name`。
 - resume checkpoint 必须 exact `schema_name` 匹配；不能因为 `schema_canonical_name` 相同而放宽恢复条件。
 - 固定为 60 帧历史条件 + 第 61 帧单帧补全。
 - `seq_len = 61`，`target_start = 60`，`target_length = 1`。

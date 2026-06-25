@@ -1,6 +1,6 @@
 # DiffusionPoser RealtimePose
 
-当前默认 schema 是 `realtime_pose_stationary5_v1`，姿态表示为 `body_fbx_local_delta_6d`。legacy exact name `realtime_pose_body_fbx_local_root_y0_v1` 仍在 registry 中注册，可继续训练和导出；恢复 checkpoint、读取 task/normalizer 和导出 Unity runtime asset 时必须使用产物里记录的 exact `schema_name`，不能只按 canonical name 放宽匹配。
+当前默认 schema 是 `realtime_pose_stationary5_v1`，姿态表示为 `body_fbx_local_delta_6d`。legacy exact name `realtime_pose_body_fbx_local_root_y0_v1` 仍在 registry 中注册，可继续训练和导出；该 alias 共享 `schemas/realtime_pose_stationary5_v1/` 下的 canonical adapter 和 README。恢复 checkpoint、读取 task/normalizer 和导出 Unity runtime asset 时必须使用产物里记录的 exact `schema_name`，不能只按 canonical name 放宽匹配。
 
 `schema_name` 只描述数据产物和 Unity runtime 必须共同理解的稳定契约。实验名、模型结构、loss 或训练超参变化应放在 run/config 名称中，不应写进 `schema_name`。
 
@@ -23,7 +23,7 @@ source/task/normalizer/runtime asset 必须包含所选 exact `schema_name`、`p
 
 ## 数据根目录
 
-本机路径优先写在 `configs/data_roots.local.json`；没有 local 文件时会读取 `configs/data_roots.example.json`。相对路径按仓库根目录解析。如果尚未创建 local 文件并只想使用 example 配置，下面命令中的 `--data_roots_config configs/data_roots.local.json` 可以省略。
+本机路径优先写在 `configs/data_roots.local.json`；没有 local 文件时会读取 `configs/data_roots.example.json`。相对路径按仓库根目录解析。下面命令默认省略 `--data_roots_config`，让脚本自动选择 local 或 example；如果需要固定使用本机路径，先创建 `configs/data_roots.local.json`，再显式传入 `--data_roots_config configs/data_roots.local.json`。
 
 ```json
 {
@@ -39,10 +39,12 @@ source/task/normalizer/runtime asset 必须包含所选 exact `schema_name`、`p
 | 产物 | 默认位置 |
 | --- | --- |
 | source set | `dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz` |
-| task set | `dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks` |
-| normalizer | `dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train` |
-| training runs | `runs/realtime_pose_stationary5_v1/<experiment_name>` |
+| task set root | `dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks` |
+| normalizer set root | `dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train` |
+| training run root | `runs/realtime_pose_stationary5_v1/<experiment_name>` |
 | export output | `output/realtime_pose_stationary5_v1/<export_name>` |
+
+task 和 normalizer 的实际产物会写到 set root 下的 timestamped 子目录；`latest_tasks.*` 和 `latest_normalizer.*` 指针记录最近一次具体产物目录。训练入口可接收 task/normalizer set root 并解析 latest，直接导出脚本的 `--normalizer_dir` 应指向具体 normalizer 产物目录。
 
 ## 数据流
 
@@ -57,14 +59,12 @@ RealtimePose/Export body_fbx_rest.json
 ```powershell
 conda run --no-capture-output -n diffusionposer5070 python -m data_converter.amass_to_realtime_pose `
   --schema realtime_pose_stationary5_v1 `
-  --data_roots_config configs/data_roots.local.json `
   --source_set_name amass_60hz `
   --target_fps 60 `
   --overwrite
 
 conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_tasks `
   --schema realtime_pose_stationary5_v1 `
-  --data_roots_config configs/data_roots.local.json `
   --source_set_name amass_60hz `
   --task_set_name amass_60hz_tasks `
   --split_dir data_loaders/splits `
@@ -75,7 +75,6 @@ conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.gener
 
 conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.compute_realtime_pose_normalizer `
   --schema realtime_pose_stationary5_v1 `
-  --data_roots_config configs/data_roots.local.json `
   --task_set_name amass_60hz_tasks `
   --normalizer_name amass_60hz_train `
   --split train `
@@ -86,12 +85,11 @@ conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.compu
 
 ## Pipeline
 
-`scripts.run_realtime_pose_pipeline` 会用同一套 `--schema`、`--source_set_name`、`--task_set_name`、`--normalizer_name`、`--experiment_name` 和 `--export_name` 解析路径。未显式指定目录时，它会使用 `configs/data_roots.local.json` 和 `generated_root/sources|tasks|normalizers/<schema>/<name>`。
+`scripts.run_realtime_pose_pipeline` 会用同一套 `--schema`、`--source_set_name`、`--task_set_name`、`--normalizer_name`、`--experiment_name` 和 `--export_name` 解析路径。未显式指定目录时，它会自动读取 `configs/data_roots.local.json` 或 fallback 到 example 配置，并使用 `generated_root/sources|tasks|normalizers/<schema>/<name>`。
 
 ```powershell
 conda run --no-capture-output -n diffusionposer5070 python -m scripts.run_realtime_pose_pipeline `
   --schema realtime_pose_stationary5_v1 `
-  --data_roots_config configs/data_roots.local.json `
   --source_set_name amass_60hz `
   --task_set_name amass_60hz_tasks `
   --normalizer_name amass_60hz_train `
@@ -134,6 +132,8 @@ conda run --no-capture-output -n diffusionposer5070 python -m export.export_sent
 Unity runtime 直接解码 body.fbx local delta：`bone.localRotation = restLocalRotation * decodedDelta`。Actor root y 固定为 0，`pelvis_height` 通过 pelvis bone `localPosition.y` 生效；`WorldOffset` 只用于显示偏移，不参与模型语义。
 
 ## 测试
+
+`tests/smoke/schemas` 覆盖 canonical exact name `realtime_pose_stationary5_v1` 和 legacy exact name `realtime_pose_body_fbx_local_root_y0_v1`。legacy alias 可以共享 canonical adapter/README，但必须保留覆盖 exact alias name 的最小 train/export smoke。
 
 ```powershell
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/schemas -q
