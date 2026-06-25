@@ -12,6 +12,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source, main as generate_realtime_pose_tasks_main
+from data_loaders.realtime_pose_dataset import (
+    RealtimePoseTaskDataset,
+    encode_realtime_pose_features,
+    load_materialized_task_npz,
+    load_realtime_task_arrays,
+)
 from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, get_schema_spec
 from export.write_unity_runtime_assets import write_runtime_assets
 from tests.smoke.realtime_pose_fixtures import build_toy_source_metadata, write_toy_source_dataset
@@ -33,6 +39,16 @@ def latest_artifact_dir(root, kind):
     latest = read_latest_pointer(root, kind=kind)
     assert latest is not None
     return latest
+
+
+def assert_runtime_payload_schema(payload, schema_name, schema):
+    assert payload["schemaName"] == schema_name
+    if "poseRepresentation" in payload:
+        assert payload["poseRepresentation"] == schema.pose_representation
+    if "rootYPolicy" in payload:
+        assert payload["rootYPolicy"] == schema.root_y_policy
+    if "pelvisHeightMode" in payload:
+        assert payload["pelvisHeightMode"] == schema.pelvis_height_mode
 
 
 @pytest.mark.parametrize("schema_name", STATIONARY5_SCHEMA_NAMES)
@@ -99,6 +115,27 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
     assert loaded_normalizer.schema.name == schema_name
     assert loaded_normalizer.mean.numel() == schema.feature_dim
 
+    dataset = RealtimePoseTaskDataset(
+        task_root,
+        split="train",
+        normalizer_dir=normalizer_dir,
+        normalize_input=True,
+        tracker_mask_policy="task",
+        schema_name=schema_name,
+    )
+    assert dataset.schema.name == schema_name
+    item = dataset[0]
+    assert tuple(item["x"].shape) == (schema.feature_dim, schema.seq_len)
+    assert tuple(item["conditioned_x"].shape) == (schema.feature_dim, schema.seq_len)
+    assert tuple(item["inpaint_mask"].shape) == (schema.feature_dim, schema.seq_len)
+    assert item["inpaint_mask"][: schema.target_dim, schema.target_start].all()
+    assert not item["inpaint_mask"][schema.target_dim :, :].any()
+
+    task = load_materialized_task_npz(task_manifest_path.parent, task_entry["task_path"], schema_name=schema_name)
+    arrays = load_realtime_task_arrays(task=task, seq_len=schema.seq_len, schema_name=schema_name)
+    features = encode_realtime_pose_features(arrays, schema_name=schema_name)
+    assert features.shape == (schema.seq_len, schema.feature_dim)
+
     assets = write_runtime_assets(
         output_dir=tmp_path / schema_name / "runtime_assets",
         normalize_input=True,
@@ -106,8 +143,13 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
         schema_name=schema_name,
     )
     feature_schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
-    assert feature_schema["schemaName"] == schema_name
+    assert_runtime_payload_schema(feature_schema, schema_name, schema)
     assert feature_schema["featureDim"] == schema.feature_dim
+    normalizer_payload = json.loads(assets["normalizer"].read_text(encoding="utf-8"))
+    assert_runtime_payload_schema(normalizer_payload, schema_name, schema)
+    assert normalizer_payload["featureDim"] == schema.feature_dim
+    ddim_schedule = json.loads(assets["ddim_schedule"].read_text(encoding="utf-8"))
+    assert_runtime_payload_schema(ddim_schedule, schema_name, schema)
 
 
 @pytest.mark.parametrize("schema_name", STATIONARY5_SCHEMA_NAMES)
