@@ -323,6 +323,24 @@ def test_pipeline_export_command_uses_schema_and_export_name(tmp_path):
     assert "--normalize_input" in export_args
 
 
+def test_pipeline_export_uses_latest_normalizer_artifact(tmp_path):
+    _, generated_root = write_data_roots_config(tmp_path)
+    normalizer_root = generated_root / "normalizers" / REALTIME_POSE_SCHEMA_NAME / "toy_norm"
+    latest_normalizer_dir = write_latest_normalizer_artifact(normalizer_root)
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--schema",
+        REALTIME_POSE_SCHEMA_NAME,
+        "--export_name",
+        "toy_export",
+    )
+
+    export_args = pipeline.build_export_args(args)
+
+    assert_arg_value(export_args, "--normalizer_dir", str(latest_normalizer_dir))
+    assert str(latest_normalizer_dir) != str(normalizer_root)
+
+
 def test_pipeline_explicit_export_dir_overrides_export_name(tmp_path):
     explicit_export_dir = tmp_path / "explicit_export"
     args = parse_schema_aware_pipeline_args(
@@ -336,6 +354,27 @@ def test_pipeline_explicit_export_dir_overrides_export_name(tmp_path):
     export_args = pipeline.build_export_args(args)
 
     assert_arg_value(export_args, "--output_dir", str(explicit_export_dir))
+
+
+def test_pipeline_skip_export_does_not_run_stage(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    def fake_run_python_module(module: str, args: list[str], dry_run: bool) -> None:
+        calls.append(module)
+
+    monkeypatch.setattr(pipeline, "run_python_module", fake_run_python_module)
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--skip_export",
+        "--start_at",
+        "export",
+        "--stop_after",
+        "export",
+    )
+
+    pipeline.run_pipeline(args)
+
+    assert calls == []
 
 
 def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):

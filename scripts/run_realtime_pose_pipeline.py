@@ -126,6 +126,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--tracker_outlier_prob", default=0.01, type=float)
     train.add_argument("--predicted_history_cache_dir", default="", type=str)
     train.add_argument("--predicted_history_prob", default=0.0, type=float)
+
+    export = parser.add_argument_group("export")
+    export.add_argument("--skip_export", action="store_true")
     return parser
 
 
@@ -441,11 +444,12 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
 
 def build_export_args(args: argparse.Namespace) -> list[str]:
     schema = get_schema_spec(args.schema)
+    normalizer_dir = resolve_latest_or_self(resolve_pipeline_normalizer_dir(args), kind="normalizer")
     command = [
         "--schema", schema.name,
         "--output_dir", normalize_path(resolve_pipeline_export_dir(args)),
         "--diffusion_steps", str(args.diffusion_steps),
-        "--normalizer_dir", normalize_path(resolve_pipeline_normalizer_dir(args)),
+        "--normalizer_dir", normalize_path(normalizer_dir),
         "--normalize_input",
     ]
     return command
