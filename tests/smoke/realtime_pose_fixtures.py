@@ -27,6 +27,7 @@ def build_toy_source_metadata(frame_count: int = 70, schema_name: str = REALTIME
     schema = get_schema_spec(schema_name)
     metadata = {
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
