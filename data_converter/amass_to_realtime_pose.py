@@ -61,13 +61,21 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_NAMES,
     get_schema_spec,
 )
+from utils.artifact_paths import source_root
+from utils.data_roots import load_data_roots
+
+
+DEFAULT_SOURCE_SET_NAME = "amass_60hz"
+DEFAULT_SMPL_MODEL_DIR = Path("dataset/body_models")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
-    parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
-    parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
-    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=Path)
+    parser.add_argument("--data_roots_config", default="", type=str)
+    parser.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
+    parser.add_argument("--amass_dir", default="", type=str)
+    parser.add_argument("--smpl_model_dir", default="", type=str)
+    parser.add_argument("--output_dir", default="", type=str)
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=1, type=int)
@@ -80,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow_partial", action="store_true")
     parser.add_argument("--reuse_source_dir", default="", type=Path)
     parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    parser.add_argument("--body_fbx_rest_json", default="", type=Path)
+    parser.add_argument("--body_fbx_rest_json", default="", type=str)
     # 复用 shared validate_args 所需字段；当前转换链路不实际使用这些可视化参数。
     parser.add_argument("--height_threshold", default=0.04, type=float)
     parser.add_argument("--speed_threshold", default=0.15, type=float)
@@ -89,6 +97,81 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--visualize_dir", default=Path("output/realtime_pose_visualization"), type=Path)
     parser.add_argument("--visualize_fps", default=20.0, type=float)
     return parser.parse_args(argv)
+
+
+def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """根据显式 CLI 参数或 data_roots 配置补齐转换入口路径。
+
+    argparse 无法可靠区分“用户显式传了旧默认值”和“使用默认值”，所以路径参数先保留为空字符串；
+    这里再把空值视为需要从 schema-aware 数据根推导的路径。
+    """
+
+    roots = None
+
+    def get_roots():
+        nonlocal roots
+        if roots is None:
+            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+        return roots
+
+    schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
+    source_set_name = str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME))
+
+    if _path_arg_is_empty(getattr(args, "amass_dir", "")):
+        args.amass_dir = get_roots().amass_root
+    else:
+        args.amass_dir = Path(args.amass_dir)
+
+    if _path_arg_is_empty(getattr(args, "smpl_model_dir", "")):
+        roots_value = get_roots().smpl_model_dir
+        args.smpl_model_dir = roots_value if roots_value is not None else DEFAULT_SMPL_MODEL_DIR
+    else:
+        args.smpl_model_dir = Path(args.smpl_model_dir)
+
+    if _path_arg_is_empty(getattr(args, "output_dir", "")):
+        args.output_dir = source_root(get_roots(), schema_name=schema_name, source_set_name=source_set_name)
+    else:
+        args.output_dir = Path(args.output_dir)
+
+    if _path_arg_is_empty(getattr(args, "body_fbx_rest_json", "")):
+        roots_value = get_roots().body_fbx_rest_json
+        args.body_fbx_rest_json = roots_value if roots_value is not None else ""
+    else:
+        args.body_fbx_rest_json = Path(args.body_fbx_rest_json)
+
+    return args
+
+
+def _path_arg_is_empty(value: object) -> bool:
+    if value is None:
+        return True
+    return not str(value).strip()
+
+
+def build_converter_args_metadata(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "target_fps": float(getattr(args, "target_fps", 60.0)),
+        "mirror": bool(getattr(args, "mirror", False)),
+        "schema": str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
+        "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+    }
+
+
+def build_source_provenance(source: MotionSource, args: argparse.Namespace, schema) -> dict[str, object]:
+    raw_relative_path = source.original_relative_path or source.relative_path
+    return build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema)
+
+
+def build_path_provenance(raw_relative_path: Path | str, args: argparse.Namespace, schema) -> dict[str, object]:
+    return {
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        "raw_dataset": "AMASS",
+        "raw_root_key": "amass_root",
+        "raw_relative_path": Path(raw_relative_path).as_posix(),
+        "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+        "converter_args": build_converter_args_metadata(args),
+    }
 
 
 _WORKER_ARGS: argparse.Namespace | None = None
@@ -252,11 +335,19 @@ def save_realtime_pose_motion(
     source: MotionSource,
     target_fps: float,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    args: argparse.Namespace | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     schema = get_schema_spec(schema_name)
+    provenance_args = argparse.Namespace(
+        target_fps=target_fps,
+        mirror=source.is_mirrored,
+        schema=schema_name,
+        source_set_name=DEFAULT_SOURCE_SET_NAME,
+    ) if args is None else args
     metadata = {
         "schema_name": schema_name,
+        "schema_canonical_name": str(schema.canonical_name),
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
@@ -270,6 +361,7 @@ def save_realtime_pose_motion(
         "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
+    metadata.update(build_source_provenance(source=source, args=provenance_args, schema=schema))
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
@@ -328,10 +420,16 @@ def record_for_output(
             if schema.body_pose_key in data.files:
                 frames = int(data[schema.body_pose_key].shape[0])
     source_relative_path = Path(str(metadata.get("source_relative_path", relative_path)))
+    raw_relative_path = metadata.get(
+        "raw_relative_path",
+        metadata.get("original_source_relative_path", path.relative_to(args.amass_dir)),
+    )
+    provenance = build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema)
     stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
     return {
         "status": status,
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
@@ -342,6 +440,7 @@ def record_for_output(
         "stablemotion_split_key": stablemotion_key,
         "output_path": str(output_path),
         "frames": int(metadata.get("frames", frames)),
+        **provenance,
     }
 
 
@@ -403,9 +502,14 @@ def save_reused_realtime_source(
     validate_schema_metadata(metadata, schema=schema, source=str(output_path))
     validate_root_y0_invariants(features, schema=schema, source=str(output_path))
     next_metadata = dict(metadata)
+    raw_relative_path = next_metadata.get(
+        "raw_relative_path",
+        next_metadata.get("original_source_relative_path", path.relative_to(args.amass_dir)),
+    )
     next_metadata.update(
         {
             "schema_name": schema.name,
+            "schema_canonical_name": str(schema.canonical_name),
             "pose_representation": schema.pose_representation,
             "root_y_policy": schema.root_y_policy,
             "pelvis_height_mode": schema.pelvis_height_mode,
@@ -419,6 +523,7 @@ def save_reused_realtime_source(
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
+    next_metadata.update(build_path_provenance(raw_relative_path=raw_relative_path, args=args, schema=schema))
     if schema.supports_stationary_prob:
         next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
@@ -530,6 +635,7 @@ def convert_one_motion(
         source=source,
         target_fps=args.target_fps,
         schema_name=str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)),
+        args=args,
     )
     return record_for_output(
         path=path,
@@ -550,9 +656,11 @@ def failed_record_for_exception(
     if mirror_variant:
         source_relative_path = Path(MIRROR_DIR_NAME) / source_relative_path
     schema = get_schema_spec(str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME)))
+    provenance = build_path_provenance(raw_relative_path=path.relative_to(args.amass_dir), args=args, schema=schema)
     return {
         "status": "failed",
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
@@ -561,6 +669,7 @@ def failed_record_for_exception(
         "stablemotion_split_key": str(source_relative_path.with_suffix(".npy")).replace("\\", "/"),
         "is_mirrored": bool(mirror_variant),
         "error": repr(exc),
+        **provenance,
     }
 
 
@@ -621,7 +730,7 @@ def iter_conversion_records(
 
 
 def main(argv: list[str] | None = None) -> dict[str, int]:
-    args = parse_args(argv)
+    args = resolve_converter_paths(parse_args(argv))
     validate_converter_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "manifest.jsonl"

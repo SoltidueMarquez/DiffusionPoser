@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import torch
 
+import data_converter.amass_to_realtime_pose as amass_converter
+from data_converter.amass_smpl_utils import MotionSource
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset, encode_realtime_pose_features
 from data_loaders.realtime_pose_kinematics import integrate_root_delta_xz_ref
@@ -26,6 +28,80 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
     latest = read_latest_pointer(root, kind=kind)
     assert latest is not None
     return latest
+
+
+def test_converter_resolves_schema_aware_source_root_from_data_roots(tmp_path):
+    config_path = tmp_path / "data_roots.json"
+    generated_root = tmp_path / "generated"
+    amass_root = tmp_path / "AMASS"
+    smpl_model_dir = tmp_path / "body_models"
+    body_fbx_rest_json = tmp_path / "body_fbx_rest.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "amass_root": str(amass_root),
+                "smpl_model_dir": str(smpl_model_dir),
+                "body_fbx_rest_json": str(body_fbx_rest_json),
+                "generated_root": str(generated_root),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = amass_converter.parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--source_set_name",
+            "toy_source",
+            "--schema",
+            "realtime_pose_stationary5_v1",
+        ]
+    )
+    resolved = amass_converter.resolve_converter_paths(args)
+
+    assert resolved.amass_dir == amass_root
+    assert resolved.smpl_model_dir == smpl_model_dir
+    assert resolved.body_fbx_rest_json == body_fbx_rest_json
+    assert resolved.output_dir == generated_root / "sources" / "realtime_pose_stationary5_v1" / "toy_source"
+
+
+def test_converter_source_provenance_is_json_safe_and_portable(tmp_path):
+    schema = get_schema_spec("realtime_pose_stationary5_v1")
+    source = MotionSource(
+        path=tmp_path / "AMASS" / "ACCAD" / "toy_motion.npz",
+        relative_path=Path("ACCAD/toy_motion.npz"),
+        poses=np.zeros((3, 66), dtype=np.float64),
+        trans=np.zeros((3, 3), dtype=np.float64),
+        betas=np.zeros(10, dtype=np.float64),
+        gender="neutral",
+        source_fps=60.0,
+        original_relative_path=Path("ACCAD/toy_motion.npz"),
+    )
+    args = amass_converter.parse_args(
+        [
+            "--source_set_name",
+            "toy_source",
+            "--schema",
+            schema.name,
+            "--target_fps",
+            "30",
+            "--mirror",
+        ]
+    )
+
+    provenance = amass_converter.build_source_provenance(source=source, args=args, schema=schema)
+    json.dumps(provenance)
+
+    assert provenance["schema_name"] == schema.name
+    assert provenance["schema_canonical_name"] == schema.canonical_name
+    assert provenance["raw_dataset"] == "AMASS"
+    assert provenance["raw_root_key"] == "amass_root"
+    assert provenance["raw_relative_path"] == "ACCAD/toy_motion.npz"
+    assert provenance["converter_args"]["schema"] == schema.name
+    assert provenance["converter_args"]["source_set_name"] == "toy_source"
+    assert provenance["converter_args"]["target_fps"] == 30.0
+    assert provenance["converter_args"]["mirror"] is True
 
 
 def test_stationary5_feature_layout_and_root_integration():
