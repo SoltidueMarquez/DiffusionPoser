@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import argparse
+import json
+
 import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_TARGET_START, get_schema_spec
-from sample.evaluate_unity_stream_source import build_long_sequence_payload, repeat_source_sequence
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_START,
+    get_schema_spec,
+)
+from sample.evaluate_unity_stream_source import build_long_sequence_payload, repeat_source_sequence, validate_v2_runtime_args
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
 from sample.simulate_unity_stream import IDENTITY_6D
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
@@ -41,6 +50,26 @@ def build_source_with_sensor_valid(frame_count: int) -> dict[str, np.ndarray]:
     source = build_toy_realtime_source(frame_count=frame_count)
     source["sensor_valid"] = np.ones((frame_count, 6), dtype=bool)
     return source
+
+
+def test_validate_runtime_args_uses_checkpoint_schema_name_when_cli_omitted(tmp_path):
+    model_path = tmp_path / "model000000000.pt"
+    model_path.write_bytes(b"")
+    (tmp_path / "args.json").write_text(
+        json.dumps({"schema_name": REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME}),
+        encoding="utf-8",
+    )
+    schema = get_schema_spec(REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME)
+    args = argparse.Namespace(
+        seq_len=REALTIME_POSE_SEQ_LEN,
+        input_feats=schema.feature_dim,
+        model_path=str(model_path),
+        schema=None,
+    )
+
+    validate_v2_runtime_args(args, cli_schema_explicit=False)
+
+    assert args.schema == REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
 
 
 def test_long_sequence_payload_aligns_gt_and_skips_warmup():

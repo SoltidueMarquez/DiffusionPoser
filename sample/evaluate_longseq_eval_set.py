@@ -24,7 +24,12 @@ from data_loaders.longseq_eval_dropout import (
     apply_longseq_dropout_to_source,
     build_longseq_dropout_config,
 )
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN, get_schema_spec
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAMES,
+    REALTIME_POSE_SEQ_LEN,
+    get_schema_spec,
+)
 from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize
 from sample.evaluate_unity_stream_source import (
     HISTORY_POSE_SOURCE_CHOICES,
@@ -57,6 +62,7 @@ from utils.parser_util import (
     parse_and_load_from_model,
     str2bool,
 )
+from utils.schema_resolution import has_explicit_schema_arg
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -70,6 +76,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq = parser.add_argument_group("longseq_eval")
     longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     longseq.add_argument("--eval_set", default="latest", type=str)
+    longseq.add_argument("--schema", default=None, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     longseq.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
     longseq.add_argument("--input_feats", default=schema.feature_dim, type=int)
@@ -142,6 +149,7 @@ def evaluate_longseq_entries(
     ik_init_reg_weight: float = 0.01,
     ik_init_delta_limit: float = 0.15,
     dropout_config: LongseqDropoutConfig | None = None,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     render_mp4: bool = True,
     render_fps: int = 30,
     render_stride: int = 1,
@@ -164,7 +172,7 @@ def evaluate_longseq_entries(
         sequence_dir.mkdir(parents=True, exist_ok=True)
 
         source_path = resolve_manifest_source_path(eval_set_dir=eval_set_dir, entry=entry)
-        source = load_v2_source_with_sensor_valid(source_path)
+        source = load_v2_source_with_sensor_valid(source_path, schema_name=schema_name)
         source, dropout_metadata = apply_longseq_dropout_to_source(
             source=source,
             sequence_id=sequence_id,
@@ -196,6 +204,7 @@ def evaluate_longseq_entries(
             ik_init_rot_weight=float(ik_init_rot_weight),
             ik_init_reg_weight=float(ik_init_reg_weight),
             ik_init_delta_limit=float(ik_init_delta_limit),
+            schema_name=schema_name,
         )
         metadata = dict(payload["metadata"].item())
         metadata.update(
@@ -296,13 +305,14 @@ def build_default_output_dir(
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser = build_arg_parser()
+    cli_schema_explicit = has_explicit_schema_arg(argv)
     args = parse_and_load_from_model(parser, argv=argv)
-    validate_v2_runtime_args(args)
+    validate_v2_runtime_args(args, cli_schema_explicit=cli_schema_explicit)
 
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     entries = read_longseq_manifest(eval_set_dir)
     dropout_config = build_longseq_dropout_config(args)
-    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
+    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=args.schema)
     if not bool(args.normalize_input):
         normalizer = None
 
@@ -349,6 +359,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         ik_init_reg_weight=float(args.ik_init_reg_weight),
         ik_init_delta_limit=float(args.ik_init_delta_limit),
         dropout_config=dropout_config,
+        schema_name=args.schema,
         render_mp4=bool(args.render_mp4),
         render_fps=int(args.render_fps),
         render_stride=int(args.render_stride),

@@ -13,6 +13,7 @@ from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.sensor_masking import (
     REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     TRACKER_COUNT,
@@ -43,6 +44,7 @@ from utils.parser_util import (
     parse_and_load_from_model,
     str2bool,
 )
+from utils.schema_resolution import has_explicit_schema_arg, resolve_runtime_schema
 
 
 HISTORY_POSE_SOURCE_PREDICTED = "predicted"
@@ -62,6 +64,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     group = parser.add_argument_group("long_sequence")
     group.add_argument("--source_path", required=True, type=str)
+    group.add_argument("--schema", default=None, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     group.add_argument("--normalizer_dir", required=True, type=str)
     group.add_argument("--normalize_input", default=True, type=str2bool)
     group.add_argument("--input_feats", default=schema.feature_dim, type=int)
@@ -123,13 +126,14 @@ def read_source_metadata(path: Path) -> dict[str, Any]:
         return {}
 
 
-def load_v2_source_with_sensor_valid(path: Path) -> dict[str, np.ndarray]:
+def load_v2_source_with_sensor_valid(path: Path, schema_name: str = REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
     metadata = read_source_metadata(path)
-    schema_name = str(metadata.get("schema_name", REALTIME_POSE_SCHEMA_NAME))
-    if schema_name != REALTIME_POSE_SCHEMA_NAME:
-        raise ValueError(f"{path} schema_name 必须是 {REALTIME_POSE_SCHEMA_NAME}，实际为 {schema_name}")
+    schema = get_schema_spec(schema_name)
+    source_schema_name = str(metadata.get("schema_name", schema.name))
+    if source_schema_name != schema.name:
+        raise ValueError(f"{path} schema_name 必须是 {schema.name}，实际为 {source_schema_name}")
 
-    source = load_realtime_source(path, schema_name=REALTIME_POSE_SCHEMA_NAME)
+    source = load_realtime_source(path, schema_name=schema.name)
     frame_count = int(source["tracker_pos_world"].shape[0])
     with np.load(path, allow_pickle=False) as data:
         if "sensor_valid" in data.files:
@@ -209,6 +213,7 @@ def build_long_sequence_payload(
     ik_init_rot_weight: float = 0.2,
     ik_init_reg_weight: float = 0.01,
     ik_init_delta_limit: float = 0.15,
+    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, np.ndarray]:
     frame_count = int(source["tracker_pos_world"].shape[0])
     if frame_count <= REALTIME_POSE_TARGET_START:
@@ -218,7 +223,7 @@ def build_long_sequence_payload(
     if warmup_target_source not in WARMUP_TARGET_SOURCE_CHOICES:
         raise ValueError(f"warmup_target_source 必须是 {WARMUP_TARGET_SOURCE_CHOICES} 之一，实际为 {warmup_target_source}")
 
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    schema = get_schema_spec(schema_name)
     reference_features = encode_realtime_pose_features(source, schema_name=schema.name)
     use_reference_history = history_pose_source == HISTORY_POSE_SOURCE_REFERENCE
     warmup_target_raw = (
@@ -354,27 +359,29 @@ def write_eval_summary(result_path: Path, output_json: Path) -> dict[str, Any]:
     return summary
 
 
-def validate_v2_runtime_args(args: argparse.Namespace) -> None:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+def validate_v2_runtime_args(args: argparse.Namespace, cli_schema_explicit: bool = False) -> None:
+    checkpoint_args = load_args_json(Path(args.model_path))
+    args.schema = resolve_runtime_schema(
+        cli_schema=getattr(args, "schema", None),
+        checkpoint_args=checkpoint_args,
+        cli_schema_explicit=cli_schema_explicit,
+    )
+    schema = get_schema_spec(args.schema)
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"{schema.name} 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {args.seq_len}")
     if int(args.input_feats) != schema.feature_dim:
         raise ValueError(f"{schema.name} input_feats 应为 {schema.feature_dim}，实际为 {args.input_feats}")
-    checkpoint_args = load_args_json(Path(args.model_path))
-    checkpoint_schema = checkpoint_args.get("schema")
-    if checkpoint_schema is not None and checkpoint_schema != schema.name:
-        raise ValueError(f"checkpoint schema 必须是 {schema.name}，实际为 {checkpoint_schema}")
-    args.schema = schema.name
 
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
     parser = build_arg_parser()
+    cli_schema_explicit = has_explicit_schema_arg(argv)
     args = parse_and_load_from_model(parser, argv=argv)
-    validate_v2_runtime_args(args)
+    validate_v2_runtime_args(args, cli_schema_explicit=cli_schema_explicit)
 
-    source = load_v2_source_with_sensor_valid(Path(args.source_path).resolve())
+    source = load_v2_source_with_sensor_valid(Path(args.source_path).resolve(), schema_name=args.schema)
     source = repeat_source_sequence(source, loop_count=int(args.loop_count))
-    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
+    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=args.schema)
     if not bool(args.normalize_input):
         normalizer = None
 
@@ -407,6 +414,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         ik_init_rot_weight=float(args.ik_init_rot_weight),
         ik_init_reg_weight=float(args.ik_init_reg_weight),
         ik_init_delta_limit=float(args.ik_init_delta_limit),
+        schema_name=args.schema,
     )
     metadata = dict(payload["metadata"].item())
     metadata.update({"weights": source_name, "loop_count": int(args.loop_count)})

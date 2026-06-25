@@ -50,9 +50,11 @@ from utils.parser_util import (
     add_diffusion_options,
     add_model_options,
     add_sampling_options,
+    load_args_json,
     parse_and_load_from_model,
     str2bool,
 )
+from utils.schema_resolution import has_explicit_schema_arg, resolve_runtime_schema
 
 
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -76,7 +78,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     default_schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
     stream = parser.add_argument_group("unity_stream")
     stream.add_argument("--tracker_stream_path", required=True, type=str, help="包含 tracker_pos_world/sensor_valid 的 npz。")
-    stream.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
+    stream.add_argument("--schema", default=None, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     stream.add_argument("--input_feats", default=default_schema.feature_dim, type=int)
     stream.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     stream.add_argument("--normalizer_dir", default="", type=str)
@@ -1189,7 +1191,14 @@ def save_simulation(path: Path, payload: dict[str, np.ndarray]) -> None:
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
     parser = build_arg_parser()
+    cli_schema_explicit = has_explicit_schema_arg(argv)
     args = parse_and_load_from_model(parser, argv=argv)
+    checkpoint_args = load_args_json(Path(args.model_path))
+    args.schema = resolve_runtime_schema(
+        cli_schema=args.schema,
+        checkpoint_args=checkpoint_args,
+        cli_schema_explicit=cli_schema_explicit,
+    )
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"Unity realtime stream 固定使用 {REALTIME_POSE_SEQ_LEN} 帧窗口，实际为 {args.seq_len}")
     schema = get_schema_spec(args.schema)

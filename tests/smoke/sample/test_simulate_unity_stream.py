@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np
 from data_loaders.sensor_masking import (
+    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     HIP_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
+    REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_TARGET_START,
     REALTIME_POSE_SEQ_LEN,
@@ -58,6 +61,51 @@ class FixedV2Diffusion:
         sample[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.0
         sample[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START] = 0.0
         return sample
+
+
+def resolve_runtime_schema_for_test(*args, **kwargs):
+    from utils.schema_resolution import resolve_runtime_schema
+
+    return resolve_runtime_schema(*args, **kwargs)
+
+
+def test_runtime_schema_resolution_prefers_checkpoint_exact_schema():
+    schema = resolve_runtime_schema_for_test(
+        cli_schema=None,
+        checkpoint_args={"schema": REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME},
+    )
+
+    assert schema == REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
+
+
+def test_runtime_schema_resolution_reads_checkpoint_schema_name_fallback():
+    schema = resolve_runtime_schema_for_test(
+        cli_schema=None,
+        checkpoint_args={"schema_name": REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME},
+    )
+
+    assert schema == REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
+
+
+def test_runtime_schema_resolution_rejects_explicit_cli_mismatch():
+    with pytest.raises(ValueError, match="checkpoint schema"):
+        resolve_runtime_schema_for_test(
+            cli_schema=DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+            checkpoint_args={"schema": REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME},
+            cli_schema_explicit=True,
+        )
+
+
+def test_runtime_schema_resolution_uses_cli_or_default_without_checkpoint_schema():
+    assert (
+        resolve_runtime_schema_for_test(
+            cli_schema=REALTIME_POSE_SCHEMA_NAME,
+            checkpoint_args={},
+            cli_schema_explicit=True,
+        )
+        == REALTIME_POSE_SCHEMA_NAME
+    )
+    assert resolve_runtime_schema_for_test(cli_schema=None, checkpoint_args=None) == DEFAULT_REALTIME_POSE_SCHEMA_NAME
 
 
 def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
