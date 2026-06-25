@@ -18,11 +18,21 @@ from sample.simulate_unity_stream import fk_joints_from_target
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
-from utils.parser_util import add_base_options, add_data_options, add_diffusion_options, add_model_options, add_sampling_options, parse_and_load_from_model
+from utils.parser_util import (
+    add_base_options,
+    add_data_options,
+    add_diffusion_options,
+    add_model_options,
+    add_sampling_options,
+    parse_and_load_runtime_schema_from_model,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run realtime_pose_body_fbx_local_root_y0_v1 stationary5 rollout reconstruction.")
+    parser = argparse.ArgumentParser(
+        description="Run realtime_pose_body_fbx_local_root_y0_v1 stationary5 rollout reconstruction.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -233,7 +243,7 @@ def save_rollout(path: Path, payload: dict[str, np.ndarray]) -> None:
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
     parser = build_arg_parser()
-    args = parse_and_load_from_model(parser, argv=argv)
+    args = parse_and_load_runtime_schema_from_model(parser, argv=argv)
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
     dataset = RealtimePoseTaskDataset(

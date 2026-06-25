@@ -11,11 +11,21 @@ from sample.reconstruct_stream import reconstruct_batch, tensor_bct_to_numpy_btc
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
-from utils.parser_util import add_base_options, add_data_options, add_diffusion_options, add_model_options, add_sampling_options, parse_and_load_from_model
+from utils.parser_util import (
+    add_base_options,
+    add_data_options,
+    add_diffusion_options,
+    add_model_options,
+    add_sampling_options,
+    parse_and_load_runtime_schema_from_model,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build predicted-history cache from a realtime_pose checkpoint.")
+    parser = argparse.ArgumentParser(
+        description="Build predicted-history cache from a realtime_pose checkpoint.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -26,7 +36,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> dict[str, int]:
-    args = parse_and_load_from_model(build_arg_parser(), argv=argv)
+    args = parse_and_load_runtime_schema_from_model(build_arg_parser(), argv=argv)
     output_dir = Path(args.output_dir or "output/pred_history_cache").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     dist_util.setup_dist(args.device if args.cuda else -1)

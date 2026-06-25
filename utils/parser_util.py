@@ -14,6 +14,7 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 from schemas.registry import list_schema_names
+from utils.schema_resolution import has_explicit_schema_arg, resolve_runtime_schema
 
 
 TRAIN_REALTIME_POSE_SCHEMA_NAMES = tuple(list_schema_names(trainable_only=True))
@@ -59,6 +60,26 @@ def parse_and_load_from_model(parser: ArgumentParser, argv: list[str] | None = N
             default_value = None
         if getattr(args, key) == default_value:
             setattr(args, key, value)
+    return args
+
+
+def parse_and_load_runtime_schema_from_model(
+    parser: ArgumentParser,
+    argv: list[str] | None = None,
+    ignore_keys: set[str] | None = None,
+):
+    cli_schema_explicit = has_explicit_schema_arg(argv)
+    effective_ignore_keys = set(ignore_keys or set())
+    if cli_schema_explicit:
+        effective_ignore_keys.add("schema")
+    args = parse_and_load_from_model(parser, argv=argv, ignore_keys=effective_ignore_keys)
+    model_path = getattr(args, "model_path", "")
+    checkpoint_args = load_args_json(Path(model_path)) if model_path else {}
+    args.schema = resolve_runtime_schema(
+        cli_schema=getattr(args, "schema", None),
+        checkpoint_args=checkpoint_args,
+        cli_schema_explicit=cli_schema_explicit,
+    )
     return args
 
 
