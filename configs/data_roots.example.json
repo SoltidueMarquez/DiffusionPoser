@@ -1,0 +1,6 @@
+{
+  "amass_root": "dataset/AMASS",
+  "smpl_model_dir": "dataset/body_models",
+  "body_fbx_rest_json": "",
+  "generated_root": "dataset/generated"
+}

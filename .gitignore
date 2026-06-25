@@ -13,6 +13,8 @@ env/
 .conda_pkgs/
 
 # Training artifacts
+configs/data_roots.local.json
+dataset/generated/
 dataset/
 data/
 save/
