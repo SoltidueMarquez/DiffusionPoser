@@ -81,7 +81,7 @@ class _Stationary5Adapter:
         self._validate_payload_schema_name(payload)
 
     def build_inpaint_mask(self, seq_len: int | None = None) -> np.ndarray:
-        actual_seq_len = int(seq_len or self.spec.seq_len)
+        actual_seq_len = self.spec.seq_len if seq_len is None else int(seq_len)
         if actual_seq_len != self.spec.seq_len:
             raise ValueError(f"{self.spec.name} 固定使用 {self.spec.seq_len} 帧窗口。")
         mask = np.zeros((actual_seq_len, self.spec.feature_dim), dtype=bool)
