@@ -1,6 +1,6 @@
 # 测试目录
 
-当前仓库的冒烟测试统一放在 `tests/smoke/`。这些测试使用临时目录和小规模构造数据，目标是在正式训练、采样或导出前快速验证 `realtime_pose_body_fbx_local_root_y0_v1` 主链路没有被破坏。
+当前仓库的冒烟测试统一放在 `tests/smoke/`。这些测试使用临时目录和小规模构造数据，目标是在正式训练、采样或导出前快速验证默认 `realtime_pose_stationary5_v1` 链路没有被破坏；legacy exact name `realtime_pose_body_fbx_local_root_y0_v1` 由 `tests/smoke/schemas` 的 schema smoke 覆盖。
 
 ```text
 tests/

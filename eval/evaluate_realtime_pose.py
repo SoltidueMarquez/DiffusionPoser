@@ -25,7 +25,7 @@ FEATURE_ARRAY_GROUPS = (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate realtime_pose_body_fbx_local_root_y0_v1 reconstruction result npz files.")
+    parser = argparse.ArgumentParser(description="Evaluate realtime_pose_stationary5_v1 reconstruction result npz files.")
     parser.add_argument("--input_dir", required=True, type=str)
     parser.add_argument("--output_json", default="", type=str)
     return parser

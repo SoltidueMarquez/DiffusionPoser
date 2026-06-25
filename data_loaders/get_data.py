@@ -39,7 +39,7 @@ def get_dataset_loader(
     enable_rollout: bool = False,
     rollout_steps: int = 1,
 ):
-    """返回当前 realtime_pose_body_fbx_local_root_y0_v1 训练 / 测试 DataLoader。"""
+    """返回默认 realtime_pose_stationary5_v1 训练 / 测试 DataLoader；legacy exact name realtime_pose_body_fbx_local_root_y0_v1 可显式作为 alias 传入。"""
 
     if not data_dir:
         raise ValueError("请提供 --data_dir，指向 data_loaders.generate_realtime_pose_tasks 生成的任务目录。")
