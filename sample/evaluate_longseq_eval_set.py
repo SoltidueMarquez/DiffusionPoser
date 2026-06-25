@@ -66,7 +66,10 @@ from utils.schema_resolution import has_explicit_schema_arg
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate a checkpoint on a fixed realtime_pose longseq eval set.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a checkpoint on a fixed realtime_pose longseq eval set.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)

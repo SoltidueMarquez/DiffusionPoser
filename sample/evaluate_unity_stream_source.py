@@ -56,7 +56,10 @@ WARMUP_TARGET_SOURCE_CHOICES = (WARMUP_TARGET_SOURCE_FIRST_FRAME, WARMUP_TARGET_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate a realtime_pose_body_fbx_local_root_y0_v1 Unity stream against a long GT source.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a realtime_pose_body_fbx_local_root_y0_v1 Unity stream against a long GT source.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)

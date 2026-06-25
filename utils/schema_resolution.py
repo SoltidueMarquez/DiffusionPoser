@@ -34,11 +34,14 @@ def has_explicit_schema_arg(argv: Sequence[str] | None) -> bool:
 def _checkpoint_exact_schema(checkpoint_args: Mapping[str, object] | None) -> str | None:
     if not checkpoint_args:
         return None
-    for key in ("schema", "schema_name"):
-        value = _non_empty_string(checkpoint_args.get(key))
-        if value is not None:
-            return value
-    return None
+    schema = _non_empty_string(checkpoint_args.get("schema"))
+    schema_name = _non_empty_string(checkpoint_args.get("schema_name"))
+    if schema is not None and schema_name is not None and schema != schema_name:
+        raise ValueError(
+            f"checkpoint args schema={schema!r} 与 schema_name={schema_name!r} 不一致；"
+            "必须使用同一个 exact schema。"
+        )
+    return schema or schema_name
 
 
 def _non_empty_string(value: object | None) -> str | None:

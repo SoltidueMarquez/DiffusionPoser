@@ -21,6 +21,7 @@ from sample.ik_initializer import build_tracker_pose_init_image
 from sample.simulate_unity_stream import (
     IDENTITY_6D,
     apply_tracker_position_ik,
+    build_arg_parser,
     clamp_body_pose_delta,
     encode_unity_tracker_frame,
     estimate_root_pos_from_hip_tracker,
@@ -106,6 +107,33 @@ def test_runtime_schema_resolution_uses_cli_or_default_without_checkpoint_schema
         == REALTIME_POSE_SCHEMA_NAME
     )
     assert resolve_runtime_schema_for_test(cli_schema=None, checkpoint_args=None) == DEFAULT_REALTIME_POSE_SCHEMA_NAME
+
+
+def test_runtime_schema_resolution_rejects_checkpoint_schema_conflict():
+    with pytest.raises(ValueError, match="schema_name"):
+        resolve_runtime_schema_for_test(
+            cli_schema=None,
+            checkpoint_args={
+                "schema": REALTIME_POSE_SCHEMA_NAME,
+                "schema_name": REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
+            },
+        )
+
+
+def test_simulate_parse_rejects_schema_abbreviation(tmp_path):
+    parser = build_arg_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--model_path",
+                str(tmp_path / "model000000000.pt"),
+                "--tracker_stream_path",
+                str(tmp_path / "stream.npz"),
+                "--sche",
+                REALTIME_POSE_SCHEMA_NAME,
+            ]
+        )
 
 
 def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():

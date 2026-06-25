@@ -70,7 +70,10 @@ TRACKER_IK_REGULARIZATION_WEIGHT = 0.01
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Simulate Unity realtime tracker-only input in Python.")
+    parser = argparse.ArgumentParser(
+        description="Simulate Unity realtime tracker-only input in Python.",
+        allow_abbrev=False,
+    )
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
