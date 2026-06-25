@@ -6,14 +6,32 @@ from pathlib import Path
 
 import pytest
 
+import data_loaders.compute_realtime_pose_normalizer as normalizer_computer
+import data_loaders.generate_realtime_pose_tasks as task_generator
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from scripts import run_realtime_pose_pipeline as pipeline
-from utils.run_dirs import write_latest_pointer
+from tests.smoke.realtime_pose_fixtures import write_toy_source_dataset
+from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
 CONVERT_MODULE = "data_converter.amass_to_realtime_pose"
 TASK_MODULE = "data_loaders.generate_realtime_pose_tasks"
 NORMALIZER_MODULE = "data_loaders.compute_realtime_pose_normalizer"
+
+
+def write_data_roots_config(tmp_path: Path) -> tuple[Path, Path]:
+    config_path = tmp_path / "data_roots.json"
+    generated_root = tmp_path / "generated"
+    config_path.write_text(
+        json.dumps(
+            {
+                "amass_root": str(tmp_path / "AMASS"),
+                "generated_root": str(generated_root),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path, generated_root
 
 
 def parse_pipeline_args(tmp_path: Path, *extra: str):
@@ -150,3 +168,169 @@ def test_pipeline_passes_parallel_converter_args(tmp_path):
 
     assert convert_args[convert_args.index("--num_workers") + 1] == "3"
     assert convert_args[convert_args.index("--worker_torch_threads") + 1] == "2"
+
+
+def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):
+    config_path, generated_root = write_data_roots_config(tmp_path)
+
+    args = task_generator.build_argument_parser().parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--source_set_name",
+            "toy_source",
+            "--task_set_name",
+            "toy_tasks",
+        ]
+    )
+    resolved = task_generator.resolve_task_generation_paths(args)
+
+    assert resolved.source_dir == generated_root / "sources" / REALTIME_POSE_SCHEMA_NAME / "toy_source"
+    assert resolved.output_dir == generated_root / "tasks" / REALTIME_POSE_SCHEMA_NAME / "toy_tasks"
+
+
+def test_task_generation_resolver_keeps_explicit_paths(tmp_path):
+    config_path, _ = write_data_roots_config(tmp_path)
+    explicit_source_dir = tmp_path / "explicit_sources"
+    explicit_output_dir = tmp_path / "explicit_tasks"
+
+    args = task_generator.build_argument_parser().parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--source_dir",
+            str(explicit_source_dir),
+            "--output_dir",
+            str(explicit_output_dir),
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--source_set_name",
+            "toy_source",
+            "--task_set_name",
+            "toy_tasks",
+        ]
+    )
+    resolved = task_generator.resolve_task_generation_paths(args)
+
+    assert resolved.source_dir == explicit_source_dir
+    assert resolved.output_dir == explicit_output_dir
+
+
+def test_normalizer_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):
+    config_path, generated_root = write_data_roots_config(tmp_path)
+
+    args = normalizer_computer.build_argument_parser().parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--task_set_name",
+            "toy_tasks",
+            "--normalizer_name",
+            "toy_norm",
+        ]
+    )
+    resolved = normalizer_computer.resolve_normalizer_paths(args)
+
+    assert resolved.task_dir == generated_root / "tasks" / REALTIME_POSE_SCHEMA_NAME / "toy_tasks"
+    assert resolved.output_dir == generated_root / "normalizers" / REALTIME_POSE_SCHEMA_NAME / "toy_norm"
+
+
+def test_normalizer_resolver_keeps_explicit_paths(tmp_path):
+    config_path, _ = write_data_roots_config(tmp_path)
+    explicit_task_dir = tmp_path / "explicit_tasks"
+    explicit_output_dir = tmp_path / "explicit_normalizer"
+
+    args = normalizer_computer.build_argument_parser().parse_args(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--task_dir",
+            str(explicit_task_dir),
+            "--output_dir",
+            str(explicit_output_dir),
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--task_set_name",
+            "toy_tasks",
+            "--normalizer_name",
+            "toy_norm",
+        ]
+    )
+    resolved = normalizer_computer.resolve_normalizer_paths(args)
+
+    assert resolved.task_dir == explicit_task_dir
+    assert resolved.output_dir == explicit_output_dir
+
+
+def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
+    config_path, generated_root = write_data_roots_config(tmp_path)
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    source_dir = generated_root / "sources" / schema.name / "toy_source"
+    task_root = generated_root / "tasks" / schema.name / "toy_tasks"
+    normalizer_root = generated_root / "normalizers" / schema.name / "toy_norm"
+    write_toy_source_dataset(source_dir, schema_name=schema.name)
+
+    task_generator.main(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--source_set_name",
+            "toy_source",
+            "--task_set_name",
+            "toy_tasks",
+            "--schema",
+            schema.name,
+            "--split_dir",
+            "",
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--overwrite",
+        ]
+    )
+    task_output_dir = read_latest_pointer(task_root, kind="tasks")
+    assert task_output_dir is not None
+    marker = json.loads((task_output_dir / task_generator.TASK_OUTPUT_MARKER).read_text(encoding="utf-8"))
+    manifest_entry = json.loads((task_output_dir / "train" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    latest_task = json.loads((task_root / "latest_tasks.json").read_text(encoding="utf-8"))
+
+    for payload in (marker, manifest_entry, latest_task):
+        assert payload["schema_canonical_name"] == schema.canonical_name
+        assert payload["generated_root"] == str(generated_root)
+        assert payload["source_set_name"] == "toy_source"
+        assert payload["task_set_name"] == "toy_tasks"
+        assert payload["source_dir"] == str(source_dir)
+        assert payload["output_dir"] == str(task_output_dir)
+
+    normalizer_computer.main(
+        [
+            "--data_roots_config",
+            str(config_path),
+            "--task_set_name",
+            "toy_tasks",
+            "--normalizer_name",
+            "toy_norm",
+            "--schema",
+            schema.name,
+            "--split",
+            "train",
+            "--overwrite",
+        ]
+    )
+    normalizer_output_dir = read_latest_pointer(normalizer_root, kind="normalizer")
+    assert normalizer_output_dir is not None
+    normalizer_meta = json.loads((normalizer_output_dir / "normalizer_meta.json").read_text(encoding="utf-8"))
+    latest_normalizer = json.loads((normalizer_root / "latest_normalizer.json").read_text(encoding="utf-8"))
+
+    for payload in (normalizer_meta, latest_normalizer):
+        assert payload["schema_canonical_name"] == schema.canonical_name
+        assert payload["generated_root"] == str(generated_root)
+        assert payload["task_set_name"] == "toy_tasks"
+        assert payload["normalizer_name"] == "toy_norm"
+        assert payload["task_dir"] == str(task_output_dir)
+        assert payload["output_dir"] == str(normalizer_output_dir)

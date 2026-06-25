@@ -23,15 +23,24 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
     validate_pose_representation,
 )
+from utils.artifact_paths import normalizer_root, task_root
+from utils.data_roots import load_data_roots
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
+
+
+DEFAULT_TASK_SET_NAME = "amass_60hz_tasks"
+DEFAULT_NORMALIZER_NAME = "amass_60hz_train"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compute realtime_pose mean/std normalizer from materialized tasks.")
     group = parser.add_argument_group("paths")
-    group.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
-    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    group.add_argument("--data_roots_config", default="", type=str)
+    group.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
+    group.add_argument("--normalizer_name", default=DEFAULT_NORMALIZER_NAME, type=str)
+    group.add_argument("--task_dir", default="", type=str)
+    group.add_argument("--output_dir", default="", type=str)
 
     group = parser.add_argument_group("statistics")
     group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
@@ -42,7 +51,47 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_normalizer_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """把空路径参数解析到 schema-aware task/normalizer 根目录。"""
+
+    roots = None
+
+    def get_roots():
+        nonlocal roots
+        if roots is None:
+            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+        return roots
+
+    schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
+    task_set_name = str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME))
+    normalizer_name = str(getattr(args, "normalizer_name", DEFAULT_NORMALIZER_NAME))
+
+    if _path_arg_is_empty(getattr(args, "task_dir", "")):
+        args.task_dir = task_root(get_roots(), schema_name=schema_name, task_set_name=task_set_name)
+    else:
+        args.task_dir = Path(args.task_dir)
+
+    if _path_arg_is_empty(getattr(args, "output_dir", "")):
+        args.output_dir = normalizer_root(get_roots(), schema_name=schema_name, normalizer_name=normalizer_name)
+    else:
+        args.output_dir = Path(args.output_dir)
+
+    if roots is not None or not _path_arg_is_empty(getattr(args, "data_roots_config", "")):
+        args.generated_root = get_roots().generated_root
+    else:
+        # 旧式显式路径没有 data_roots 来源，用 normalizer root 作为可追踪的产物根记录。
+        args.generated_root = Path(args.output_dir)
+    return args
+
+
+def _path_arg_is_empty(value: object) -> bool:
+    if value is None:
+        return True
+    return not str(value).strip()
+
+
 def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, object]:
+    args = resolve_normalizer_paths(args)
     task_dir = resolve_latest_or_self(Path(args.task_dir), kind="tasks")
     output_root = Path(args.output_dir).resolve()
     output_dir = timestamped_child_dir(output_root, resolve_normalizer_run_label(args))
@@ -91,9 +140,13 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
 
     meta = {
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
+        "generated_root": str(Path(getattr(args, "generated_root", output_root))),
+        "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+        "normalizer_name": str(getattr(args, "normalizer_name", DEFAULT_NORMALIZER_NAME)),
         "task_dir": str(task_dir),
         "normalizer_root": str(output_root),
         "output_dir": str(output_dir),
@@ -111,13 +164,18 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         kind="normalizer",
         output_dir=output_dir,
         metadata={
+            "output_dir": str(output_dir),
             "normalizer_dir": str(output_dir),
             "normalizer_root": str(output_root),
             "task_dir": str(task_dir),
             "schema_name": schema.name,
+            "schema_canonical_name": str(schema.canonical_name),
             "pose_representation": schema.pose_representation,
             "root_y_policy": schema.root_y_policy,
             "pelvis_height_mode": schema.pelvis_height_mode,
+            "generated_root": str(Path(getattr(args, "generated_root", output_root))),
+            "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+            "normalizer_name": str(getattr(args, "normalizer_name", DEFAULT_NORMALIZER_NAME)),
             "split": args.split,
             "matched_tasks": len(task_entries),
         },

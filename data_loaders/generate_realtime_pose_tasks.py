@@ -37,9 +37,13 @@ from data_loaders.sensor_masking import (
     validate_pose_representation,
     validate_sensor_valid,
 )
+from utils.artifact_paths import source_root, task_root
+from utils.data_roots import load_data_roots
 from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
+DEFAULT_SOURCE_SET_NAME = "amass_60hz"
+DEFAULT_TASK_SET_NAME = "amass_60hz_tasks"
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
 USABLE_SOURCE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
 SHORT_SOURCE_POLICY_SKIP = "skip"
@@ -70,8 +74,11 @@ class TaskGenerationPlan:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-    paths.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
+    paths.add_argument("--data_roots_config", default="", type=str)
+    paths.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
+    paths.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
+    paths.add_argument("--source_dir", default="", type=str)
+    paths.add_argument("--output_dir", default="", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
 
     task = parser.add_argument_group("task")
@@ -108,6 +115,45 @@ def str2bool(value):
     raise argparse.ArgumentTypeError(f"Cannot parse boolean value: {value}")
 
 
+def resolve_task_generation_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """把空路径参数解析到 schema-aware 数据根，显式传入的路径保持优先。"""
+
+    roots = None
+
+    def get_roots():
+        nonlocal roots
+        if roots is None:
+            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+        return roots
+
+    schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
+    source_set_name = str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME))
+    task_set_name = str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME))
+
+    if _path_arg_is_empty(getattr(args, "source_dir", "")):
+        args.source_dir = source_root(get_roots(), schema_name=schema_name, source_set_name=source_set_name)
+    else:
+        args.source_dir = Path(args.source_dir)
+
+    if _path_arg_is_empty(getattr(args, "output_dir", "")):
+        args.output_dir = task_root(get_roots(), schema_name=schema_name, task_set_name=task_set_name)
+    else:
+        args.output_dir = Path(args.output_dir)
+
+    if roots is not None or not _path_arg_is_empty(getattr(args, "data_roots_config", "")):
+        args.generated_root = get_roots().generated_root
+    else:
+        # 旧式显式路径没有 data_roots 来源，用 task root 作为可追踪的产物根记录。
+        args.generated_root = Path(args.output_dir)
+    return args
+
+
+def _path_arg_is_empty(value: object) -> bool:
+    if value is None:
+        return True
+    return not str(value).strip()
+
+
 def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
     plan = plan_realtime_pose_task_generation(args)
     return execute_realtime_pose_task_generation(plan=plan, args=args)
@@ -119,6 +165,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
 
     这样 split 配错、source 不存在或没有匹配样本时，不会留下空 output_dir 或 marker。
     """
+    args = resolve_task_generation_paths(args)
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
     if int(getattr(args, "rollout_steps", 1)) < 1:
@@ -176,6 +223,9 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
         overwrite=bool(args.overwrite),
         split_dir=plan.split_dir,
         schema_name=str(args.schema),
+        generated_root=Path(getattr(args, "generated_root", plan.output_root)),
+        source_set_name=str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+        task_set_name=str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
     )
 
     counts = {}
@@ -189,17 +239,23 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             args=args,
             source_split_dir=plan.split_dir,
         )
+    schema = get_schema_spec(str(args.schema))
     write_latest_pointer(
         root_dir=plan.output_root,
         kind="tasks",
         output_dir=plan.output_dir,
         metadata={
+            "output_dir": str(plan.output_dir),
             "task_dir": str(plan.output_dir),
             "task_root": str(plan.output_root),
-            "schema_name": str(args.schema),
-            "pose_representation": get_schema_spec(str(args.schema)).pose_representation,
-            "root_y_policy": get_schema_spec(str(args.schema)).root_y_policy,
-            "pelvis_height_mode": get_schema_spec(str(args.schema)).pelvis_height_mode,
+            "schema_name": schema.name,
+            "schema_canonical_name": str(schema.canonical_name),
+            "pose_representation": schema.pose_representation,
+            "root_y_policy": schema.root_y_policy,
+            "pelvis_height_mode": schema.pelvis_height_mode,
+            "generated_root": str(Path(getattr(args, "generated_root", plan.output_root))),
+            "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+            "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
             "source_dir": str(plan.source_dir),
             "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
             "splits": [split_plan.split for split_plan in plan.split_plans],
@@ -225,6 +281,9 @@ def prepare_task_output_dir(
     overwrite: bool,
     split_dir: Path | None,
     schema_name: str,
+    generated_root: Path,
+    source_set_name: str,
+    task_set_name: str,
 ) -> None:
     """准备 task 输出目录，并在覆盖已有目录前做路径安全检查。"""
 
@@ -232,7 +291,15 @@ def prepare_task_output_dir(
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_task_output_marker(source_dir=source_dir, output_dir=output_dir, split_dir=split_dir, schema_name=schema_name)
+    write_task_output_marker(
+        source_dir=source_dir,
+        output_dir=output_dir,
+        split_dir=split_dir,
+        schema_name=schema_name,
+        generated_root=generated_root,
+        source_set_name=source_set_name,
+        task_set_name=task_set_name,
+    )
 
 
 def validate_task_output_root_available(source_dir: Path, output_root: Path) -> None:
@@ -332,15 +399,28 @@ def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -
     validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
 
 
-def write_task_output_marker(source_dir: Path, output_dir: Path, split_dir: Path | None, schema_name: str) -> None:
+def write_task_output_marker(
+    source_dir: Path,
+    output_dir: Path,
+    split_dir: Path | None,
+    schema_name: str,
+    generated_root: Path,
+    source_set_name: str,
+    task_set_name: str,
+) -> None:
     schema = get_schema_spec(schema_name)
     marker = {
         "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
         "task_format": schema.task_format,
         POSE_REPRESENTATION_KEY: schema.pose_representation,
         "root_y_policy": schema.root_y_policy,
         "pelvis_height_mode": schema.pelvis_height_mode,
+        "generated_root": str(generated_root),
+        "source_set_name": str(source_set_name),
+        "task_set_name": str(task_set_name),
         "source_dir": str(source_dir),
+        "output_dir": str(output_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
     marker_path = output_dir / TASK_OUTPUT_MARKER
@@ -550,6 +630,7 @@ def generate_split_tasks(
                         "task_path": task_rel_path.as_posix(),
                         "split": split,
                         "source_path": str(source_path),
+                        "source_dir": str(Path(getattr(args, "source_dir", "")).resolve()),
                         "source_relative_path": normalize_slashes(entry["source_relative_path"]),
                         "stablemotion_split_key": normalize_slashes(entry["stablemotion_split_key"]),
                         "start_frame": start_frame,
@@ -561,9 +642,14 @@ def generate_split_tasks(
                         "rollout_task_paths": rollout_task_paths,
                         "task_format": schema.task_format,
                         "schema_name": schema.name,
+                        "schema_canonical_name": str(schema.canonical_name),
                         POSE_REPRESENTATION_KEY: schema.pose_representation,
                         "root_y_policy": schema.root_y_policy,
                         "pelvis_height_mode": schema.pelvis_height_mode,
+                        "generated_root": str(Path(getattr(args, "generated_root", output_dir))),
+                        "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+                        "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+                        "output_dir": str(output_dir),
                         "task_mode": TASK_MODE_REALTIME_POSE,
                         "target_start": REALTIME_POSE_TARGET_START,
                         "target_length": REALTIME_POSE_TARGET_LENGTH,
