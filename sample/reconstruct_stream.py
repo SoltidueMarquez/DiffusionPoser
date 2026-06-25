@@ -38,7 +38,7 @@ from utils.parser_util import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Sample realtime_pose_body_fbx_local_root_y0_v1 stationary5 single-frame reconstruction tasks.",
+        description="Sample realtime_pose_stationary5_v1 single-frame reconstruction tasks.",
         allow_abbrev=False,
     )
     add_base_options(parser)

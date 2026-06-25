@@ -30,7 +30,7 @@ from utils.parser_util import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run realtime_pose_body_fbx_local_root_y0_v1 stationary5 rollout reconstruction.",
+        description="Run realtime_pose_stationary5_v1 rollout reconstruction.",
         allow_abbrev=False,
     )
     add_base_options(parser)

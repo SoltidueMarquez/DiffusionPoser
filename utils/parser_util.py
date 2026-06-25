@@ -65,7 +65,7 @@ def _install_data_path_default_parser(parser: ArgumentParser) -> None:
 
 
 def train_args():
-    parser = ArgumentParser(description="Train a realtime_pose_body_fbx_local_root_y0_v1 diffusion reconstruction model.")
+    parser = ArgumentParser(description="Train a realtime_pose_stationary5_v1 diffusion reconstruction model.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)

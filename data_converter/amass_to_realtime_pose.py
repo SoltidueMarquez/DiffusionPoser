@@ -1,6 +1,7 @@
 """
 把 AMASS SMPL/SMPL-H 动作转换为 realtime_pose 源数据。
-默认生成当前主链路 `realtime_pose_body_fbx_local_root_y0_v1`。
+默认生成 `realtime_pose_stationary5_v1`；
+`realtime_pose_body_fbx_local_root_y0_v1` 仅作为 legacy alias 保留。
 """
 
 from __future__ import annotations
