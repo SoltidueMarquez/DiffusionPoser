@@ -4,11 +4,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from schemas.base import SchemaSpec
+from schemas.registry import get_default_schema_name, get_schema_spec, list_schema_names
+
 
 REALTIME_POSE_V2_MOTION_SCHEMA_NAME = "realtime_pose_v2_motion"
 REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
-REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
+REALTIME_POSE_SCHEMA_NAME = get_default_schema_name()
 DEFAULT_REALTIME_POSE_SCHEMA_NAME = REALTIME_POSE_SCHEMA_NAME
+REALTIME_POSE_SCHEMA_NAMES = list_schema_names()
 POSE_REPRESENTATION_KEY = "pose_representation"
 POSE_REPRESENTATION_ROOT_YAW_GLOBAL_6D = "root_yaw_global_6d"
 POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D = "body_fbx_local_delta_6d"
@@ -130,129 +134,6 @@ class TrackerPattern:
                 TRACKER_NAMES[index] for index, value in enumerate(self.sensor_valid) if value
             ],
         }
-
-
-@dataclass(frozen=True)
-class SchemaSpec:
-    """集中描述 realtime_pose 各版本的通道布局，避免调用侧硬编码切片。"""
-
-    name: str
-    task_format: str
-    feature_dim: int
-    target_dim: int
-    body_pose_start: int
-    root_yaw_delta_start: int
-    tracker_pos_ref_start: int
-    tracker_rot_ref_start: int
-    sensor_valid_start: int
-    pose_representation: str = POSE_REPRESENTATION_ROOT_YAW_GLOBAL_6D
-    body_pose_key: str = BODY_POSE_ROOT_GLOBAL_KEY
-    root_heading_delta_key: str = "root_yaw_delta_sincos"
-    pelvis_height_key: str = "root_height"
-    root_delta_xz_start: int | None = None
-    root_height_start: int | None = None
-    stationary_prob_start: int | None = None
-    root_y_policy: str = ROOT_Y_POLICY_ACTOR_ROOT_FROM_PELVIS
-    pelvis_height_mode: str = PELVIS_HEIGHT_MODE_ACTOR_ROOT_Y
-
-    @property
-    def supports_root_motion(self) -> bool:
-        return self.root_delta_xz_start is not None and self.root_height_start is not None
-
-    @property
-    def supports_stationary_prob(self) -> bool:
-        return self.stationary_prob_start is not None
-
-    def target_slice(self) -> slice:
-        return slice(BODY_POSE_START, self.target_dim)
-
-    def body_pose_slice(self) -> slice:
-        return slice(self.body_pose_start, self.body_pose_start + BODY_POSE_DIM)
-
-    def root_yaw_delta_slice(self) -> slice:
-        return slice(self.root_yaw_delta_start, self.root_yaw_delta_start + ROOT_YAW_DELTA_DIM)
-
-    def root_heading_delta_slice(self) -> slice:
-        return self.root_yaw_delta_slice()
-
-    def root_delta_xz_slice(self) -> slice:
-        if self.root_delta_xz_start is None:
-            raise ValueError(f"{self.name} 不包含 root_delta_xz_ref。")
-        return slice(self.root_delta_xz_start, self.root_delta_xz_start + ROOT_DELTA_XZ_DIM)
-
-    def root_height_slice(self) -> slice:
-        if self.root_height_start is None:
-            raise ValueError(f"{self.name} 不包含 root_height。")
-        return slice(self.root_height_start, self.root_height_start + ROOT_HEIGHT_DIM)
-
-    def pelvis_height_slice(self) -> slice:
-        return self.root_height_slice()
-
-    def stationary_prob_slice(self) -> slice:
-        if self.stationary_prob_start is None:
-            raise ValueError(f"{self.name} 不包含 stationary_prob_5。")
-        return slice(self.stationary_prob_start, self.stationary_prob_start + STATIONARY_PROB_DIM)
-
-    def tracker_pos_slice(self, tracker_index: int | None = None) -> slice:
-        if tracker_index is None:
-            return slice(self.tracker_pos_ref_start, self.tracker_pos_ref_start + TRACKER_POS_DIM)
-        start = self.tracker_pos_ref_start + int(tracker_index) * 3
-        return slice(start, start + 3)
-
-    def tracker_rot_slice(self, tracker_index: int | None = None) -> slice:
-        if tracker_index is None:
-            return slice(self.tracker_rot_ref_start, self.tracker_rot_ref_start + TRACKER_ROT_DIM)
-        start = self.tracker_rot_ref_start + int(tracker_index) * 6
-        return slice(start, start + 6)
-
-    def sensor_valid_slice(self) -> slice:
-        return slice(self.sensor_valid_start, self.sensor_valid_start + SENSOR_VALID_DIM)
-
-
-SCHEMA_SPECS: dict[str, SchemaSpec] = {
-    REALTIME_POSE_V2_MOTION_SCHEMA_NAME: SchemaSpec(
-        name=REALTIME_POSE_V2_MOTION_SCHEMA_NAME,
-        task_format=TASK_FORMAT_REALTIME_POSE_V2_MOTION,
-        feature_dim=REALTIME_POSE_V2_MOTION_INPUT_DIM,
-        target_dim=REALTIME_POSE_V2_MOTION_TARGET_DIM,
-        body_pose_start=BODY_POSE_START,
-        root_yaw_delta_start=ROOT_YAW_DELTA_START,
-        root_delta_xz_start=V2_MOTION_ROOT_DELTA_XZ_START,
-        root_height_start=V2_MOTION_ROOT_HEIGHT_START,
-        tracker_pos_ref_start=V2_MOTION_TRACKER_POS_REF_START,
-        tracker_rot_ref_start=V2_MOTION_TRACKER_ROT_REF_START,
-        sensor_valid_start=V2_MOTION_SENSOR_VALID_START,
-    ),
-    REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME: SchemaSpec(
-        name=REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
-        task_format=TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0,
-        feature_dim=REALTIME_POSE_BODY_FBX_LOCAL_INPUT_DIM,
-        target_dim=REALTIME_POSE_BODY_FBX_LOCAL_TARGET_DIM,
-        body_pose_start=BODY_POSE_START,
-        root_yaw_delta_start=ROOT_YAW_DELTA_START,
-        root_delta_xz_start=BODY_FBX_LOCAL_ROOT_DELTA_XZ_START,
-        root_height_start=BODY_FBX_LOCAL_PELVIS_HEIGHT_START,
-        stationary_prob_start=BODY_FBX_LOCAL_STATIONARY_PROB_START,
-        tracker_pos_ref_start=BODY_FBX_LOCAL_TRACKER_POS_REF_START,
-        tracker_rot_ref_start=BODY_FBX_LOCAL_TRACKER_ROT_REF_START,
-        sensor_valid_start=BODY_FBX_LOCAL_SENSOR_VALID_START,
-        pose_representation=POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
-        body_pose_key=BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
-        root_heading_delta_key="root_heading_delta_sincos",
-        pelvis_height_key="pelvis_height",
-        root_y_policy=ROOT_Y_POLICY_FIXED_ZERO,
-        pelvis_height_mode=PELVIS_HEIGHT_MODE_PELVIS_LOCAL_OFFSET_Y,
-    ),
-}
-REALTIME_POSE_SCHEMA_NAMES = tuple(SCHEMA_SPECS.keys())
-
-
-def get_schema_spec(schema_name: str | None) -> SchemaSpec:
-    name = str(schema_name or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
-    try:
-        return SCHEMA_SPECS[name]
-    except KeyError as exc:
-        raise ValueError(f"未知 realtime pose schema: {name}，可选值为 {REALTIME_POSE_SCHEMA_NAMES}") from exc
 
 
 def scalar_string(value: object, name: str) -> str:

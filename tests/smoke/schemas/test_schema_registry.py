@@ -20,6 +20,28 @@ def test_stationary5_default_schema_registered():
     assert "realtime_pose_body_fbx_local_root_y0_v1" in list_schema_names(trainable_only=True)
 
 
+def test_sensor_masking_exports_schema_registry_compatibility():
+    from data_loaders.sensor_masking import (
+        DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+        REALTIME_POSE_SCHEMA_NAMES,
+        get_schema_spec,
+    )
+
+    assert DEFAULT_REALTIME_POSE_SCHEMA_NAME == "realtime_pose_stationary5_v1"
+    assert "realtime_pose_body_fbx_local_root_y0_v1" in REALTIME_POSE_SCHEMA_NAMES
+    assert get_schema_spec("realtime_pose_stationary5_v1").feature_dim == 214
+
+
+def test_sensor_masking_default_inpaint_mask_uses_stationary5_schema():
+    from data_loaders.sensor_masking import create_realtime_inpaint_mask
+
+    mask = create_realtime_inpaint_mask()
+
+    assert mask.shape == (61, 214)
+    assert mask.dtype == bool
+    assert mask[60, 0:154].all()
+
+
 def test_legacy_schema_name_keeps_exact_identity():
     spec = get_schema_spec("realtime_pose_body_fbx_local_root_y0_v1")
     assert spec.name == "realtime_pose_body_fbx_local_root_y0_v1"
