@@ -8,9 +8,28 @@ import torch
 from data_loaders.build_realtime_longseq_eval_set import build_realtime_longseq_eval_set, read_longseq_manifest
 from data_loaders.longseq_eval_dropout import LongseqDropoutConfig
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_TARGET_START, get_schema_spec
-from sample.evaluate_longseq_eval_set import evaluate_longseq_entries
+from sample.evaluate_longseq_eval_set import build_arg_parser, evaluate_longseq_entries
 from sample.simulate_unity_stream import IDENTITY_6D
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
+
+
+GENERATED_NORMALIZER_ROOT = "dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train"
+GENERATED_LONGSEQ_EVAL_ROOT = "dataset/generated/longseq_eval/realtime_pose_stationary5_v1/amass_60hz_test_stress_long"
+LEGACY_PARENT_LOCAL_MARKERS = (
+    "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+    "dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+)
+
+
+def normalized_path_text(value) -> str:
+    return str(value).replace("\\", "/")
+
+
+def assert_generated_layout_path(value, expected_suffix: str) -> None:
+    text = normalized_path_text(value)
+    assert text.endswith(expected_suffix)
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in text
 
 
 class FixedLongseqDiffusion:
@@ -34,6 +53,29 @@ class FixedLongseqDiffusion:
         sample[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.0
         sample[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START] = 0.0
         return sample
+
+
+def test_evaluate_longseq_parser_defaults_use_generated_artifact_layout():
+    args = build_arg_parser().parse_args(["--model_path", "model000000000.pt"])
+
+    assert_generated_layout_path(args.eval_root, GENERATED_LONGSEQ_EVAL_ROOT)
+    assert_generated_layout_path(args.normalizer_dir, GENERATED_NORMALIZER_ROOT)
+
+
+def test_evaluate_longseq_parser_preserves_explicit_path_overrides():
+    args = build_arg_parser().parse_args(
+        [
+            "--model_path",
+            "model000000000.pt",
+            "--eval_root",
+            "custom/longseq_eval",
+            "--normalizer_dir",
+            "custom/normalizer",
+        ]
+    )
+
+    assert normalized_path_text(args.eval_root) == "custom/longseq_eval"
+    assert normalized_path_text(args.normalizer_dir) == "custom/normalizer"
 
 
 def test_evaluate_longseq_entries_writes_per_sequence_and_aggregate_summary(tmp_path):

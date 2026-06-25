@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +16,85 @@ from utils.run_dirs import read_latest_pointer
 from visual_editor.models import StudioConfig
 from visual_editor.realtime_pose import load_task_npz
 from visual_editor.services import MotionStudioService
+
+
+GENERATED_SOURCE_ROOT = "dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz"
+GENERATED_TASK_ROOT = "dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks"
+LEGACY_PARENT_LOCAL_MARKERS = (
+    "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+    "dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+)
+
+
+def normalized_path_text(value) -> str:
+    return str(value).replace("\\", "/")
+
+
+def assert_generated_layout_path(value, expected_suffix: str) -> None:
+    text = normalized_path_text(value)
+    assert text.endswith(expected_suffix)
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in text
+
+
+def import_server_with_optional_dependency_stubs(monkeypatch):
+    class FakeFastAPI:
+        def __init__(self, *args, **kwargs):
+            self.state = types.SimpleNamespace()
+
+        def add_middleware(self, *args, **kwargs):
+            return None
+
+        def get(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def post(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def patch(self, *args, **kwargs):
+            return lambda fn: fn
+
+    class FakeHTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class FakeBaseModel:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+        def model_dump(self, exclude_none: bool = False):
+            payload = dict(self.__dict__)
+            if exclude_none:
+                payload = {key: value for key, value in payload.items() if value is not None}
+            return payload
+
+    def fake_field(default=None, default_factory=None, **kwargs):
+        del kwargs
+        if default_factory is not None:
+            return default_factory()
+        return default
+
+    fake_fastapi = types.ModuleType("fastapi")
+    fake_fastapi.FastAPI = FakeFastAPI
+    fake_fastapi.HTTPException = FakeHTTPException
+    fake_middleware = types.ModuleType("fastapi.middleware")
+    fake_cors = types.ModuleType("fastapi.middleware.cors")
+    fake_cors.CORSMiddleware = object
+    fake_pydantic = types.ModuleType("pydantic")
+    fake_pydantic.BaseModel = FakeBaseModel
+    fake_pydantic.Field = fake_field
+    monkeypatch.setitem(sys.modules, "fastapi", fake_fastapi)
+    monkeypatch.setitem(sys.modules, "fastapi.middleware", fake_middleware)
+    monkeypatch.setitem(sys.modules, "fastapi.middleware.cors", fake_cors)
+    monkeypatch.setitem(sys.modules, "pydantic", fake_pydantic)
+    sys.modules.pop("visual_editor.server", None)
+
+    from visual_editor import server
+
+    return server
 
 
 def write_task_variant(source_task: Path, output_task: Path, drop_keys: set[str] | None = None, **overrides) -> None:
@@ -52,13 +133,74 @@ def generate_first_task(tmp_path: Path) -> Path:
     return manifest_path.parent / entry["task_path"]
 
 
-def test_visual_editor_ai_index_defaults_to_root_y0_schema():
+def test_visual_editor_server_defaults_use_generated_artifact_layout(monkeypatch, tmp_path):
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_OUTPUT_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("REALTIME_POSE_EDITOR_SOURCE_DIR", raising=False)
+    monkeypatch.delenv("REALTIME_POSE_EDITOR_DATA_DIR", raising=False)
+
+    server = import_server_with_optional_dependency_stubs(monkeypatch)
+
+    config = server.config_from_env()
+    args = server.build_argument_parser().parse_args([])
+
+    assert_generated_layout_path(config.source_dir, GENERATED_SOURCE_ROOT)
+    assert_generated_layout_path(config.data_dir, GENERATED_TASK_ROOT)
+    assert_generated_layout_path(args.source_dir, GENERATED_SOURCE_ROOT)
+    assert_generated_layout_path(args.data_dir, GENERATED_TASK_ROOT)
+
+
+def test_visual_editor_server_preserves_env_path_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_OUTPUT_DIR", str(tmp_path / "exports"))
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_SOURCE_DIR", "custom/source")
+    monkeypatch.setenv("REALTIME_POSE_EDITOR_DATA_DIR", "custom/tasks")
+
+    server = import_server_with_optional_dependency_stubs(monkeypatch)
+
+    config = server.config_from_env()
+    args = server.build_argument_parser().parse_args([])
+
+    assert normalized_path_text(config.source_dir) == "custom/source"
+    assert normalized_path_text(config.data_dir) == "custom/tasks"
+    assert normalized_path_text(args.source_dir) == "custom/source"
+    assert normalized_path_text(args.data_dir) == "custom/tasks"
+
+
+def test_visual_editor_ai_index_defaults_to_generated_layout():
     index_path = Path("visual_editor/ai_index.json")
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     api = payload["entrypoints"]["api"]
-    assert "body_fbx_local_root_y0" in api
+    assert GENERATED_SOURCE_ROOT in api
+    assert GENERATED_TASK_ROOT in api
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in api
     assert "body_fbx_local_root_y0" in payload["data_contract"]["source"]
     assert REALTIME_POSE_SCHEMA_NAME in payload["data_contract"]["source"]
+
+
+def test_visual_editor_readme_examples_use_generated_layout():
+    readme = Path("visual_editor/README.md").read_text(encoding="utf-8")
+
+    assert GENERATED_SOURCE_ROOT in readme
+    assert GENERATED_TASK_ROOT in readme
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in readme
+
+
+def test_visual_editor_launcher_defaults_use_generated_layout():
+    launcher_paths = [
+        Path("visual_editor/electron/main.cjs"),
+        Path("visual_editor/scripts/start.ps1"),
+        Path("visual_editor/scripts/start_web.ps1"),
+    ]
+
+    for path in launcher_paths:
+        text = normalized_path_text(path.read_text(encoding="utf-8"))
+        assert GENERATED_SOURCE_ROOT in text
+        assert GENERATED_TASK_ROOT in text
+        for marker in LEGACY_PARENT_LOCAL_MARKERS:
+            assert marker not in text
 
 
 def test_visual_editor_task_loader_rejects_missing_contract_metadata(tmp_path):

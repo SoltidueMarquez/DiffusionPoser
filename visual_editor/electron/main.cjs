@@ -12,6 +12,8 @@ app.commandLine.appendSwitch("disable-gpu-compositing");
 
 const editorRoot = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(editorRoot, "..");
+const preferredDataDir = path.join(repoRoot, "dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks");
+const preferredSourceDir = path.join(repoRoot, "dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz");
 const apiPort = process.env.REALTIME_POSE_EDITOR_PORT || "8765";
 let serverProcess = null;
 let shutdownTimer = null;
@@ -41,9 +43,9 @@ function startServer() {
     "--amass_dir",
     envOrDefault("REALTIME_POSE_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
     "--data_dir",
-    envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks")),
+    envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", preferredDataDir),
     "--source_dir",
-    envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz")),
+    envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", preferredSourceDir),
     "--result_dir",
     envOrDefault("REALTIME_POSE_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
     "--output_dir",
@@ -59,8 +61,8 @@ function startServer() {
       PYTHONPATH: repoRoot,
       REALTIME_POSE_EDITOR_RUNTIME_DIR: envOrDefault("REALTIME_POSE_EDITOR_RUNTIME_DIR", path.join(editorRoot, ".runtime")),
       REALTIME_POSE_EDITOR_AMASS_DIR: envOrDefault("REALTIME_POSE_EDITOR_AMASS_DIR", path.join(repoRoot, "dataset", "AMASS")),
-      REALTIME_POSE_EDITOR_DATA_DIR: envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks")),
-      REALTIME_POSE_EDITOR_SOURCE_DIR: envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", path.join(repoRoot, "dataset", "AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz")),
+      REALTIME_POSE_EDITOR_DATA_DIR: envOrDefault("REALTIME_POSE_EDITOR_DATA_DIR", preferredDataDir),
+      REALTIME_POSE_EDITOR_SOURCE_DIR: envOrDefault("REALTIME_POSE_EDITOR_SOURCE_DIR", preferredSourceDir),
       REALTIME_POSE_EDITOR_RESULT_DIR: envOrDefault("REALTIME_POSE_EDITOR_RESULT_DIR", path.join(repoRoot, "output")),
       REALTIME_POSE_EDITOR_OUTPUT_DIR: envOrDefault("REALTIME_POSE_EDITOR_OUTPUT_DIR", path.join(editorRoot, ".runtime", "exports")),
     },

@@ -5,7 +5,7 @@
 ## 启动 API
 
 ```powershell
-conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server --source_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz --data_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports
+conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server --source_dir dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz --data_dir dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports
 ```
 
 ## 数据

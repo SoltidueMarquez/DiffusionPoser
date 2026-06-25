@@ -14,11 +14,12 @@ import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root, default_realtime_pose_task_root
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
-DEFAULT_TASK_ROOT = "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks"
-DEFAULT_LONGSEQ_EVAL_ROOT = "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_longseq_eval"
+DEFAULT_TASK_ROOT = str(default_realtime_pose_task_root())
+DEFAULT_LONGSEQ_EVAL_ROOT = str(default_realtime_pose_longseq_eval_root())
 DEFAULT_LONGSEQ_RUN_NAME = "v1_test_stress_long_seed10"
 LONGSEQ_LATEST_KIND = "longseq_eval"
 PRESET_STRESS_LONG = "stress_long"

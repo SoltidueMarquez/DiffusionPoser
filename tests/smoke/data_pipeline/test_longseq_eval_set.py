@@ -4,6 +4,7 @@ import argparse
 import json
 
 from data_loaders.build_realtime_longseq_eval_set import (
+    build_arg_parser,
     build_realtime_longseq_eval_set,
     read_longseq_manifest,
     resolve_manifest_source_path,
@@ -11,7 +12,72 @@ from data_loaders.build_realtime_longseq_eval_set import (
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
+from utils.parser_util import add_data_options
 from utils.run_dirs import read_latest_pointer
+
+
+GENERATED_TASK_ROOT = "dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_tasks"
+GENERATED_NORMALIZER_ROOT = "dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_train"
+GENERATED_LONGSEQ_EVAL_ROOT = "dataset/generated/longseq_eval/realtime_pose_stationary5_v1/amass_60hz_test_stress_long"
+LEGACY_PARENT_LOCAL_MARKERS = (
+    "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+    "dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+)
+
+
+def normalized_path_text(value) -> str:
+    return str(value).replace("\\", "/")
+
+
+def assert_generated_layout_path(value, expected_suffix: str) -> None:
+    text = normalized_path_text(value)
+    assert text.endswith(expected_suffix)
+    for marker in LEGACY_PARENT_LOCAL_MARKERS:
+        assert marker not in text
+
+
+def test_longseq_eval_builder_defaults_use_generated_artifact_layout():
+    args = build_arg_parser().parse_args([])
+
+    assert_generated_layout_path(args.task_dir, GENERATED_TASK_ROOT)
+    assert_generated_layout_path(args.output_root, GENERATED_LONGSEQ_EVAL_ROOT)
+
+
+def test_longseq_eval_builder_preserves_explicit_path_overrides():
+    args = build_arg_parser().parse_args(
+        [
+            "--task_dir",
+            "custom/tasks",
+            "--output_root",
+            "custom/longseq_eval",
+        ]
+    )
+
+    assert normalized_path_text(args.task_dir) == "custom/tasks"
+    assert normalized_path_text(args.output_root) == "custom/longseq_eval"
+
+
+def test_data_options_default_normalizer_uses_generated_artifact_layout():
+    parser = argparse.ArgumentParser()
+    add_data_options(parser)
+    args = parser.parse_args(["--data_dir", "custom/tasks"])
+
+    assert_generated_layout_path(args.normalizer_dir, GENERATED_NORMALIZER_ROOT)
+
+
+def test_data_options_preserves_explicit_normalizer_override():
+    parser = argparse.ArgumentParser()
+    add_data_options(parser)
+    args = parser.parse_args(
+        [
+            "--data_dir",
+            "custom/tasks",
+            "--normalizer_dir",
+            "custom/normalizer",
+        ]
+    )
+
+    assert normalized_path_text(args.normalizer_dir) == "custom/normalizer"
 
 
 def test_longseq_eval_builder_selects_test_non_mirror_long_sources(tmp_path):

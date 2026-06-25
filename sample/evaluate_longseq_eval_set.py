@@ -52,6 +52,7 @@ from sample.simulate_unity_stream import (
 )
 from sample.utils import load_checkpoint_model
 from utils import dist_util
+from utils.default_artifact_paths import default_realtime_pose_normalizer_root
 from utils.model_util import create_model_and_diffusion
 from utils.normalizer import RealtimePoseNormalizer
 from utils.parser_util import (
@@ -80,7 +81,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     longseq.add_argument("--eval_set", default="latest", type=str)
     longseq.add_argument("--schema", default=None, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    longseq.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    longseq.add_argument("--normalizer_dir", default=str(default_realtime_pose_normalizer_root()), type=str)
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
     longseq.add_argument("--input_feats", default=schema.feature_dim, type=int)
     longseq.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)

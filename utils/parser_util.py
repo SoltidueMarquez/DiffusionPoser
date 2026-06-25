@@ -14,6 +14,7 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 from schemas.registry import list_schema_names
+from utils.default_artifact_paths import default_realtime_pose_normalizer_root
 from utils.schema_resolution import has_explicit_schema_arg, resolve_runtime_schema
 
 
@@ -105,7 +106,7 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=TRAIN_REALTIME_POSE_SCHEMA_NAMES, type=str)
     group.add_argument("--data_dir", required=True, type=str, help="realtime_pose materialized task 目录。")
     group.add_argument("--data_split", default="train", type=str)
-    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    group.add_argument("--normalizer_dir", default=str(default_realtime_pose_normalizer_root()), type=str)
     group.add_argument("--normalize_input", default=True, type=str2bool)
     group.add_argument("--preload_data", default=False, type=str2bool)
     group.add_argument("--input_feats", default=default_schema.feature_dim, type=int)

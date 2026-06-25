@@ -22,6 +22,12 @@ def normalizer_root(roots: Any, schema_name: str, normalizer_name: str) -> Path:
     return Path(roots.generated_root) / "normalizers" / schema / normalizer
 
 
+def longseq_eval_root(roots: Any, schema_name: str, eval_set_name: str) -> Path:
+    schema = _validate_path_name(schema_name, "schema_name")
+    eval_set = _validate_path_name(eval_set_name, "eval_set_name")
+    return Path(roots.generated_root) / "longseq_eval" / schema / eval_set
+
+
 def run_root(schema_name: str, experiment_name: str, base_dir: str | Path = "runs") -> Path:
     schema = _validate_path_name(schema_name, "schema_name")
     experiment = _validate_path_name(experiment_name, "experiment_name")
