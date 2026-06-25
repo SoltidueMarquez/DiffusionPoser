@@ -26,6 +26,7 @@ from data_loaders.sensor_masking import (  # noqa: E402
     REALTIME_POSE_TARGET_START,
     get_schema_spec,
 )
+from schemas.base import SchemaSpec  # noqa: E402
 from utils.model_util import create_model_and_diffusion  # noqa: E402
 from write_unity_runtime_assets import default_unity_model_dir, validate_normalizer_metadata, write_runtime_assets  # noqa: E402
 
@@ -112,7 +113,34 @@ def load_checkpoint_args(model_path: Path) -> dict[str, Any]:
         return json.load(file)
 
 
+def checkpoint_exact_schema_name(checkpoint_args: dict[str, Any]) -> str | None:
+    names: dict[str, str] = {}
+    for key in ("schema", "schema_name"):
+        value = checkpoint_args.get(key)
+        if value is None or str(value).strip() == "":
+            continue
+        names[key] = str(value)
+    unique_names = set(names.values())
+    if len(unique_names) > 1:
+        raise ValueError(f"checkpoint args.json schema 元数据不一致: {names}")
+    return next(iter(unique_names), None)
+
+
+def resolve_export_schema(cli_schema: str | None, checkpoint_args: dict[str, Any]) -> SchemaSpec:
+    checkpoint_schema = checkpoint_exact_schema_name(checkpoint_args)
+    requested_schema = None if cli_schema is None or str(cli_schema).strip() == "" else str(cli_schema)
+    if checkpoint_schema is not None:
+        if requested_schema is not None and requested_schema != checkpoint_schema:
+            raise ValueError(
+                "Sentis export 要求 CLI --schema 与 checkpoint exact schema 完全一致："
+                f"checkpoint schema={checkpoint_schema!r}, CLI --schema={requested_schema!r}。"
+            )
+        return get_schema_spec(checkpoint_schema)
+    return get_schema_spec(requested_schema or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+
+
 def validate_normalizer_export_contract(cli_args: argparse.Namespace, checkpoint_args: dict[str, Any]) -> None:
+    schema = resolve_export_schema(getattr(cli_args, "schema", None), checkpoint_args)
     checkpoint_normalize_input = bool(checkpoint_args.get("normalize_input", True))
     export_normalize_input = bool(cli_args.normalize_input)
     normalizer_dir = Path(cli_args.normalizer_dir).resolve() if cli_args.normalizer_dir else None
@@ -133,17 +161,22 @@ def validate_normalizer_export_contract(cli_args: argparse.Namespace, checkpoint
             "导出 normalized checkpoint 时缺少 normalizer 文件："
             + ", ".join(str(path) for path in missing)
         )
+    validate_normalizer_metadata(normalizer_dir=normalizer_dir, schema_name=schema.name)
 
 
-    schema_name = str(getattr(cli_args, "schema", None) or checkpoint_args.get("schema") or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
-    validate_normalizer_metadata(normalizer_dir=normalizer_dir, schema_name=schema_name)
-
-
-def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:
+def build_model_config(
+    cli_args: argparse.Namespace,
+    checkpoint_args: dict[str, Any] | None = None,
+) -> SimpleNamespace:
     config = dict(DEFAULT_MODEL_CONFIG)
-    checkpoint_args = load_checkpoint_args(Path(cli_args.model_path))
-    config.update({key: value for key, value in checkpoint_args.items() if key in config})
+    if checkpoint_args is None:
+        checkpoint_args = load_checkpoint_args(Path(cli_args.model_path))
+    schema = resolve_export_schema(getattr(cli_args, "schema", None), checkpoint_args)
+    config.update({key: value for key, value in checkpoint_args.items() if key in config and key != "schema"})
+    config["schema"] = schema.name
     for key in DEFAULT_MODEL_CONFIG:
+        if key == "schema":
+            continue
         value = getattr(cli_args, key)
         if value is not None:
             config[key] = value
@@ -164,6 +197,7 @@ def build_model_config(cli_args: argparse.Namespace) -> SimpleNamespace:
     config["predict_xstart"] = int(config["predict_xstart"])
     if not bool(config["predict_xstart"]):
         raise ValueError("Unity Sentis export requires predict_xstart=true. Epsilon-prediction checkpoints are rejected.")
+    config["schema_canonical_name"] = schema.canonical_name
     return SimpleNamespace(**config)
 
 
@@ -307,7 +341,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     checkpoint_args = load_checkpoint_args(model_path)
     validate_normalizer_export_contract(cli_args=cli_args, checkpoint_args=checkpoint_args)
     device = torch.device(cli_args.device)
-    model_config = build_model_config(cli_args)
+    model_config = build_model_config(cli_args, checkpoint_args=checkpoint_args)
     schema = get_schema_spec(model_config.schema)
 
     model, _diffusion = create_model_and_diffusion(model_config)
@@ -358,6 +392,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "model_source": model_source,
         "max_abs_error": max_abs_error,
         "schema_name": schema.name,
+        "schema_canonical_name": schema.canonical_name,
         "feature_dim": schema.feature_dim,
         "sequence_length": REALTIME_POSE_SEQ_LEN,
     }

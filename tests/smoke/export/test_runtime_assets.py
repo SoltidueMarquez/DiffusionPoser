@@ -13,9 +13,22 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     get_schema_spec,
 )
-from export.export_sentis_denoiser import validate_normalizer_export_contract
-from export.write_unity_runtime_assets import build_normalizer, write_runtime_assets
+from export.export_sentis_denoiser import (
+    DEFAULT_MODEL_CONFIG,
+    build_model_config,
+    validate_normalizer_export_contract,
+)
+from export.write_unity_runtime_assets import (
+    build_normalizer,
+    build_realtime_pose_feature_schema,
+    write_runtime_assets,
+)
+from schemas.registry import get_schema_adapter
 from utils.normalizer import RealtimePoseNormalizer
+
+
+CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
+LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
 
 
 def write_legacy_policyless_normalizer(normalizer_dir, schema):
@@ -33,6 +46,13 @@ def write_legacy_policyless_normalizer(normalizer_dir, schema):
         ),
         encoding="utf-8",
     )
+
+
+def make_sentis_cli_args(model_path, **overrides):
+    values = {key: None for key in DEFAULT_MODEL_CONFIG}
+    values.update({"model_path": str(model_path)})
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def test_runtime_assets_are_realtime_pose_only(tmp_path):
@@ -62,6 +82,27 @@ def test_runtime_assets_are_realtime_pose_only(tmp_path):
     assert schema["runtimeRules"]["rootPositionY"] == schema_spec.root_y_policy
     assert schema["runtimeRules"]["pelvisHeightApplication"] == schema_spec.pelvis_height_mode
     assert schema["runtimeRules"]["onnxDummyInputShape"] == [1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN]
+
+
+def test_runtime_assets_write_exact_schema_for_stationary5_aliases(tmp_path):
+    for schema_name in (CANONICAL_SCHEMA_NAME, LEGACY_SCHEMA_NAME):
+        assets = write_runtime_assets(
+            output_dir=tmp_path / schema_name,
+            normalize_input=False,
+            schema_name=schema_name,
+        )
+
+        feature_schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
+
+        assert feature_schema["schemaName"] == schema_name
+        assert feature_schema["featureDim"] == 214
+        assert feature_schema["runtimeRules"]["rootPositionY"] == "fixed_zero"
+
+
+def test_export_feature_schema_matches_legacy_adapter_builder():
+    assert build_realtime_pose_feature_schema(schema_name=LEGACY_SCHEMA_NAME) == get_schema_adapter(
+        LEGACY_SCHEMA_NAME
+    ).build_unity_feature_schema()
 
 
 def test_realtime_normalizer_requires_schema_dimensions(tmp_path):
@@ -152,3 +193,27 @@ def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():
     args = SimpleNamespace(normalize_input=True, normalizer_dir="")
     with pytest.raises(FileNotFoundError):
         validate_normalizer_export_contract(args, {"normalize_input": True})
+
+
+def test_sentis_export_rejects_cli_schema_when_checkpoint_exact_schema_differs(tmp_path):
+    checkpoint = tmp_path / "model000000001.pt"
+    checkpoint.write_bytes(b"")
+    legacy = get_schema_spec(LEGACY_SCHEMA_NAME)
+    (tmp_path / "args.json").write_text(
+        json.dumps(
+            {
+                "schema": LEGACY_SCHEMA_NAME,
+                "schema_name": LEGACY_SCHEMA_NAME,
+                "schema_canonical_name": legacy.canonical_name,
+                "input_feats": legacy.feature_dim,
+                "seq_len": legacy.seq_len,
+                "max_seq_len": legacy.seq_len,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = make_sentis_cli_args(checkpoint, schema=CANONICAL_SCHEMA_NAME)
+
+    with pytest.raises(ValueError, match="schema"):
+        build_model_config(args)

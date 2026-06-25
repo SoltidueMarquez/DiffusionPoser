@@ -14,32 +14,15 @@ if str(DIFFUSIONPOSER_ROOT) not in sys.path:
     sys.path.insert(0, str(DIFFUSIONPOSER_ROOT))
 
 
-from data_loaders.realtime_pose_kinematics import SMPL_JOINT_NAMES, TRACKER_JOINT_INDICES  # noqa: E402
 from data_loaders.sensor_masking import (  # noqa: E402
-    BODY_POSE_DIM,
-    BODY_POSE_START,
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    HIP_TRACKER_INDEX,
-    MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_KEY,
-    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_LENGTH,
-    REALTIME_POSE_TARGET_START,
-    ROOT_YAW_DELTA_DIM,
-    ROOT_YAW_DELTA_START,
-    SENSOR_VALID_DIM,
-    STATIONARY_JOINT_INDICES,
-    STATIONARY_JOINT_NAMES,
-    STATIONARY_PROB_DIM,
-    TRACKER_COUNT,
-    TRACKER_NAMES,
-    TRACKER_POS_DIM,
-    TRACKER_ROT_DIM,
     get_schema_spec,
     validate_pose_representation,
 )
+from schemas.registry import get_schema_adapter  # noqa: E402
 from utils.normalizer import enforce_realtime_pose_normalizer_contract  # noqa: E402
 
 
@@ -65,70 +48,15 @@ def build_realtime_pose_feature_schema(
     sequence_length: int = REALTIME_POSE_SEQ_LEN,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, Any]:
-    schema = get_schema_spec(schema_name)
+    adapter = get_schema_adapter(schema_name)
+    schema = adapter.spec
     feature_dim = schema.feature_dim if feature_dim is None else int(feature_dim)
     if int(feature_dim) != schema.feature_dim:
         raise ValueError(f"{schema.name} featureDim 必须为 {schema.feature_dim}，实际为 {feature_dim}")
-    if int(sequence_length) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"realtime_pose sequenceLength 必须为 {REALTIME_POSE_SEQ_LEN}，实际为 {sequence_length}")
+    if int(sequence_length) != schema.seq_len:
+        raise ValueError(f"{schema.name} sequenceLength 必须为 {schema.seq_len}，实际为 {sequence_length}")
 
-    is_body_fbx_local = schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D
-    payload = {
-        "schemaVersion": 4 if is_body_fbx_local else 2,
-        "schemaName": schema.name,
-        "poseRepresentation": schema.pose_representation,
-        "featureDim": schema.feature_dim,
-        "sequenceLength": REALTIME_POSE_SEQ_LEN,
-        "targetStart": REALTIME_POSE_TARGET_START,
-        "targetLength": REALTIME_POSE_TARGET_LENGTH,
-        "targetFeatureLength": schema.target_dim,
-        "boneCount": len(SMPL_JOINT_NAMES),
-        "boneNames": list(SMPL_JOINT_NAMES),
-        "trackerCount": TRACKER_COUNT,
-        "trackerNames": list(TRACKER_NAMES),
-        "trackerJointIndices": [int(value) for value in TRACKER_JOINT_INDICES.tolist()],
-        "hipTrackerIndex": HIP_TRACKER_INDEX,
-        "minValidTrackers": MIN_VALID_TRACKERS,
-        "bodyPoseBodyFbxLocalDelta6d" if is_body_fbx_local else "bodyPoseRootGlobal6d": {
-            "name": schema.body_pose_key,
-            "start": BODY_POSE_START,
-            "length": BODY_POSE_DIM,
-        },
-        "rootHeadingDeltaSinCos" if is_body_fbx_local else "rootYawDeltaSinCos": {
-            "name": schema.root_heading_delta_key,
-            "start": ROOT_YAW_DELTA_START,
-            "length": ROOT_YAW_DELTA_DIM,
-        },
-        "trackerPositionReference": {"name": "tracker_pos_ref", "start": schema.tracker_pos_ref_start, "length": TRACKER_POS_DIM},
-        "trackerRotation6dReference": {"name": "tracker_rot_ref_6d", "start": schema.tracker_rot_ref_start, "length": TRACKER_ROT_DIM},
-        "sensorValid": {"name": "sensor_valid", "start": schema.sensor_valid_start, "length": SENSOR_VALID_DIM},
-        "runtimeRules": {
-            "poseRepresentation": schema.pose_representation,
-            "rootPositionY": schema.root_y_policy,
-            "pelvisHeightApplication": schema.pelvis_height_mode,
-            "requiresHipTracker": True,
-            "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
-            "trackerReferenceYaw": "previous_frame_root_heading" if is_body_fbx_local else "previous_frame_root_yaw",
-            "onnxDummyInputShape": [1, schema.feature_dim, REALTIME_POSE_SEQ_LEN],
-            "failSafe": "hold_previous_frame_when_tracker_validity_fails",
-        },
-    }
-    if schema.supports_root_motion:
-        payload["rootDeltaXZReference"] = {"name": "root_delta_xz_ref", "start": schema.root_delta_xz_start, "length": 2}
-        payload["pelvisHeight" if is_body_fbx_local else "rootHeight"] = {
-            "name": schema.pelvis_height_key,
-            "start": schema.root_height_start,
-            "length": 1,
-        }
-    if schema.supports_stationary_prob:
-        payload["stationaryProb5"] = {
-            "name": "stationary_prob_5",
-            "start": schema.stationary_prob_start,
-            "length": STATIONARY_PROB_DIM,
-            "jointIndices": [int(value) for value in STATIONARY_JOINT_INDICES],
-            "jointNames": list(STATIONARY_JOINT_NAMES),
-        }
-    return payload
+    return dict(adapter.build_unity_feature_schema())
 
 
 def build_ddim_schedule(
