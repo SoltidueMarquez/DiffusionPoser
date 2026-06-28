@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_START, get_schema_spec
 from model.causal_attention import build_target_dit_causal_mask
-from model.diffusionposer_dit import SinusoidalTimestepEmbedding
+from model.diffusionposer_dit import SinusoidalTimestepEmbedding, StationaryHead
 
 
 class SensorTokenEncoder(nn.Module):
@@ -46,6 +46,7 @@ class RealtimePoseTargetDiT(nn.Module):
         dropout: float = 0.0,
         zero_init: bool = False,
         max_seq_len: int = 61,
+        use_stationary_head: bool = False,
     ):
         super().__init__()
         self.schema = get_schema_spec(schema_name)
@@ -53,6 +54,7 @@ class RealtimePoseTargetDiT(nn.Module):
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
         self.max_seq_len = int(max_seq_len)
+        self.use_stationary_head = bool(use_stationary_head)
         if self.input_feats != self.schema.feature_dim:
             raise ValueError(f"{self.schema.name} 需要 input_feats={self.schema.feature_dim}，实际为 {self.input_feats}")
 
@@ -72,6 +74,7 @@ class RealtimePoseTargetDiT(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(self.latent_dim, self.schema.target_dim)
+        self.stationary_head = StationaryHead(self.latent_dim) if self.use_stationary_head else None
         if zero_init:
             nn.init.zeros_(self.output_proj.weight)
             nn.init.zeros_(self.output_proj.bias)
@@ -86,8 +89,9 @@ class RealtimePoseTargetDiT(nn.Module):
         inpaint_cond: Optional[torch.Tensor] = None,
         valid_frame_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        return_stationary_head: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         if hidden_states.dim() != 3:
             raise ValueError(f"hidden_states 应为 [B,C,T]，实际为 {tuple(hidden_states.shape)}")
         batch_size, channels, seq_len = hidden_states.shape
@@ -129,14 +133,20 @@ class RealtimePoseTargetDiT(nn.Module):
             device=hidden_states.device,
         )
         hidden = self.transformer(tokens, mask=causal_mask, src_key_padding_mask=token_mask)
-        pred_target = self.output_proj(hidden[:, 0])
+        target_hidden = hidden[:, 0]
+        pred_target = self.output_proj(target_hidden)
         target_mask = inpaint_cond[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START].to(dtype=hidden_states.dtype)
         input_target = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
         pred_target = pred_target * target_mask + input_target * (1.0 - target_mask)
 
         output = hidden_states.clone()
         output[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START] = pred_target
-        return output
+        if not return_stationary_head:
+            return output
+        if self.stationary_head is None:
+            return {"motion": output}
+        stationary_logits = self.stationary_head(target_hidden)
+        return {"motion": output, "stationary_logits": stationary_logits}
 
     def _extract_sensor_values(self, hidden_states: torch.Tensor) -> torch.Tensor:
         values = []

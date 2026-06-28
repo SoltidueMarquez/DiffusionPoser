@@ -217,6 +217,7 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--zero_init", action="store_true")
     group.add_argument("--max_seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--model_arch", default="full_feature_dit", choices=["full_feature_dit", "target_dit"], type=str)
+    group.add_argument("--use_stationary_head", default=False, action=BooleanOptionalAction)
 
 
 def add_diffusion_options(parser: ArgumentParser):
@@ -242,6 +243,7 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--checkpoint_max_keep", default=0, type=int)
     group.add_argument("--num_steps", default=1_000_000, type=int)
     group.add_argument("--resume_checkpoint", default="", type=str)
+    group.add_argument("--init_checkpoint", default="", type=str)
     group.add_argument("--gradient_clip", action="store_true")
     group.add_argument("--weighted_loss", action="store_true")
     group.add_argument("--feature_w_file", default="feature_w.pt", type=str)
@@ -255,6 +257,9 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--root_delta_loss_weight", default=1.0, type=float)
     group.add_argument("--root_height_loss_weight", default=1.0, type=float)
     group.add_argument("--contact_loss_weight", default=0.5, type=float)
+    group.add_argument("--stationary_head_loss_weight", default=0.05, type=float)
+    group.add_argument("--freeze_non_stationary_head", default=False, action=BooleanOptionalAction)
+    group.add_argument("--stationary_head_only_loss", default=False, action=BooleanOptionalAction)
     group.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
     group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)
     group.add_argument("--tracker_pos_timestep_min_weight", default=0.1, type=float)

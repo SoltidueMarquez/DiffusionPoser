@@ -99,6 +99,27 @@ def test_runtime_assets_write_exact_schema_for_stationary5_aliases(tmp_path):
         assert feature_schema["runtimeRules"]["rootPositionY"] == "fixed_zero"
 
 
+def test_sibling_unity_runtime_accepts_current_stationary5_schema_name():
+    unity_schema_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[3].parent
+        / "SIGGRAPH2024Unity"
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Features"
+        / "PoseFeatureSchema.cs"
+    )
+    if not unity_schema_path.exists():
+        pytest.skip("Sibling Unity project is not available in this workspace.")
+
+    source = unity_schema_path.read_text(encoding="utf-8")
+
+    assert 'RealtimePoseSchemaName = "realtime_pose_stationary5_v1"' in source
+    assert 'LegacyRealtimePoseSchemaName = "realtime_pose_body_fbx_local_root_y0_v1"' in source
+    assert "IsSupportedSchemaName" in source
+
+
 def test_export_feature_schema_matches_legacy_adapter_builder():
     assert build_realtime_pose_feature_schema(schema_name=LEGACY_SCHEMA_NAME) == get_schema_adapter(
         LEGACY_SCHEMA_NAME
@@ -187,6 +208,22 @@ def test_runtime_assets_default_to_body_fbx_local(tmp_path):
     assert schema["rootDeltaXZReference"]["start"] == schema_spec.root_delta_xz_start
     assert schema["pelvisHeight"]["start"] == schema_spec.root_height_start
     assert schema["stationaryProb5"]["start"] == schema_spec.stationary_prob_start
+
+
+def test_runtime_assets_can_advertise_stationary_head_output(tmp_path):
+    assets = write_runtime_assets(
+        output_dir=tmp_path,
+        normalize_input=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+        stationary_head_output_enabled=True,
+    )
+    schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
+    assert schema["stationaryProb5Output"] == {
+        "enabled": True,
+        "name": "stationary_prob5",
+        "length": 5,
+        "valueType": "probability",
+    }
 
 
 def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():

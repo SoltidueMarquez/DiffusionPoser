@@ -21,7 +21,14 @@ from data_loaders.sensor_masking import (
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.diffusionposer_dit import DiffusionPoserDiT
-from train.training_loop import TrainLoop, validate_finite_losses
+from train.train_diffusionposer import resolve_run_label
+from train.training_loop import (
+    TrainLoop,
+    is_stationary_head_key,
+    log_loss_dict,
+    validate_finite_losses,
+    validate_loaded_state_dict_keys,
+)
 from utils import dist_util
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, write_toy_source_dataset
 
@@ -77,6 +84,86 @@ def test_model_forward_has_frame_positional_embedding_and_seq_limit():
     assert tuple(y.shape) == tuple(x.shape)
     with pytest.raises(ValueError, match="max_seq_len"):
         model(torch.zeros(1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN + 1), torch.zeros(1))
+
+
+def test_training_loss_adds_stationary_head_loss_when_enabled():
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    batch_size = 2
+    model = DiffusionPoserDiT(
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+        use_stationary_head=True,
+    )
+    diffusion = _make_loss_test_diffusion()
+    sample = torch.zeros(batch_size, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+    mask = torch.zeros_like(sample, dtype=torch.bool)
+    mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
+    model_kwargs = {
+        "inpaint_cond": mask,
+        "y": {
+            "mask": mask,
+            "target_stationary_prob_5": torch.rand(batch_size, 5),
+        },
+    }
+    losses = diffusion.training_losses(
+        model,
+        sample,
+        torch.zeros(batch_size, dtype=torch.long),
+        model_kwargs=model_kwargs,
+        snr_gamma=0.0,
+    )
+    assert {"stationary_head_loss", "stationary_head_prob_mean", "stationary_head_prob_min", "stationary_head_prob_max"}.issubset(losses)
+    assert tuple(losses["stationary_head_loss"].shape) == (batch_size,)
+    assert torch.allclose(
+        losses["loss"],
+        losses["simple_loss"] + diffusion.stationary_head_loss_weight * losses["stationary_head_loss"],
+    )
+
+
+def test_init_checkpoint_key_validation_only_allows_stationary_head_mismatch():
+    validate_loaded_state_dict_keys(
+        missing_keys=["stationary_head.net.0.weight", "stationary_head.net.0.bias"],
+        unexpected_keys=[],
+        allow_stationary_head_mismatch=True,
+        source="init checkpoint",
+    )
+    with pytest.raises(RuntimeError, match="frame_proj.weight"):
+        validate_loaded_state_dict_keys(
+            missing_keys=["frame_proj.weight"],
+            unexpected_keys=[],
+            allow_stationary_head_mismatch=True,
+            source="init checkpoint",
+        )
+    with pytest.raises(RuntimeError, match="stationary_head"):
+        validate_loaded_state_dict_keys(
+            missing_keys=["stationary_head.net.0.weight"],
+            unexpected_keys=[],
+            allow_stationary_head_mismatch=False,
+            source="resume checkpoint",
+        )
+
+
+def test_auto_run_label_uses_short_stationary_head_name():
+    args = argparse.Namespace(
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        model_arch="target_dit",
+        seed=10,
+        run_name="auto",
+        use_stationary_head=True,
+    )
+    assert resolve_run_label(args) == "s5_head_tdit_seed10"
+    args.stationary_head_only_loss = True
+    assert resolve_run_label(args) == "s5_headonly_tdit_seed10"
+
+
+def test_log_loss_dict_accepts_bfloat16_values():
+    diffusion = argparse.Namespace(num_timesteps=4)
+    timesteps = torch.tensor([0, 3], dtype=torch.long)
+    losses = {"loss": torch.tensor([1.0, 2.0], dtype=torch.bfloat16)}
+    log_loss_dict(diffusion, timesteps, losses)
 
 
 def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
@@ -170,6 +257,91 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
     del model_kwargs_missing_stationary["y"]["target_stationary_prob_5"]
     with pytest.raises(KeyError, match="target_stationary_prob_5"):
         diffusion._realtime_pose_aux_losses(batch["x"], batch["x"], model_kwargs_missing_stationary)
+
+
+def test_stationary_head_only_training_freezes_backbone_and_replaces_loss(tmp_path):
+    source_dir = tmp_path / "sources"
+    task_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir",
+            str(source_dir),
+            "--output_dir",
+            str(task_dir),
+            "--splits",
+            "train",
+            "--samples_per_file",
+            "1",
+            "--schema",
+            REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir",
+            "",
+            "--overwrite",
+        ]
+    )
+    loader = get_dataset_loader(
+        data_dir=str(task_dir),
+        batch_size=1,
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        seq_len=REALTIME_POSE_SEQ_LEN,
+        split="train",
+        normalize_input=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+    )
+    batch = next(iter(loader))
+    dist_util.setup_dist(-1)
+    model = DiffusionPoserDiT(
+        input_feats=REALTIME_POSE_INPUT_DIM,
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+        use_stationary_head=True,
+    )
+    diffusion = _make_loss_test_diffusion()
+    args = argparse.Namespace(
+        batch_size=1,
+        lr=1e-4,
+        log_interval=1,
+        save_interval=0,
+        resume_checkpoint="",
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        gradient_clip=False,
+        snr_gamma=0.0,
+        l1_loss=False,
+        task_mode="realtime_pose_reconstruction",
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        checkpoint_max_keep=0,
+        save_dir=str(tmp_path / "run"),
+        num_steps=1,
+        eval_during_training=False,
+        eval_num_batches=1,
+        weighted_loss=False,
+        normalizer_dir="",
+        feature_w_file="feature_w.pt",
+        model_ema=False,
+        freeze_non_stationary_head=True,
+        stationary_head_only_loss=True,
+    )
+    loop = TrainLoop(args, train_platform=NoopPlatform(), model=model, diffusion=diffusion, data=loader)
+
+    for name, param in model.named_parameters():
+        assert param.requires_grad is is_stationary_head_key(name)
+    losses = loop.compute_losses(batch=batch, timesteps=torch.zeros(1, dtype=torch.long))
+
+    assert "pose_loss_frozen" in losses
+    assert "stationary_head_loss" in losses
+    assert torch.allclose(losses["loss"], losses["stationary_head_loss"])
+    assert not torch.allclose(losses["loss"], losses["pose_loss_frozen"])
+
+    losses["loss"].mean().backward()
+    for name, param in model.named_parameters():
+        if is_stationary_head_key(name):
+            assert param.grad is not None
+        else:
+            assert param.grad is None
 
 
 def test_rollout_training_loss_reinjects_predicted_target_and_backprops(tmp_path):

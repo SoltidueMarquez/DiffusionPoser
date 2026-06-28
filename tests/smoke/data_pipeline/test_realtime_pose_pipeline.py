@@ -541,3 +541,17 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
         assert payload["normalizer_name"] == "toy_norm"
         assert payload["task_dir"] == str(task_output_dir)
         assert payload["output_dir"] == str(normalizer_output_dir)
+def test_pipeline_allows_partial_conversion_by_default(tmp_path):
+    args = parse_pipeline_args(tmp_path)
+
+    convert_args = pipeline.build_convert_args(args)
+
+    assert "--allow_partial" in convert_args
+
+
+def test_pipeline_can_disable_partial_conversion_for_strict_runs(tmp_path):
+    args = parse_pipeline_args(tmp_path, "--no-allow_partial")
+
+    convert_args = pipeline.build_convert_args(args)
+
+    assert "--allow_partial" not in convert_args

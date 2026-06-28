@@ -23,6 +23,7 @@ from utils import dist_util
 
 CHECKPOINT_CONTRACT_KEYS = ("task_mode", "schema", "input_feats", "seq_len", "max_seq_len", "model_arch")
 CHECKPOINT_INT_CONTRACT_KEYS = {"input_feats", "seq_len", "max_seq_len"}
+STATIONARY_HEAD_KEY_PREFIX = "stationary_head."
 
 
 def validate_realtime_pose_training_args(args):
@@ -108,6 +109,32 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
         raise ValueError(f"{args_path} 与当前 {schema.name} 训练配置不兼容：{joined}")
 
 
+def is_stationary_head_key(key: str) -> bool:
+    return str(key).startswith(STATIONARY_HEAD_KEY_PREFIX)
+
+
+def validate_loaded_state_dict_keys(
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+    *,
+    allow_stationary_head_mismatch: bool,
+    source: str,
+) -> None:
+    allowed_missing = [key for key in missing_keys if allow_stationary_head_mismatch and is_stationary_head_key(key)]
+    allowed_unexpected = [key for key in unexpected_keys if allow_stationary_head_mismatch and is_stationary_head_key(key)]
+    disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
+    disallowed_unexpected = [key for key in unexpected_keys if key not in allowed_unexpected]
+    if disallowed_missing or disallowed_unexpected:
+        raise RuntimeError(
+            f"{source} does not match current model. "
+            f"missing_keys={disallowed_missing}, unexpected_keys={disallowed_unexpected}"
+        )
+    if allowed_missing:
+        logger.log(f"{source}: initialize missing stationary head keys randomly: {allowed_missing}")
+    if allowed_unexpected:
+        logger.log(f"{source}: ignore unexpected stationary head keys: {allowed_unexpected}")
+
+
 class TrainLoop:
     """realtime_pose 扩散训练循环。"""
 
@@ -125,6 +152,7 @@ class TrainLoop:
         self.log_interval = args.log_interval
         self.save_interval = args.save_interval
         self.resume_checkpoint = args.resume_checkpoint
+        self.init_checkpoint = getattr(args, "init_checkpoint", "")
         self.weight_decay = args.weight_decay
         self.lr_anneal_steps = args.lr_anneal_steps
         self.gradient_clip = args.gradient_clip
@@ -137,6 +165,8 @@ class TrainLoop:
         self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
         self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
         self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
+        self.freeze_non_stationary_head = bool(getattr(args, "freeze_non_stationary_head", False))
+        self.stationary_head_only_loss = bool(getattr(args, "stationary_head_only_loss", False))
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
         if self.rollout_steps > 2:
@@ -176,10 +206,16 @@ class TrainLoop:
             raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
         if self.device.type == "cuda":
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
+        logger.log(
+            "stationary head training: "
+            f"freeze_non_head={self.freeze_non_stationary_head}, "
+            f"head_only_loss={self.stationary_head_only_loss}"
+        )
 
         self.feature_w = self._load_feature_weights(args)
         self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
+        self._configure_trainable_parameters()
 
         self.amp_dtype = self._select_amp_dtype()
         self.scaler = GradScaler(
@@ -189,7 +225,7 @@ class TrainLoop:
         )
         if self.device.type == "cuda":
             logger.log(f"amp dtype: {self.amp_dtype}, grad scaler enabled: {self.scaler.is_enabled()}")
-        self.opt = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.opt = AdamW(self._trainable_parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
         if self.resume_step:
             self._load_optimizer_state()
@@ -222,6 +258,30 @@ class TrainLoop:
         feature_w.requires_grad_(False)
         return feature_w
 
+    def _configure_trainable_parameters(self) -> None:
+        """根据训练模式冻结参数，head-only 阶段只更新 stationary_head。
+
+        这个阶段用于把新 TIP-style 标签先对齐到现有 pose 表征，避免一开始就让
+        stationary 监督改动已经收敛的 denoiser backbone。
+        """
+
+        if self.stationary_head_only_loss and not self.freeze_non_stationary_head:
+            raise ValueError("--stationary_head_only_loss 需要同时启用 --freeze_non_stationary_head。")
+        if self.freeze_non_stationary_head and not bool(getattr(self.model, "use_stationary_head", False)):
+            raise ValueError("--freeze_non_stationary_head 需要模型启用 --use_stationary_head。")
+
+        for name, param in self.model.named_parameters():
+            param.requires_grad_(not self.freeze_non_stationary_head or is_stationary_head_key(name))
+
+        trainable = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
+        total = sum(param.numel() for param in self.model.parameters())
+        if trainable <= 0:
+            raise RuntimeError("当前训练配置没有任何可训练参数。")
+        logger.log(f"trainable parameters: {trainable}/{total}")
+
+    def _trainable_parameters(self):
+        return [param for param in self.model.parameters() if param.requires_grad]
+
     @staticmethod
     def _read_dataset_normalizer_stats(data):
         dataset = getattr(data, "dataset", None)
@@ -235,10 +295,14 @@ class TrainLoop:
         return mean.detach().float().clone(), std.detach().float().clone()
 
     def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint(
-            save_dir=self.save_dir,
-            requested_checkpoint=self.resume_checkpoint,
-        )
+        if self.resume_checkpoint:
+            self._load_resume_checkpoint()
+            return
+        if self.init_checkpoint:
+            self._load_init_checkpoint()
+
+    def _load_resume_checkpoint(self):
+        resume_checkpoint = find_resume_checkpoint(save_dir=self.save_dir, requested_checkpoint=self.resume_checkpoint)
         if not resume_checkpoint:
             return
 
@@ -248,13 +312,29 @@ class TrainLoop:
         logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
         state_dict = dist_util.load_state_dict(resume_checkpoint, map_location=self.device)
         incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
-        missing_keys = list(incompatible_keys.missing_keys)
-        unexpected_keys = list(incompatible_keys.unexpected_keys)
-        if missing_keys or unexpected_keys:
-            raise RuntimeError(
-                f"checkpoint 与当前 {self.schema.name} realtime_pose 模型结构不匹配，已停止恢复。"
-                f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
-            )
+        validate_loaded_state_dict_keys(
+            missing_keys=list(incompatible_keys.missing_keys),
+            unexpected_keys=list(incompatible_keys.unexpected_keys),
+            allow_stationary_head_mismatch=False,
+            source="resume checkpoint",
+        )
+
+    def _load_init_checkpoint(self):
+        init_checkpoint = Path(str(self.init_checkpoint)).expanduser()
+        if not init_checkpoint.exists():
+            raise FileNotFoundError(f"--init_checkpoint file does not exist: {init_checkpoint}")
+
+        validate_resume_checkpoint_contract(resume_checkpoint=init_checkpoint, args=self.args, schema_name=self.schema.name)
+        logger.log(f"warm-start model from checkpoint: {init_checkpoint}")
+        state_dict = dist_util.load_state_dict(init_checkpoint, map_location=self.device)
+        incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
+        validate_loaded_state_dict_keys(
+            missing_keys=list(incompatible_keys.missing_keys),
+            unexpected_keys=list(incompatible_keys.unexpected_keys),
+            allow_stationary_head_mismatch=True,
+            source="init checkpoint",
+        )
+        logger.log("warm-start keeps optimizer/EMA/global step fresh; use --resume_checkpoint for full training resume.")
 
     def _load_optimizer_state(self):
         main_checkpoint = self.resume_checkpoint
@@ -454,6 +534,11 @@ class TrainLoop:
             use_l1=self.use_l1,
             return_pred_xstart=do_rollout,
         )
+        if self.stationary_head_only_loss:
+            if "stationary_head_loss" not in losses:
+                raise KeyError("stationary head only training requires stationary_head_loss；请启用 --use_stationary_head。")
+            losses["pose_loss_frozen"] = losses["loss"]
+            losses["loss"] = losses["stationary_head_loss"]
         pred_xstart = losses.pop("pred_xstart", None)
         if not do_rollout:
             return losses
@@ -477,6 +562,8 @@ class TrainLoop:
         return losses
 
     def should_compute_rollout_loss(self, batch: dict) -> bool:
+        if self.stationary_head_only_loss:
+            return False
         if self.rollout_steps <= 1 or self.rollout_loss_weight <= 0.0 or self.rollout_prob <= 0.0:
             return False
         if not self.model.training or not torch.is_grad_enabled():
@@ -784,8 +871,9 @@ def log_loss_dict(diffusion, timesteps, losses):
     for key, values in losses.items():
         if not torch.is_tensor(values):
             continue
-        logger.logkv_mean(key, values.mean().item())
-        for timestep, loss in zip(timesteps.cpu().numpy(), values.detach().cpu().numpy()):
+        log_values = values.detach().float()
+        logger.logkv_mean(key, log_values.mean().item())
+        for timestep, loss in zip(timesteps.detach().cpu().numpy(), log_values.cpu().numpy()):
             quartile = int(4 * timestep / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", float(loss))
 

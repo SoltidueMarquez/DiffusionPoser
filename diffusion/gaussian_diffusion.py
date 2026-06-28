@@ -150,6 +150,7 @@ class GaussianDiffusion:
         tracker_pos_timestep_min_weight=0.1,
         tracker_pos_timestep_gamma=2.0,
         tracker_rot_loss_weight=2.0,
+        stationary_head_loss_weight=0.05,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -168,6 +169,7 @@ class GaussianDiffusion:
         self.tracker_pos_timestep_min_weight = float(tracker_pos_timestep_min_weight)
         self.tracker_pos_timestep_gamma = float(tracker_pos_timestep_gamma)
         self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
+        self.stationary_head_loss_weight = float(stationary_head_loss_weight)
         if self.tracker_pos_huber_beta <= 0.0:
             raise ValueError("tracker_pos_huber_beta 必须大于 0")
         if not 0.0 <= self.tracker_pos_timestep_min_weight <= 1.0:
@@ -216,6 +218,44 @@ class GaussianDiffusion:
 
         self.l2_loss = th.nn.MSELoss(reduction='none')
         self.l1_loss = th.nn.L1Loss(reduction='none')
+
+    @staticmethod
+    def _split_model_output(raw_output):
+        if isinstance(raw_output, dict):
+            if "motion" not in raw_output:
+                raise KeyError("dict model output must contain `motion`.")
+            return raw_output["motion"], raw_output.get("stationary_logits")
+        return raw_output, None
+
+    @staticmethod
+    def _uses_stationary_head(model) -> bool:
+        base_model = getattr(model, "model", model)
+        return bool(getattr(base_model, "use_stationary_head", False))
+
+    def _stationary_head_terms(self, stationary_logits, model_kwargs):
+        y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
+        if stationary_logits is None:
+            return {}
+        if "target_stationary_prob_5" not in y:
+            raise KeyError("stationary_head loss requires target_stationary_prob_5.")
+        target = y["target_stationary_prob_5"].to(device=stationary_logits.device, dtype=stationary_logits.dtype)
+        if tuple(target.shape) != tuple(stationary_logits.shape):
+            raise ValueError(
+                f"stationary_logits and target_stationary_prob_5 shape mismatch: "
+                f"{tuple(stationary_logits.shape)} vs {tuple(target.shape)}"
+            )
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            stationary_logits,
+            target.clamp(0.0, 1.0),
+            reduction="none",
+        ).mean(dim=1)
+        probs = torch.sigmoid(stationary_logits.detach()).clamp(0.0, 1.0)
+        return {
+            "stationary_head_loss": loss,
+            "stationary_head_prob_mean": probs.mean(dim=1),
+            "stationary_head_prob_min": probs.min(dim=1).values,
+            "stationary_head_prob_max": probs.max(dim=1).values,
+        }
 
     def masked_l2(self, a, b, mask, feature_w=None, use_l1=False):
         # assuming a.shape == b.shape == bs, Jdim, seqlen
@@ -1646,7 +1686,12 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE: # 计算 MSE 损失，走的是这
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            model_call_kwargs = model_kwargs
+            if self.stationary_head_loss_weight > 0.0 and self._uses_stationary_head(model):
+                model_call_kwargs = dict(model_kwargs)
+                model_call_kwargs["return_stationary_head"] = True
+            raw_model_output = model(x_t, self._scale_timesteps(t), **model_call_kwargs)
+            model_output, stationary_logits = self._split_model_output(raw_model_output)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1699,6 +1744,11 @@ class GaussianDiffusion:
                 if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                     mse_loss_weights = mse_loss_weights / (snr + 1)
                 terms["loss"] *= mse_loss_weights
+
+            stationary_terms = self._stationary_head_terms(stationary_logits, model_kwargs)
+            if stationary_terms:
+                terms.update(stationary_terms)
+                terms["loss"] = terms["loss"] + self.stationary_head_loss_weight * terms["stationary_head_loss"]
 
             if pred_xstart is not None:
                 aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs, timesteps=t)

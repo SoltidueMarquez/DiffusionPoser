@@ -81,7 +81,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert.add_argument("--body_fbx_rest_json", default="", type=str)
     convert.add_argument("--mirror", action=BooleanOptionalAction, default=True)
     convert.add_argument("--skip_existing", action=BooleanOptionalAction, default=True)
-    convert.add_argument("--allow_partial", action="store_true")
+    convert.add_argument(
+        "--allow_partial",
+        action=BooleanOptionalAction,
+        default=True,
+        help="批量重建数据时允许 converter 记录并跳过少量失败/过短样本；可用 --no-allow_partial 恢复严格模式。",
+    )
 
     normalizer = parser.add_argument_group("normalizer")
     normalizer.add_argument("--skip_normalizer", action="store_true")
@@ -98,7 +103,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train = parser.add_argument_group("train")
     train.add_argument("--skip_train", action="store_true")
     train.add_argument("--resume_latest", action="store_true")
+    train.add_argument("--init_checkpoint", default="", type=str)
     train.add_argument("--model_arch", default="target_dit", choices=["full_feature_dit", "target_dit"])
+    train.add_argument("--use_stationary_head", action=BooleanOptionalAction, default=True)
+    train.add_argument("--stationary_head_loss_weight", default=0.05, type=float)
     train.add_argument("--cuda", default=True, type=str2bool)
     train.add_argument("--device", default=0, type=int)
     train.add_argument("--train_batch_size", default=64, type=int)
@@ -478,6 +486,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--heads", str(args.heads),
         "--latent_dim", str(args.latent_dim),
         "--diffusion_steps", str(args.diffusion_steps),
+        "--stationary_head_loss_weight", str(args.stationary_head_loss_weight),
         "--history_pose_noise_std", str(args.history_pose_noise_std),
         "--history_yaw_noise_std", str(args.history_yaw_noise_std),
         "--history_pose_dropout_prob", str(args.history_pose_dropout_prob),
@@ -490,12 +499,15 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--tracker_mask_categories", "all",
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
+    add_flag(command, bool(args.use_stationary_head), "--use_stationary_head")
     command.extend(["--device", str(args.device)])
     if args.ts_respace:
         command.extend(["--ts_respace", args.ts_respace])
     if args.predicted_history_cache_dir:
         command.extend(["--predicted_history_cache_dir", normalize_path(args.predicted_history_cache_dir)])
         command.extend(["--predicted_history_prob", str(args.predicted_history_prob)])
+    if args.init_checkpoint:
+        command.extend(["--init_checkpoint", normalize_path(args.init_checkpoint)])
     add_flag(command, bool(args.model_ema), "--model_ema")
     add_flag(command, bool(args.gradient_clip), "--gradient_clip")
     add_flag(command, bool(args.overwrite), "--overwrite")

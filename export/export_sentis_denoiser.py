@@ -47,15 +47,18 @@ DEFAULT_MODEL_CONFIG = {
     "predict_xstart": 1,
     "ts_respace": "",
     "model_arch": "full_feature_dit",
+    "use_stationary_head": False,
+    "stationary_head_loss_weight": 0.05,
 }
 
 
 class SentisDenoiserWrapper(nn.Module):
     """Unity Sentis 固定调用合约：输入 `[1,C,61]`，输出 `pred_x0`。"""
 
-    def __init__(self, denoiser: nn.Module):
+    def __init__(self, denoiser: nn.Module, export_stationary_head: bool = False):
         super().__init__()
         self.denoiser = denoiser
+        self.export_stationary_head = bool(export_stationary_head)
 
     def forward(
         self,
@@ -63,13 +66,23 @@ class SentisDenoiserWrapper(nn.Module):
         timestep: torch.Tensor,
         inpaint_mask: torch.Tensor,
         valid_frame_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.denoiser(
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        raw_output = self.denoiser(
             hidden_states=x_t,
             timestep=timestep,
             inpaint_cond=inpaint_mask,
             valid_frame_mask=valid_frame_mask,
+            return_stationary_head=self.export_stationary_head,
         )
+        if not isinstance(raw_output, dict):
+            return raw_output
+        pred_x0 = raw_output["motion"]
+        if not self.export_stationary_head:
+            return pred_x0
+        stationary_logits = raw_output.get("stationary_logits")
+        if stationary_logits is None:
+            raise RuntimeError("export_stationary_head=True, but model did not return stationary_logits.")
+        return pred_x0, torch.sigmoid(stationary_logits)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -273,14 +286,21 @@ def export_onnx(
     opset: int,
     device: torch.device,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     wrapper.eval()
     if hasattr(torch.backends, "mha") and hasattr(torch.backends.mha, "set_fastpath_enabled"):
         torch.backends.mha.set_fastpath_enabled(False)
 
     dummy_inputs = build_dummy_inputs(feature_dim, sequence_length, device, schema_name=schema_name)
     with torch.no_grad():
-        reference = wrapper(*dummy_inputs).detach().cpu()
+        raw_reference = wrapper(*dummy_inputs)
+        if isinstance(raw_reference, tuple):
+            reference = tuple(value.detach().cpu() for value in raw_reference)
+        else:
+            reference = (raw_reference.detach().cpu(),)
+    output_names = ["pred_x0"]
+    if len(reference) > 1:
+        output_names.append("stationary_prob5")
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -288,7 +308,7 @@ def export_onnx(
         dummy_inputs,
         str(onnx_path),
         input_names=["x_t", "timestep", "inpaint_mask", "valid_frame_mask"],
-        output_names=["pred_x0"],
+        output_names=output_names,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -297,7 +317,7 @@ def export_onnx(
 
 def check_onnx_alignment(
     onnx_path: Path,
-    reference: torch.Tensor,
+    reference: tuple[torch.Tensor, ...],
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     tolerance: float,
     strict: bool,
@@ -313,8 +333,11 @@ def check_onnx_alignment(
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     x_t, timestep, inpaint_mask, valid_frame_mask = inputs
+    output_names = ["pred_x0"]
+    if len(reference) > 1:
+        output_names.append("stationary_prob5")
     outputs = session.run(
-        ["pred_x0"],
+        output_names,
         {
             "x_t": x_t.numpy(),
             "timestep": timestep.numpy(),
@@ -322,9 +345,13 @@ def check_onnx_alignment(
             "valid_frame_mask": valid_frame_mask.numpy(),
         },
     )
-    onnx_output = np.asarray(outputs[0], dtype=np.float32)
-    reference_np = reference.numpy().astype(np.float32, copy=False)
-    max_abs_error = float(np.max(np.abs(reference_np - onnx_output)))
+    max_abs_error = 0.0
+    for output_name, expected, actual in zip(output_names, reference, outputs):
+        onnx_output = np.asarray(actual, dtype=np.float32)
+        reference_np = expected.numpy().astype(np.float32, copy=False)
+        output_error = float(np.max(np.abs(reference_np - onnx_output)))
+        if output_error > max_abs_error:
+            max_abs_error = output_error
     if max_abs_error > tolerance:
         message = f"PyTorch vs ONNXRuntime max_abs_error={max_abs_error:.6g} exceeds tolerance={tolerance:.6g}."
         if strict:
@@ -346,7 +373,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     model, _diffusion = create_model_and_diffusion(model_config)
     export_model, model_source = load_export_model(model, model_path, device=device, use_ema=cli_args.use_ema)
-    wrapper = SentisDenoiserWrapper(export_model).to(device).eval()
+    export_stationary_head = bool(getattr(model_config, "use_stationary_head", False))
+    wrapper = SentisDenoiserWrapper(export_model, export_stationary_head=export_stationary_head).to(device).eval()
 
     onnx_path = output_dir / "diffusionposer_denoiser.onnx"
     staging_onnx_path = output_dir / ".diffusionposer_denoiser.onnx.tmp"
@@ -384,6 +412,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         normalize_input=bool(cli_args.normalize_input),
         strict_normalizer=bool(cli_args.strict_normalizer or cli_args.normalize_input),
         schema_name=schema.name,
+        stationary_head_output_enabled=export_stationary_head,
     )
 
     result = {
@@ -395,6 +424,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "schema_canonical_name": schema.canonical_name,
         "feature_dim": schema.feature_dim,
         "sequence_length": REALTIME_POSE_SEQ_LEN,
+        "stationary_head_output": export_stationary_head,
     }
     print(f"[export_sentis_denoiser] ONNX: {onnx_path}")
     print(f"[export_sentis_denoiser] weights: {model_source}")

@@ -47,6 +47,7 @@ def build_realtime_pose_feature_schema(
     feature_dim: int | None = None,
     sequence_length: int = REALTIME_POSE_SEQ_LEN,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    stationary_head_output_enabled: bool = False,
 ) -> dict[str, Any]:
     adapter = get_schema_adapter(schema_name)
     schema = adapter.spec
@@ -56,7 +57,18 @@ def build_realtime_pose_feature_schema(
     if int(sequence_length) != schema.seq_len:
         raise ValueError(f"{schema.name} sequenceLength 必须为 {schema.seq_len}，实际为 {sequence_length}")
 
-    return dict(adapter.build_unity_feature_schema())
+    payload = dict(adapter.build_unity_feature_schema())
+    if stationary_head_output_enabled:
+        stationary_prob = payload.get("stationaryProb5")
+        if not isinstance(stationary_prob, dict):
+            raise ValueError(f"{schema.name} does not expose stationaryProb5, cannot advertise stationary head output.")
+        payload["stationaryProb5Output"] = {
+            "enabled": True,
+            "name": "stationary_prob5",
+            "length": int(stationary_prob["length"]),
+            "valueType": "probability",
+        }
+    return payload
 
 
 def build_ddim_schedule(
@@ -212,6 +224,7 @@ def write_runtime_assets(
     normalize_input: bool = False,
     strict_normalizer: bool = False,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    stationary_head_output_enabled: bool = False,
 ) -> dict[str, Path]:
     schema = get_schema_spec(schema_name)
     feature_dim = schema.feature_dim if feature_dim is None or int(feature_dim) <= 0 else int(feature_dim)
@@ -221,7 +234,15 @@ def write_runtime_assets(
         "normalizer": output_dir / "normalizer.json",
         "ddim_schedule": output_dir / "ddim_schedule.json",
     }
-    write_json(assets["feature_schema"], build_realtime_pose_feature_schema(feature_dim, sequence_length, schema_name=schema.name))
+    write_json(
+        assets["feature_schema"],
+        build_realtime_pose_feature_schema(
+            feature_dim,
+            sequence_length,
+            schema_name=schema.name,
+            stationary_head_output_enabled=stationary_head_output_enabled,
+        ),
+    )
     write_json(
         assets["normalizer"],
         build_normalizer(

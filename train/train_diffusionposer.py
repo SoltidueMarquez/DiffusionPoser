@@ -159,6 +159,9 @@ def prepare_save_dir(args):
 def resolve_save_dir(args, *, cli_schema_explicit: bool = False, normalizer_dir_explicit: bool = False):
     """把用户给的 save_dir 解析成本次训练实际写入的 run 目录。"""
 
+    if args.resume_checkpoint and getattr(args, "init_checkpoint", ""):
+        raise ValueError("--resume_checkpoint and --init_checkpoint are mutually exclusive.")
+
     if args.resume_checkpoint:
         resolve_resume_schema_and_paths(
             args,
@@ -241,9 +244,26 @@ def resolve_input_artifact_dirs(args):
 def resolve_run_label(args) -> str:
     run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
     if run_name.lower() in {"auto", ""}:
-        run_name = f"{getattr(args, 'schema', 'schema')}_{getattr(args, 'model_arch', 'model')}_seed{getattr(args, 'seed', 0)}"
+        run_name = build_auto_run_label(args)
     run_name = re.sub(r"[^A-Za-z0-9._-]+", "_", run_name).strip("._-")
     return run_name or "run"
+
+
+def build_auto_run_label(args) -> str:
+    schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
+    schema_alias = "s5" if schema.name == REALTIME_POSE_SCHEMA_NAME else schema.name
+    model_arch = str(getattr(args, "model_arch", "model"))
+    model_alias = {
+        "target_dit": "tdit",
+        "full_feature_dit": "dit",
+    }.get(model_arch, model_arch)
+    parts = [schema_alias]
+    if bool(getattr(args, "stationary_head_only_loss", False)):
+        parts.append("headonly")
+    elif bool(getattr(args, "use_stationary_head", False)):
+        parts.append("head")
+    parts.extend([model_alias, f"seed{getattr(args, 'seed', 0)}"])
+    return "_".join(parts)
 
 
 def write_latest_run_pointer(args):
