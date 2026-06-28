@@ -62,6 +62,7 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_NAMES,
     get_schema_spec,
 )
+from data_loaders.stationary_label_config import stationary_label_metadata
 from utils.artifact_paths import source_root
 from utils.data_roots import load_data_roots
 
@@ -311,6 +312,7 @@ def build_realtime_pose_features(
         tracker_pos_world = joint_positions[:, TRACKER_JOINT_INDICES].astype(np.float32)
         tracker_rot_world_6d = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
         joints_world = joint_positions.astype(np.float32)
+        joint_rotations_world = joint_rotations.astype(np.float32)
         joint_offsets_parent = estimate_root_global_offsets(
             joints_world=joints_world,
             body_pose_root_global_6d=body_pose_6d,
@@ -347,6 +349,7 @@ def build_realtime_pose_features(
     if schema.supports_stationary_prob:
         features["stationary_prob_5"] = derive_stationary_prob_5(
             joints_world=joints_world,
+            joint_rotations_world=joint_rotations_world,
             fps=float(target_fps),
         )
     return features
@@ -388,6 +391,7 @@ def save_realtime_pose_motion(
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+        metadata.update(stationary_label_metadata())
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D and "body_fbx_rest_json" in features:
         metadata["body_fbx_rest_json"] = str(features["body_fbx_rest_json"].item())
     np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
@@ -415,7 +419,10 @@ def resolve_body_fbx_rest_for_schema(args: argparse.Namespace) -> BodyFbxRest | 
     if cached is not None:
         return cached
     rest_arg = getattr(args, "body_fbx_rest_json", "")
-    rest_path = rest_arg if str(rest_arg).strip() else None
+    rest_text = str(rest_arg).strip()
+    # argparse 会把 default="" + type=Path 解析成 Path(".")；这里必须把空路径和当前目录都
+    # 视作“未显式提供”，否则会尝试把仓库目录当 JSON 文件打开并触发 PermissionError。
+    rest_path = None if rest_text in {"", "."} else rest_arg
     rest = load_body_fbx_rest(rest_path)
     setattr(args, "_body_fbx_rest", rest)
     return rest
@@ -454,7 +461,7 @@ def record_for_output(
         schema=schema,
     )
     stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
-    return {
+    record = {
         "status": status,
         "schema_name": schema.name,
         "schema_canonical_name": str(schema.canonical_name),
@@ -470,6 +477,9 @@ def record_for_output(
         "frames": int(metadata.get("frames", frames)),
         **provenance,
     }
+    if schema.supports_stationary_prob:
+        record.update(stationary_label_metadata())
+    return record
 
 
 def reusable_source_path_for(path: Path, args: argparse.Namespace, mirror_variant: bool) -> Path | None:
@@ -562,6 +572,7 @@ def save_reused_realtime_source(
     if schema.supports_stationary_prob:
         next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+        next_metadata.update(stationary_label_metadata())
     np.savez(output_path, **features, metadata=json.dumps(next_metadata, ensure_ascii=False))
 
 

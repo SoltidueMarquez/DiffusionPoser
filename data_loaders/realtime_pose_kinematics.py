@@ -9,6 +9,7 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_INDICES,
     STATIONARY_PROB_DIM,
 )
+from data_loaders.stationary_label_config import DEFAULT_STATIONARY_LABEL_CONFIG, StationaryLabelConfig
 
 
 SMPL_JOINT_NAMES = (
@@ -137,35 +138,48 @@ def integrate_root_delta_xz_ref(
 
 def derive_stationary_prob_5(
     joints_world: np.ndarray,
+    joint_rotations_world: np.ndarray,
     fps: float = 60.0,
-    speed_full_motion: float = 0.25,
-    median_window: int = 5,
+    config: StationaryLabelConfig = DEFAULT_STATIONARY_LABEL_CONFIG,
 ) -> np.ndarray:
-    """从 5 个 GlobalPose 候选接触关节的世界速度派生静止概率 `[T,5]`。
+    """用 5 个候选关节的中心速度派生静止概率 `[T,5]`。
 
-    概率只表达“近似静止”，后续物理模块可以再结合接触可行性决定最终 contact set。
+    `joint_rotations_world` 保留在签名里是为了兼容转换阶段已有调用；纯速度标签只看
+    `joints_world[:, STATIONARY_JOINT_INDICES]` 的世界位移，不再使用局部采样点或脚高度门控。
     """
 
     joints = np.asarray(joints_world, dtype=np.float64)
     if joints.ndim != 3 or joints.shape[1:] != (24, 3):
         raise ValueError(f"joints_world 应为 [T,24,3]，实际为 {joints.shape}")
+    rotations = np.asarray(joint_rotations_world, dtype=np.float64)
+    if rotations.shape != (joints.shape[0], 24, 3, 3):
+        raise ValueError(f"joint_rotations_world 应为 [T,24,3,3]，实际为 {rotations.shape}")
     if float(fps) <= 0.0:
         raise ValueError(f"fps 必须为正数，实际为 {fps}")
-    if float(speed_full_motion) <= 0.0:
-        raise ValueError(f"speed_full_motion 必须为正数，实际为 {speed_full_motion}")
-
+    if float(config.speed_full_motion) <= 0.0:
+        raise ValueError(f"speed_full_motion 必须为正数，实际为 {config.speed_full_motion}")
     joint_indices = np.asarray(STATIONARY_JOINT_INDICES, dtype=np.int64)
     if joint_indices.shape != (STATIONARY_PROB_DIM,):
         raise ValueError(f"stationary joint 数量必须为 {STATIONARY_PROB_DIM}，实际为 {joint_indices.shape}")
-    joint_pos = joints[:, joint_indices]
-    speed = np.zeros((joints.shape[0], STATIONARY_PROB_DIM), dtype=np.float64)
-    if joints.shape[0] > 1:
-        speed[1:] = np.linalg.norm(joint_pos[1:] - joint_pos[:-1], axis=-1) * float(fps)
-        speed[0] = speed[1]
 
-    smoothed_speed = median_filter_time(speed, window=int(median_window))
-    stationary_prob = np.clip(1.0 - smoothed_speed / float(speed_full_motion), 0.0, 1.0)
+    joint_centers = joints[:, joint_indices]
+    speed = joint_center_speed(joint_centers, fps=float(fps))
+    smoothed_speed = median_filter_time(speed, window=int(config.median_window))
+    stationary_prob = np.clip(1.0 - smoothed_speed / float(config.speed_full_motion), 0.0, 1.0)
     return stationary_prob.astype(np.float32)
+
+
+def joint_center_speed(joint_centers_world: np.ndarray, fps: float) -> np.ndarray:
+    """根据 5 个候选关节中心 `[T,5,3]` 计算逐关节速度 `[T,5]`。"""
+
+    joints = np.asarray(joint_centers_world, dtype=np.float64)
+    if joints.ndim != 3 or joints.shape[1:] != (STATIONARY_PROB_DIM, 3):
+        raise ValueError(f"joint_centers_world 应为 [T,{STATIONARY_PROB_DIM},3]，实际为 {joints.shape}")
+    speed = np.zeros(joints.shape[:2], dtype=np.float64)
+    if joints.shape[0] > 1:
+        speed[1:] = np.linalg.norm(joints[1:] - joints[:-1], axis=-1) * float(fps)
+        speed[0] = speed[1]
+    return speed
 
 
 def median_filter_time(values: np.ndarray, window: int) -> np.ndarray:

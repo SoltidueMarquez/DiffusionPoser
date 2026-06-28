@@ -47,6 +47,7 @@ from data_loaders.sensor_masking import (
     TRACKER_ROT_REF_START,
     get_schema_spec,
 )
+from data_loaders.stationary_label_config import stationary_label_metadata
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, build_toy_source_metadata, write_toy_source_dataset
 from utils.run_dirs import read_latest_pointer
 
@@ -136,6 +137,20 @@ def test_converter_cli_defaults_to_current_recommended_schema():
     args = amass_converter.parse_args(["--num_workers", "3", "--worker_torch_threads", "2"])
     assert args.num_workers == 3
     assert args.worker_torch_threads == 2
+
+
+def test_converter_default_body_fbx_rest_arg_uses_default_json(monkeypatch):
+    calls = []
+
+    def fake_load_body_fbx_rest(path):
+        calls.append(path)
+        return object()
+
+    monkeypatch.setattr(amass_converter, "load_body_fbx_rest", fake_load_body_fbx_rest)
+    args = amass_converter.parse_args([])
+
+    assert amass_converter.resolve_body_fbx_rest_for_schema(args) is not None
+    assert calls == [None]
 
 
 def test_converter_parallel_work_items_include_mirror_variants():
@@ -259,6 +274,58 @@ def test_converter_reuses_existing_root_y0_source_without_smpl(monkeypatch, tmp_
     assert metadata["pose_representation"] == schema.pose_representation
     assert metadata["root_y_policy"] == schema.root_y_policy
     assert metadata["pelvis_height_mode"] == schema.pelvis_height_mode
+    for key, value in stationary_label_metadata().items():
+        assert metadata[key] == value
+
+
+@pytest.mark.parametrize(
+    ("drop_key", "override", "match"),
+    [
+        ("stationary_label_method", {}, "stationary label metadata"),
+        (None, {"stationary_label_method": "joint_speed_v0"}, "stationary_label_method"),
+    ],
+)
+def test_converter_rejects_stationary_label_metadata_mismatch_on_reuse(
+    monkeypatch,
+    tmp_path,
+    drop_key,
+    override,
+    match,
+):
+    amass_dir = tmp_path / "AMASS"
+    reuse_dir = tmp_path / "reuse_bad_stationary"
+    output_dir = tmp_path / "converted"
+    fake_amass_path = amass_dir / "ACCAD" / "toy_realtime.npz"
+    fake_amass_path.parent.mkdir(parents=True)
+    fake_amass_path.write_bytes(b"reuse path does not load this file")
+
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    metadata = build_toy_source_metadata(frame_count=REALTIME_POSE_SEQ_LEN)
+    if drop_key is not None:
+        metadata.pop(drop_key)
+    metadata.update(override)
+    source["metadata"] = np.asarray(json.dumps(metadata))
+    reuse_path = reuse_dir / "ACCAD" / "toy_realtime.npz"
+    reuse_path.parent.mkdir(parents=True)
+    np.savez(reuse_path, **source)
+
+    monkeypatch.setattr(
+        amass_converter,
+        "run_smpl_forward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no smpl")),
+    )
+    args = SimpleNamespace(
+        amass_dir=amass_dir,
+        output_dir=output_dir,
+        target_fps=60.0,
+        batch_size=1,
+        schema=REALTIME_POSE_SCHEMA_NAME,
+        reuse_source_dir=reuse_dir,
+        skip_existing=False,
+        overwrite=True,
+    )
+    with pytest.raises(ValueError, match=match):
+        amass_converter.convert_one_motion(path=fake_amass_path, args=args, model_cache=object(), mirror_variant=False)
 
 
 def test_converter_rejects_legacy_body_fbx_source_reuse(monkeypatch, tmp_path):

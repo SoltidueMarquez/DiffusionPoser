@@ -25,6 +25,7 @@ from data_loaders.sensor_masking import (
     validate_realtime_seq_len,
     validate_realtime_target,
 )
+from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 
 
 SOURCE_STATIC_FIELDS = {
@@ -67,6 +68,29 @@ def validate_schema_metadata(metadata: Mapping[str, Any], schema: SchemaSpec, so
         )
 
 
+def validate_stationary_label_metadata(metadata: Mapping[str, Any], source: str) -> None:
+    """校验 stationary label 配置，防止旧 joint-speed 标签混入新 TIP-style 数据。"""
+
+    expected = stationary_label_metadata()
+    missing = [key for key in STATIONARY_LABEL_METADATA_FIELDS if key not in metadata]
+    if missing:
+        raise ValueError(f"{source} stationary label metadata 缺少字段: {missing}")
+    for key, expected_value in expected.items():
+        value = metadata[key]
+        if isinstance(expected_value, str):
+            actual = scalar_string(value, key)
+            if actual != expected_value:
+                raise ValueError(f"{source} {key}={actual!r}, expected {expected_value!r}.")
+        elif isinstance(expected_value, int):
+            actual = _scalar_int(value, key)
+            if actual != int(expected_value):
+                raise ValueError(f"{source} {key}={actual!r}, expected {int(expected_value)!r}.")
+        else:
+            actual = _scalar_float(value, key)
+            if not np.isclose(actual, float(expected_value), rtol=0.0, atol=1e-8):
+                raise ValueError(f"{source} {key}={actual!r}, expected {float(expected_value)!r}.")
+
+
 def validate_root_y0_invariants(arrays: Mapping[str, Any], schema: SchemaSpec, source: str) -> None:
     if schema.root_y_policy != ROOT_Y_POLICY_FIXED_ZERO:
         return
@@ -102,6 +126,8 @@ def validate_realtime_source_contract(data: Mapping[str, Any] | Any, schema: Sch
 
     metadata = load_source_metadata(data, source=source)
     validate_schema_metadata(metadata, schema=schema, source=source)
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(metadata, source=source)
     validate_pose_representation(_payload_value(data, POSE_REPRESENTATION_KEY), schema_name=schema.name, source=source)
 
     frame_count = int(np.asarray(_payload_value(data, schema.body_pose_key)).shape[0])
@@ -125,6 +151,8 @@ def validate_realtime_task_contract(task: Mapping[str, Any], schema: SchemaSpec,
 
     metadata = {key: task[key] for key in SCHEMA_METADATA_FIELDS}
     validate_schema_metadata(metadata, schema=schema, source=source)
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(task, source=source)
     task_format = scalar_string(task["task_format"], "task_format")
     if task_format != schema.task_format:
         raise ValueError(f"{source} task_format={task_format!r}, expected {schema.task_format!r}.")
@@ -175,6 +203,8 @@ def required_realtime_task_fields(schema: SchemaSpec | str) -> set[str]:
         }
     )
     required.update(TASK_METADATA_FIELDS)
+    if schema.supports_stationary_prob:
+        required.update(STATIONARY_LABEL_METADATA_FIELDS)
     return required
 
 
@@ -247,3 +277,12 @@ def _scalar_int(value: Any, name: str) -> int:
     if array.size == 1:
         return int(array.reshape(()).item())
     raise ValueError(f"{name} must be a scalar int, got shape={array.shape}")
+
+
+def _scalar_float(value: Any, name: str) -> float:
+    array = np.asarray(value)
+    if array.shape == ():
+        return float(array.item())
+    if array.size == 1:
+        return float(array.reshape(()).item())
+    raise ValueError(f"{name} must be a scalar float, got shape={array.shape}")

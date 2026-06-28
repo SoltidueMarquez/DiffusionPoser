@@ -12,6 +12,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.realtime_pose_contract import (
+    load_source_metadata,
     required_realtime_source_fields,
     validate_realtime_source_contract,
 )
@@ -37,6 +38,7 @@ from data_loaders.sensor_masking import (
     validate_pose_representation,
     validate_sensor_valid,
 )
+from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 from utils.artifact_paths import source_root, task_root
 from utils.data_roots import load_data_roots
 from utils.run_dirs import timestamped_child_dir, write_latest_pointer
@@ -53,6 +55,12 @@ SHORT_SOURCE_REPORT_NAME = "skipped_short_sources.jsonl"
 MAX_TASK_ID_STEM_CHARS = 28
 MAX_TASK_ID_CATEGORY_CHARS = 12
 TASK_ID_DIGEST_CHARS = 16
+STATIC_CLIP_FIELDS = {
+    "joint_offsets_parent",
+    "joint_rest_local_rotations_6d",
+    POSE_REPRESENTATION_KEY,
+    *STATIONARY_LABEL_METADATA_FIELDS,
+}
 
 
 @dataclass(frozen=True)
@@ -240,28 +248,31 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             source_split_dir=plan.split_dir,
         )
     schema = get_schema_spec(str(args.schema))
+    latest_metadata = {
+        "output_dir": str(plan.output_dir),
+        "task_dir": str(plan.output_dir),
+        "task_root": str(plan.output_root),
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "generated_root": str(Path(getattr(args, "generated_root", plan.output_root))),
+        "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+        "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+        "source_dir": str(plan.source_dir),
+        "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
+        "splits": [split_plan.split for split_plan in plan.split_plans],
+        "max_rollout_steps": int(getattr(args, "rollout_steps", 1)),
+        "counts": counts,
+    }
+    if schema.supports_stationary_prob:
+        latest_metadata.update(stationary_label_metadata())
     write_latest_pointer(
         root_dir=plan.output_root,
         kind="tasks",
         output_dir=plan.output_dir,
-        metadata={
-            "output_dir": str(plan.output_dir),
-            "task_dir": str(plan.output_dir),
-            "task_root": str(plan.output_root),
-            "schema_name": schema.name,
-            "schema_canonical_name": str(schema.canonical_name),
-            "pose_representation": schema.pose_representation,
-            "root_y_policy": schema.root_y_policy,
-            "pelvis_height_mode": schema.pelvis_height_mode,
-            "generated_root": str(Path(getattr(args, "generated_root", plan.output_root))),
-            "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
-            "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
-            "source_dir": str(plan.source_dir),
-            "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
-            "splits": [split_plan.split for split_plan in plan.split_plans],
-            "max_rollout_steps": int(getattr(args, "rollout_steps", 1)),
-            "counts": counts,
-        },
+        metadata=latest_metadata,
     )
     return counts
 
@@ -423,6 +434,8 @@ def write_task_output_marker(
         "output_dir": str(output_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
+    if schema.supports_stationary_prob:
+        marker.update(stationary_label_metadata())
     marker_path = output_dir / TASK_OUTPUT_MARKER
     marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
@@ -658,6 +671,14 @@ def generate_split_tasks(
                         "tracker_pattern": pattern.category,
                         "tracker_pattern_detail": pattern.to_dict(),
                     }
+                    if schema.supports_stationary_prob:
+                        manifest_entry.update(
+                            {
+                                key: scalar_manifest_value(source[key])
+                                for key in STATIONARY_LABEL_METADATA_FIELDS
+                                if key in source
+                            }
+                        )
                     manifest_file.write(json.dumps(manifest_entry, ensure_ascii=False, sort_keys=True) + "\n")
                     written += 1
                     if args.manifest_flush_interval > 0 and written % int(args.manifest_flush_interval) == 0:
@@ -727,6 +748,7 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
         validate_realtime_source_contract(data, schema=schema, source=str(path))
+        metadata = load_source_metadata(data, source=str(path))
         required_keys = required_realtime_source_fields(schema)
         source = {
             key: data[key].astype(np.float32, copy=True)
@@ -734,6 +756,8 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
             if key != POSE_REPRESENTATION_KEY
         }
         source[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
+        if schema.supports_stationary_prob:
+            source.update({key: np.asarray(metadata[key]) for key in STATIONARY_LABEL_METADATA_FIELDS})
     return source
 
 
@@ -741,7 +765,7 @@ def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -
     end_frame = int(start_frame) + int(seq_len)
     return {
         key: value.copy()
-        if key in {"joint_offsets_parent", "joint_rest_local_rotations_6d", POSE_REPRESENTATION_KEY}
+        if key in STATIC_CLIP_FIELDS
         else value[start_frame:end_frame].copy()
         for key, value in source.items()
     }
@@ -764,6 +788,15 @@ def temporary_task_path(task_path: Path) -> Path:
     """临时文件名不能比最终 .npz 更长，避免 Windows 长路径边界下写入失败。"""
 
     return task_path.with_suffix(".tmp")
+
+
+def scalar_manifest_value(value) -> str | int | float:
+    array = np.asarray(value)
+    if array.shape == ():
+        return array.item()
+    if array.size == 1:
+        return array.reshape(()).item()
+    raise ValueError(f"manifest scalar value must be scalar, got shape={array.shape}")
 
 
 def make_task_id(split: str, stablemotion_split_key: str, sample_index: int, pattern_index: int, pattern_category: str) -> str:
