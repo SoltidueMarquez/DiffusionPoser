@@ -9,8 +9,7 @@ tests/
 │   ├── train/          # DiT forward、训练入口、单 batch loss
 │   ├── sample/         # 61 帧实时重建和可视化辅助
 │   ├── eval/           # realtime_pose 评估指标
-│   ├── export/         # Unity/Sentis runtime assets
-│   └── visual_editor/  # RealtimePose Studio 后端扫描和导出
+│   └── export/         # Unity/Sentis runtime assets
 └── README.md
 ```
 
@@ -28,5 +27,4 @@ conda run -n diffusionposer5070 pytest tests/smoke/train
 conda run -n diffusionposer5070 pytest tests/smoke/sample
 conda run -n diffusionposer5070 pytest tests/smoke/eval
 conda run -n diffusionposer5070 pytest tests/smoke/export
-conda run -n diffusionposer5070 pytest tests/smoke/visual_editor
 ```

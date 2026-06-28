@@ -9,7 +9,8 @@
 ## 基本环境
 
 - 默认工作目录是仓库根目录。
-- Python、pytest、训练、采样、评估和导出命令优先使用 Anaconda 环境；给用户生成或实际执行 `conda run` 命令时，默认带 `--no-capture-output`，方便面板实时显示日志：
+- Python、pytest、训练、采样、评估和导出命令优先使用 Anaconda 环境：
+- 给用户生成或实际执行 `conda run` 命令时，检查是否包含 `--no-capture-output`；需要面板实时显示日志的命令默认使用该参数。
 
 ```powershell
 conda run --no-capture-output -n diffusionposer5070 <command>
@@ -54,7 +55,6 @@ conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/train
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/sample
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/eval
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/export
-conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/visual_editor
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/schemas
 ```
 
