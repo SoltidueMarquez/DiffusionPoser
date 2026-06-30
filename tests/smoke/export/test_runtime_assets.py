@@ -120,6 +120,97 @@ def test_sibling_unity_runtime_accepts_current_stationary5_schema_name():
     assert "IsSupportedSchemaName" in source
 
 
+def test_sibling_unity_runtime_exposes_stationary_signal_source_switch():
+    unity_root = __import__("pathlib").Path(__file__).resolve().parents[3].parent / "SIGGRAPH2024Unity"
+    types_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Core"
+        / "RealtimePoseTypes.cs"
+    )
+    prediction_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Output"
+        / "PosePrediction.cs"
+    )
+    pipeline_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Core"
+        / "RealtimePoseInferencePipeline.cs"
+    )
+    driver_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Core"
+        / "DiffusionPoserRealtimeDriver.cs"
+    )
+    if not types_path.exists():
+        pytest.skip("Sibling Unity project is not available in this workspace.")
+
+    types_source = types_path.read_text(encoding="utf-8")
+    prediction_source = prediction_path.read_text(encoding="utf-8")
+    pipeline_source = pipeline_path.read_text(encoding="utf-8")
+    driver_source = driver_path.read_text(encoding="utf-8")
+
+    assert "public enum StationarySignalSource" in types_source
+    assert "Auto" in types_source
+    assert "FeatureChannel" in types_source
+    assert "StationaryHead" in types_source
+    assert "StationarySignalSourceUsed" in prediction_source
+    assert "ApplyStationarySignalSource" in pipeline_source
+    assert "shouldReadStationaryHead = stationarySignalSource != StationarySignalSource.FeatureChannel" in pipeline_source
+    assert "StationarySignalSource = StationarySignalSource" in driver_source
+
+
+def test_sibling_unity_replay_metrics_record_stationary_source_and_lock_rates():
+    unity_root = __import__("pathlib").Path(__file__).resolve().parents[3].parent / "SIGGRAPH2024Unity"
+    evaluator_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Debug"
+        / "RealtimePoseReplayEvaluator.cs"
+    )
+    runner_path = (
+        unity_root
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Scripts"
+        / "Editor"
+        / "RealtimePoseAutomatedReplayTestRunner.cs"
+    )
+    if not evaluator_path.exists():
+        pytest.skip("Sibling Unity project is not available in this workspace.")
+
+    evaluator_source = evaluator_path.read_text(encoding="utf-8")
+    runner_source = runner_path.read_text(encoding="utf-8")
+
+    assert "stationarySignalSourceUsed" in evaluator_source
+    assert "falseLockRate" in evaluator_source
+    assert "missedLockRate" in evaluator_source
+    assert "stationaryProbJitter" in evaluator_source
+    assert "StationarySignalSource.FeatureChannel" in runner_source
+    assert "StationarySignalSource.StationaryHead" in runner_source
+    assert "playbackController.EvaluationWriteMetricsOnDisable = true" in runner_source
+
+
 def test_export_feature_schema_matches_legacy_adapter_builder():
     assert build_realtime_pose_feature_schema(schema_name=LEGACY_SCHEMA_NAME) == get_schema_adapter(
         LEGACY_SCHEMA_NAME
