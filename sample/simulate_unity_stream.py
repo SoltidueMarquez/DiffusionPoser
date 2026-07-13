@@ -22,6 +22,7 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
@@ -191,7 +192,7 @@ def load_tracker_stream(
 
 def sensor_validity_ok(sensor_valid: np.ndarray) -> bool:
     valid = np.asarray(sensor_valid, dtype=bool)
-    return bool(valid.shape == (TRACKER_COUNT,) and valid[HIP_TRACKER_INDEX] and valid.sum() >= MIN_VALID_TRACKERS)
+    return bool(valid.shape == (TRACKER_COUNT,) and valid.sum() >= MIN_VALID_TRACKERS)
 
 
 def estimate_root_pos_from_hip_tracker(
@@ -207,6 +208,42 @@ def estimate_root_pos_from_hip_tracker(
             raise ValueError(f"joint_offsets_parent 应为 [{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
         yaw_rotation = make_yaw_rotation_np(np.asarray([float(root_yaw)], dtype=np.float64))[0]
         root_pos = root_pos - (yaw_rotation @ offsets[0].astype(np.float64)).astype(np.float32)
+    root_pos[1] = 0.0
+    return root_pos
+
+
+def estimate_root_pos_from_available_trackers(
+    tracker_pos_world: np.ndarray,
+    sensor_valid: np.ndarray,
+    root_yaw: float = 0.0,
+    fallback_root_pos_world: np.ndarray | None = None,
+    joint_offsets_parent: np.ndarray | None = None,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+) -> np.ndarray:
+    """有腰时使用实测 pelvis；无腰时沿用预测 root，首帧用 head XZ 初始化。"""
+
+    tracker_pos = np.asarray(tracker_pos_world, dtype=np.float32)
+    valid = np.asarray(sensor_valid, dtype=bool)
+    if tracker_pos.shape != (TRACKER_COUNT, 3):
+        raise ValueError(f"单帧 tracker_pos_world 应为 [{TRACKER_COUNT},3]，实际为 {tracker_pos.shape}")
+    if valid.shape != (TRACKER_COUNT,):
+        raise ValueError(f"单帧 sensor_valid 应为 [{TRACKER_COUNT}]，实际为 {valid.shape}")
+    if valid[HIP_TRACKER_INDEX]:
+        return estimate_root_pos_from_hip_tracker(
+            tracker_pos,
+            root_yaw=root_yaw,
+            joint_offsets_parent=joint_offsets_parent,
+            schema_name=schema_name,
+        )
+    if fallback_root_pos_world is not None:
+        root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
+    elif valid[HEAD_TRACKER_INDEX]:
+        root_pos = tracker_pos[HEAD_TRACKER_INDEX].copy()
+    else:
+        first_valid = np.flatnonzero(valid)
+        if first_valid.size == 0:
+            raise ValueError("至少需要一个有效 tracker 来初始化 root 位置。")
+        root_pos = tracker_pos[int(first_valid[0])].copy()
     root_pos[1] = 0.0
     return root_pos
 
@@ -554,7 +591,8 @@ def correct_predicted_root_with_trackers(
 
     schema = get_schema_spec(schema_name)
     corrected = np.asarray(predicted_frame_raw, dtype=np.float32).copy()
-    if not enabled:
+    valid = np.asarray(sensor_valid, dtype=bool)
+    if not enabled or valid.shape != (TRACKER_COUNT,) or not valid[HIP_TRACKER_INDEX]:
         return corrected, float(model_root_yaw), np.asarray(model_root_pos_world, dtype=np.float32).copy()
 
     tracker_pos = np.asarray(tracker_pos_world, dtype=np.float32)
@@ -639,8 +677,9 @@ def encode_unity_tracker_frame(
             sensor_valid=valid,
             fallback_yaw=reference_root_yaw,
         )
-        root_pos = estimate_root_pos_from_hip_tracker(
+        root_pos = estimate_root_pos_from_available_trackers(
             tracker_pos,
+            sensor_valid=valid,
             root_yaw=root_position_yaw,
             joint_offsets_parent=joint_offsets_parent,
             schema_name=schema.name,
@@ -1023,12 +1062,15 @@ def simulate_unity_stream(
             sensor_valid=frame_valid,
             fallback_yaw=state.current_root_yaw,
         )
+        fallback_root_pos = state.current_root_pos_world
         root_pos = (
             reference_root_pos[frame_index].copy()
             if reference_root_pos is not None and use_reference_state_frame
-            else estimate_root_pos_from_hip_tracker(
+            else estimate_root_pos_from_available_trackers(
                 tracker_pos_world[frame_index],
+                sensor_valid=frame_valid,
                 root_yaw=measured_root_yaw,
+                fallback_root_pos_world=fallback_root_pos,
                 joint_offsets_parent=joint_offsets,
                 schema_name=schema.name,
             )
@@ -1045,10 +1087,15 @@ def simulate_unity_stream(
         history_target_raw = history_features[frame_index] if use_reference_history_frame else None
 
         if not state.has_full_history():
+            warmup_root_height = (
+                float(tracker_pos_world[frame_index, HIP_TRACKER_INDEX, 1])
+                if frame_valid[HIP_TRACKER_INDEX]
+                else float(joint_offsets[0, 1]) if joint_offsets is not None else 0.0
+            )
             predicted_frame_raw, output_root_pos = state.append_warmup_frame(
                 tracker_feature_raw=tracker_feature_raw,
                 root_pos_world=root_pos,
-                root_height=float(tracker_pos_world[frame_index, HIP_TRACKER_INDEX, 1]),
+                root_height=warmup_root_height,
                 target_feature_raw=history_target_raw if history_target_raw is not None else warmup_target,
             )
             if reference_yaw is not None and use_reference_state_frame:
