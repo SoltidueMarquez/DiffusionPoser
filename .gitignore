@@ -36,6 +36,7 @@ runs/
 *.zip
 
 # Editors and OS
+.vs/
 .idea/
 .DS_Store
 Thumbs.db
