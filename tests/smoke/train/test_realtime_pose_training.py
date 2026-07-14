@@ -74,6 +74,32 @@ def _make_loss_test_diffusion() -> SpacedDiffusion:
     )
 
 
+def test_rotation_axis_cosine_loss_is_non_negative_under_mixed_precision_drift():
+    identity_forward_up = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=torch.bfloat16)
+    pred = identity_forward_up.repeat(2, 6, 1)
+    target = identity_forward_up.repeat(2, 6, 1)
+
+    # Simulate the small axis-length drift produced by BF16 FK composition.
+    pred[..., :3] *= torch.tensor(1.015625, dtype=torch.bfloat16)
+    pred[..., 3:] *= torch.tensor(1.0078125, dtype=torch.bfloat16)
+
+    loss = gd._rotation_axis_cosine_loss(pred, target)
+
+    assert loss.dtype == torch.float32
+    assert torch.all(loss >= 0.0)
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-6)
+
+
+def test_rotation_axis_cosine_loss_preserves_expected_axis_error():
+    target = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+    pred = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+
+    loss = gd._rotation_axis_cosine_loss(pred, target)
+
+    # Forward differs by 90 degrees (loss 1), up is identical (loss 0).
+    assert loss.item() == pytest.approx(0.5, abs=1e-7)
+
+
 def test_model_forward_has_frame_positional_embedding_and_seq_limit():
     model = DiffusionPoserDiT(input_feats=REALTIME_POSE_INPUT_DIM, latent_dim=32, num_layers=1, num_heads=4, max_seq_len=REALTIME_POSE_SEQ_LEN)
     assert tuple(model.frame_pos_embed.shape) == (1, REALTIME_POSE_SEQ_LEN, 32)
@@ -173,6 +199,7 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         "sensor_reprojection_rot_loss",
     }.issubset(losses)
     assert torch.allclose(losses["loss"], losses["simple_loss"] + losses["aux_loss"])
+    assert torch.all(losses["sensor_reprojection_rot_loss"] >= 0.0)
     losses["loss"].mean().backward()
 
     model_kwargs["y"]["target_stationary_prob_5"] = torch.zeros_like(model_kwargs["y"]["target_stationary_prob_5"])

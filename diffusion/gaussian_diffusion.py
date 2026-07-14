@@ -33,6 +33,30 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 
+
+def _rotation_axis_cosine_loss(pred_rotation_6d, target_rotation_6d):
+    """Return a non-negative forward/up axis cosine loss in float32.
+
+    FK composes many rotation matrices under mixed precision, so the resulting
+    forward/up columns can drift slightly away from unit length.  A raw dot
+    product can then exceed one and make ``1 - cosine`` negative.  Normalize
+    both axes in float32 and clamp the cosine to its mathematical range before
+    constructing the loss.
+    """
+
+    if pred_rotation_6d.shape != target_rotation_6d.shape or pred_rotation_6d.shape[-1] != 6:
+        raise ValueError(
+            "rotation axis cosine loss expects matching [..., 6] tensors, "
+            f"got {tuple(pred_rotation_6d.shape)} and {tuple(target_rotation_6d.shape)}"
+        )
+    pred_axes = pred_rotation_6d.float().reshape(*pred_rotation_6d.shape[:-1], 2, 3)
+    target_axes = target_rotation_6d.float().reshape(*target_rotation_6d.shape[:-1], 2, 3)
+    pred_axes = torch.nn.functional.normalize(pred_axes, dim=-1, eps=1e-8)
+    target_axes = torch.nn.functional.normalize(target_axes, dim=-1, eps=1e-8)
+    cosine = (pred_axes * target_axes).sum(dim=-1).clamp(-1.0, 1.0)
+    return (1.0 - cosine).mean(dim=-1)
+
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -1617,11 +1641,10 @@ class GaussianDiffusion:
             target_tracker_rot_ref = rotation_6d_to_matrix_torch(target_tracker_rot_ref)
             pred_tracker_rot_ref_6d = rotation_6d_forward_up_torch(pred_tracker_rot_ref)
             target_tracker_rot_ref_6d = rotation_6d_forward_up_torch(target_tracker_rot_ref)
-            rot_cos = (
-                pred_tracker_rot_ref_6d.reshape(pred_tracker_rot_ref_6d.shape[0], pred_tracker_rot_ref_6d.shape[1], 2, 3)
-                * target_tracker_rot_ref_6d.reshape(target_tracker_rot_ref_6d.shape[0], target_tracker_rot_ref_6d.shape[1], 2, 3)
-            ).sum(dim=-1)
-            rot_reproj = 1.0 - rot_cos.mean(dim=-1)
+            rot_reproj = _rotation_axis_cosine_loss(
+                pred_tracker_rot_ref_6d,
+                target_tracker_rot_ref_6d,
+            )
             denom = valid_target.float().sum(dim=1).clamp_min(1.0)
             result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
             head_anchor_rot = rot_reproj[:, HEAD_TRACKER_INDEX]
