@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 from data_loaders.build_realtime_longseq_eval_set import build_realtime_longseq_eval_set, read_longseq_manifest
 from data_loaders.longseq_eval_dropout import LongseqDropoutConfig
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_TARGET_START, get_schema_spec
-from sample.evaluate_longseq_eval_set import build_arg_parser, evaluate_longseq_entries
+from sample.evaluate_longseq_eval_set import build_arg_parser, evaluate_longseq_entries, parse_longseq_eval_args
 from sample.simulate_unity_stream import IDENTITY_6D
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
 
@@ -111,6 +112,45 @@ def test_evaluate_longseq_parser_preserves_explicit_path_overrides():
 
     assert normalized_path_text(args.eval_root) == "custom/longseq_eval"
     assert normalized_path_text(args.normalizer_dir) == "custom/normalizer"
+
+
+def test_evaluate_longseq_checkpoint_only_restores_model_and_diffusion_args(tmp_path):
+    model_path = tmp_path / "model000000100.pt"
+    model_path.touch()
+    (tmp_path / "args.json").write_text(
+        json.dumps(
+            {
+                "layers": 4,
+                "diffusion_steps": 100,
+                "seed": 0,
+                "tracker_mask_seed": 0,
+                "tracker_latency_max_frames": 2,
+                "tracker_burst_dropout_prob": 0.05,
+                "tracker_outlier_prob": 0.01,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_longseq_eval_args(
+        build_arg_parser(),
+        argv=[
+            "--model_path",
+            str(model_path),
+            "--tracker_mask_policy",
+            "fixed_categories",
+            "--tracker_mask_categories",
+            "standard_three",
+        ],
+    )
+
+    assert args.layers == 4
+    assert args.diffusion_steps == 100
+    assert args.seed == 10
+    assert args.tracker_mask_seed == 10
+    assert args.tracker_latency_max_frames == 0
+    assert args.tracker_burst_dropout_prob == 0.0
+    assert args.tracker_outlier_prob == 0.0
 
 
 def test_evaluate_longseq_entries_writes_per_sequence_and_aggregate_summary(tmp_path):

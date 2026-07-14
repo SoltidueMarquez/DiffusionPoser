@@ -125,6 +125,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 EVAL_ROOT_ARG = "--eval_root"
 NORMALIZER_DIR_ARG = "--normalizer_dir"
+CHECKPOINT_CONFIG_GROUP_TITLES = frozenset({"model", "diffusion"})
+
+
+def longseq_checkpoint_ignore_keys(parser: argparse.ArgumentParser) -> set[str]:
+    """Keep evaluation/runtime settings independent from checkpoint training args."""
+    return {
+        action.dest
+        for group in parser._action_groups
+        if group.title not in CHECKPOINT_CONFIG_GROUP_TITLES
+        for action in group._group_actions
+        if action.dest != argparse.SUPPRESS
+    }
 
 
 def install_longseq_path_default_parser(parser: argparse.ArgumentParser) -> None:
@@ -163,6 +175,25 @@ def apply_longseq_path_defaults(
     else:
         setattr(args, "_normalizer_dir_auto_default", False)
     return args
+
+
+def parse_longseq_eval_args(
+    parser: argparse.ArgumentParser,
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    cli_schema_explicit = has_explicit_schema_arg(argv)
+    eval_root_explicit = has_explicit_option_arg(argv, EVAL_ROOT_ARG)
+    normalizer_dir_explicit = has_explicit_option_arg(argv, NORMALIZER_DIR_ARG)
+    ignore_keys = longseq_checkpoint_ignore_keys(parser)
+    args = parse_and_load_from_model(parser, argv=argv, ignore_keys=ignore_keys)
+    validate_v2_runtime_args(args, cli_schema_explicit=cli_schema_explicit)
+    return apply_longseq_path_defaults(
+        args,
+        eval_root_explicit=eval_root_explicit,
+        normalizer_dir_explicit=normalizer_dir_explicit,
+        force_eval_root=not eval_root_explicit,
+        force_normalizer_dir=not normalizer_dir_explicit,
+    )
 
 
 def evaluate_longseq_entries(
@@ -353,23 +384,7 @@ def build_default_output_dir(
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser = build_arg_parser()
-    cli_schema_explicit = has_explicit_schema_arg(argv)
-    eval_root_explicit = has_explicit_option_arg(argv, EVAL_ROOT_ARG)
-    normalizer_dir_explicit = has_explicit_option_arg(argv, NORMALIZER_DIR_ARG)
-    ignore_keys = set()
-    if not eval_root_explicit:
-        ignore_keys.add("eval_root")
-    if not normalizer_dir_explicit:
-        ignore_keys.add("normalizer_dir")
-    args = parse_and_load_from_model(parser, argv=argv, ignore_keys=ignore_keys)
-    validate_v2_runtime_args(args, cli_schema_explicit=cli_schema_explicit)
-    apply_longseq_path_defaults(
-        args,
-        eval_root_explicit=eval_root_explicit,
-        normalizer_dir_explicit=normalizer_dir_explicit,
-        force_eval_root=not eval_root_explicit,
-        force_normalizer_dir=not normalizer_dir_explicit,
-    )
+    args = parse_longseq_eval_args(parser, argv=argv)
 
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     entries = read_longseq_manifest(eval_set_dir)
