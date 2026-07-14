@@ -4,8 +4,10 @@ import json
 import os
 import re
 import time
+import copy
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
@@ -17,13 +19,26 @@ from data_loaders.sensor_masking import (
     TASK_MODE_REALTIME_POSE,
     get_schema_spec,
 )
+from data_loaders.realtime_pose_kinematics import fk_body_fbx_local_torch
+from data_loaders.tracker_codec import (
+    build_tracker_reference_np,
+    decode_tracker_positions_np,
+    decode_tracker_rotations_np,
+    encode_tracker_positions_np,
+    encode_tracker_rotations_np,
+)
 from diffusion import logger
+from sample.runtime_root_resolver import (
+    RuntimeRootResolver,
+    RuntimeRootResolverState,
+    encode_single_root_delta_xz_ref,
+    wrap_angle,
+)
 from utils import dist_util
 
 
 CHECKPOINT_CONTRACT_KEYS = ("task_mode", "schema", "input_feats", "seq_len", "max_seq_len", "model_arch")
 CHECKPOINT_INT_CONTRACT_KEYS = {"input_feats", "seq_len", "max_seq_len"}
-STATIONARY_HEAD_KEY_PREFIX = "stationary_head."
 
 
 def validate_realtime_pose_training_args(args):
@@ -109,30 +124,17 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
         raise ValueError(f"{args_path} 与当前 {schema.name} 训练配置不兼容：{joined}")
 
 
-def is_stationary_head_key(key: str) -> bool:
-    return str(key).startswith(STATIONARY_HEAD_KEY_PREFIX)
-
-
 def validate_loaded_state_dict_keys(
     missing_keys: list[str],
     unexpected_keys: list[str],
     *,
-    allow_stationary_head_mismatch: bool,
     source: str,
 ) -> None:
-    allowed_missing = [key for key in missing_keys if allow_stationary_head_mismatch and is_stationary_head_key(key)]
-    allowed_unexpected = [key for key in unexpected_keys if allow_stationary_head_mismatch and is_stationary_head_key(key)]
-    disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
-    disallowed_unexpected = [key for key in unexpected_keys if key not in allowed_unexpected]
-    if disallowed_missing or disallowed_unexpected:
+    if missing_keys or unexpected_keys:
         raise RuntimeError(
             f"{source} does not match current model. "
-            f"missing_keys={disallowed_missing}, unexpected_keys={disallowed_unexpected}"
+            f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
         )
-    if allowed_missing:
-        logger.log(f"{source}: initialize missing stationary head keys randomly: {allowed_missing}")
-    if allowed_unexpected:
-        logger.log(f"{source}: ignore unexpected stationary head keys: {allowed_unexpected}")
 
 
 class TrainLoop:
@@ -165,8 +167,7 @@ class TrainLoop:
         self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
         self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
         self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
-        self.freeze_non_stationary_head = bool(getattr(args, "freeze_non_stationary_head", False))
-        self.stationary_head_only_loss = bool(getattr(args, "stationary_head_only_loss", False))
+        self.rollout_ddim_steps = int(getattr(args, "rollout_ddim_steps", 10))
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
         if self.rollout_steps > 2:
@@ -195,6 +196,7 @@ class TrainLoop:
                 raise RuntimeError("eval DataLoader 没有可用 batch；请检查 --eval_split 或降低 --batch_size。")
         self.num_epochs = self.num_steps // self.data_num_batches + 1
         self.device = dist_util.dev()
+        self.rollout_diffusion = self._create_rollout_diffusion(args)
 
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
@@ -206,11 +208,6 @@ class TrainLoop:
             raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
         if self.device.type == "cuda":
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
-        logger.log(
-            "stationary head training: "
-            f"freeze_non_head={self.freeze_non_stationary_head}, "
-            f"head_only_loss={self.stationary_head_only_loss}"
-        )
 
         self.feature_w = self._load_feature_weights(args)
         self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
@@ -244,6 +241,25 @@ class TrainLoop:
             return torch.bfloat16
         return torch.float16
 
+    def _create_rollout_diffusion(self, args):
+        if self.rollout_steps <= 1 or self.rollout_loss_weight <= 0.0:
+            return None
+        if self.rollout_ddim_steps != 10:
+            raise ValueError("当前运行时契约固定使用 DDIM10 rollout。")
+        from utils.model_util import create_gaussian_diffusion
+
+        rollout_args = copy.copy(args)
+        rollout_args.diffusion_steps = int(
+            getattr(args, "diffusion_steps", getattr(self.diffusion, "original_num_steps", self.diffusion.num_timesteps))
+        )
+        rollout_args.noise_schedule = str(getattr(args, "noise_schedule", "cosine"))
+        rollout_args.predict_xstart = bool(
+            getattr(args, "predict_xstart", self.diffusion.model_mean_type.name == "START_X")
+        )
+        rollout_args.sigma_small = bool(getattr(args, "sigma_small", True))
+        rollout_args.ts_respace = f"ddim{self.rollout_ddim_steps}"
+        return create_gaussian_diffusion(rollout_args)
+
     def _load_feature_weights(self, args):
         if not args.weighted_loss:
             return None
@@ -259,19 +275,10 @@ class TrainLoop:
         return feature_w
 
     def _configure_trainable_parameters(self) -> None:
-        """根据训练模式冻结参数，head-only 阶段只更新 stationary_head。
+        """Stage A 起始终训练完整 pose backbone。"""
 
-        这个阶段用于把新 TIP-style 标签先对齐到现有 pose 表征，避免一开始就让
-        stationary 监督改动已经收敛的 denoiser backbone。
-        """
-
-        if self.stationary_head_only_loss and not self.freeze_non_stationary_head:
-            raise ValueError("--stationary_head_only_loss 需要同时启用 --freeze_non_stationary_head。")
-        if self.freeze_non_stationary_head and not bool(getattr(self.model, "use_stationary_head", False)):
-            raise ValueError("--freeze_non_stationary_head 需要模型启用 --use_stationary_head。")
-
-        for name, param in self.model.named_parameters():
-            param.requires_grad_(not self.freeze_non_stationary_head or is_stationary_head_key(name))
+        for param in self.model.parameters():
+            param.requires_grad_(True)
 
         trainable = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
         total = sum(param.numel() for param in self.model.parameters())
@@ -315,7 +322,6 @@ class TrainLoop:
         validate_loaded_state_dict_keys(
             missing_keys=list(incompatible_keys.missing_keys),
             unexpected_keys=list(incompatible_keys.unexpected_keys),
-            allow_stationary_head_mismatch=False,
             source="resume checkpoint",
         )
 
@@ -331,7 +337,6 @@ class TrainLoop:
         validate_loaded_state_dict_keys(
             missing_keys=list(incompatible_keys.missing_keys),
             unexpected_keys=list(incompatible_keys.unexpected_keys),
-            allow_stationary_head_mismatch=True,
             source="init checkpoint",
         )
         logger.log("warm-start keeps optimizer/EMA/global step fresh; use --resume_checkpoint for full training resume.")
@@ -532,21 +537,16 @@ class TrainLoop:
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
-            return_pred_xstart=do_rollout,
+            return_pred_xstart=False,
         )
-        if self.stationary_head_only_loss:
-            if "stationary_head_loss" not in losses:
-                raise KeyError("stationary head only training requires stationary_head_loss；请启用 --use_stationary_head。")
-            losses["pose_loss_frozen"] = losses["loss"]
-            losses["loss"] = losses["stationary_head_loss"]
-        pred_xstart = losses.pop("pred_xstart", None)
         if not do_rollout:
             return losses
+
+        pred_xstart = self.sample_rollout_history(batch)
 
         rollout_losses = self.compute_one_step_rollout_losses(
             batch=batch,
             pred_xstart=pred_xstart,
-            timesteps=timesteps,
         )
         base_loss = losses["loss"]
         rollout_loss = rollout_losses["loss"]
@@ -562,8 +562,6 @@ class TrainLoop:
         return losses
 
     def should_compute_rollout_loss(self, batch: dict) -> bool:
-        if self.stationary_head_only_loss:
-            return False
         if self.rollout_steps <= 1 or self.rollout_loss_weight <= 0.0 or self.rollout_prob <= 0.0:
             return False
         if not self.model.training or not torch.is_grad_enabled():
@@ -580,7 +578,6 @@ class TrainLoop:
         self,
         batch: dict,
         pred_xstart: torch.Tensor,
-        timesteps: torch.Tensor,
     ) -> dict:
         if pred_xstart is None:
             raise ValueError("rollout loss 需要第一步 diffusion.training_losses 返回 pred_xstart。")
@@ -588,26 +585,349 @@ class TrainLoop:
         next_sample = rollout_batch["x"]  # [B, C, 61]
         if next_sample.shape != batch["x"].shape:
             raise ValueError(f"rollout[0]['x'] 应为 {tuple(batch['x'].shape)}，实际为 {tuple(next_sample.shape)}")
-
-        next_batch = dict(rollout_batch)
-        next_conditioned = self.build_one_step_rollout_conditioned_x(
+        next_batch, next_sample = self.prepare_one_step_rollout_batch(
+            batch=batch,
             rollout_batch=rollout_batch,
             pred_xstart=pred_xstart,
         )
-        next_batch["conditioned_x"] = next_conditioned
 
         batch_size, _, seq_len = next_sample.shape
         feature_w = self._feature_weights_for_batch(batch_size, seq_len)
         model_kwargs = self.mask_manager(next_batch, next_sample)
+        next_timesteps = torch.randint(
+            low=0,
+            high=self.diffusion.num_timesteps,
+            size=(batch_size,),
+            device=self.device,
+        )
+        next_noise = torch.randn_like(next_sample)
         return self.diffusion.training_losses(
             self.model,
             next_sample,
-            timesteps,
+            next_timesteps,
             model_kwargs=model_kwargs,
+            noise=next_noise,
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
         )
+
+    def sample_rollout_history(self, batch: dict) -> torch.Tensor:
+        if self.rollout_diffusion is None:
+            raise RuntimeError("rollout diffusion 尚未初始化。")
+        sample = batch["conditioned_x"]
+        model_kwargs = self.mask_manager(batch, batch["x"])
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                return self.rollout_diffusion.ddim_sample_loop(
+                    self.model,
+                    shape=tuple(sample.shape),
+                    noise=torch.randn_like(sample),
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                    device=self.device,
+                    progress=False,
+                    eta=0.0,
+                ).detach()
+        finally:
+            self.model.train(was_training)
+
+    def prepare_one_step_rollout_batch(
+        self,
+        *,
+        batch: dict,
+        rollout_batch: dict,
+        pred_xstart: torch.Tensor,
+    ) -> tuple[dict, torch.Tensor]:
+        """把第一步 DDIM 输出经 Resolver 校正后写入第二步全部历史与参考字段。"""
+
+        final_target, final_root, final_yaw, final_height, final_joints, final_state = self.resolve_rollout_target(
+            batch=batch,
+            pred_xstart=pred_xstart,
+        )
+        finalized_prediction = pred_xstart.detach().clone()
+        finalized_prediction[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START] = final_target
+        next_conditioned = self.build_one_step_rollout_conditioned_x(
+            rollout_batch=rollout_batch,
+            pred_xstart=finalized_prediction,
+        )
+        next_batch = dict(rollout_batch)
+        next_sample = rollout_batch["x"].clone()
+
+        next_batch["prev_root_pos_world"] = final_root
+        next_batch["prev_root_yaw"] = final_yaw
+        next_batch["prev_joints_world"] = final_joints
+        next_batch["resolver_before_target_root_pos_world"] = final_root
+        next_batch["resolver_before_target_root_yaw"] = final_yaw
+        next_batch["resolver_before_target_pelvis_height"] = final_height
+        next_batch["resolver_before_target_joints_world"] = final_joints
+        next_batch.update(final_state)
+
+        next_raw_target = self._target_features_to_raw(next_sample)
+        target_root = rollout_batch["target_root_pos_world"].detach().cpu().numpy()
+        target_yaw = rollout_batch["target_root_yaw"].detach().cpu().numpy()
+        final_root_np = final_root.detach().cpu().numpy()
+        final_yaw_np = final_yaw.detach().cpu().numpy()
+        root_delta = np.stack(
+            [
+                encode_single_root_delta_xz_ref(final_root_np[index], final_yaw_np[index], target_root[index])
+                for index in range(final_root_np.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32)
+        yaw_delta = np.asarray(
+            [wrap_angle(target_yaw[index] - final_yaw_np[index]) for index in range(final_yaw_np.shape[0])],
+            dtype=np.float32,
+        )
+        yaw_pair = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
+        next_raw_target[:, self.schema.root_yaw_delta_slice()] = torch.from_numpy(yaw_pair).to(
+            device=next_sample.device, dtype=next_sample.dtype
+        )
+        next_raw_target[:, self.schema.root_delta_xz_slice()] = torch.from_numpy(root_delta).to(
+            device=next_sample.device, dtype=next_sample.dtype
+        )
+        next_batch["target_root_delta_xz_ref"] = torch.from_numpy(root_delta).to(
+            device=next_sample.device, dtype=next_sample.dtype
+        )
+        next_sample[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START] = self._raw_target_to_normalized(
+            next_raw_target
+        )
+        next_batch["x"] = next_sample
+
+        self._reencode_rollout_target_trackers(
+            next_batch=next_batch,
+            next_conditioned=next_conditioned,
+            previous_final_root=final_root,
+            previous_final_yaw=final_yaw,
+        )
+        next_batch["conditioned_x"] = next_conditioned
+        return next_batch, next_sample
+
+    def resolve_rollout_target(
+        self,
+        *,
+        batch: dict,
+        pred_xstart: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        raw_target = self._target_features_to_raw(pred_xstart)
+        raw_target_np = raw_target.detach().cpu().numpy().astype(np.float32)
+        batch_size = raw_target_np.shape[0]
+        ref_pos = batch["tracker_ref_root_pos_world"].detach().cpu().numpy()
+        ref_yaw = batch["tracker_ref_root_yaw"].detach().cpu().numpy()
+        tracker_pos_world = decode_tracker_positions_np(
+            batch["target_tracker_pos_ref"].detach().cpu().numpy(), ref_pos, ref_yaw
+        )
+        tracker_rot_world = decode_tracker_rotations_np(
+            batch["target_tracker_rot_ref_6d"].detach().cpu().numpy(), ref_yaw
+        )
+        valid = batch["target_sensor_valid"].detach().cpu().numpy().astype(bool)
+        offsets = batch["joint_offsets_parent"].detach().cpu().numpy().astype(np.float32)
+        rest_rotations = batch.get("joint_rest_local_rotations_6d")
+        rest_rotations_np = None if rest_rotations is None else rest_rotations.detach().cpu().numpy().astype(np.float32)
+
+        roots: list[np.ndarray] = []
+        yaws: list[float] = []
+        heights: list[float] = []
+        joints: list[np.ndarray] = []
+        states: list[RuntimeRootResolverState] = []
+        finalized = raw_target_np.copy()
+        for index in range(batch_size):
+            state = RuntimeRootResolverState(
+                initialized=True,
+                final_root_pos_world=batch["resolver_before_target_root_pos_world"][index].detach().cpu().numpy(),
+                final_root_yaw=float(batch["resolver_before_target_root_yaw"][index].item()),
+                final_pelvis_height=float(batch["resolver_before_target_pelvis_height"][index].item()),
+                final_joints_world=batch["resolver_before_target_joints_world"][index].detach().cpu().numpy(),
+                hip_was_valid=bool(batch["resolver_before_target_hip_valid"][index].item()),
+                reconnect_active=(
+                    0.0 < float(batch["resolver_before_target_reconnect_elapsed_seconds"][index].item()) < 0.1
+                ),
+                reconnect_elapsed_seconds=float(
+                    batch["resolver_before_target_reconnect_elapsed_seconds"][index].item()
+                ),
+                reconnect_start_root_pos_world=batch[
+                    "resolver_before_target_reconnect_start_root_pos_world"
+                ][index].detach().cpu().numpy(),
+                reconnect_start_root_yaw=float(
+                    batch["resolver_before_target_reconnect_start_root_yaw"][index].item()
+                ),
+                reconnect_start_pelvis_height=float(
+                    batch["resolver_before_target_reconnect_start_pelvis_height"][index].item()
+                ),
+                last_timestamp=float(batch["resolver_before_target_last_timestamp_seconds"][index].item()),
+                floor_y=float(batch["resolver_before_target_floor_y"][index].item()),
+                tracking_origin_revision=int(
+                    batch["resolver_before_target_tracking_origin_revision"][index].item()
+                ),
+            )
+            pose = raw_target_np[index, self.schema.body_pose_slice()].copy()
+            local_offsets = offsets[index].copy()
+            local_rest = None if rest_rotations_np is None else rest_rotations_np[index].copy()
+
+            def fk_callback(root: np.ndarray, yaw: float, pelvis_height: float) -> np.ndarray:
+                fk_offsets = local_offsets.copy()
+                fk_offsets[0, 1] = float(pelvis_height)
+                with torch.no_grad():
+                    output = fk_body_fbx_local_torch(
+                        body_pose_local_delta_6d=torch.from_numpy(pose[None]).float(),
+                        actor_root_pos_world=torch.from_numpy(root[None]).float(),
+                        root_heading=torch.tensor([yaw], dtype=torch.float32),
+                        rest_local_positions=torch.from_numpy(fk_offsets[None]).float(),
+                        rest_local_rotations_6d=(
+                            None if local_rest is None else torch.from_numpy(local_rest[None]).float()
+                        ),
+                    )
+                return output[0].cpu().numpy()
+
+            resolver = RuntimeRootResolver(
+                pelvis_offset_parent=local_offsets[0],
+                state=state,
+            )
+            result = resolver.resolve(
+                tracker_pos_world=tracker_pos_world[index],
+                tracker_rot_world_6d=tracker_rot_world[index],
+                sensor_valid=valid[index],
+                timestamp=float(batch["target_timestamp_seconds"][index].item()),
+                floor_y=float(batch["target_floor_y"][index].item()),
+                tracking_origin_revision=int(batch["target_tracking_origin_revision"][index].item()),
+                model_root_delta_xz_ref=raw_target_np[index, self.schema.root_delta_xz_slice()],
+                model_yaw_delta_sincos=raw_target_np[index, self.schema.root_yaw_delta_slice()],
+                model_pelvis_height=float(raw_target_np[index, self.schema.root_height_slice()][0]),
+                fk_callback=fk_callback,
+            )
+            finalized[index, self.schema.root_delta_xz_slice()] = result.final_root_delta_xz_ref
+            finalized[index, self.schema.root_yaw_delta_slice()] = result.final_yaw_delta_sincos
+            finalized[index, self.schema.root_height_slice()] = result.final_pelvis_height
+            roots.append(result.final_root_pos_world)
+            yaws.append(result.final_root_yaw)
+            heights.append(result.final_pelvis_height)
+            joints.append(result.final_joints_world)
+            states.append(result.state)
+
+        device = pred_xstart.device
+        dtype = pred_xstart.dtype
+        final_target = self._raw_target_to_normalized(torch.from_numpy(finalized).to(device=device, dtype=dtype))
+        state_tensors = {
+            "resolver_before_target_hip_valid": torch.tensor(
+                [state.hip_was_valid for state in states], device=device, dtype=torch.bool
+            ),
+            "resolver_before_target_reconnect_start_root_pos_world": torch.from_numpy(
+                np.stack([state.reconnect_start_root_pos_world for state in states])
+            ).to(device=device, dtype=dtype),
+            "resolver_before_target_reconnect_start_root_yaw": torch.tensor(
+                [state.reconnect_start_root_yaw for state in states], device=device, dtype=dtype
+            ),
+            "resolver_before_target_reconnect_start_pelvis_height": torch.tensor(
+                [state.reconnect_start_pelvis_height for state in states], device=device, dtype=dtype
+            ),
+            "resolver_before_target_reconnect_elapsed_seconds": torch.tensor(
+                [state.reconnect_elapsed_seconds for state in states], device=device, dtype=dtype
+            ),
+            "resolver_before_target_last_timestamp_seconds": torch.tensor(
+                [float(state.last_timestamp) for state in states], device=device, dtype=torch.float64
+            ),
+            "resolver_before_target_floor_y": torch.tensor(
+                [state.floor_y for state in states], device=device, dtype=dtype
+            ),
+            "resolver_before_target_tracking_origin_revision": torch.tensor(
+                [state.tracking_origin_revision for state in states], device=device, dtype=torch.int64
+            ),
+        }
+        return (
+            final_target,
+            torch.from_numpy(np.stack(roots)).to(device=device, dtype=dtype),
+            torch.tensor(yaws, device=device, dtype=dtype),
+            torch.tensor(heights, device=device, dtype=dtype),
+            torch.from_numpy(np.stack(joints)).to(device=device, dtype=dtype),
+            state_tensors,
+        )
+
+    def _reencode_rollout_target_trackers(
+        self,
+        *,
+        next_batch: dict,
+        next_conditioned: torch.Tensor,
+        previous_final_root: torch.Tensor,
+        previous_final_yaw: torch.Tensor,
+    ) -> None:
+        old_ref_pos = next_batch["tracker_ref_root_pos_world"].detach().cpu().numpy()
+        old_ref_yaw = next_batch["tracker_ref_root_yaw"].detach().cpu().numpy()
+        tracker_world = decode_tracker_positions_np(
+            next_batch["target_tracker_pos_ref"].detach().cpu().numpy(), old_ref_pos, old_ref_yaw
+        )
+        tracker_rot_world = decode_tracker_rotations_np(
+            next_batch["target_tracker_rot_ref_6d"].detach().cpu().numpy(), old_ref_yaw
+        )
+        valid = next_batch["target_sensor_valid"].detach().cpu().numpy().astype(bool)
+        offsets = next_batch["joint_offsets_parent"].detach().cpu().numpy()
+        floor = next_batch["target_floor_y"].detach().cpu().numpy()
+        previous_root_np = previous_final_root.detach().cpu().numpy()
+        previous_yaw_np = previous_final_yaw.detach().cpu().numpy()
+        ref_positions = []
+        ref_yaws = []
+        ref_sources = []
+        encoded_positions = []
+        encoded_rotations = []
+        for index in range(valid.shape[0]):
+            ref_pos, ref_yaw, ref_source = build_tracker_reference_np(
+                tracker_pos_world=tracker_world[index:index + 1],
+                tracker_rot_world_6d=tracker_rot_world[index:index + 1],
+                sensor_valid=valid[index:index + 1],
+                previous_final_root_pos_world=previous_root_np[index:index + 1],
+                previous_final_root_yaw=previous_yaw_np[index:index + 1],
+                pelvis_offset_parent=offsets[index, 0],
+                floor_y=floor[index:index + 1],
+            )
+            ref_positions.append(ref_pos[0])
+            ref_yaws.append(ref_yaw[0])
+            ref_sources.append(ref_source[0])
+            encoded_positions.append(encode_tracker_positions_np(tracker_world[index:index + 1], ref_pos, ref_yaw)[0])
+            encoded_rotations.append(encode_tracker_rotations_np(tracker_rot_world[index:index + 1], ref_yaw)[0])
+
+        device = next_conditioned.device
+        dtype = next_conditioned.dtype
+        encoded_pos = torch.from_numpy(np.stack(encoded_positions)).to(device=device, dtype=dtype)
+        encoded_rot = torch.from_numpy(np.stack(encoded_rotations)).to(device=device, dtype=dtype)
+        valid_tensor = next_batch["target_sensor_valid"].to(device=device)
+        next_batch["tracker_ref_root_pos_world"] = torch.from_numpy(np.stack(ref_positions)).to(device=device, dtype=dtype)
+        next_batch["tracker_ref_root_yaw"] = torch.tensor(ref_yaws, device=device, dtype=dtype)
+        next_batch["tracker_ref_source"] = torch.tensor(ref_sources, device=device, dtype=torch.int64)
+        next_batch["target_tracker_pos_ref"] = encoded_pos
+        next_batch["target_tracker_rot_ref_6d"] = encoded_rot
+
+        pos_slice = self.schema.tracker_pos_slice()
+        rot_slice = self.schema.tracker_rot_slice()
+        pos_values = encoded_pos.reshape(encoded_pos.shape[0], -1)
+        rot_values = encoded_rot.reshape(encoded_rot.shape[0], -1)
+        if self.normalizer_mean is not None and self.normalizer_std is not None:
+            mean = self.normalizer_mean.to(device=device, dtype=dtype)
+            std = self.normalizer_std.to(device=device, dtype=dtype)
+            pos_values = (pos_values - mean[pos_slice]) / std[pos_slice]
+            rot_values = (rot_values - mean[rot_slice]) / std[rot_slice]
+        for tracker_index in range(valid_tensor.shape[1]):
+            missing = ~valid_tensor[:, tracker_index]
+            pos_values[missing, tracker_index * 3 : tracker_index * 3 + 3] = 0.0
+            rot_values[missing, tracker_index * 6 : tracker_index * 6 + 6] = 0.0
+        next_conditioned[:, pos_slice, REALTIME_POSE_TARGET_START] = pos_values
+        next_conditioned[:, rot_slice, REALTIME_POSE_TARGET_START] = rot_values
+        next_conditioned[:, self.schema.sensor_valid_slice(), REALTIME_POSE_TARGET_START] = valid_tensor.to(dtype=dtype)
+
+    def _target_features_to_raw(self, features: torch.Tensor) -> torch.Tensor:
+        values = features[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
+        if self.normalizer_mean is None or self.normalizer_std is None:
+            return values.clone()
+        mean = self.normalizer_mean.to(device=features.device, dtype=features.dtype)[self.schema.target_slice()]
+        std = self.normalizer_std.to(device=features.device, dtype=features.dtype)[self.schema.target_slice()]
+        return values * std + mean
+
+    def _raw_target_to_normalized(self, values: torch.Tensor) -> torch.Tensor:
+        if self.normalizer_mean is None or self.normalizer_std is None:
+            return values
+        mean = self.normalizer_mean.to(device=values.device, dtype=values.dtype)[self.schema.target_slice()]
+        std = self.normalizer_std.to(device=values.device, dtype=values.dtype)[self.schema.target_slice()]
+        return (values - mean) / std
 
     def build_one_step_rollout_conditioned_x(self, rollout_batch: dict, pred_xstart: torch.Tensor) -> torch.Tensor:
         next_conditioned = rollout_batch["conditioned_x"].clone()
@@ -674,6 +994,10 @@ class TrainLoop:
             "target_root_pos_world": batch["target_root_pos_world"],
             "prev_root_yaw": batch["prev_root_yaw"],
             "target_root_yaw": batch["target_root_yaw"],
+            "tracker_ref_root_pos_world": batch["tracker_ref_root_pos_world"],
+            "tracker_ref_root_yaw": batch["tracker_ref_root_yaw"],
+            "tracker_ref_source": batch["tracker_ref_source"],
+            "target_floor_y": batch["target_floor_y"],
             "target_tracker_pos_ref": batch["target_tracker_pos_ref"],
             "target_tracker_rot_ref_6d": batch["target_tracker_rot_ref_6d"],
             "target_sensor_valid": batch["target_sensor_valid"],

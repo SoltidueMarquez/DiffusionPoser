@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,16 +11,16 @@ import torch
 from torch.utils.data import Dataset
 
 from data_loaders.manifest_utils import filter_entries_by_folder_path
-from data_loaders.realtime_pose_contract import validate_realtime_task_contract
+from data_loaders.realtime_pose_contract import RESOLVER_CONTEXT_FRAMES, validate_realtime_task_contract
 from data_loaders.realtime_pose_kinematics import (
     make_yaw_rotation_np,
-    rotation_6d_forward_up_np,
-    rotation_6d_to_matrix_np,
 )
+from data_loaders.tracker_codec import build_tracker_reference_np, encode_tracker_positions_np, encode_tracker_rotations_np
 from data_loaders.sensor_masking import (
     BODY_POSE_DIM,
     POSE_REPRESENTATION_KEY,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
@@ -32,6 +33,7 @@ from data_loaders.sensor_masking import (
     SchemaSpec,
     STATIONARY_PROB_DIM,
     TRACKER_COUNT,
+    TRACKER_PATTERN_CATEGORIES,
     TRACKER_MASK_FILL_MODES,
     TRACKER_MASK_FILL_ZERO,
     TRACKER_MASK_POLICIES,
@@ -40,6 +42,7 @@ from data_loaders.sensor_masking import (
     TRACKER_MASK_POLICY_FIXED_CATEGORIES,
     TRACKER_MASK_POLICY_TASK,
     make_tracker_pattern,
+    make_dynamic_dropout_sensor_valid,
     normalize_tracker_pattern_categories,
     repeat_pattern_sensor_valid,
     validate_realtime_seq_len,
@@ -70,10 +73,11 @@ class RealtimePoseTaskDataset(Dataset):
         normalizer_dir: str | Path | None = None,
         normalize_input: bool = True,
         preload_data: bool = False,
+        cache_last_task: bool = False,
         folder_path: str | Path | None = None,
         tracker_pos_noise_std: float = 0.0,
         tracker_rot_noise_std: float = 0.0,
-        non_hip_tracker_dropout_prob: float = 0.0,
+        non_head_tracker_dropout_prob: float = 0.0,
         history_pose_noise_std: float = 0.0,
         history_yaw_noise_std: float = 0.0,
         root_yaw_ref_noise_std: float = 0.0,
@@ -101,10 +105,11 @@ class RealtimePoseTaskDataset(Dataset):
         self.schema = get_schema_spec(schema_name)
         self.normalize_input = bool(normalize_input)
         self.preload_data = bool(preload_data)
+        self.cache_last_task = bool(cache_last_task)
         self.is_train_split = "train" in str(split).lower()
         self.tracker_pos_noise_std = float(tracker_pos_noise_std)
         self.tracker_rot_noise_std = float(tracker_rot_noise_std)
-        self.non_hip_tracker_dropout_prob = float(non_hip_tracker_dropout_prob)
+        self.non_head_tracker_dropout_prob = float(non_head_tracker_dropout_prob)
         self.history_pose_noise_std = float(history_pose_noise_std)
         self.history_yaw_noise_std = float(history_yaw_noise_std)
         self.root_yaw_ref_noise_std = float(root_yaw_ref_noise_std)
@@ -173,6 +178,8 @@ class RealtimePoseTaskDataset(Dataset):
                     )
 
         self.task_cache = None
+        self._last_task_cache_index: int | None = None
+        self._last_task_cache: dict[str, np.ndarray] | None = None
         if self.preload_data:
             self.task_cache = [
                 load_materialized_task_npz(
@@ -203,18 +210,34 @@ class RealtimePoseTaskDataset(Dataset):
                 index=index,
                 salt=f"augment:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
             )
+            sensor_valid_before_augmentation = arrays["sensor_valid"].copy()
             arrays = augment_realtime_arrays(
                 arrays=arrays,
                 rng=rng,
                 tracker_pos_noise_std=self.tracker_pos_noise_std,
                 tracker_rot_noise_std=self.tracker_rot_noise_std,
-                non_hip_tracker_dropout_prob=self.non_hip_tracker_dropout_prob,
+                non_head_tracker_dropout_prob=(
+                    0.0
+                    if applied_tracker_pattern == "standard_three" or self.tracker_mask_policy != TRACKER_MASK_POLICY_TASK
+                    else self.non_head_tracker_dropout_prob
+                ),
                 tracker_latency_max_frames=self.tracker_latency_max_frames,
-                tracker_burst_dropout_prob=self.tracker_burst_dropout_prob,
+                tracker_burst_dropout_prob=(
+                    0.0
+                    if applied_tracker_pattern == "standard_three" or self.tracker_mask_policy != TRACKER_MASK_POLICY_TASK
+                    else self.tracker_burst_dropout_prob
+                ),
                 tracker_outlier_prob=self.tracker_outlier_prob,
                 history_pose_noise_std=self.history_pose_noise_std,
                 history_yaw_noise_std=self.history_yaw_noise_std,
                 root_yaw_ref_noise_std=self.root_yaw_ref_noise_std,
+            )
+            refresh_tracker_reference(
+                arrays,
+                refresh_resolver_state=not np.array_equal(
+                    sensor_valid_before_augmentation,
+                    arrays["sensor_valid"],
+                ),
             )
 
         sensor_valid = arrays["sensor_valid"]
@@ -264,6 +287,39 @@ class RealtimePoseTaskDataset(Dataset):
             "prev_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START - 1]).float(),
             "prev_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START - 1])).float(),
             "target_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START])).float(),
+            "tracker_ref_root_pos_world": torch.from_numpy(
+                arrays["tracker_ref_root_pos_world"][REALTIME_POSE_TARGET_START]
+            ).float(),
+            "tracker_ref_root_yaw": torch.tensor(
+                float(arrays["tracker_ref_root_yaw"][REALTIME_POSE_TARGET_START])
+            ).float(),
+            "tracker_ref_source": torch.tensor(
+                int(arrays["tracker_ref_source"][REALTIME_POSE_TARGET_START]), dtype=torch.int64
+            ),
+            "target_timestamp_seconds": torch.tensor(
+                float(arrays["timestamp_seconds"][REALTIME_POSE_TARGET_START]), dtype=torch.float64
+            ),
+            "target_floor_y": torch.tensor(float(arrays["floor_y"][REALTIME_POSE_TARGET_START])).float(),
+            "target_tracking_origin_revision": torch.tensor(
+                int(arrays["tracking_origin_revision"][REALTIME_POSE_TARGET_START]), dtype=torch.int64
+            ),
+            **resolver_state_tensors(arrays, prefix="resolver_window_start"),
+            "resolver_before_target_root_pos_world": torch.from_numpy(
+                arrays["resolver_before_target_root_pos_world"]
+            ).float(),
+            "resolver_before_target_root_yaw": torch.tensor(
+                float(arrays["resolver_before_target_root_yaw"])
+            ).float(),
+            "resolver_before_target_pelvis_height": torch.tensor(
+                float(arrays["resolver_before_target_pelvis_height"])
+            ).float(),
+            "resolver_before_target_joints_world": torch.from_numpy(
+                arrays["resolver_before_target_joints_world"]
+            ).float(),
+            "resolver_before_target_hip_valid": torch.tensor(
+                bool(arrays["resolver_before_target_hip_valid"]), dtype=torch.bool
+            ),
+            **resolver_state_tensors(arrays, prefix="resolver_before_target"),
             "target_tracker_pos_ref": torch.from_numpy(
                 raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_pos_slice()].reshape(TRACKER_COUNT, 3)
             ).float(),
@@ -352,18 +408,34 @@ class RealtimePoseTaskDataset(Dataset):
                 index=index,
                 salt=f"augment:{keyid_suffix}:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
             )
+            sensor_valid_before_augmentation = arrays["sensor_valid"].copy()
             arrays = augment_realtime_arrays(
                 arrays=arrays,
                 rng=rng,
                 tracker_pos_noise_std=self.tracker_pos_noise_std,
                 tracker_rot_noise_std=self.tracker_rot_noise_std,
-                non_hip_tracker_dropout_prob=self.non_hip_tracker_dropout_prob,
+                non_head_tracker_dropout_prob=(
+                    0.0
+                    if applied_tracker_pattern == "standard_three" or self.tracker_mask_policy != TRACKER_MASK_POLICY_TASK
+                    else self.non_head_tracker_dropout_prob
+                ),
                 tracker_latency_max_frames=self.tracker_latency_max_frames,
-                tracker_burst_dropout_prob=self.tracker_burst_dropout_prob,
+                tracker_burst_dropout_prob=(
+                    0.0
+                    if applied_tracker_pattern == "standard_three" or self.tracker_mask_policy != TRACKER_MASK_POLICY_TASK
+                    else self.tracker_burst_dropout_prob
+                ),
                 tracker_outlier_prob=self.tracker_outlier_prob,
                 history_pose_noise_std=self.history_pose_noise_std,
                 history_yaw_noise_std=self.history_yaw_noise_std,
                 root_yaw_ref_noise_std=self.root_yaw_ref_noise_std,
+            )
+            refresh_tracker_reference(
+                arrays,
+                refresh_resolver_state=not np.array_equal(
+                    sensor_valid_before_augmentation,
+                    arrays["sensor_valid"],
+                ),
             )
 
         sensor_valid = arrays["sensor_valid"]
@@ -409,6 +481,39 @@ class RealtimePoseTaskDataset(Dataset):
             "prev_root_pos_world": torch.from_numpy(arrays["root_pos_world"][REALTIME_POSE_TARGET_START - 1]).float(),
             "prev_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START - 1])).float(),
             "target_root_yaw": torch.tensor(float(arrays["root_yaw"][REALTIME_POSE_TARGET_START])).float(),
+            "tracker_ref_root_pos_world": torch.from_numpy(
+                arrays["tracker_ref_root_pos_world"][REALTIME_POSE_TARGET_START]
+            ).float(),
+            "tracker_ref_root_yaw": torch.tensor(
+                float(arrays["tracker_ref_root_yaw"][REALTIME_POSE_TARGET_START])
+            ).float(),
+            "tracker_ref_source": torch.tensor(
+                int(arrays["tracker_ref_source"][REALTIME_POSE_TARGET_START]), dtype=torch.int64
+            ),
+            "target_timestamp_seconds": torch.tensor(
+                float(arrays["timestamp_seconds"][REALTIME_POSE_TARGET_START]), dtype=torch.float64
+            ),
+            "target_floor_y": torch.tensor(float(arrays["floor_y"][REALTIME_POSE_TARGET_START])).float(),
+            "target_tracking_origin_revision": torch.tensor(
+                int(arrays["tracking_origin_revision"][REALTIME_POSE_TARGET_START]), dtype=torch.int64
+            ),
+            **resolver_state_tensors(arrays, prefix="resolver_window_start"),
+            "resolver_before_target_root_pos_world": torch.from_numpy(
+                arrays["resolver_before_target_root_pos_world"]
+            ).float(),
+            "resolver_before_target_root_yaw": torch.tensor(
+                float(arrays["resolver_before_target_root_yaw"])
+            ).float(),
+            "resolver_before_target_pelvis_height": torch.tensor(
+                float(arrays["resolver_before_target_pelvis_height"])
+            ).float(),
+            "resolver_before_target_joints_world": torch.from_numpy(
+                arrays["resolver_before_target_joints_world"]
+            ).float(),
+            "resolver_before_target_hip_valid": torch.tensor(
+                bool(arrays["resolver_before_target_hip_valid"]), dtype=torch.bool
+            ),
+            **resolver_state_tensors(arrays, prefix="resolver_before_target"),
             "target_tracker_pos_ref": torch.from_numpy(
                 raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_pos_slice()].reshape(TRACKER_COUNT, 3)
             ).float(),
@@ -445,11 +550,23 @@ class RealtimePoseTaskDataset(Dataset):
     def load_task(self, index: int, entry: dict) -> dict[str, np.ndarray]:
         if self.task_cache is not None:
             return self.task_cache[index]
-        return load_materialized_task_npz(
+        if self.cache_last_task and self._last_task_cache_index == index and self._last_task_cache is not None:
+            return self._last_task_cache
+        task = load_materialized_task_npz(
             manifest_dir=self.manifest_dir,
             task_path=entry["task_path"],
             schema_name=self.schema.name,
         )
+        if self.cache_last_task:
+            # Cache only the unmasked, unaugmented materialized task.  The array
+            # loader creates working copies before masking, and read-only base
+            # arrays make accidental cross-sample mutation fail immediately.
+            for value in task.values():
+                if isinstance(value, np.ndarray):
+                    value.setflags(write=False)
+            self._last_task_cache_index = int(index)
+            self._last_task_cache = task
+        return task
 
     def apply_predicted_history_cache(
         self,
@@ -540,21 +657,47 @@ class RealtimePoseTaskDataset(Dataset):
             raise ValueError(f"未知 tracker_mask_policy={self.tracker_mask_policy}")
 
         pattern = make_tracker_pattern(category, rng)
-        result["sensor_valid"] = repeat_pattern_sensor_valid(pattern, seq_len=self.seq_len)
+        source_frames = int(np.asarray(result["source_frames"]).item())
+        absolute_start_frame = int(np.asarray(result["start_frame"]).item())
+        full_sensor_valid = (
+            make_dynamic_dropout_sensor_valid(rng=rng, seq_len=source_frames)
+            if category == "dynamic_dropout"
+            else repeat_pattern_sensor_valid(pattern, seq_len=source_frames)
+        )
+        result["sensor_valid"] = full_sensor_valid[
+            absolute_start_frame : absolute_start_frame + self.seq_len
+        ].copy()
+        refresh_tracker_reference(
+            result,
+            full_sensor_valid=full_sensor_valid,
+            absolute_start_frame=absolute_start_frame,
+        )
         return result, pattern.category
 
     def dynamic_mask_category(self, entry: dict, index: int, random_context: RandomContext) -> str:
         # 动态遮盖按“洗牌后的类别轮转”采样，既覆盖所有类别，又能用 seed 复现实验。
-        categories = np.asarray(self.tracker_mask_categories, dtype=object)
-        cycle_index = random_context.access_index // len(categories)
-        position = random_context.access_index % len(categories)
+        categories = tuple(self.tracker_mask_categories)
+        if set(categories) == set(TRACKER_PATTERN_CATEGORIES) and len(categories) == len(TRACKER_PATTERN_CATEGORIES):
+            schedule = np.asarray(
+                [
+                    "full_six", "full_six", "full_six",
+                    "standard_three", "standard_three", "standard_three",
+                    "static_sparse", "static_sparse",
+                    "dynamic_dropout", "dynamic_dropout",
+                ],
+                dtype=object,
+            )
+        else:
+            schedule = np.asarray(categories, dtype=object)
+        cycle_index = random_context.access_index // len(schedule)
+        position = random_context.access_index % len(schedule)
         rng = self.stable_rng(
             entry=entry,
             index=index,
             salt=f"dynamic_category:e{random_context.epoch}:w{random_context.worker_id}:c{cycle_index}",
         )
-        rng.shuffle(categories)
-        return str(categories[position])
+        rng.shuffle(schedule)
+        return str(schedule[position])
 
     def fixed_mask_category(self, entry: dict, index: int) -> str:
         categories = self.tracker_mask_categories
@@ -613,13 +756,53 @@ def load_materialized_task_npz(
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> dict[str, np.ndarray]:
     path = manifest_dir / task_path
-    if not path.exists():
+    fs_path = windows_extended_path(path)
+    if not fs_path.exists():
         raise FileNotFoundError(f"realtime_pose task 文件不存在: {path}")
-    with np.load(path, allow_pickle=False) as data:
+    with np.load(fs_path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
     schema = get_schema_spec(schema_name)
     validate_realtime_task_contract(task, schema=schema, source=str(path))
     return task
+
+
+def windows_extended_path(path: Path) -> Path:
+    resolved = path.resolve()
+    text = str(resolved)
+    if os.name == "nt" and not text.startswith("\\\\?\\") and len(text) >= 248:
+        return Path("\\\\?\\" + text)
+    return resolved
+
+def resolver_state_tensors(arrays: dict[str, np.ndarray], prefix: str) -> dict[str, torch.Tensor]:
+    """Expose the complete serialized Resolver boundary state without changing the 214-D feature tensor."""
+
+    return {
+        f"{prefix}_root_pos_world": torch.from_numpy(arrays[f"{prefix}_root_pos_world"]).float(),
+        f"{prefix}_root_yaw": torch.tensor(float(arrays[f"{prefix}_root_yaw"])).float(),
+        f"{prefix}_pelvis_height": torch.tensor(float(arrays[f"{prefix}_pelvis_height"])).float(),
+        f"{prefix}_joints_world": torch.from_numpy(arrays[f"{prefix}_joints_world"]).float(),
+        f"{prefix}_hip_valid": torch.tensor(bool(arrays[f"{prefix}_hip_valid"]), dtype=torch.bool),
+        f"{prefix}_reconnect_start_root_pos_world": torch.from_numpy(
+            arrays[f"{prefix}_reconnect_start_root_pos_world"]
+        ).float(),
+        f"{prefix}_reconnect_start_root_yaw": torch.tensor(
+            float(arrays[f"{prefix}_reconnect_start_root_yaw"])
+        ).float(),
+        f"{prefix}_reconnect_start_pelvis_height": torch.tensor(
+            float(arrays[f"{prefix}_reconnect_start_pelvis_height"])
+        ).float(),
+        f"{prefix}_reconnect_elapsed_seconds": torch.tensor(
+            float(arrays[f"{prefix}_reconnect_elapsed_seconds"])
+        ).float(),
+        f"{prefix}_last_timestamp_seconds": torch.tensor(
+            float(arrays[f"{prefix}_last_timestamp_seconds"]), dtype=torch.float64
+        ),
+        f"{prefix}_floor_y": torch.tensor(float(arrays[f"{prefix}_floor_y"])).float(),
+        f"{prefix}_tracking_origin_revision": torch.tensor(
+            int(arrays[f"{prefix}_tracking_origin_revision"]), dtype=torch.int64
+        ),
+    }
+
 
 def load_realtime_task_arrays(
     task: dict[str, np.ndarray],
@@ -649,7 +832,111 @@ def load_realtime_task_arrays(
         "joint_offsets_parent": array_shape(task["joint_offsets_parent"], (24, 3), "joint_offsets_parent").astype(np.float32),
         "sensor_valid": array_shape(task["sensor_valid"], (seq_len, SENSOR_VALID_DIM), "sensor_valid").astype(bool),
         "inpaint_mask": array_shape(task["inpaint_mask"], (seq_len, schema.feature_dim), "inpaint_mask").astype(bool),
+        "tracker_ref_root_pos_world": array_shape(
+            task["tracker_ref_root_pos_world"], (seq_len, 3), "tracker_ref_root_pos_world"
+        ).astype(np.float32),
+        "tracker_ref_root_yaw": array_shape(
+            task["tracker_ref_root_yaw"], (seq_len,), "tracker_ref_root_yaw"
+        ).astype(np.float32),
+        "tracker_ref_source": array_shape(task["tracker_ref_source"], (seq_len,), "tracker_ref_source").astype(np.int8),
+        "timestamp_seconds": array_shape(task["timestamp_seconds"], (seq_len,), "timestamp_seconds").astype(np.float64),
+        "floor_y": array_shape(task["floor_y"], (seq_len,), "floor_y").astype(np.float32),
+        "tracking_origin_revision": array_shape(
+            task["tracking_origin_revision"], (seq_len,), "tracking_origin_revision"
+        ).astype(np.int64),
+        "start_frame": np.asarray(task["start_frame"], dtype=np.int64).reshape(()),
+        "source_frames": np.asarray(task["source_frames"], dtype=np.int64).reshape(()),
+        "resolver_context_frame_indices": array_shape(
+            task["resolver_context_frame_indices"],
+            (RESOLVER_CONTEXT_FRAMES,),
+            "resolver_context_frame_indices",
+        ).astype(np.int64),
+        "resolver_context_root_pos_world": array_shape(
+            task["resolver_context_root_pos_world"],
+            (RESOLVER_CONTEXT_FRAMES, 3),
+            "resolver_context_root_pos_world",
+        ).astype(np.float32),
+        "resolver_context_root_yaw": array_shape(
+            task["resolver_context_root_yaw"],
+            (RESOLVER_CONTEXT_FRAMES,),
+            "resolver_context_root_yaw",
+        ).astype(np.float32),
+        "resolver_context_pelvis_height": array_shape(
+            task["resolver_context_pelvis_height"],
+            (RESOLVER_CONTEXT_FRAMES, 1),
+            "resolver_context_pelvis_height",
+        ).astype(np.float32),
+        "resolver_context_joints_world": array_shape(
+            task["resolver_context_joints_world"],
+            (RESOLVER_CONTEXT_FRAMES, 24, 3),
+            "resolver_context_joints_world",
+        ).astype(np.float32),
+        "resolver_context_timestamp_seconds": array_shape(
+            task["resolver_context_timestamp_seconds"],
+            (RESOLVER_CONTEXT_FRAMES,),
+            "resolver_context_timestamp_seconds",
+        ).astype(np.float64),
+        "resolver_context_floor_y": array_shape(
+            task["resolver_context_floor_y"],
+            (RESOLVER_CONTEXT_FRAMES,),
+            "resolver_context_floor_y",
+        ).astype(np.float32),
+        "resolver_context_tracking_origin_revision": array_shape(
+            task["resolver_context_tracking_origin_revision"],
+            (RESOLVER_CONTEXT_FRAMES,),
+            "resolver_context_tracking_origin_revision",
+        ).astype(np.int64),
+        "resolver_window_start_root_pos_world": array_shape(
+            task["resolver_window_start_root_pos_world"], (3,), "resolver_window_start_root_pos_world"
+        ).astype(np.float32),
+        "resolver_window_start_joints_world": array_shape(
+            task["resolver_window_start_joints_world"], (24, 3), "resolver_window_start_joints_world"
+        ).astype(np.float32),
+        "resolver_window_start_reconnect_start_root_pos_world": array_shape(
+            task["resolver_window_start_reconnect_start_root_pos_world"],
+            (3,),
+            "resolver_window_start_reconnect_start_root_pos_world",
+        ).astype(np.float32),
+        "resolver_before_target_root_pos_world": array_shape(
+            task["resolver_before_target_root_pos_world"], (3,), "resolver_before_target_root_pos_world"
+        ).astype(np.float32),
+        "resolver_before_target_joints_world": array_shape(
+            task["resolver_before_target_joints_world"], (24, 3), "resolver_before_target_joints_world"
+        ).astype(np.float32),
+        "resolver_before_target_reconnect_start_root_pos_world": array_shape(
+            task["resolver_before_target_reconnect_start_root_pos_world"],
+            (3,),
+            "resolver_before_target_reconnect_start_root_pos_world",
+        ).astype(np.float32),
     }
+    for key in (
+        "resolver_window_start_root_yaw",
+        "resolver_window_start_pelvis_height",
+        "resolver_window_start_reconnect_start_root_yaw",
+        "resolver_window_start_reconnect_start_pelvis_height",
+        "resolver_window_start_reconnect_elapsed_seconds",
+        "resolver_window_start_floor_y",
+        "resolver_before_target_root_yaw",
+        "resolver_before_target_pelvis_height",
+        "resolver_before_target_reconnect_start_root_yaw",
+        "resolver_before_target_reconnect_start_pelvis_height",
+        "resolver_before_target_reconnect_elapsed_seconds",
+        "resolver_before_target_floor_y",
+    ):
+        arrays[key] = np.asarray(task[key], dtype=np.float32).reshape(())
+    for key in (
+        "resolver_window_start_last_timestamp_seconds",
+        "resolver_before_target_last_timestamp_seconds",
+    ):
+        arrays[key] = np.asarray(task[key], dtype=np.float64).reshape(())
+    arrays["resolver_window_start_hip_valid"] = np.asarray(task["resolver_window_start_hip_valid"], dtype=bool).reshape(())
+    arrays["resolver_window_start_tracking_origin_revision"] = np.asarray(
+        task["resolver_window_start_tracking_origin_revision"], dtype=np.int64
+    ).reshape(())
+    arrays["resolver_before_target_hip_valid"] = np.asarray(task["resolver_before_target_hip_valid"], dtype=bool).reshape(())
+    arrays["resolver_before_target_tracking_origin_revision"] = np.asarray(
+        task["resolver_before_target_tracking_origin_revision"], dtype=np.int64
+    ).reshape(())
     if schema.supports_root_motion:
         arrays["root_delta_xz_ref"] = array_shape(
             task["root_delta_xz_ref"],
@@ -686,6 +973,12 @@ def encode_realtime_pose_features(
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> np.ndarray:
     schema = get_schema_spec(schema_name)
+    if "tracker_ref_root_pos_world" not in arrays:
+        # Feature encoding only needs the inference-time tracker reference.  Resolver
+        # boundary snapshots belong to serialized training tasks and must not be
+        # synthesized here: evaluation helpers and legacy in-memory fixtures may
+        # intentionally provide shorter masks or omit timestamp/origin metadata.
+        refresh_tracker_reference(arrays, refresh_resolver_state=False)
     seq_len = arrays[schema.body_pose_key].shape[0]
     features = np.zeros((seq_len, schema.feature_dim), dtype=np.float32)
     features[:, schema.body_pose_slice()] = arrays[schema.body_pose_key]
@@ -702,31 +995,266 @@ def encode_realtime_pose_features(
     return features
 
 
+def refresh_tracker_reference(
+    arrays: dict[str, np.ndarray],
+    *,
+    refresh_resolver_state: bool = True,
+    full_sensor_valid: np.ndarray | None = None,
+    absolute_start_frame: int | None = None,
+) -> None:
+    """mask 或 observation 改变后，按推理前可计算策略重建 Tracker reference。"""
+
+    first_previous_root = np.asarray(
+        arrays.get("resolver_window_start_root_pos_world", arrays["root_pos_world"][0]),
+        dtype=np.float32,
+    )[None]
+    first_previous_yaw = np.asarray(
+        arrays.get("resolver_window_start_root_yaw", arrays["root_yaw"][0]),
+        dtype=np.float32,
+    ).reshape(1)
+    previous_root = np.concatenate([first_previous_root, arrays["root_pos_world"][:-1]], axis=0)
+    previous_yaw = np.concatenate([first_previous_yaw, arrays["root_yaw"][:-1]], axis=0)
+    ref_pos, ref_yaw, ref_source = build_tracker_reference_np(
+        tracker_pos_world=arrays["tracker_pos_world"],
+        tracker_rot_world_6d=arrays["tracker_rot_world_6d"],
+        sensor_valid=arrays["sensor_valid"],
+        previous_final_root_pos_world=previous_root,
+        previous_final_root_yaw=previous_yaw,
+        pelvis_offset_parent=arrays["joint_offsets_parent"][0],
+        floor_y=arrays.get("floor_y", 0.0),
+    )
+    arrays["tracker_ref_root_pos_world"] = ref_pos
+    arrays["tracker_ref_root_yaw"] = ref_yaw
+    arrays["tracker_ref_source"] = ref_source
+    if refresh_resolver_state:
+        if full_sensor_valid is not None:
+            if absolute_start_frame is None:
+                raise ValueError("online mask refresh requires absolute_start_frame")
+            refresh_resolver_states_from_timeline(
+                arrays,
+                full_sensor_valid=full_sensor_valid,
+                absolute_start_frame=int(absolute_start_frame),
+            )
+        else:
+            refresh_resolver_before_target_state(arrays)
+
+
+def refresh_resolver_states_from_timeline(
+    arrays: dict[str, np.ndarray],
+    *,
+    full_sensor_valid: np.ndarray,
+    absolute_start_frame: int,
+) -> None:
+    valid = validate_sensor_valid(np.asarray(full_sensor_valid, dtype=bool))
+    source_frames = int(np.asarray(arrays["source_frames"]).item())
+    if valid.shape[0] != source_frames:
+        raise ValueError(f"full_sensor_valid length={valid.shape[0]}, expected source_frames={source_frames}")
+    _write_online_resolver_snapshot(
+        arrays,
+        full_sensor_valid=valid,
+        absolute_start_frame=absolute_start_frame,
+        frame_index=max(absolute_start_frame - 1, 0),
+        prefix="resolver_window_start",
+    )
+    _write_online_resolver_snapshot(
+        arrays,
+        full_sensor_valid=valid,
+        absolute_start_frame=absolute_start_frame,
+        frame_index=absolute_start_frame + REALTIME_POSE_TARGET_START - 1,
+        prefix="resolver_before_target",
+    )
+
+
+def _write_online_resolver_snapshot(
+    arrays: dict[str, np.ndarray],
+    *,
+    full_sensor_valid: np.ndarray,
+    absolute_start_frame: int,
+    frame_index: int,
+    prefix: str,
+) -> None:
+    index = int(np.clip(frame_index, 0, full_sensor_valid.shape[0] - 1))
+    hip_valid = bool(full_sensor_valid[index, HIP_TRACKER_INDEX])
+    reconnect_start_index = index
+    reconnect_elapsed = 0.0
+    if hip_valid:
+        first_valid = index
+        while first_valid > 0 and full_sensor_valid[first_valid - 1, HIP_TRACKER_INDEX]:
+            first_valid -= 1
+        if first_valid > 0:
+            candidate_start_index = first_valid - 1
+            timestamps = np.asarray(arrays["timestamp_seconds"], dtype=np.float64)
+            frame_dt = float(np.median(np.diff(timestamps))) if timestamps.size > 1 else 1.0 / 60.0
+            elapsed = float(index - candidate_start_index) * max(frame_dt, 0.0)
+            if elapsed < 0.1:
+                reconnect_start_index = candidate_start_index
+                reconnect_elapsed = elapsed
+
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    root = _task_value_at_absolute_frame(
+        arrays,
+        key="root_pos_world",
+        context_key="resolver_context_root_pos_world",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    yaw = _task_value_at_absolute_frame(
+        arrays,
+        key="root_yaw",
+        context_key="resolver_context_root_yaw",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    height = _task_value_at_absolute_frame(
+        arrays,
+        key=schema.pelvis_height_key,
+        context_key="resolver_context_pelvis_height",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    joints = _task_value_at_absolute_frame(
+        arrays,
+        key="joints_world",
+        context_key="resolver_context_joints_world",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    reconnect_root = _task_value_at_absolute_frame(
+        arrays,
+        key="root_pos_world",
+        context_key="resolver_context_root_pos_world",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=reconnect_start_index,
+    )
+    reconnect_yaw = _task_value_at_absolute_frame(
+        arrays,
+        key="root_yaw",
+        context_key="resolver_context_root_yaw",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=reconnect_start_index,
+    )
+    reconnect_height = _task_value_at_absolute_frame(
+        arrays,
+        key=schema.pelvis_height_key,
+        context_key="resolver_context_pelvis_height",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=reconnect_start_index,
+    )
+    timestamp = _task_value_at_absolute_frame(
+        arrays,
+        key="timestamp_seconds",
+        context_key="resolver_context_timestamp_seconds",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    floor_y = _task_value_at_absolute_frame(
+        arrays,
+        key="floor_y",
+        context_key="resolver_context_floor_y",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    origin_revision = _task_value_at_absolute_frame(
+        arrays,
+        key="tracking_origin_revision",
+        context_key="resolver_context_tracking_origin_revision",
+        absolute_start_frame=absolute_start_frame,
+        frame_index=index,
+    )
+    arrays[f"{prefix}_root_pos_world"] = np.asarray(root, dtype=np.float32)
+    arrays[f"{prefix}_root_yaw"] = np.float32(yaw)
+    arrays[f"{prefix}_pelvis_height"] = np.float32(np.asarray(height).reshape(-1)[0])
+    arrays[f"{prefix}_joints_world"] = np.asarray(joints, dtype=np.float32)
+    arrays[f"{prefix}_hip_valid"] = np.asarray(hip_valid)
+    arrays[f"{prefix}_reconnect_start_root_pos_world"] = np.asarray(reconnect_root, dtype=np.float32)
+    arrays[f"{prefix}_reconnect_start_root_yaw"] = np.float32(reconnect_yaw)
+    arrays[f"{prefix}_reconnect_start_pelvis_height"] = np.float32(
+        np.asarray(reconnect_height).reshape(-1)[0]
+    )
+    arrays[f"{prefix}_reconnect_elapsed_seconds"] = np.float32(reconnect_elapsed)
+    arrays[f"{prefix}_last_timestamp_seconds"] = np.float64(timestamp)
+    arrays[f"{prefix}_floor_y"] = np.float32(floor_y)
+    arrays[f"{prefix}_tracking_origin_revision"] = np.int64(origin_revision)
+
+
+def _task_value_at_absolute_frame(
+    arrays: dict[str, np.ndarray],
+    *,
+    key: str,
+    context_key: str,
+    absolute_start_frame: int,
+    frame_index: int,
+):
+    local_index = int(frame_index) - int(absolute_start_frame)
+    values = np.asarray(arrays[key])
+    if 0 <= local_index < values.shape[0]:
+        return values[local_index]
+    context_indices = np.asarray(arrays["resolver_context_frame_indices"], dtype=np.int64)
+    matches = np.flatnonzero(context_indices == int(frame_index))
+    if matches.size == 0:
+        raise ValueError(
+            f"Resolver context does not cover absolute frame {frame_index} for start={absolute_start_frame}"
+        )
+    return np.asarray(arrays[context_key])[int(matches[-1])]
+
+
+def refresh_resolver_before_target_state(arrays: dict[str, np.ndarray]) -> None:
+    """Keep rollout boundary state consistent when training-time masking changes."""
+
+    index = REALTIME_POSE_TARGET_START - 1
+    valid = np.asarray(arrays["sensor_valid"], dtype=bool)
+    hip_valid = bool(valid[index, HIP_TRACKER_INDEX])
+    reconnect_start_index = index
+    reconnect_elapsed = 0.0
+    if hip_valid:
+        first_valid = index
+        while first_valid > 0 and valid[first_valid - 1, HIP_TRACKER_INDEX]:
+            first_valid -= 1
+        if first_valid > 0:
+            reconnect_start_index = first_valid - 1
+            elapsed = float(arrays["timestamp_seconds"][index] - arrays["timestamp_seconds"][first_valid - 1])
+            reconnect_elapsed = elapsed if elapsed < 0.1 else 0.0
+    height_values = arrays.get("pelvis_height")
+    if height_values is None:
+        height = float(arrays["resolver_before_target_pelvis_height"])
+        reconnect_height = height
+    else:
+        height = float(np.asarray(height_values)[index].reshape(-1)[0])
+        reconnect_height = float(np.asarray(height_values)[reconnect_start_index].reshape(-1)[0])
+    arrays["resolver_before_target_root_pos_world"] = np.asarray(arrays["root_pos_world"][index], dtype=np.float32)
+    arrays["resolver_before_target_root_yaw"] = np.float32(arrays["root_yaw"][index])
+    arrays["resolver_before_target_pelvis_height"] = np.float32(height)
+    arrays["resolver_before_target_joints_world"] = np.asarray(arrays["joints_world"][index], dtype=np.float32)
+    arrays["resolver_before_target_hip_valid"] = np.asarray(hip_valid)
+    arrays["resolver_before_target_reconnect_start_root_pos_world"] = np.asarray(
+        arrays["root_pos_world"][reconnect_start_index], dtype=np.float32
+    )
+    arrays["resolver_before_target_reconnect_start_root_yaw"] = np.float32(
+        arrays["root_yaw"][reconnect_start_index]
+    )
+    arrays["resolver_before_target_reconnect_start_pelvis_height"] = np.float32(reconnect_height)
+    arrays["resolver_before_target_reconnect_elapsed_seconds"] = np.float32(reconnect_elapsed)
+    arrays["resolver_before_target_last_timestamp_seconds"] = np.float64(arrays["timestamp_seconds"][index])
+    arrays["resolver_before_target_floor_y"] = np.float32(arrays["floor_y"][index])
+    arrays["resolver_before_target_tracking_origin_revision"] = np.int64(
+        arrays["tracking_origin_revision"][index]
+    )
+
+
 def encode_tracker_pos_ref(arrays: dict[str, np.ndarray]) -> np.ndarray:
     tracker_world = arrays["tracker_pos_world"].astype(np.float64)
-    roots = arrays["root_pos_world"].astype(np.float64)
-    root_yaw = arrays["root_yaw"].astype(np.float64)
-    ref_yaw = np.concatenate([root_yaw[:1], root_yaw[:-1]], axis=0)
+    roots = arrays["tracker_ref_root_pos_world"].astype(np.float64)
+    ref_yaw = arrays["tracker_ref_root_yaw"].astype(np.float64)
     if "root_yaw_ref_noise" in arrays:
         ref_yaw = ref_yaw + np.asarray(arrays["root_yaw_ref_noise"], dtype=np.float64)
-    result = np.zeros_like(tracker_world)
-    for frame_index in range(tracker_world.shape[0]):
-        rotation = make_yaw_rotation_np(np.asarray([ref_yaw[frame_index]], dtype=np.float64))[0]
-        result[frame_index] = (tracker_world[frame_index] - roots[frame_index][None]) @ rotation
-    return result.astype(np.float32)
+    return encode_tracker_positions_np(tracker_world, roots, ref_yaw)
 
 
 def encode_tracker_rot_ref(arrays: dict[str, np.ndarray]) -> np.ndarray:
-    tracker_world_rot = rotation_6d_to_matrix_np(arrays["tracker_rot_world_6d"])
-    root_yaw = arrays["root_yaw"].astype(np.float64)
-    ref_yaw = np.concatenate([root_yaw[:1], root_yaw[:-1]], axis=0)
+    ref_yaw = arrays["tracker_ref_root_yaw"].astype(np.float64)
     if "root_yaw_ref_noise" in arrays:
         ref_yaw = ref_yaw + np.asarray(arrays["root_yaw_ref_noise"], dtype=np.float64)
-    result = np.zeros_like(tracker_world_rot)
-    for frame_index in range(tracker_world_rot.shape[0]):
-        rotation_inv = make_yaw_rotation_np(np.asarray([ref_yaw[frame_index]], dtype=np.float64))[0].T
-        result[frame_index] = rotation_inv[None] @ tracker_world_rot[frame_index]
-    return rotation_6d_forward_up_np(result).astype(np.float32)
+    return encode_tracker_rotations_np(arrays["tracker_rot_world_6d"], ref_yaw)
 
 
 def zero_missing_tracker_channels(
@@ -749,7 +1277,7 @@ def augment_realtime_arrays(
     rng: np.random.Generator,
     tracker_pos_noise_std: float = 0.0,
     tracker_rot_noise_std: float = 0.0,
-    non_hip_tracker_dropout_prob: float = 0.0,
+    non_head_tracker_dropout_prob: float = 0.0,
     tracker_latency_max_frames: int = 0,
     tracker_burst_dropout_prob: float = 0.0,
     tracker_outlier_prob: float = 0.0,
@@ -761,9 +1289,9 @@ def augment_realtime_arrays(
 
     result = {key: value.copy() for key, value in arrays.items()}
     sensor_valid = result["sensor_valid"].copy()
-    dropout_prob = max(float(non_hip_tracker_dropout_prob), float(tracker_burst_dropout_prob))
+    dropout_prob = max(float(non_head_tracker_dropout_prob), float(tracker_burst_dropout_prob))
     if dropout_prob > 0:
-        sensor_valid = dropout_non_hip_trackers(
+        sensor_valid = dropout_non_head_trackers(
             sensor_valid=sensor_valid,
             rng=rng,
             dropout_prob=dropout_prob,
@@ -854,22 +1382,22 @@ def apply_history_condition_corruption(
     history_yaw[:] = history_yaw / np.maximum(yaw_norm, 1e-8)
 
 
-def dropout_non_hip_trackers(
+def dropout_non_head_trackers(
     sensor_valid: np.ndarray,
     rng: np.random.Generator,
     dropout_prob: float,
 ) -> np.ndarray:
     valid = np.asarray(sensor_valid, dtype=bool).copy()
-    valid[:, HIP_TRACKER_INDEX] = True
-    non_hip_indices = [index for index in range(TRACKER_COUNT) if index != HIP_TRACKER_INDEX]
+    valid[:, HEAD_TRACKER_INDEX] = True
+    non_head_indices = [index for index in range(TRACKER_COUNT) if index != HEAD_TRACKER_INDEX]
     for frame_index in range(valid.shape[0]):
         original = valid[frame_index].copy()
         for _attempt in range(100):
             candidate = original.copy()
-            for tracker_index in non_hip_indices:
+            for tracker_index in non_head_indices:
                 if candidate[tracker_index] and rng.random() < dropout_prob:
                     candidate[tracker_index] = False
-            candidate[HIP_TRACKER_INDEX] = True
+            candidate[HEAD_TRACKER_INDEX] = True
             if candidate.sum() >= 3:
                 valid[frame_index] = candidate
                 break

@@ -47,8 +47,10 @@ from data_loaders.realtime_pose_kinematics import (
     wrap_radians,
 )
 from data_loaders.realtime_pose_contract import (
+    RUNTIME_CONTRACT_METADATA_FIELDS,
     load_source_metadata,
     required_realtime_source_fields,
+    runtime_contract_metadata,
     validate_realtime_source_contract,
     validate_root_y0_invariants,
     validate_schema_metadata,
@@ -387,6 +389,7 @@ def save_realtime_pose_motion(
         "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
+    metadata.update(runtime_contract_metadata())
     metadata.update(build_source_provenance(source=source, args=provenance_args, schema=schema))
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
@@ -496,8 +499,25 @@ def load_reusable_realtime_features(
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     schema = get_schema_spec(schema_name)
     with np.load(reuse_path, allow_pickle=False) as data:
-        validate_realtime_source_contract(data, schema=schema, source=str(reuse_path))
         metadata = load_source_metadata(data, source=str(reuse_path))
+        missing_runtime_fields = [
+            key for key in RUNTIME_CONTRACT_METADATA_FIELDS if key not in metadata
+        ]
+        if missing_runtime_fields:
+            if len(missing_runtime_fields) != len(RUNTIME_CONTRACT_METADATA_FIELDS):
+                raise ValueError(
+                    f"{reuse_path} metadata 部分缺少 v2 runtime 字段: "
+                    f"{missing_runtime_fields}; 拒绝猜测或覆盖已有版本。"
+                )
+            metadata = {**metadata, **runtime_contract_metadata()}
+
+        validation_payload = {
+            key: np.asarray(data[key])
+            for key in data.files
+            if key != "metadata"
+        }
+        validation_payload["metadata"] = np.asarray(json.dumps(metadata, ensure_ascii=False))
+        validate_realtime_source_contract(validation_payload, schema=schema, source=str(reuse_path))
         validate_schema_metadata(metadata, schema=schema, source=str(reuse_path))
         required = required_source_fields(schema_name)
         features = {
@@ -561,6 +581,7 @@ def save_reused_realtime_source(
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
+    next_metadata.update(runtime_contract_metadata())
     next_metadata.update(
         build_source_provenance_from_metadata(
             metadata=next_metadata,

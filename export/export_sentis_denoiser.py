@@ -47,18 +47,15 @@ DEFAULT_MODEL_CONFIG = {
     "predict_xstart": 1,
     "ts_respace": "",
     "model_arch": "full_feature_dit",
-    "use_stationary_head": False,
-    "stationary_head_loss_weight": 0.05,
 }
 
 
 class SentisDenoiserWrapper(nn.Module):
     """Unity Sentis 固定调用合约：输入 `[1,C,61]`，输出 `pred_x0`。"""
 
-    def __init__(self, denoiser: nn.Module, export_stationary_head: bool = False):
+    def __init__(self, denoiser: nn.Module):
         super().__init__()
         self.denoiser = denoiser
-        self.export_stationary_head = bool(export_stationary_head)
 
     def forward(
         self,
@@ -66,23 +63,13 @@ class SentisDenoiserWrapper(nn.Module):
         timestep: torch.Tensor,
         inpaint_mask: torch.Tensor,
         valid_frame_mask: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        raw_output = self.denoiser(
+    ) -> torch.Tensor:
+        return self.denoiser(
             hidden_states=x_t,
             timestep=timestep,
             inpaint_cond=inpaint_mask,
             valid_frame_mask=valid_frame_mask,
-            return_stationary_head=self.export_stationary_head,
         )
-        if not isinstance(raw_output, dict):
-            return raw_output
-        pred_x0 = raw_output["motion"]
-        if not self.export_stationary_head:
-            return pred_x0
-        stationary_logits = raw_output.get("stationary_logits")
-        if stationary_logits is None:
-            raise RuntimeError("export_stationary_head=True, but model did not return stationary_logits.")
-        return pred_x0, torch.sigmoid(stationary_logits)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -295,12 +282,12 @@ def export_onnx(
     with torch.no_grad():
         raw_reference = wrapper(*dummy_inputs)
         if isinstance(raw_reference, tuple):
+            if len(raw_reference) != 1:
+                raise RuntimeError("Sentis export contract requires exactly one motion output.")
             reference = tuple(value.detach().cpu() for value in raw_reference)
         else:
             reference = (raw_reference.detach().cpu(),)
     output_names = ["pred_x0"]
-    if len(reference) > 1:
-        output_names.append("stationary_prob5")
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -334,8 +321,8 @@ def check_onnx_alignment(
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     x_t, timestep, inpaint_mask, valid_frame_mask = inputs
     output_names = ["pred_x0"]
-    if len(reference) > 1:
-        output_names.append("stationary_prob5")
+    if len(reference) != 1:
+        raise RuntimeError("Sentis alignment contract requires exactly one motion output.")
     outputs = session.run(
         output_names,
         {
@@ -373,8 +360,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     model, _diffusion = create_model_and_diffusion(model_config)
     export_model, model_source = load_export_model(model, model_path, device=device, use_ema=cli_args.use_ema)
-    export_stationary_head = bool(getattr(model_config, "use_stationary_head", False))
-    wrapper = SentisDenoiserWrapper(export_model, export_stationary_head=export_stationary_head).to(device).eval()
+    wrapper = SentisDenoiserWrapper(export_model).to(device).eval()
 
     onnx_path = output_dir / "diffusionposer_denoiser.onnx"
     staging_onnx_path = output_dir / ".diffusionposer_denoiser.onnx.tmp"
@@ -412,7 +398,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         normalize_input=bool(cli_args.normalize_input),
         strict_normalizer=bool(cli_args.strict_normalizer or cli_args.normalize_input),
         schema_name=schema.name,
-        stationary_head_output_enabled=export_stationary_head,
     )
 
     result = {
@@ -424,7 +409,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "schema_canonical_name": schema.canonical_name,
         "feature_dim": schema.feature_dim,
         "sequence_length": REALTIME_POSE_SEQ_LEN,
-        "stationary_head_output": export_stationary_head,
     }
     print(f"[export_sentis_denoiser] ONNX: {onnx_path}")
     print(f"[export_sentis_denoiser] weights: {model_source}")

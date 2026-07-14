@@ -14,7 +14,7 @@ from data_loaders.sensor_masking import (
 from eval.evaluate_stationary_signal_source import evaluate_directory, main
 
 
-def _write_prediction_npz(path, *, feature_pred, head_pred=None):
+def _write_prediction_npz(path, *, feature_pred):
     schema = get_schema_spec("realtime_pose_stationary5_v1")
     reference = np.zeros((1, 4, REALTIME_POSE_INPUT_DIM), dtype=np.float32)
     reconstructed = reference.copy()
@@ -35,15 +35,12 @@ def _write_prediction_npz(path, *, feature_pred, head_pred=None):
         "reference_stationary_prob_5": target,
         "feature_stationary_prob_5": np.asarray(feature_pred, dtype=np.float32),
     }
-    if head_pred is not None:
-        payload["head_stationary_prob_5"] = np.asarray(head_pred, dtype=np.float32)
     np.savez(path, **payload)
 
 
 def test_evaluate_directory_writes_summary_and_csv_reports(tmp_path):
     feature_pred = np.zeros((4, 5), dtype=np.float32)
-    head_pred = np.ones((4, 5), dtype=np.float32)
-    _write_prediction_npz(tmp_path / "clip_a.npz", feature_pred=feature_pred, head_pred=head_pred)
+    _write_prediction_npz(tmp_path / "clip_a.npz", feature_pred=feature_pred)
 
     output_dir = tmp_path / "report"
     result = evaluate_directory(input_dir=tmp_path, output_dir=output_dir, thresholds=(0.5,))
@@ -52,13 +49,12 @@ def test_evaluate_directory_writes_summary_and_csv_reports(tmp_path):
     assert result["per_clip_path"].exists()
     assert result["per_joint_path"].exists()
     summary = json.loads(result["summary_path"].read_text(encoding="utf-8"))
-    assert set(summary["signals"]) == {"feature_channel", "stationary_head"}
+    assert set(summary["signals"]) == {"feature_channel"}
     assert summary["signals"]["feature_channel"]["thresholds"]["0.5"]["aggregate"]["missed_lock_rate"] > 0.0
-    assert summary["signals"]["stationary_head"]["thresholds"]["0.5"]["aggregate"]["false_lock_rate"] > 0.0
 
     with result["per_clip_path"].open("r", encoding="utf-8", newline="") as file:
         rows = list(csv.DictReader(file))
-    assert {row["signal_source"] for row in rows} == {"feature_channel", "stationary_head"}
+    assert {row["signal_source"] for row in rows} == {"feature_channel"}
 
 
 def test_stationary_signal_cli_main_returns_paths(tmp_path):

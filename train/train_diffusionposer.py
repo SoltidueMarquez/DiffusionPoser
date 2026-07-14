@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None):
             schema_name=args.schema,
             tracker_pos_noise_std=args.tracker_pos_noise_std,
             tracker_rot_noise_std=args.tracker_rot_noise_std,
-            non_hip_tracker_dropout_prob=args.non_hip_tracker_dropout_prob,
+            non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
             history_pose_noise_std=args.history_pose_noise_std,
             history_yaw_noise_std=args.history_yaw_noise_std,
             root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None):
                 schema_name=args.schema,
                 tracker_pos_noise_std=args.tracker_pos_noise_std,
                 tracker_rot_noise_std=args.tracker_rot_noise_std,
-                non_hip_tracker_dropout_prob=args.non_hip_tracker_dropout_prob,
+                non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
                 history_pose_noise_std=args.history_pose_noise_std,
                 history_yaw_noise_std=args.history_yaw_noise_std,
                 root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
@@ -258,10 +258,6 @@ def build_auto_run_label(args) -> str:
         "full_feature_dit": "dit",
     }.get(model_arch, model_arch)
     parts = [schema_alias]
-    if bool(getattr(args, "stationary_head_only_loss", False)):
-        parts.append("headonly")
-    elif bool(getattr(args, "use_stationary_head", False)):
-        parts.append("head")
     parts.extend([model_alias, f"seed{getattr(args, 'seed', 0)}"])
     return "_".join(parts)
 

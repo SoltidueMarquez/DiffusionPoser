@@ -15,6 +15,7 @@ from data_loaders.sensor_masking import (
 from export.export_sentis_denoiser import SentisDenoiserWrapper, export_onnx
 from model.diffusionposer_dit import DiffusionPoserDiT
 from utils.model_util import create_model_and_diffusion
+from train.training_loop import validate_loaded_state_dict_keys
 
 
 def test_target_dit_predicts_only_target_slice_shape():
@@ -72,50 +73,30 @@ def test_target_dit_without_schema_uses_current_default_schema():
     assert model.schema.name == DEFAULT_REALTIME_POSE_SCHEMA_NAME
 
 
-def test_stationary_head_extra_output_shapes_for_both_dit_arches():
+def test_models_have_single_motion_output_and_no_stationary_head():
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    x = torch.zeros(2, schema.feature_dim, REALTIME_POSE_SEQ_LEN)
-    x[:, schema.sensor_valid_slice(), :] = 1.0
-    mask = torch.zeros_like(x, dtype=torch.bool)
-    mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
-
-    full_model = DiffusionPoserDiT(
+    model = DiffusionPoserDiT(
         input_feats=schema.feature_dim,
         latent_dim=32,
         num_layers=1,
         num_heads=4,
         max_seq_len=REALTIME_POSE_SEQ_LEN,
-        use_stationary_head=True,
     )
-    full_default = full_model(x, torch.zeros(2), inpaint_cond=mask)
-    full_extra = full_model(x, torch.zeros(2), inpaint_cond=mask, return_stationary_head=True)
-    assert tuple(full_default.shape) == tuple(x.shape)
-    assert tuple(full_extra["motion"].shape) == tuple(x.shape)
-    assert tuple(full_extra["stationary_logits"].shape) == (2, 5)
+    assert not hasattr(model, "stationary_head")
+    x = torch.zeros(1, schema.feature_dim, REALTIME_POSE_SEQ_LEN)
+    output = model(x, torch.zeros(1), inpaint_cond=torch.zeros_like(x, dtype=torch.bool))
+    assert torch.is_tensor(output)
+    assert output.shape == x.shape
 
-    args = SimpleNamespace(
-        model_arch="target_dit",
-        schema=schema.name,
-        input_feats=schema.feature_dim,
-        latent_dim=32,
-        layers=1,
-        heads=4,
-        dropout=0.0,
-        zero_init=False,
-        max_seq_len=REALTIME_POSE_SEQ_LEN,
-        diffusion_steps=4,
-        ts_respace="",
-        noise_schedule="cosine",
-        predict_xstart=1,
-        sigma_small=True,
-        use_stationary_head=True,
-    )
-    target_model, _diffusion = create_model_and_diffusion(args)
-    target_default = target_model(x, torch.zeros(2), inpaint_cond=mask)
-    target_extra = target_model(x, torch.zeros(2), inpaint_cond=mask, return_stationary_head=True)
-    assert tuple(target_default.shape) == tuple(x.shape)
-    assert tuple(target_extra["motion"].shape) == tuple(x.shape)
-    assert tuple(target_extra["stationary_logits"].shape) == (2, 5)
+
+def test_checkpoint_loading_rejects_all_missing_or_unexpected_keys():
+    validate_loaded_state_dict_keys(missing_keys=[], unexpected_keys=[], source="checkpoint")
+    with pytest.raises(RuntimeError, match="stationary_head"):
+        validate_loaded_state_dict_keys(
+            missing_keys=[],
+            unexpected_keys=["stationary_head.net.0.weight"],
+            source="checkpoint",
+        )
 
 
 def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
@@ -151,39 +132,5 @@ def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
     graph = onnx.load(str(onnx_path)).graph
     input_names = {value.name for value in graph.input}
     assert {"x_t", "timestep", "inpaint_mask", "valid_frame_mask"}.issubset(input_names)
-
-
-def test_target_dit_onnx_exports_stationary_prob5_output(tmp_path):
-    onnx = pytest.importorskip("onnx")
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    args = SimpleNamespace(
-        model_arch="target_dit",
-        schema=schema.name,
-        input_feats=schema.feature_dim,
-        latent_dim=32,
-        layers=1,
-        heads=4,
-        dropout=0.0,
-        zero_init=False,
-        max_seq_len=REALTIME_POSE_SEQ_LEN,
-        diffusion_steps=4,
-        ts_respace="",
-        noise_schedule="cosine",
-        predict_xstart=1,
-        sigma_small=True,
-        use_stationary_head=True,
-    )
-    model, _diffusion = create_model_and_diffusion(args)
-    onnx_path = tmp_path / "target_dit_stationary_head.onnx"
-    export_onnx(
-        wrapper=SentisDenoiserWrapper(model, export_stationary_head=True),
-        onnx_path=onnx_path,
-        feature_dim=schema.feature_dim,
-        sequence_length=REALTIME_POSE_SEQ_LEN,
-        opset=17,
-        device=torch.device("cpu"),
-        schema_name=schema.name,
-    )
-    graph = onnx.load(str(onnx_path)).graph
-    output_names = {value.name for value in graph.output}
-    assert {"pred_x0", "stationary_prob5"}.issubset(output_names)
+    assert [value.name for value in graph.output] == ["pred_x0"]
+    assert len(graph.output) == 1

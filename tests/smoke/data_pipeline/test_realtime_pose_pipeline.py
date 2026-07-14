@@ -289,6 +289,46 @@ def test_pipeline_train_save_dir_uses_schema_and_experiment_name(tmp_path):
     assert_arg_value(train_args, "--save_dir", str(Path("runs") / "realtime_pose_stationary5_v1" / "toy_exp"))
 
 
+def test_pipeline_task_defaults_rebuild_final_distribution_with_adjacent_rollout(tmp_path):
+    args = parse_schema_aware_pipeline_args(tmp_path)
+    task_args = pipeline.build_task_args(args)
+    assert_arg_value(task_args, "--mask_policy", "full")
+    assert_arg_value(task_args, "--patterns_per_window", "1")
+    assert_arg_value(task_args, "--rollout_steps", "2")
+    assert "--fixed_tracker_patterns" not in task_args
+
+
+def test_pipeline_training_stage_presets_match_sparse_root_plan(tmp_path):
+    expected = {
+        "A": ("20000", "5e-05", "1", "0.0", "dynamic_categories", ["full_six", "standard_three"]),
+        "B": ("20000", "5e-05", "2", "0.5", "dynamic_categories", ["full_six", "standard_three"]),
+        "C": ("20000", "2e-05", "2", "0.5", "dynamic_categories", ["all"]),
+    }
+    for stage, values in expected.items():
+        args = parse_schema_aware_pipeline_args(tmp_path, "--training_stage", stage)
+        train_args = pipeline.build_train_args(args)
+        num_steps, lr, rollout_steps, rollout_prob, mask_policy, categories = values
+        assert_arg_value(train_args, "--num_steps", num_steps)
+        assert_arg_value(train_args, "--lr", lr)
+        assert_arg_value(train_args, "--rollout_steps", rollout_steps)
+        assert_arg_value(train_args, "--rollout_prob", rollout_prob)
+        assert_arg_value(train_args, "--tracker_mask_policy", mask_policy)
+        category_index = train_args.index("--tracker_mask_categories") + 1
+        assert train_args[category_index : category_index + len(categories)] == categories
+
+
+def test_pipeline_resumed_stage_presets_use_cumulative_global_step_targets(tmp_path):
+    for stage, expected_steps in (("A", "20000"), ("B", "40000"), ("C", "60000")):
+        args = parse_schema_aware_pipeline_args(
+            tmp_path,
+            "--training_stage",
+            stage,
+            "--resume_latest",
+        )
+        train_args = pipeline.build_train_args(args)
+        assert_arg_value(train_args, "--num_steps", expected_steps)
+
+
 def test_pipeline_explicit_save_dir_overrides_experiment_name(tmp_path):
     explicit_save_dir = tmp_path / "explicit_runs"
     args = parse_schema_aware_pipeline_args(

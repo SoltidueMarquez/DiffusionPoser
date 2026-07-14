@@ -7,9 +7,9 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.realtime_pose_dataset import dropout_non_hip_trackers
+from data_loaders.realtime_pose_dataset import dropout_non_head_trackers
 from data_loaders.sensor_masking import (
-    HIP_TRACKER_INDEX,
+    HEAD_TRACKER_INDEX,
     TRACKER_COUNT,
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
     TRACKER_MASK_POLICY_FIXED_CATEGORIES,
@@ -32,9 +32,9 @@ class LongseqDropoutConfig:
     preset: str = DROPOUT_PRESET_NONE
     tracker_mask_policy: str = TRACKER_MASK_POLICY_TASK
     tracker_mask_seed: int = 10
-    tracker_mask_categories: tuple[str, ...] = ("full-trackers",)
+    tracker_mask_categories: tuple[str, ...] = ("full_six",)
     tracker_mask_segment_frames: int = 61
-    non_hip_tracker_dropout_prob: float = 0.0
+    non_head_tracker_dropout_prob: float = 0.0
     tracker_burst_dropout_prob: float = 0.0
     tracker_latency_max_frames: int = 0
     tracker_outlier_prob: float = 0.0
@@ -59,7 +59,13 @@ def add_longseq_dropout_options(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--tracker_mask_seed", default=10, type=int)
     group.add_argument("--tracker_mask_categories", nargs="+", default=["all"], type=str)
     group.add_argument("--tracker_mask_segment_frames", default=61, type=int)
-    group.add_argument("--non_hip_tracker_dropout_prob", default=0.0, type=float)
+    group.add_argument(
+        "--non_head_tracker_dropout_prob",
+        "--non_hip_tracker_dropout_prob",
+        dest="non_head_tracker_dropout_prob",
+        default=0.0,
+        type=float,
+    )
     group.add_argument("--tracker_burst_dropout_prob", default=0.0, type=float)
     group.add_argument("--tracker_latency_max_frames", default=0, type=int)
     group.add_argument("--tracker_outlier_prob", default=0.0, type=float)
@@ -84,7 +90,7 @@ def build_longseq_dropout_config(args: argparse.Namespace) -> LongseqDropoutConf
         tracker_mask_seed=int(getattr(args, "tracker_mask_seed", 10)),
         tracker_mask_categories=categories,
         tracker_mask_segment_frames=int(getattr(args, "tracker_mask_segment_frames", 61)),
-        non_hip_tracker_dropout_prob=float(getattr(args, "non_hip_tracker_dropout_prob", 0.0)),
+        non_head_tracker_dropout_prob=float(getattr(args, "non_head_tracker_dropout_prob", 0.0)),
         tracker_burst_dropout_prob=float(getattr(args, "tracker_burst_dropout_prob", 0.0)),
         tracker_latency_max_frames=int(getattr(args, "tracker_latency_max_frames", 0)),
         tracker_outlier_prob=float(getattr(args, "tracker_outlier_prob", 0.0)),
@@ -186,10 +192,10 @@ def build_longseq_sensor_valid(
             config=config,
         )
 
-    dropout_prob = max(float(config.non_hip_tracker_dropout_prob), float(config.tracker_burst_dropout_prob))
+    dropout_prob = max(float(config.non_head_tracker_dropout_prob), float(config.tracker_burst_dropout_prob))
     if dropout_prob > 0:
         rng = stable_rng(sequence_id=sequence_id, seed=config.tracker_mask_seed, salt="frame_dropout")
-        valid = dropout_non_hip_trackers(sensor_valid=valid, rng=rng, dropout_prob=dropout_prob)
+        valid = dropout_non_head_trackers(sensor_valid=valid, rng=rng, dropout_prob=dropout_prob)
 
     validate_sensor_valid(valid)
     return valid
@@ -258,7 +264,7 @@ def build_dropout_metadata(source: dict[str, np.ndarray], config: LongseqDropout
         "valid_tracker_ratio": float(sensor_valid.mean()) if sensor_valid.size else 1.0,
         "min_valid_trackers": int(sensor_valid.sum(axis=1).min()) if sensor_valid.size else TRACKER_COUNT,
         "max_valid_trackers": int(sensor_valid.sum(axis=1).max()) if sensor_valid.size else TRACKER_COUNT,
-        "hip_valid_all": bool(sensor_valid[:, HIP_TRACKER_INDEX].all()) if sensor_valid.size else True,
+        "head_valid_all": bool(sensor_valid[:, HEAD_TRACKER_INDEX].all()) if sensor_valid.size else True,
     }
 
 

@@ -134,8 +134,16 @@ def compute_stationary_signal_metrics(
     joint_names: tuple[str, ...] = STATIONARY_JOINT_NAMES,
     max_transition_lag: int = 30,
 ) -> dict[str, Any]:
+    pred_raw = np.asarray(predicted_stationary_prob_5, dtype=np.float32)
+    if pred_raw.ndim == 3 and pred_raw.shape[0] == 1:
+        pred_raw = pred_raw[0]
+    if pred_raw.ndim != 2 or pred_raw.shape[1] != STATIONARY_PROB_DIM:
+        raise ValueError(
+            f"predicted_stationary_prob_5 must have shape [T,5] or [1,T,5], got {pred_raw.shape}"
+        )
+    out_of_bounds_ratio = float(np.mean((pred_raw < 0.0) | (pred_raw > 1.0)))
     target = _as_prob_matrix("target_stationary_prob_5", target_stationary_prob_5)
-    pred = _as_prob_matrix("predicted_stationary_prob_5", predicted_stationary_prob_5)
+    pred = _as_prob_matrix("predicted_stationary_prob_5", pred_raw)
     if target.shape != pred.shape:
         raise ValueError(f"target and predicted stationary probabilities must match: {target.shape} vs {pred.shape}")
     if len(joint_names) != STATIONARY_PROB_DIM:
@@ -151,9 +159,12 @@ def compute_stationary_signal_metrics(
         )
         for threshold in thresholds
     }
+    for report in threshold_reports.values():
+        report["aggregate"]["clamp_pre_out_of_bounds_ratio"] = out_of_bounds_ratio
     return {
         "frames": int(target.shape[0]),
         "joints": int(target.shape[1]),
         "joint_names": list(joint_names),
+        "clamp_pre_out_of_bounds_ratio": out_of_bounds_ratio,
         "thresholds": threshold_reports,
     }

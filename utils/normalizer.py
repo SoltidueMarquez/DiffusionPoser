@@ -7,6 +7,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from data_loaders.realtime_pose_contract import (
+    FEATURE_CONTRACT_VERSION,
+    RESOLVER_CONTRACT_VERSION,
+    runtime_contract_metadata,
+)
+from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION
 from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAME,
@@ -130,6 +136,15 @@ class RealtimePoseNormalizer:
             raise ValueError(
                 f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {self.schema.pelvis_height_mode!r}."
             )
+        expected_contract = {
+            "feature_contract_version": FEATURE_CONTRACT_VERSION,
+            "tracker_codec_version": TRACKER_CODEC_VERSION,
+            "reference_policy_version": REFERENCE_POLICY_VERSION,
+            "resolver_contract_version": RESOLVER_CONTRACT_VERSION,
+        }
+        for key, expected in expected_contract.items():
+            if meta.get(key) != expected:
+                raise ValueError(f"normalizer {key}={meta.get(key)!r}, expected {expected!r}; rebuild normalizer")
 
     def _write_meta(self) -> None:
         meta = {
@@ -139,6 +154,7 @@ class RealtimePoseNormalizer:
             "pelvis_height_mode": self.schema.pelvis_height_mode,
             "feature_dim": self.schema.feature_dim,
             "eps": self.eps,
+            **runtime_contract_metadata(),
         }
         with self.meta_path.open("w", encoding="utf-8") as file:
             json.dump(meta, file, indent=2, ensure_ascii=False, sort_keys=True)

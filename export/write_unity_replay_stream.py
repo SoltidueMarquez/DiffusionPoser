@@ -15,6 +15,13 @@ if str(DIFFUSIONPOSER_ROOT) not in sys.path:
 
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source  # noqa: E402
+from data_loaders.realtime_pose_contract import (  # noqa: E402
+    COORDINATE_CONVENTION_VERSION,
+    FEATURE_CONTRACT_VERSION,
+    JOINT_MAPPING_VERSION,
+    RESOLVER_CONTRACT_VERSION,
+)
+from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION  # noqa: E402
 from data_loaders.realtime_pose_kinematics import (  # noqa: E402
     SMPL_PARENTS,
     make_yaw_rotation_np,
@@ -229,6 +236,22 @@ def build_unity_replay_stream_payload(
     root_pos = slice_time(source["root_pos_world"], start, count)
     stationary_prob = slice_time(source["stationary_prob_5"], start, count) if schema.supports_stationary_prob else None
     target_features_raw = build_target_features_raw(source, start, count, schema.target_dim, schema_name=schema.name)
+    timestamps_all = np.asarray(
+        source.get("timestamp_seconds", np.arange(total_frames, dtype=np.float64) / float(fps)),
+        dtype=np.float64,
+    )
+    floor_all = np.asarray(source.get("floor_y", np.zeros(total_frames, dtype=np.float32)), dtype=np.float32)
+    origin_revision_all = np.asarray(
+        source.get("tracking_origin_revision", np.zeros(total_frames, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    timestamps = slice_time(timestamps_all, start, count)
+    floor_y = slice_time(floor_all, start, count)
+    origin_revision = slice_time(origin_revision_all, start, count)
+    tracker_space = str(np.asarray(source.get("tracker_space", "synthetic_joint_world")).item())
+    if tracker_space == "raw_device_world":
+        raise ValueError("Unity replay rejects raw_device_world; calibrate tracker joints before export")
+    calibration_version = str(np.asarray(source.get("calibration_version", "synthetic_identity_v1")).item())
     if identity_6d_rotations:
         target_features_raw[:, 0:BODY_POSE_DIM] = build_identity_body_pose_6d(count)
         tracker_rotations = build_identity_tracker_rotations_6d(count)
@@ -241,6 +264,14 @@ def build_unity_replay_stream_payload(
     payload = {
         "schemaName": schema.name,
         "poseRepresentation": schema.pose_representation,
+        "featureContractVersion": FEATURE_CONTRACT_VERSION,
+        "trackerSpace": tracker_space,
+        "calibrationVersion": calibration_version,
+        "jointMappingVersion": JOINT_MAPPING_VERSION,
+        "coordinateConventionVersion": COORDINATE_CONVENTION_VERSION,
+        "trackerCodecVersion": TRACKER_CODEC_VERSION,
+        "referencePolicyVersion": REFERENCE_POLICY_VERSION,
+        "resolverContractVersion": RESOLVER_CONTRACT_VERSION,
         "fps": float(fps),
         "frameStart": int(start),
         "frameCount": int(count),
@@ -251,6 +282,9 @@ def build_unity_replay_stream_payload(
         "trackerPositions": flatten_float(tracker_positions),
         "trackerRotations6d": flatten_float(tracker_rotations),
         "sensorValid": flatten_int(valid),
+        "timestampSeconds": flatten_float(timestamps),
+        "floorY": flatten_float(floor_y),
+        "trackingOriginRevision": flatten_int(origin_revision),
         "referenceJointsWorld": flatten_float(joints),
         "rootHeading": flatten_float(root_heading),
         "rootPosWorld": flatten_float(root_pos),
@@ -266,6 +300,9 @@ def build_unity_replay_stream_payload(
             "trackerPositionsShape": [count, TRACKER_COUNT, 3],
             "trackerRotations6dShape": [count, TRACKER_COUNT, 6],
             "sensorValidShape": [count, TRACKER_COUNT],
+            "timestampSecondsShape": [count],
+            "floorYShape": [count],
+            "trackingOriginRevisionShape": [count],
             "referenceJointsWorldShape": [count, SMPL_JOINT_COUNT, 3],
             "rootHeadingShape": [count],
             "rootPosWorldShape": [count, 3],

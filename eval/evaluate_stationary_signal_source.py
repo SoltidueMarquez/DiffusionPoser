@@ -15,7 +15,6 @@ from eval.stationary_signal_metrics import STATIONARY_JOINT_NAMES, compute_stati
 
 SIGNAL_KEYS = {
     "feature_channel": ("feature_stationary_prob_5",),
-    "stationary_head": ("head_stationary_prob_5", "stationary_head_prob_5"),
 }
 
 
@@ -144,6 +143,7 @@ def _summarize_signal(signal_metrics: list[dict[str, Any]], thresholds: tuple[fl
                     "false_lock_rate",
                     "missed_lock_rate",
                     "prob_jitter_mean_abs",
+                    "clamp_pre_out_of_bounds_ratio",
                     "move_to_static_lag_mean_frames",
                     "static_to_move_lag_mean_frames",
                 )

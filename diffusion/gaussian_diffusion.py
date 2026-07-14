@@ -26,6 +26,7 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_torch,
 )
 from data_loaders.sensor_masking import (
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_TARGET_START,
@@ -150,7 +151,10 @@ class GaussianDiffusion:
         tracker_pos_timestep_min_weight=0.1,
         tracker_pos_timestep_gamma=2.0,
         tracker_rot_loss_weight=2.0,
-        stationary_head_loss_weight=0.05,
+        head_anchor_loss_weight=1.0,
+        hip_root_position_loss_weight=1.0,
+        hip_root_yaw_loss_weight=1.0,
+        hip_root_height_loss_weight=1.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -169,7 +173,10 @@ class GaussianDiffusion:
         self.tracker_pos_timestep_min_weight = float(tracker_pos_timestep_min_weight)
         self.tracker_pos_timestep_gamma = float(tracker_pos_timestep_gamma)
         self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
-        self.stationary_head_loss_weight = float(stationary_head_loss_weight)
+        self.head_anchor_loss_weight = float(head_anchor_loss_weight)
+        self.hip_root_position_loss_weight = float(hip_root_position_loss_weight)
+        self.hip_root_yaw_loss_weight = float(hip_root_yaw_loss_weight)
+        self.hip_root_height_loss_weight = float(hip_root_height_loss_weight)
         if self.tracker_pos_huber_beta <= 0.0:
             raise ValueError("tracker_pos_huber_beta 必须大于 0")
         if not 0.0 <= self.tracker_pos_timestep_min_weight <= 1.0:
@@ -218,44 +225,6 @@ class GaussianDiffusion:
 
         self.l2_loss = th.nn.MSELoss(reduction='none')
         self.l1_loss = th.nn.L1Loss(reduction='none')
-
-    @staticmethod
-    def _split_model_output(raw_output):
-        if isinstance(raw_output, dict):
-            if "motion" not in raw_output:
-                raise KeyError("dict model output must contain `motion`.")
-            return raw_output["motion"], raw_output.get("stationary_logits")
-        return raw_output, None
-
-    @staticmethod
-    def _uses_stationary_head(model) -> bool:
-        base_model = getattr(model, "model", model)
-        return bool(getattr(base_model, "use_stationary_head", False))
-
-    def _stationary_head_terms(self, stationary_logits, model_kwargs):
-        y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
-        if stationary_logits is None:
-            return {}
-        if "target_stationary_prob_5" not in y:
-            raise KeyError("stationary_head loss requires target_stationary_prob_5.")
-        target = y["target_stationary_prob_5"].to(device=stationary_logits.device, dtype=stationary_logits.dtype)
-        if tuple(target.shape) != tuple(stationary_logits.shape):
-            raise ValueError(
-                f"stationary_logits and target_stationary_prob_5 shape mismatch: "
-                f"{tuple(stationary_logits.shape)} vs {tuple(target.shape)}"
-            )
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            stationary_logits,
-            target.clamp(0.0, 1.0),
-            reduction="none",
-        ).mean(dim=1)
-        probs = torch.sigmoid(stationary_logits.detach()).clamp(0.0, 1.0)
-        return {
-            "stationary_head_loss": loss,
-            "stationary_head_prob_mean": probs.mean(dim=1),
-            "stationary_head_prob_min": probs.min(dim=1).values,
-            "stationary_head_prob_max": probs.max(dim=1).values,
-        }
 
     def masked_l2(self, a, b, mask, feature_w=None, use_l1=False):
         # assuming a.shape == b.shape == bs, Jdim, seqlen
@@ -1572,21 +1541,27 @@ class GaussianDiffusion:
         target_tracker_pos_ref = y.get("target_tracker_pos_ref")
         target_tracker_rot_ref = y.get("target_tracker_rot_ref_6d")
         target_sensor_valid = y.get("target_sensor_valid")
+        tracker_ref_root_pos_world = y.get("tracker_ref_root_pos_world")
+        tracker_ref_root_yaw = y.get("tracker_ref_root_yaw")
+        head_anchor_pos = None
+        head_anchor_rot = None
         if target_tracker_pos_ref is not None and target_sensor_valid is not None:
+            if tracker_ref_root_pos_world is None or tracker_ref_root_yaw is None:
+                raise KeyError("Tracker reprojection requires explicit tracker_ref_root_pos_world/yaw.")
             target_tracker_pos_ref = target_tracker_pos_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
+            ref_root_pos = tracker_ref_root_pos_world.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            ref_root_yaw = tracker_ref_root_yaw.to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
             tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
             pred_tracker = pred_joints[:, tracker_indices]
             # tracker_pos_ref 的定义是 `(tracker_world - current_root_world) @ R(prev_yaw)`。
             # hip/waist tracker 已经用于 root correction，这里只让 head/hands/feet 约束姿态，
             # 避免 pelvis pose 和 root 位移在同一个观测上抢解释权。
             pred_tracker_ref = torch.einsum(
-                "btj,bjk->btk",
-                pred_tracker - target_root_pos[:, None],
-                make_yaw_rotation_torch(prev_root_yaw),
+                "bij,btj->bti",
+                make_yaw_rotation_torch(ref_root_yaw).transpose(-1, -2),
+                pred_tracker - ref_root_pos[:, None],
             )
-            valid_nonhip = valid_target.clone()
-            valid_nonhip[:, HIP_TRACKER_INDEX] = False
             tracker_distance = torch.linalg.norm(pred_tracker_ref - target_tracker_pos_ref, dim=-1)
             beta = torch.as_tensor(self.tracker_pos_huber_beta, device=pred_xstart.device, dtype=pred_xstart.dtype)
             reproj = torch.where(
@@ -1594,7 +1569,7 @@ class GaussianDiffusion:
                 0.5 * tracker_distance.square() / beta,
                 tracker_distance - 0.5 * beta,
             )
-            valid_weight = valid_nonhip.float()
+            valid_weight = valid_target.float()
             denom = valid_weight.sum(dim=1).clamp_min(1.0)
             tracker_loss = (reproj * valid_weight).sum(dim=1) / denom
             timestep_weight = self._tracker_pos_timestep_weight(
@@ -1604,14 +1579,40 @@ class GaussianDiffusion:
                 dtype=pred_xstart.dtype,
             )
             result["sensor_reprojection_pos_loss"] = timestep_weight * tracker_loss
+            head_anchor_pos = tracker_distance[:, HEAD_TRACKER_INDEX]
+            hip_valid = valid_target[:, HIP_TRACKER_INDEX].float()
+            hip_position = torch.linalg.norm(
+                target_root_pos[:, [0, 2]] - ref_root_pos[:, [0, 2]], dim=-1
+            )
+            observed_tracker_world = torch.einsum(
+                "bij,btj->bti",
+                make_yaw_rotation_torch(ref_root_yaw),
+                target_tracker_pos_ref,
+            ) + ref_root_pos[:, None]
+            floor_y = y.get("target_floor_y")
+            if floor_y is None:
+                floor_y = torch.zeros_like(ref_root_yaw)
+            else:
+                floor_y = floor_y.to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
+            observed_hip_height = observed_tracker_world[:, HIP_TRACKER_INDEX, 1] - floor_y
+            result["hip_root_position_consistency_loss"] = hip_position * hip_valid
+            result["hip_root_height_consistency_loss"] = (
+                torch.abs(pred_root_height.view(-1) - observed_hip_height) * hip_valid
+            )
+            result["hip_root_yaw_consistency_loss"] = (
+                1.0 - torch.cos(pred_root_yaw - ref_root_yaw)
+            ) * hip_valid
         if target_tracker_rot_ref is not None and target_sensor_valid is not None:
+            if tracker_ref_root_yaw is None:
+                raise KeyError("Tracker rotation reprojection requires explicit tracker_ref_root_yaw.")
             target_tracker_rot_ref = target_tracker_rot_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
             tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
             pred_tracker_rot_world = pred_global_rot[:, tracker_indices]
             # tracker_rot_ref_6d 的定义是 `R(prev_yaw)^T @ tracker_rot_world`。
             # 这里把 FK 得到的关节全局旋转投到同一参考系，只对 valid tracker 做旋转对齐。
-            ref_inv = make_yaw_rotation_torch(prev_root_yaw).transpose(-1, -2)
+            ref_root_yaw = tracker_ref_root_yaw.to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
+            ref_inv = make_yaw_rotation_torch(ref_root_yaw).transpose(-1, -2)
             pred_tracker_rot_ref = torch.einsum("bij,btjk->btik", ref_inv, pred_tracker_rot_world)
             target_tracker_rot_ref = rotation_6d_to_matrix_torch(target_tracker_rot_ref)
             pred_tracker_rot_ref_6d = rotation_6d_forward_up_torch(pred_tracker_rot_ref)
@@ -1623,6 +1624,11 @@ class GaussianDiffusion:
             rot_reproj = 1.0 - rot_cos.mean(dim=-1)
             denom = valid_target.float().sum(dim=1).clamp_min(1.0)
             result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
+            head_anchor_rot = rot_reproj[:, HEAD_TRACKER_INDEX]
+        if head_anchor_pos is not None:
+            result["head_anchor_loss"] = head_anchor_pos + (
+                head_anchor_rot if head_anchor_rot is not None else torch.zeros_like(head_anchor_pos)
+            )
         return result
 
     def training_losses(
@@ -1686,12 +1692,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE: # 计算 MSE 损失，走的是这
-            model_call_kwargs = model_kwargs
-            if self.stationary_head_loss_weight > 0.0 and self._uses_stationary_head(model):
-                model_call_kwargs = dict(model_kwargs)
-                model_call_kwargs["return_stationary_head"] = True
-            raw_model_output = model(x_t, self._scale_timesteps(t), **model_call_kwargs)
-            model_output, stationary_logits = self._split_model_output(raw_model_output)
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1745,11 +1746,6 @@ class GaussianDiffusion:
                     mse_loss_weights = mse_loss_weights / (snr + 1)
                 terms["loss"] *= mse_loss_weights
 
-            stationary_terms = self._stationary_head_terms(stationary_logits, model_kwargs)
-            if stationary_terms:
-                terms.update(stationary_terms)
-                terms["loss"] = terms["loss"] + self.stationary_head_loss_weight * terms["stationary_head_loss"]
-
             if pred_xstart is not None:
                 aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs, timesteps=t)
                 if aux_terms:
@@ -1772,6 +1768,20 @@ class GaussianDiffusion:
                         aux_loss = aux_loss + self.tracker_pos_loss_weight * terms["sensor_reprojection_pos_loss"]
                     if "sensor_reprojection_rot_loss" in terms:
                         aux_loss = aux_loss + self.tracker_rot_loss_weight * terms["sensor_reprojection_rot_loss"]
+                    if "head_anchor_loss" in terms:
+                        aux_loss = aux_loss + self.head_anchor_loss_weight * terms["head_anchor_loss"]
+                    if "hip_root_position_consistency_loss" in terms:
+                        aux_loss = aux_loss + self.hip_root_position_loss_weight * terms[
+                            "hip_root_position_consistency_loss"
+                        ]
+                    if "hip_root_yaw_consistency_loss" in terms:
+                        aux_loss = aux_loss + self.hip_root_yaw_loss_weight * terms[
+                            "hip_root_yaw_consistency_loss"
+                        ]
+                    if "hip_root_height_consistency_loss" in terms:
+                        aux_loss = aux_loss + self.hip_root_height_loss_weight * terms[
+                            "hip_root_height_consistency_loss"
+                        ]
                     terms["aux_loss"] = self.aux_loss_weight * aux_loss
                     terms["loss"] = terms["loss"] + terms["aux_loss"]
 

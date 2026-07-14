@@ -125,13 +125,13 @@ def test_longseq_eval_unity_replay_export_can_apply_dropout(tmp_path):
         dropout_config=LongseqDropoutConfig(
             preset="tracker_mask_train",
             tracker_mask_policy="fixed_categories",
-            tracker_mask_categories=("upper-body",),
+            tracker_mask_categories=("standard_three",),
         ),
     )
 
     payload = json.loads(open(summary["files"][0]["output_json"], "r", encoding="utf-8").read())
     valid = np.asarray(payload["sensorValid"], dtype=np.int32).reshape(payload["frameCount"], TRACKER_COUNT)
     assert not valid.all()
-    assert valid[:, 3].all()
+    assert valid[:, 0].all()
     assert valid.sum(axis=1).min() >= 3
     assert summary["files"][0]["valid_tracker_ratio"] < 1.0

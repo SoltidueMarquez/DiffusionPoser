@@ -120,7 +120,7 @@ def test_sibling_unity_runtime_accepts_current_stationary5_schema_name():
     assert "IsSupportedSchemaName" in source
 
 
-def test_sibling_unity_runtime_exposes_stationary_signal_source_switch():
+def test_sibling_unity_runtime_uses_only_main_stationary_feature_channel():
     unity_root = __import__("pathlib").Path(__file__).resolve().parents[3].parent / "SIGGRAPH2024Unity"
     types_path = (
         unity_root
@@ -166,17 +166,13 @@ def test_sibling_unity_runtime_exposes_stationary_signal_source_switch():
     pipeline_source = pipeline_path.read_text(encoding="utf-8")
     driver_source = driver_path.read_text(encoding="utf-8")
 
-    assert "public enum StationarySignalSource" in types_source
-    assert "Auto" in types_source
-    assert "FeatureChannel" in types_source
-    assert "StationaryHead" in types_source
-    assert "StationarySignalSourceUsed" in prediction_source
-    assert "ApplyStationarySignalSource" in pipeline_source
-    assert "shouldReadStationaryHead = stationarySignalSource != StationarySignalSource.FeatureChannel" in pipeline_source
-    assert "StationarySignalSource = StationarySignalSource" in driver_source
+    assert "StationarySignalSource" not in types_source
+    assert "HasStationaryHead" not in prediction_source
+    assert "ApplyStationarySignalSource" not in pipeline_source
+    assert "StationarySignalSource" not in driver_source
 
 
-def test_sibling_unity_replay_metrics_record_stationary_source_and_lock_rates():
+def test_sibling_unity_replay_metrics_record_main_stationary_lock_rates():
     unity_root = __import__("pathlib").Path(__file__).resolve().parents[3].parent / "SIGGRAPH2024Unity"
     evaluator_path = (
         unity_root
@@ -202,12 +198,11 @@ def test_sibling_unity_replay_metrics_record_stationary_source_and_lock_rates():
     evaluator_source = evaluator_path.read_text(encoding="utf-8")
     runner_source = runner_path.read_text(encoding="utf-8")
 
-    assert "stationarySignalSourceUsed" in evaluator_source
+    assert "stationarySignalSourceUsed" not in evaluator_source
     assert "falseLockRate" in evaluator_source
     assert "missedLockRate" in evaluator_source
     assert "stationaryProbJitter" in evaluator_source
-    assert "StationarySignalSource.FeatureChannel" in runner_source
-    assert "StationarySignalSource.StationaryHead" in runner_source
+    assert "StationarySignalSource" not in runner_source
     assert "playbackController.EvaluationWriteMetricsOnDisable = true" in runner_source
 
 
@@ -301,20 +296,15 @@ def test_runtime_assets_default_to_body_fbx_local(tmp_path):
     assert schema["stationaryProb5"]["start"] == schema_spec.stationary_prob_start
 
 
-def test_runtime_assets_can_advertise_stationary_head_output(tmp_path):
+def test_runtime_assets_have_only_main_stationary_feature_channel(tmp_path):
     assets = write_runtime_assets(
         output_dir=tmp_path,
         normalize_input=False,
         schema_name=REALTIME_POSE_SCHEMA_NAME,
-        stationary_head_output_enabled=True,
     )
     schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
-    assert schema["stationaryProb5Output"] == {
-        "enabled": True,
-        "name": "stationary_prob5",
-        "length": 5,
-        "valueType": "probability",
-    }
+    assert "stationaryProb5Output" not in schema
+    assert "stationaryHeadOutputEnabled" not in schema["runtimeRules"]
 
 
 def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():

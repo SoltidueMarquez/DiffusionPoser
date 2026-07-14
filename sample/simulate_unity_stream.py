@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from argparse import BooleanOptionalAction
 from collections import deque
 from dataclasses import dataclass, field
@@ -10,6 +11,12 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import zero_missing_tracker_channels
+from data_loaders.realtime_pose_contract import (
+    COORDINATE_CONVENTION_VERSION,
+    FEATURE_CONTRACT_VERSION,
+    JOINT_MAPPING_VERSION,
+    TRACKER_SPACE_CALIBRATED_JOINT_WORLD,
+)
 from data_loaders.realtime_pose_kinematics import (
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
@@ -35,12 +42,24 @@ from data_loaders.sensor_masking import (
     TRACKER_COUNT,
     get_schema_spec,
 )
+from data_loaders.tracker_codec import (
+    REFERENCE_POLICY_VERSION,
+    TRACKER_CODEC_VERSION,
+    build_tracker_reference_np,
+    encode_tracker_positions_np,
+    encode_tracker_rotations_np,
+)
 from sample.ik_initializer import IK_INIT_MODE_TRACKER_POSE, resolve_ik_init_timestep, validate_ik_init_mode
 from sample.reconstruct_stream import (
     build_ik_init_image_for_batch,
     build_realtime_inpaint_mask,
     reconstruct_batch,
     tensor_bct_to_numpy_btc,
+)
+from sample.runtime_root_resolver import (
+    RESOLVER_CONTRACT_VERSION,
+    RootSource,
+    RuntimeRootResolver,
 )
 from sample.utils import load_checkpoint_model
 from utils import dist_util
@@ -131,6 +150,27 @@ def load_tracker_stream(
     limit: int = 0,
 ) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
+        expected_metadata = {
+            "feature_contract_version": FEATURE_CONTRACT_VERSION,
+            "tracker_space": TRACKER_SPACE_CALIBRATED_JOINT_WORLD,
+            "joint_mapping_version": JOINT_MAPPING_VERSION,
+            "coordinate_convention_version": COORDINATE_CONVENTION_VERSION,
+            "tracker_codec_version": TRACKER_CODEC_VERSION,
+            "reference_policy_version": REFERENCE_POLICY_VERSION,
+            "resolver_contract_version": RESOLVER_CONTRACT_VERSION,
+        }
+        missing_metadata = [key for key in (*expected_metadata, "calibration_version") if key not in data.files]
+        if missing_metadata:
+            raise ValueError(f"{path} missing calibrated tracker contract metadata: {missing_metadata}")
+        for key, expected in expected_metadata.items():
+            value = np.asarray(data[key]).item()
+            actual = int(value) if isinstance(expected, int) else str(value)
+            if actual != expected:
+                raise ValueError(f"{path} {key}={actual!r}, expected {expected!r}")
+        calibration_version = str(np.asarray(data["calibration_version"]).item()).strip()
+        if not calibration_version:
+            raise ValueError(f"{path} calibration_version must be non-empty")
+
         if "tracker_pos_world" not in data.files:
             raise KeyError(f"{path} 缺少 tracker_pos_world 字段。")
         tracker_pos_world = np.asarray(data["tracker_pos_world"], dtype=np.float32)
@@ -175,6 +215,40 @@ def load_tracker_stream(
                 f"joint_rest_local_rotations_6d 应为 [{SMPL_JOINT_COUNT},6]，实际为 {joint_rest_local_rotations_6d.shape}"
             )
 
+        frame_count_total = tracker_pos_world.shape[0]
+        timestamp_seconds = (
+            np.asarray(data["timestamp_seconds"], dtype=np.float64)
+            if "timestamp_seconds" in data.files
+            else np.arange(frame_count_total, dtype=np.float64) / 60.0
+        )
+        floor_y = (
+            np.asarray(data["floor_y"], dtype=np.float32)
+            if "floor_y" in data.files
+            else np.zeros(frame_count_total, dtype=np.float32)
+        )
+        tracking_origin_revision = (
+            np.asarray(data["tracking_origin_revision"], dtype=np.int64)
+            if "tracking_origin_revision" in data.files
+            else np.zeros(frame_count_total, dtype=np.int64)
+        )
+        previous_to_current_world = (
+            np.asarray(data["previous_to_current_world"], dtype=np.float32)
+            if "previous_to_current_world" in data.files
+            else None
+        )
+        if timestamp_seconds.shape != (frame_count_total,):
+            raise ValueError(f"timestamp_seconds must be [{frame_count_total}], got {timestamp_seconds.shape}")
+        if floor_y.shape != (frame_count_total,):
+            raise ValueError(f"floor_y must be [{frame_count_total}], got {floor_y.shape}")
+        if tracking_origin_revision.shape != (frame_count_total,):
+            raise ValueError(
+                f"tracking_origin_revision must be [{frame_count_total}], got {tracking_origin_revision.shape}"
+            )
+        if previous_to_current_world is not None and previous_to_current_world.shape != (frame_count_total, 4, 4):
+            raise ValueError(
+                f"previous_to_current_world must be [{frame_count_total},4,4], got {previous_to_current_world.shape}"
+            )
+
     frame_count = tracker_pos_world.shape[0]
     if int(limit) > 0:
         frame_count = min(frame_count, int(limit))
@@ -182,7 +256,20 @@ def load_tracker_stream(
         "tracker_pos_world": tracker_pos_world[:frame_count],
         "tracker_rot_world_6d": tracker_rot_world_6d[:frame_count],
         "sensor_valid": sensor_valid[:frame_count],
+        "timestamp_seconds": timestamp_seconds[:frame_count],
+        "floor_y": floor_y[:frame_count],
+        "tracking_origin_revision": tracking_origin_revision[:frame_count],
+        "feature_contract_version": np.asarray(FEATURE_CONTRACT_VERSION, dtype=np.int64),
+        "tracker_space": np.asarray(TRACKER_SPACE_CALIBRATED_JOINT_WORLD),
+        "calibration_version": np.asarray(calibration_version),
+        "joint_mapping_version": np.asarray(JOINT_MAPPING_VERSION),
+        "coordinate_convention_version": np.asarray(COORDINATE_CONVENTION_VERSION),
+        "tracker_codec_version": np.asarray(TRACKER_CODEC_VERSION),
+        "reference_policy_version": np.asarray(REFERENCE_POLICY_VERSION),
+        "resolver_contract_version": np.asarray(RESOLVER_CONTRACT_VERSION),
     }
+    if previous_to_current_world is not None:
+        stream["previous_to_current_world"] = previous_to_current_world[:frame_count]
     if joint_offsets_parent is not None:
         stream["joint_offsets_parent"] = joint_offsets_parent
     if joint_rest_local_rotations_6d is not None:
@@ -192,7 +279,11 @@ def load_tracker_stream(
 
 def sensor_validity_ok(sensor_valid: np.ndarray) -> bool:
     valid = np.asarray(sensor_valid, dtype=bool)
-    return bool(valid.shape == (TRACKER_COUNT,) and valid.sum() >= MIN_VALID_TRACKERS)
+    return bool(
+        valid.shape == (TRACKER_COUNT,)
+        and valid[HEAD_TRACKER_INDEX]
+        and valid.sum() >= MIN_VALID_TRACKERS
+    )
 
 
 def estimate_root_pos_from_hip_tracker(
@@ -568,82 +659,6 @@ def apply_tracker_position_ik(
     return corrected
 
 
-def correct_predicted_root_with_trackers(
-    predicted_frame_raw: np.ndarray,
-    prev_root_yaw: float,
-    prev_root_pos_world: np.ndarray,
-    model_root_yaw: float,
-    model_root_pos_world: np.ndarray,
-    tracker_pos_world: np.ndarray,
-    tracker_rot_world_6d: np.ndarray,
-    sensor_valid: np.ndarray,
-    schema_name: str,
-    joint_offsets_parent: np.ndarray | None = None,
-    joint_rest_local_rotations_6d: np.ndarray | None = None,
-    enabled: bool = True,
-) -> tuple[np.ndarray, float, np.ndarray]:
-    """
-    用真实 waist tracker 把 root 状态拉回传感器坐标。
-
-    diffusion 仍负责生成 body pose/contact 等未观测自由度；root yaw、root xz 和
-    root height 是在线系统最容易积分漂移的状态，因此在每帧预测后投影回真实 tracker。
-    """
-
-    schema = get_schema_spec(schema_name)
-    corrected = np.asarray(predicted_frame_raw, dtype=np.float32).copy()
-    valid = np.asarray(sensor_valid, dtype=bool)
-    if not enabled or valid.shape != (TRACKER_COUNT,) or not valid[HIP_TRACKER_INDEX]:
-        return corrected, float(model_root_yaw), np.asarray(model_root_pos_world, dtype=np.float32).copy()
-
-    tracker_pos = np.asarray(tracker_pos_world, dtype=np.float32)
-    if tracker_pos.shape != (TRACKER_COUNT, 3):
-        raise ValueError(f"单帧 tracker_pos_world 应为 [{TRACKER_COUNT},3]，实际为 {tracker_pos.shape}")
-
-    measured_root_yaw = estimate_root_yaw_from_hip_tracker(
-        tracker_rot_world_6d=tracker_rot_world_6d,
-        sensor_valid=sensor_valid,
-        fallback_yaw=model_root_yaw,
-    )
-    measured_root_height = float(tracker_pos[HIP_TRACKER_INDEX, 1])
-    if schema.supports_root_motion:
-        corrected[schema.root_height_slice()] = np.asarray([measured_root_height], dtype=np.float32)
-
-    root_pos = np.asarray(model_root_pos_world, dtype=np.float32).copy()
-    if joint_offsets_parent is not None:
-        predicted_tracker_pos = fk_tracker_positions_from_target(
-            target_raw=corrected,
-            root_pos_world=root_pos,
-            root_yaw=measured_root_yaw,
-            joint_offsets_parent=joint_offsets_parent,
-            schema_name=schema.name,
-            joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
-        )
-        hip_correction = tracker_pos[HIP_TRACKER_INDEX] - predicted_tracker_pos[HIP_TRACKER_INDEX]
-        root_pos[[0, 2]] += hip_correction[[0, 2]]
-        root_pos = apply_root_y0_actor_root(
-            actor_root_pos_world=root_pos,
-            schema_name=schema.name,
-        )
-    else:
-        root_pos = estimate_root_pos_from_hip_tracker(
-            tracker_pos,
-            root_yaw=measured_root_yaw,
-            joint_offsets_parent=joint_offsets_parent,
-            schema_name=schema.name,
-        )
-        root_pos = apply_root_y0_actor_root(actor_root_pos_world=root_pos, schema_name=schema.name)
-
-    yaw_delta = float(measured_root_yaw - float(prev_root_yaw))
-    corrected[schema.root_yaw_delta_slice()] = np.asarray([np.sin(yaw_delta), np.cos(yaw_delta)], dtype=np.float32)
-    if schema.supports_root_motion:
-        corrected[schema.root_delta_xz_slice()] = encode_single_root_delta_xz_ref(
-            prev_root_pos_world=prev_root_pos_world,
-            prev_root_yaw=float(prev_root_yaw),
-            root_pos_world=root_pos,
-        )
-    return corrected, float(measured_root_yaw), root_pos.astype(np.float32)
-
-
 def encode_unity_tracker_frame(
     tracker_pos_world: np.ndarray,
     tracker_rot_world_6d: np.ndarray,
@@ -688,12 +703,15 @@ def encode_unity_tracker_frame(
         root_pos = np.asarray(root_pos_world, dtype=np.float32).copy()
     root_pos[1] = 0.0
 
-    yaw_rotation = make_yaw_rotation_np(np.asarray([float(reference_root_yaw)], dtype=np.float64))[0]
-    tracker_pos_ref = (tracker_pos.astype(np.float64) - root_pos.astype(np.float64)[None]) @ yaw_rotation
-
-    tracker_rot_world = rotation_6d_to_matrix_np(tracker_rot)
-    tracker_rot_ref = yaw_rotation.T[None] @ tracker_rot_world
-    tracker_rot_ref_6d = rotation_6d_forward_up_np(tracker_rot_ref)
+    tracker_pos_ref = encode_tracker_positions_np(
+        tracker_pos_world=tracker_pos,
+        ref_root_pos_world=root_pos,
+        ref_root_yaw=np.asarray(float(reference_root_yaw), dtype=np.float32),
+    )
+    tracker_rot_ref_6d = encode_tracker_rotations_np(
+        tracker_rot_world_6d=tracker_rot,
+        ref_root_yaw=np.asarray(float(reference_root_yaw), dtype=np.float32),
+    )
 
     features = np.zeros((schema.feature_dim,), dtype=np.float32)
     features[schema.tracker_pos_slice()] = tracker_pos_ref.reshape(-1).astype(np.float32)
@@ -757,6 +775,12 @@ class UnityStreamState:
     last_validity_ok: bool = True
     tracker_ik_smoothed_pos_world: np.ndarray | None = None
     tracker_ik_smoothed_valid: np.ndarray | None = None
+    root_resolver: RuntimeRootResolver | None = None
+    current_pelvis_height: float = 0.0
+    final_joints_world: np.ndarray | None = None
+    last_root_source: RootSource = RootSource.RESET
+    last_reconnect_alpha: float = 0.0
+    last_resolver_elapsed_ms: float = 0.0
 
     def __post_init__(self) -> None:
         if self.invalid_frame_policy not in INVALID_FRAME_POLICIES:
@@ -856,8 +880,13 @@ class UnityStreamState:
         tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
         tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
         tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
+        timestamp: float = 0.0,
+        floor_y: float = 0.0,
+        tracking_origin_revision: int = 0,
+        previous_to_current_world: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        predicted = np.asarray(predicted_frame_raw, dtype=np.float32)
+        del history_target_raw
+        predicted = np.asarray(predicted_frame_raw, dtype=np.float32).copy()
         prev_root_yaw = float(self.current_root_yaw)
         prev_root_pos = (
             np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
@@ -870,36 +899,88 @@ class UnityStreamState:
             else np.asarray(self.last_output_raw[self.schema.body_pose_slice()], dtype=np.float32).copy()
         )
         yaw_delta = predicted[self.schema.root_yaw_delta_slice()]
-        self.current_root_yaw = float(prev_root_yaw + np.arctan2(float(yaw_delta[0]), float(yaw_delta[1])))
+        model_root_yaw = float(prev_root_yaw + np.arctan2(float(yaw_delta[0]), float(yaw_delta[1])))
 
         if self.schema.supports_root_motion:
-            root_pos = integrate_root_delta_xz_ref(
+            model_root_pos = integrate_root_delta_xz_ref(
                 prev_root_pos_world=prev_root_pos[None],
                 prev_root_yaw=np.asarray([prev_root_yaw], dtype=np.float32),
                 root_delta_xz_ref=predicted[self.schema.root_delta_xz_slice()][None],
             )[0]
-            root_pos = apply_root_y0_actor_root(
-                actor_root_pos_world=root_pos,
+            model_root_pos = apply_root_y0_actor_root(
+                actor_root_pos_world=model_root_pos,
                 schema_name=self.schema.name,
             )
         else:
-            root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
+            model_root_pos = np.asarray(fallback_root_pos_world, dtype=np.float32).copy()
+
+        root_pos = model_root_pos
+        self.current_root_yaw = model_root_yaw
 
         if tracker_pos_world is not None and tracker_rot_world_6d is not None and sensor_valid is not None:
-            predicted, self.current_root_yaw, root_pos = correct_predicted_root_with_trackers(
-                predicted_frame_raw=predicted,
-                prev_root_yaw=prev_root_yaw,
-                prev_root_pos_world=prev_root_pos,
-                model_root_yaw=self.current_root_yaw,
-                model_root_pos_world=root_pos,
-                tracker_pos_world=tracker_pos_world,
-                tracker_rot_world_6d=tracker_rot_world_6d,
-                sensor_valid=sensor_valid,
-                schema_name=self.schema.name,
-                joint_offsets_parent=joint_offsets_parent,
-                joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
-                enabled=root_correction,
+            offsets = (
+                np.zeros((SMPL_JOINT_COUNT, 3), dtype=np.float32)
+                if joint_offsets_parent is None
+                else np.asarray(joint_offsets_parent, dtype=np.float32)
             )
+            if self.root_resolver is None:
+                self.root_resolver = RuntimeRootResolver(pelvis_offset_parent=offsets[0])
+
+            if root_correction:
+                model_height = (
+                    float(predicted[self.schema.root_height_slice()][0])
+                    if self.schema.supports_root_motion
+                    else self.current_pelvis_height
+                )
+
+                def fk_callback(root: np.ndarray, yaw: float, pelvis_height: float) -> np.ndarray:
+                    fk_target = predicted.copy()
+                    if self.schema.supports_root_motion:
+                        fk_target[self.schema.root_height_slice()] = np.asarray([pelvis_height], dtype=np.float32)
+                    return fk_joints_from_target(
+                        target_raw=fk_target,
+                        root_pos_world=root,
+                        root_yaw=yaw,
+                        joint_offsets_parent=offsets,
+                        schema_name=self.schema.name,
+                        joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+                    )
+
+                preliminary_joints = fk_callback(model_root_pos, model_root_yaw, model_height)
+                model_root_delta = (
+                    predicted[self.schema.root_delta_xz_slice()]
+                    if self.schema.supports_root_motion
+                    else np.zeros(ROOT_DELTA_XZ_DIM, dtype=np.float32)
+                )
+                resolver_started = time.perf_counter()
+                resolved = self.root_resolver.resolve(
+                    tracker_pos_world=tracker_pos_world,
+                    tracker_rot_world_6d=tracker_rot_world_6d,
+                    sensor_valid=sensor_valid,
+                    timestamp=float(timestamp),
+                    floor_y=float(floor_y),
+                    tracking_origin_revision=int(tracking_origin_revision),
+                    model_root_delta_xz_ref=model_root_delta,
+                    model_yaw_delta_sincos=predicted[self.schema.root_yaw_delta_slice()],
+                    model_pelvis_height=model_height,
+                    fk_callback=fk_callback,
+                    preliminary_joints_world=preliminary_joints,
+                    previous_to_current_world=previous_to_current_world,
+                )
+                self.last_resolver_elapsed_ms = (time.perf_counter() - resolver_started) * 1000.0
+                root_pos = resolved.final_root_pos_world.copy()
+                self.current_root_yaw = float(resolved.final_root_yaw)
+                self.current_pelvis_height = float(resolved.final_pelvis_height)
+                self.final_joints_world = resolved.final_joints_world.copy()
+                self.last_root_source = resolved.root_source
+                self.last_reconnect_alpha = float(resolved.reconnect_alpha)
+                if self.schema.supports_root_motion:
+                    predicted[self.schema.root_delta_xz_slice()] = resolved.final_root_delta_xz_ref
+                    predicted[self.schema.root_height_slice()] = np.asarray(
+                        [resolved.final_pelvis_height], dtype=np.float32
+                    )
+                predicted[self.schema.root_yaw_delta_slice()] = resolved.final_yaw_delta_sincos
+
             ik_tracker_pos_world = (
                 self.update_tracker_ik_targets(
                     tracker_pos_world=tracker_pos_world,
@@ -926,6 +1007,17 @@ class UnityStreamState:
                 blend=tracker_ik_blend,
                 delta_limit=tracker_ik_delta_limit,
             )
+            if tracker_ik and joint_offsets_parent is not None:
+                self.final_joints_world = fk_joints_from_target(
+                    target_raw=predicted,
+                    root_pos_world=root_pos,
+                    root_yaw=self.current_root_yaw,
+                    joint_offsets_parent=joint_offsets_parent,
+                    schema_name=self.schema.name,
+                    joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+                )
+                if self.root_resolver is not None and self.root_resolver.state.initialized:
+                    self.root_resolver.state.final_joints_world = self.final_joints_world.copy()
 
         self.current_root_pos_world = root_pos.astype(np.float32)
         predicted_frame_raw[...] = predicted
@@ -933,7 +1025,7 @@ class UnityStreamState:
             tracker_feature_raw,
             predicted,
             root_pos_world=self.current_root_pos_world,
-            history_target_raw=history_target_raw,
+            history_target_raw=None,
         )
         return predicted.copy(), self.current_root_pos_world.copy()
 
@@ -973,6 +1065,10 @@ def simulate_unity_stream(
     reference_root_pos_world: np.ndarray | None = None,
     joint_offsets_parent: np.ndarray | None = None,
     joint_rest_local_rotations_6d: np.ndarray | None = None,
+    timestamp_seconds: np.ndarray | None = None,
+    floor_y: np.ndarray | None = None,
+    tracking_origin_revision: np.ndarray | None = None,
+    previous_to_current_world: np.ndarray | None = None,
     root_correction: bool = True,
     tracker_ik: bool = True,
     tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
@@ -997,6 +1093,30 @@ def simulate_unity_stream(
         else -1
     )
     frame_count = int(tracker_pos_world.shape[0])
+    timestamps = (
+        np.arange(frame_count, dtype=np.float64) / 60.0
+        if timestamp_seconds is None
+        else np.asarray(timestamp_seconds, dtype=np.float64)
+    )
+    floor_values = (
+        np.zeros(frame_count, dtype=np.float32)
+        if floor_y is None
+        else np.asarray(floor_y, dtype=np.float32)
+    )
+    origin_revisions = (
+        np.zeros(frame_count, dtype=np.int64)
+        if tracking_origin_revision is None
+        else np.asarray(tracking_origin_revision, dtype=np.int64)
+    )
+    origin_transforms = None if previous_to_current_world is None else np.asarray(previous_to_current_world, dtype=np.float32)
+    if timestamps.shape != (frame_count,):
+        raise ValueError(f"timestamp_seconds must be [{frame_count}], got {timestamps.shape}")
+    if floor_values.shape != (frame_count,):
+        raise ValueError(f"floor_y must be [{frame_count}], got {floor_values.shape}")
+    if origin_revisions.shape != (frame_count,):
+        raise ValueError(f"tracking_origin_revision must be [{frame_count}], got {origin_revisions.shape}")
+    if origin_transforms is not None and origin_transforms.shape != (frame_count, 4, 4):
+        raise ValueError(f"previous_to_current_world must be [{frame_count},4,4], got {origin_transforms.shape}")
     state = UnityStreamState(
         schema_name=schema.name,
         initial_root_yaw=initial_root_yaw,
@@ -1040,8 +1160,18 @@ def simulate_unity_stream(
     root_pos_predicted = []
     validity_flags = []
     is_predicted = []
+    tracker_ref_root_pos = []
+    tracker_ref_root_yaw = []
+    tracker_ref_source = []
+    root_sources = []
+    reconnect_alphas = []
+    codec_fk_elapsed_ms = []
+    ddim_elapsed_ms = []
+    resolver_elapsed_ms = []
+    end_to_end_elapsed_ms = []
 
     for frame_index in range(frame_count):
+        frame_started = time.perf_counter()
         frame_valid = np.asarray(sensor_valid[frame_index], dtype=bool)
         validity_ok = sensor_validity_ok(frame_valid)
         if not validity_ok and invalid_frame_policy == INVALID_FRAME_POLICY_RAISE:
@@ -1057,33 +1187,35 @@ def simulate_unity_stream(
         if reference_root_pos is not None and use_reference_state_frame:
             state.current_root_pos_world = reference_root_pos[max(frame_index - 1, 0)].copy()
 
-        measured_root_yaw = estimate_root_yaw_from_hip_tracker(
+        codec_started = time.perf_counter()
+        previous_final_root = (
+            np.asarray([tracker_pos_world[frame_index, HEAD_TRACKER_INDEX, 0], floor_values[frame_index], tracker_pos_world[frame_index, HEAD_TRACKER_INDEX, 2]], dtype=np.float32)
+            if state.current_root_pos_world is None
+            else state.current_root_pos_world
+        )
+        pelvis_offset = np.zeros(3, dtype=np.float32) if joint_offsets is None else joint_offsets[0]
+        root_pos, reference_yaw_value, reference_source_value = build_tracker_reference_np(
+            tracker_pos_world=tracker_pos_world[frame_index],
             tracker_rot_world_6d=tracker_rot_world_6d[frame_index],
             sensor_valid=frame_valid,
-            fallback_yaw=state.current_root_yaw,
-        )
-        fallback_root_pos = state.current_root_pos_world
-        root_pos = (
-            reference_root_pos[frame_index].copy()
-            if reference_root_pos is not None and use_reference_state_frame
-            else estimate_root_pos_from_available_trackers(
-                tracker_pos_world[frame_index],
-                sensor_valid=frame_valid,
-                root_yaw=measured_root_yaw,
-                fallback_root_pos_world=fallback_root_pos,
-                joint_offsets_parent=joint_offsets,
-                schema_name=schema.name,
-            )
+            previous_final_root_pos_world=previous_final_root,
+            previous_final_root_yaw=np.asarray(state.current_root_yaw, dtype=np.float32),
+            pelvis_offset_parent=pelvis_offset,
+            floor_y=float(floor_values[frame_index]),
         )
         tracker_feature_raw = encode_unity_tracker_frame(
             tracker_pos_world=tracker_pos_world[frame_index],
             tracker_rot_world_6d=tracker_rot_world_6d[frame_index],
             sensor_valid=frame_valid,
-            reference_root_yaw=state.current_root_yaw,
+            reference_root_yaw=float(reference_yaw_value),
             schema_name=schema.name,
             root_pos_world=root_pos,
             joint_offsets_parent=joint_offsets,
         )
+        codec_fk_elapsed_ms.append((time.perf_counter() - codec_started) * 1000.0)
+        tracker_ref_root_pos.append(np.asarray(root_pos, dtype=np.float32).copy())
+        tracker_ref_root_yaw.append(float(reference_yaw_value))
+        tracker_ref_source.append(int(reference_source_value))
         history_target_raw = history_features[frame_index] if use_reference_history_frame else None
 
         if not state.has_full_history():
@@ -1098,6 +1230,10 @@ def simulate_unity_stream(
                 root_height=warmup_root_height,
                 target_feature_raw=history_target_raw if history_target_raw is not None else warmup_target,
             )
+            state.current_root_pos_world = np.asarray(root_pos, dtype=np.float32).copy()
+            state.current_root_yaw = float(reference_yaw_value)
+            state.current_pelvis_height = float(warmup_root_height)
+            output_root_pos = state.current_root_pos_world.copy()
             if reference_yaw is not None and use_reference_state_frame:
                 state.current_root_yaw = float(reference_yaw[frame_index])
             if reference_root_pos is not None and use_reference_state_frame:
@@ -1106,6 +1242,8 @@ def simulate_unity_stream(
             conditioned_frame_raw = tracker_feature_raw.copy()
             conditioned_frame_raw[schema.target_slice()] = 0.0
             frame_predicted = False
+            ddim_elapsed_ms.append(0.0)
+            state.last_resolver_elapsed_ms = 0.0
         elif not validity_ok:
             if history_target_raw is None:
                 predicted_frame_raw, output_root_pos = state.hold_output(tracker_feature_raw, root_pos_world=root_pos)
@@ -1126,6 +1264,8 @@ def simulate_unity_stream(
             conditioned_frame_raw = tracker_feature_raw.copy()
             conditioned_frame_raw[schema.target_slice()] = 0.0
             frame_predicted = False
+            ddim_elapsed_ms.append(0.0)
+            state.last_resolver_elapsed_ms = 0.0
         else:
             window_raw = state.build_window_raw(tracker_feature_raw)
             conditioned_raw = normalize_conditioned_window(window_raw, normalizer=normalizer, schema_name=schema.name)
@@ -1152,6 +1292,7 @@ def simulate_unity_stream(
                 ik_init_reg_weight=ik_init_reg_weight,
                 ik_init_delta_limit=ik_init_delta_limit,
             )
+            ddim_started = time.perf_counter()
             reconstructed = reconstruct_batch(
                 model=model,
                 diffusion=diffusion,
@@ -1162,6 +1303,7 @@ def simulate_unity_stream(
                 init_image=ik_init_image,
                 start_timestep=resolved_ik_init_timestep if ik_init_image is not None else None,
             )
+            ddim_elapsed_ms.append((time.perf_counter() - ddim_started) * 1000.0)
             reconstructed_np = tensor_bct_to_numpy_btc(reconstructed)[0]
             reconstructed_raw = inverse_feature_window(reconstructed_np, normalizer=normalizer)
             predicted_frame_raw = reconstructed_raw[REALTIME_POSE_TARGET_START].copy()
@@ -1183,6 +1325,12 @@ def simulate_unity_stream(
                 tracker_ik_blend=float(tracker_ik_blend),
                 tracker_ik_target_smoothing=float(tracker_ik_target_smoothing),
                 tracker_ik_delta_limit=float(tracker_ik_delta_limit),
+                timestamp=float(timestamps[frame_index]),
+                floor_y=float(floor_values[frame_index]),
+                tracking_origin_revision=int(origin_revisions[frame_index]),
+                previous_to_current_world=(
+                    None if origin_transforms is None else origin_transforms[frame_index]
+                ),
             )
             frame_predicted = True
 
@@ -1192,6 +1340,17 @@ def simulate_unity_stream(
         root_pos_predicted.append(output_root_pos.astype(np.float32))
         validity_flags.append(bool(validity_ok))
         is_predicted.append(bool(frame_predicted))
+        root_sources.append(int(state.last_root_source))
+        reconnect_alphas.append(float(state.last_reconnect_alpha))
+        resolver_elapsed_ms.append(float(state.last_resolver_elapsed_ms))
+        frame_elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
+        end_to_end_elapsed_ms.append(frame_elapsed_ms)
+        # Include encoding, history assembly and all FK work, while keeping DDIM
+        # and Resolver timings as non-overlapping headline buckets.
+        codec_fk_elapsed_ms[-1] = max(
+            0.0,
+            frame_elapsed_ms - float(ddim_elapsed_ms[-1]) - float(resolver_elapsed_ms[-1]),
+        )
         state.last_validity_ok = bool(validity_ok)
 
     predicted_mask = np.asarray(is_predicted, dtype=bool)
@@ -1208,10 +1367,26 @@ def simulate_unity_stream(
         "tracker_pos_world": np.asarray(tracker_pos_world, dtype=np.float32)[None],
         "tracker_rot_world_6d": np.asarray(tracker_rot_world_6d, dtype=np.float32)[None],
         "sensor_valid": np.asarray(sensor_valid, dtype=bool)[None],
+        "timestamp_seconds": timestamps[None],
+        "floor_y": floor_values[None],
+        "tracking_origin_revision": origin_revisions[None],
+        "tracker_ref_root_pos_world": np.asarray(tracker_ref_root_pos, dtype=np.float32)[None],
+        "tracker_ref_root_yaw": np.asarray(tracker_ref_root_yaw, dtype=np.float32)[None],
+        "tracker_ref_source": np.asarray(tracker_ref_source, dtype=np.int8)[None],
+        "root_source": np.asarray(root_sources, dtype=np.int8)[None],
+        "reconnect_alpha": np.asarray(reconnect_alphas, dtype=np.float32)[None],
+        "codec_fk_elapsed_ms": np.asarray(codec_fk_elapsed_ms, dtype=np.float32)[None],
+        "ddim_elapsed_ms": np.asarray(ddim_elapsed_ms, dtype=np.float32)[None],
+        "resolver_elapsed_ms": np.asarray(resolver_elapsed_ms, dtype=np.float32)[None],
+        "end_to_end_elapsed_ms": np.asarray(end_to_end_elapsed_ms, dtype=np.float32)[None],
         "validity_ok": validity_mask[None],
         "is_predicted": predicted_mask[None],
         "eval_frame_mask": (predicted_mask & validity_mask)[None],
         "warmup_frames": np.asarray(REALTIME_POSE_TARGET_START, dtype=np.int64),
+        "feature_contract_version": np.asarray(FEATURE_CONTRACT_VERSION, dtype=np.int64),
+        "tracker_codec_version": np.asarray(TRACKER_CODEC_VERSION),
+        "reference_policy_version": np.asarray(REFERENCE_POLICY_VERSION),
+        "resolver_contract_version": np.asarray(RESOLVER_CONTRACT_VERSION),
         "root_correction": np.asarray(bool(root_correction)),
         "tracker_ik": np.asarray(bool(tracker_ik)),
         "tracker_ik_iterations": np.asarray(int(tracker_ik_iterations), dtype=np.int64),
@@ -1284,6 +1459,10 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         invalid_frame_policy=args.invalid_frame_policy,
         joint_offsets_parent=stream.get("joint_offsets_parent"),
         joint_rest_local_rotations_6d=stream.get("joint_rest_local_rotations_6d"),
+        timestamp_seconds=stream["timestamp_seconds"],
+        floor_y=stream["floor_y"],
+        tracking_origin_revision=stream["tracking_origin_revision"],
+        previous_to_current_world=stream.get("previous_to_current_world"),
         root_correction=bool(args.root_correction),
         tracker_ik=bool(args.tracker_ik),
         tracker_ik_iterations=int(args.tracker_ik_iterations),

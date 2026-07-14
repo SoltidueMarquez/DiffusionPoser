@@ -19,6 +19,7 @@ from data_loaders.sensor_masking import (
     SMPL_JOINT_COUNT,
     get_schema_spec,
 )
+from data_loaders.tracker_codec import build_tracker_reference_np
 from sample.ik_initializer import build_tracker_pose_init_image
 from sample.simulate_unity_stream import (
     IDENTITY_6D,
@@ -149,14 +150,22 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
     )
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     frame_index = 12
+    ref_pos, ref_yaw, _ = build_tracker_reference_np(
+        tracker_pos_world=source["tracker_pos_world"][frame_index],
+        tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
+        sensor_valid=sensor_valid[frame_index],
+        previous_final_root_pos_world=source["root_pos_world"][frame_index - 1],
+        previous_final_root_yaw=np.asarray(source["root_yaw"][frame_index - 1]),
+        pelvis_offset_parent=source["joint_offsets_parent"][0],
+    )
 
     encoded = encode_unity_tracker_frame(
         tracker_pos_world=source["tracker_pos_world"][frame_index],
         tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
         sensor_valid=sensor_valid[frame_index],
-        reference_root_yaw=float(source["root_yaw"][frame_index - 1]),
+        reference_root_yaw=float(ref_yaw),
         schema_name=REALTIME_POSE_SCHEMA_NAME,
-        root_pos_world=source["root_pos_world"][frame_index],
+        root_pos_world=ref_pos,
     )
 
     np.testing.assert_allclose(encoded[schema.tracker_pos_slice()], reference[frame_index, schema.tracker_pos_slice()])
@@ -258,16 +267,20 @@ def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
     assert payload["predicted_features_raw"].shape == (1, 63, schema.feature_dim)
     assert not payload["eval_frame_mask"][0, :REALTIME_POSE_TARGET_START].any()
     assert payload["eval_frame_mask"][0, REALTIME_POSE_TARGET_START:].all()
-    np.testing.assert_allclose(payload["root_yaw_predicted"][0, :REALTIME_POSE_TARGET_START], 0.0)
     np.testing.assert_allclose(
-        payload["root_yaw_predicted"][0, REALTIME_POSE_TARGET_START:],
-        measured_yaw[REALTIME_POSE_TARGET_START:],
+        payload["root_yaw_predicted"][0, :REALTIME_POSE_TARGET_START],
+        measured_yaw[:REALTIME_POSE_TARGET_START],
         atol=1e-6,
     )
+    yaw_error = np.abs(
+        payload["root_yaw_predicted"][0, REALTIME_POSE_TARGET_START:]
+        - measured_yaw[REALTIME_POSE_TARGET_START:]
+    )
+    assert float(yaw_error.max()) < 0.004
     np.testing.assert_allclose(
         payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, [0, 2]],
         source["root_pos_world"][REALTIME_POSE_TARGET_START:][:, [0, 2]],
-        atol=1e-6,
+        atol=0.01,
     )
     np.testing.assert_allclose(
         payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, 1],

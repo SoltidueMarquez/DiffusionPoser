@@ -194,7 +194,7 @@ def test_evaluate_longseq_entries_applies_dropout_to_sensor_valid(tmp_path):
         dropout_config=LongseqDropoutConfig(
             preset="tracker_mask_train",
             tracker_mask_policy="fixed_categories",
-            tracker_mask_categories=("upper-body",),
+            tracker_mask_categories=("standard_three",),
         ),
     )
 
@@ -202,6 +202,6 @@ def test_evaluate_longseq_entries_applies_dropout_to_sensor_valid(tmp_path):
     with np.load(result_path, allow_pickle=True) as data:
         sensor_valid = np.asarray(data["sensor_valid"], dtype=bool)[0]
     assert not sensor_valid.all()
-    assert sensor_valid[:, 3].all()
+    assert sensor_valid[:, 0].all()
     assert sensor_valid.sum(axis=1).min() >= 3
     assert summary["files"][0]["valid_tracker_ratio"] < 1.0

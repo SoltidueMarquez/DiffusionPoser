@@ -17,7 +17,6 @@ def create_model_and_diffusion(args):
             dropout=args.dropout,
             zero_init=args.zero_init,
             max_seq_len=args.max_seq_len,
-            use_stationary_head=getattr(args, "use_stationary_head", False),
         )
     elif model_arch == "full_feature_dit":
         model = DiffusionPoserDiT(
@@ -28,7 +27,6 @@ def create_model_and_diffusion(args):
             dropout=args.dropout,
             zero_init=args.zero_init,
             max_seq_len=args.max_seq_len,
-            use_stationary_head=getattr(args, "use_stationary_head", False),
         )
     else:
         raise ValueError(f"未知 model_arch={model_arch}")
@@ -63,5 +61,8 @@ def create_gaussian_diffusion(args):
         tracker_pos_timestep_min_weight=getattr(args, "tracker_pos_timestep_min_weight", 0.1),
         tracker_pos_timestep_gamma=getattr(args, "tracker_pos_timestep_gamma", 2.0),
         tracker_rot_loss_weight=getattr(args, "tracker_rot_loss_weight", 2.0),
-        stationary_head_loss_weight=getattr(args, "stationary_head_loss_weight", 0.05),
+        head_anchor_loss_weight=getattr(args, "head_anchor_loss_weight", 1.0),
+        hip_root_position_loss_weight=getattr(args, "hip_root_position_loss_weight", 1.0),
+        hip_root_yaw_loss_weight=getattr(args, "hip_root_yaw_loss_weight", 1.0),
+        hip_root_height_loss_weight=getattr(args, "hip_root_height_loss_weight", 1.0),
     )

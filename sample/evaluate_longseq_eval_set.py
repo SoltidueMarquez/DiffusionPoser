@@ -112,7 +112,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     stream = parser.add_argument_group("stream")
     stream.add_argument("--root_correction", default=True, action=BooleanOptionalAction)
-    stream.add_argument("--tracker_ik", default=True, action=BooleanOptionalAction)
+    stream.add_argument("--tracker_ik", default=False, action=BooleanOptionalAction)
     stream.add_argument("--tracker_ik_iterations", default=DEFAULT_TRACKER_IK_ITERATIONS, type=int)
     stream.add_argument("--tracker_ik_lr", default=DEFAULT_TRACKER_IK_LR, type=float)
     stream.add_argument("--tracker_ik_blend", default=DEFAULT_TRACKER_IK_BLEND, type=float)
@@ -182,7 +182,7 @@ def evaluate_longseq_entries(
     history_pose_source: str = HISTORY_POSE_SOURCE_REFERENCE,
     warmup_target_source: str = WARMUP_TARGET_SOURCE_FIRST_FRAME,
     root_correction: bool = True,
-    tracker_ik: bool = True,
+    tracker_ik: bool = False,
     tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
     tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
     tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,

@@ -6,7 +6,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_START, STATIONARY_PROB_DIM
 from model.causal_attention import build_frame_causal_mask
 
 
@@ -37,20 +36,6 @@ class SinusoidalTimestepEmbedding(nn.Module):
         return self.proj(embedding)
 
 
-class StationaryHead(nn.Module):
-    def __init__(self, latent_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, STATIONARY_PROB_DIM),
-        )
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.net(hidden)
-
-
 class DiffusionPoserDiT(nn.Module):
     """
     realtime_pose_v2 条件扩散去噪网络。
@@ -69,14 +54,12 @@ class DiffusionPoserDiT(nn.Module):
         dropout: float = 0.0,
         zero_init: bool = False,
         max_seq_len: int = 61,
-        use_stationary_head: bool = False,
     ):
         super().__init__()
         self.input_feats = int(input_feats)
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
         self.max_seq_len = int(max_seq_len)
-        self.use_stationary_head = bool(use_stationary_head)
 
         self.input_proj = nn.Linear(self.input_feats * 2, self.latent_dim)
         self.time_embed = SinusoidalTimestepEmbedding(self.latent_dim)
@@ -92,7 +75,6 @@ class DiffusionPoserDiT(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(self.latent_dim, self.input_feats)
-        self.stationary_head = StationaryHead(self.latent_dim) if self.use_stationary_head else None
 
         if zero_init:
             nn.init.zeros_(self.output_proj.weight)
@@ -108,9 +90,8 @@ class DiffusionPoserDiT(nn.Module):
         inpaint_cond: Optional[torch.Tensor] = None,
         valid_frame_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        return_stationary_head: bool = False,
         **kwargs,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         if hidden_states.dim() != 3:
             raise ValueError(f"hidden_states 应为 [B, C, T]，实际为 {tuple(hidden_states.shape)}")
         batch_size, channels, seq_len = hidden_states.shape
@@ -144,11 +125,4 @@ class DiffusionPoserDiT(nn.Module):
         causal_mask = build_frame_causal_mask(seq_len, device=hidden_states.device)
         hidden = self.transformer(hidden, mask=causal_mask, src_key_padding_mask=key_padding_mask)
         motion = self.output_proj(hidden).transpose(1, 2)
-        if not return_stationary_head:
-            return motion
-        if self.stationary_head is None:
-            return {"motion": motion}
-        if seq_len <= REALTIME_POSE_TARGET_START:
-            raise ValueError(f"stationary_head requires frame {REALTIME_POSE_TARGET_START}, got seq_len={seq_len}")
-        stationary_logits = self.stationary_head(hidden[:, REALTIME_POSE_TARGET_START])
-        return {"motion": motion, "stationary_logits": stationary_logits}
+        return motion

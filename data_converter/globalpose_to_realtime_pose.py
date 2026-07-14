@@ -29,6 +29,7 @@ from data_converter.amass_to_realtime_pose import (
     resolve_body_fbx_rest_for_schema,
 )
 from data_loaders.realtime_pose_contract import (
+    runtime_contract_metadata,
     validate_realtime_source_contract,
     validate_root_y0_invariants,
 )
@@ -342,6 +343,7 @@ def build_source_metadata(args: argparse.Namespace, source: MotionSource, featur
         "globalpose_dataset_name": str(args.dataset_name),
         "globalpose_sequence_name": sequence_name,
     }
+    metadata.update(runtime_contract_metadata())
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
