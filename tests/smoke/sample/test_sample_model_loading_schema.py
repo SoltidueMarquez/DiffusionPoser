@@ -153,6 +153,17 @@ def test_reconstruct_rollout_default_output_dir_uses_generic_stationary5_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = write_checkpoint_args(tmp_path, REALTIME_POSE_SCHEMA_NAME)
+    roots_config = tmp_path / "artifact_roots.json"
+    roots_config.write_text(
+        json.dumps(
+            {
+                "amass_root": str(tmp_path / "AMASS"),
+                "generated_root": str(tmp_path / "generated"),
+                "outputs_root": str(tmp_path / "outputs"),
+            }
+        ),
+        encoding="utf-8",
+    )
     saved_paths: list[Path] = []
 
     class DummyDataset:
@@ -180,12 +191,14 @@ def test_reconstruct_rollout_default_output_dir_uses_generic_stationary5_name(
             str(model_path),
             "--data_dir",
             str(tmp_path / "data"),
+            "--artifact_roots_config",
+            str(roots_config),
             "--cuda",
             "false",
         ]
     )
 
-    expected_path = (Path("output/realtime_pose_stationary5_rollout") / "rollout_result.npz").resolve()
+    expected_path = (tmp_path / "outputs/realtime_pose_stationary5_rollout/rollout_result.npz").resolve()
     assert saved_paths == [expected_path]
     assert result["output_path"] == expected_path
     assert "body_fbx_local_root_y0" not in expected_path.as_posix()

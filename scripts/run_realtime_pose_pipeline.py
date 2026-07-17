@@ -12,8 +12,9 @@ from data_converter.amass_to_realtime_pose import DEFAULT_SOURCE_SET_NAME
 from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
 from data_loaders.generate_realtime_pose_tasks import DEFAULT_TASK_SET_NAME
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
+from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS
 from utils.artifact_paths import export_root, normalizer_root, run_root, source_root, task_root
-from utils.data_roots import load_data_roots
+from utils.artifact_roots import load_artifact_roots
 from utils.run_dirs import resolve_latest_or_self
 
 
@@ -34,7 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run realtime_pose data conversion, task generation, normalizer, and training in one command."
     )
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--data_roots_config", default="", type=str)
+    paths.add_argument("--artifact_roots_config", default="", type=str)
     paths.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
     paths.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
     paths.add_argument("--normalizer_name", default=DEFAULT_NORMALIZER_NAME, type=str)
@@ -81,23 +82,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert.add_argument("--body_fbx_rest_json", default="", type=str)
     convert.add_argument("--mirror", action=BooleanOptionalAction, default=True)
     convert.add_argument("--skip_existing", action=BooleanOptionalAction, default=True)
-    convert.add_argument("--allow_partial", action="store_true")
+    convert.add_argument(
+        "--allow_partial",
+        action=BooleanOptionalAction,
+        default=True,
+        help="批量重建数据时允许 converter 记录并跳过少量失败/过短样本；可用 --no-allow_partial 恢复严格模式。",
+    )
 
     normalizer = parser.add_argument_group("normalizer")
     normalizer.add_argument("--skip_normalizer", action="store_true")
     normalizer.add_argument("--normalizer_split", default="train", type=str)
+    normalizer.add_argument("--normalizer_mask_samples_per_task", default=10, type=int)
+    normalizer.add_argument("--normalizer_tracker_mask_seed", default=10, type=int)
+    normalizer.add_argument("--normalizer_tracker_mask_epoch", default=0, type=int)
 
     tasks = parser.add_argument_group("tasks")
     tasks.add_argument("--skip_tasks", action="store_true")
     tasks.add_argument("--splits", nargs="+", default=["train", "test"])
     tasks.add_argument("--samples_per_file", default=4, type=int)
     tasks.add_argument("--mask_policy", default="full", choices=["full", "fixed_patterns"])
-    tasks.add_argument("--fixed_tracker_patterns", nargs="+", default=["all"])
+    tasks.add_argument("--fixed_tracker_patterns", nargs="+", default=[])
+    tasks.add_argument("--patterns_per_window", default=1, type=int)
+    tasks.add_argument("--task_rollout_steps", default=2, type=int)
     tasks.add_argument("--short_source_policy", default="skip", choices=["skip", "error"])
 
     train = parser.add_argument_group("train")
     train.add_argument("--skip_train", action="store_true")
     train.add_argument("--resume_latest", action="store_true")
+    train.add_argument("--init_checkpoint", default="", type=str)
+    train.add_argument("--training_stage", default="custom", choices=["custom", "A", "B", "C"], type=str)
     train.add_argument("--model_arch", default="target_dit", choices=["full_feature_dit", "target_dit"])
     train.add_argument("--cuda", default=True, type=str2bool)
     train.add_argument("--device", default=0, type=int)
@@ -121,11 +134,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--history_pose_dropout_prob", default=0.05, type=float)
     train.add_argument("--history_pose_replace_prob", default=0.05, type=float)
     train.add_argument("--history_yaw_replace_prob", default=0.0, type=float)
-    train.add_argument("--tracker_latency_max_frames", default=2, type=int)
-    train.add_argument("--tracker_burst_dropout_prob", default=0.05, type=float)
-    train.add_argument("--tracker_outlier_prob", default=0.01, type=float)
+    train.add_argument("--tracker_latency_max_frames", default=0, type=int)
+    train.add_argument("--tracker_burst_dropout_prob", default=0.0, type=float)
+    train.add_argument("--tracker_outlier_prob", default=0.0, type=float)
     train.add_argument("--predicted_history_cache_dir", default="", type=str)
     train.add_argument("--predicted_history_prob", default=0.0, type=float)
+    train.add_argument("--rollout_steps", default=1, type=int)
+    for option_name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
+        train.add_argument(f"--{option_name}", default=default, type=type(default))
+    train.add_argument("--tracker_mask_policy", default="task", choices=["task", "fixed_categories", "dynamic_categories"])
+    train.add_argument("--tracker_mask_categories", nargs="+", default=["all"])
+    train.add_argument("--eval_during_training", action=BooleanOptionalAction, default=True)
+    train.add_argument("--eval_num_batches", default=4, type=int)
 
     export = parser.add_argument_group("export")
     export.add_argument("--skip_export", action="store_true")
@@ -194,13 +214,13 @@ def add_optional_path_arg(command: list[str], flag: str, value: object) -> None:
         command.extend([flag, normalize_path(str(value))])
 
 
-def add_data_roots_arg(command: list[str], args: argparse.Namespace) -> None:
-    if not path_arg_is_empty(getattr(args, "data_roots_config", "")):
-        command.extend(["--data_roots_config", normalize_path(str(args.data_roots_config))])
+def add_artifact_roots_arg(command: list[str], args: argparse.Namespace) -> None:
+    if not path_arg_is_empty(getattr(args, "artifact_roots_config", "")):
+        command.extend(["--artifact_roots_config", normalize_path(str(args.artifact_roots_config))])
 
 
-def load_pipeline_data_roots(args: argparse.Namespace):
-    return load_data_roots(getattr(args, "data_roots_config", "") or None)
+def load_pipeline_artifact_roots(args: argparse.Namespace):
+    return load_artifact_roots(getattr(args, "artifact_roots_config", "") or None)
 
 
 def first_non_empty(*values: object, default: str = "auto") -> str:
@@ -216,7 +236,7 @@ def resolve_pipeline_source_dir(args: argparse.Namespace) -> Path:
         return Path(args.source_dir)
     # 与 converter/task resolver 使用同一套 schema 和 set 名，避免 pipeline 检查旧目录。
     return source_root(
-        load_pipeline_data_roots(args),
+        load_pipeline_artifact_roots(args),
         schema_name=str(args.schema),
         source_set_name=str(args.source_set_name),
     )
@@ -226,7 +246,7 @@ def resolve_pipeline_task_dir(args: argparse.Namespace) -> Path:
     if not path_arg_is_empty(getattr(args, "task_dir", "")):
         return Path(args.task_dir)
     return task_root(
-        load_pipeline_data_roots(args),
+        load_pipeline_artifact_roots(args),
         schema_name=str(args.schema),
         task_set_name=str(args.task_set_name),
     )
@@ -236,7 +256,7 @@ def resolve_pipeline_normalizer_dir(args: argparse.Namespace) -> Path:
     if not path_arg_is_empty(getattr(args, "normalizer_dir", "")):
         return Path(args.normalizer_dir)
     return normalizer_root(
-        load_pipeline_data_roots(args),
+        load_pipeline_artifact_roots(args),
         schema_name=str(args.schema),
         normalizer_name=str(args.normalizer_name),
     )
@@ -246,7 +266,11 @@ def resolve_pipeline_save_dir(args: argparse.Namespace) -> Path:
     if not path_arg_is_empty(getattr(args, "save_dir", "")):
         return Path(args.save_dir)
     experiment_name = first_non_empty(getattr(args, "experiment_name", ""), getattr(args, "run_name", ""))
-    return run_root(schema_name=str(args.schema), experiment_name=experiment_name)
+    return run_root(
+        schema_name=str(args.schema),
+        experiment_name=experiment_name,
+        roots=load_pipeline_artifact_roots(args),
+    )
 
 
 def resolve_pipeline_export_dir(args: argparse.Namespace) -> Path:
@@ -257,7 +281,11 @@ def resolve_pipeline_export_dir(args: argparse.Namespace) -> Path:
         getattr(args, "experiment_name", ""),
         getattr(args, "run_name", ""),
     )
-    return export_root(schema_name=str(args.schema), export_name=export_name)
+    return export_root(
+        schema_name=str(args.schema),
+        export_name=export_name,
+        roots=load_pipeline_artifact_roots(args),
+    )
 
 
 def stage_is_disabled(stage: str, args: argparse.Namespace) -> bool:
@@ -387,7 +415,7 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
         "--num_workers", str(args.convert_num_workers),
         "--worker_torch_threads", str(args.convert_worker_torch_threads),
     ]
-    add_data_roots_arg(command, args)
+    add_artifact_roots_arg(command, args)
     add_optional_path_arg(command, "--amass_dir", getattr(args, "amass_dir", ""))
     add_optional_path_arg(command, "--smpl_model_dir", getattr(args, "smpl_model_dir", ""))
     add_optional_path_arg(command, "--output_dir", getattr(args, "source_dir", ""))
@@ -413,9 +441,12 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
         "--task_set_name", str(args.task_set_name),
         "--normalizer_name", str(args.normalizer_name),
         "--split", args.normalizer_split,
+        "--mask_samples_per_task", str(args.normalizer_mask_samples_per_task),
+        "--tracker_mask_seed", str(args.normalizer_tracker_mask_seed),
+        "--tracker_mask_epoch", str(args.normalizer_tracker_mask_epoch),
         "--run_name", args.run_name,
     ]
-    add_data_roots_arg(command, args)
+    add_artifact_roots_arg(command, args)
     add_optional_path_arg(command, "--task_dir", getattr(args, "task_dir", ""))
     add_optional_path_arg(command, "--output_dir", getattr(args, "normalizer_dir", ""))
     add_flag(command, bool(args.overwrite), "--overwrite")
@@ -431,11 +462,14 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--splits", *[str(split) for split in args.splits],
         "--samples_per_file", str(args.samples_per_file),
         "--mask_policy", args.mask_policy,
-        "--fixed_tracker_patterns", *[str(pattern) for pattern in args.fixed_tracker_patterns],
+        "--patterns_per_window", str(args.patterns_per_window),
+        "--rollout_steps", str(args.task_rollout_steps),
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
     ]
-    add_data_roots_arg(command, args)
+    if args.fixed_tracker_patterns:
+        command.extend(["--fixed_tracker_patterns", *[str(pattern) for pattern in args.fixed_tracker_patterns]])
+    add_artifact_roots_arg(command, args)
     add_optional_path_arg(command, "--source_dir", getattr(args, "source_dir", ""))
     add_optional_path_arg(command, "--output_dir", getattr(args, "task_dir", ""))
     add_flag(command, bool(args.overwrite), "--overwrite")
@@ -457,6 +491,7 @@ def build_export_args(args: argparse.Namespace) -> list[str]:
 
 def build_train_args(args: argparse.Namespace) -> list[str]:
     schema = get_schema_spec(args.schema)
+    stage = resolve_training_stage(args)
     command = [
         "--schema", schema.name,
         "--model_arch", args.model_arch,
@@ -468,11 +503,11 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
         "--num_workers", str(args.num_workers),
-        "--num_steps", str(args.num_steps),
+        "--num_steps", str(stage["num_steps"]),
         "--save_interval", str(args.save_interval),
         "--log_interval", str(args.log_interval),
         "--checkpoint_max_keep", str(args.checkpoint_max_keep),
-        "--lr", str(args.lr),
+        "--lr", str(stage["lr"]),
         "--train_platform_type", args.train_platform_type,
         "--layers", str(args.layers),
         "--heads", str(args.heads),
@@ -486,8 +521,21 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--tracker_latency_max_frames", str(args.tracker_latency_max_frames),
         "--tracker_burst_dropout_prob", str(args.tracker_burst_dropout_prob),
         "--tracker_outlier_prob", str(args.tracker_outlier_prob),
-        "--tracker_mask_policy", "dynamic_categories",
-        "--tracker_mask_categories", "all",
+        "--tracker_mask_policy", str(stage["tracker_mask_policy"]),
+        "--tracker_mask_categories", *[str(value) for value in stage["tracker_mask_categories"]],
+        "--rollout_steps", str(stage["rollout_steps"]),
+        "--short_rollout_prob", str(stage["short_rollout_prob"]),
+        "--short_rollout_loss_weight", str(stage["short_rollout_loss_weight"]),
+        "--long_rollout_prob", str(stage["long_rollout_prob"]),
+        "--long_rollout_loss_weight", str(stage["long_rollout_loss_weight"]),
+        "--long_rollout_phase1_steps", str(stage["long_rollout_phase1_steps"]),
+        "--long_rollout_phase2_steps", str(stage["long_rollout_phase2_steps"]),
+        "--long_rollout_phase1_max_horizon", str(stage["long_rollout_phase1_max_horizon"]),
+        "--long_rollout_phase2_max_horizon", str(stage["long_rollout_phase2_max_horizon"]),
+        "--long_rollout_transition_prob", str(stage["long_rollout_transition_prob"]),
+        "--long_rollout_smooth_l1_beta", str(stage["long_rollout_smooth_l1_beta"]),
+        "--rollout_ddim_steps", str(stage["rollout_ddim_steps"]),
+        "--eval_num_batches", str(args.eval_num_batches),
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
     command.extend(["--device", str(args.device)])
@@ -496,13 +544,76 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
     if args.predicted_history_cache_dir:
         command.extend(["--predicted_history_cache_dir", normalize_path(args.predicted_history_cache_dir)])
         command.extend(["--predicted_history_prob", str(args.predicted_history_prob)])
+    if args.init_checkpoint:
+        command.extend(["--init_checkpoint", normalize_path(args.init_checkpoint)])
     add_flag(command, bool(args.model_ema), "--model_ema")
     add_flag(command, bool(args.gradient_clip), "--gradient_clip")
+    add_flag(command, bool(args.eval_during_training), "--eval_during_training")
     add_flag(command, bool(args.overwrite), "--overwrite")
     add_flag(command, bool(args.resume_latest), "--resume_checkpoint")
     if bool(args.resume_latest):
         command.append("latest")
     return command
+
+
+def resolve_training_stage(args: argparse.Namespace) -> dict[str, object]:
+    stage = str(args.training_stage)
+    values: dict[str, object] = {
+        "num_steps": int(args.num_steps),
+        "lr": float(args.lr),
+        "tracker_mask_policy": str(args.tracker_mask_policy),
+        "tracker_mask_categories": list(args.tracker_mask_categories),
+        "rollout_steps": int(args.rollout_steps),
+        **{
+            name: type(default)(getattr(args, name))
+            for name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items()
+        },
+    }
+    if stage == "A":
+        values.update(
+            num_steps=20_000,
+            lr=5e-5,
+            tracker_mask_policy="dynamic_categories",
+            tracker_mask_categories=["full_six", "standard_three"],
+            rollout_steps=1,
+            short_rollout_prob=0.0,
+            short_rollout_loss_weight=0.0,
+            long_rollout_prob=0.0,
+            long_rollout_loss_weight=0.0,
+            rollout_ddim_steps=10,
+        )
+    elif stage == "B":
+        values.update(
+            # TrainLoop interprets num_steps as an absolute global-step target
+            # when resuming, so an A -> B continuation must target 40k.
+            num_steps=40_000 if bool(args.resume_latest) else 20_000,
+            lr=5e-5,
+            tracker_mask_policy="dynamic_categories",
+            tracker_mask_categories=["full_six", "standard_three"],
+            rollout_steps=2,
+            short_rollout_prob=0.5,
+            short_rollout_loss_weight=0.5,
+            long_rollout_prob=0.0,
+            long_rollout_loss_weight=0.0,
+            rollout_ddim_steps=10,
+        )
+    elif stage == "C":
+        values.update(
+            # Likewise, a single resumed A -> B -> C run finishes at 60k.
+            # Starting C from --init_checkpoint creates a fresh optimizer/run
+            # and therefore still performs the requested 20k local steps.
+            num_steps=60_000 if bool(args.resume_latest) else 20_000,
+            lr=2e-5,
+            tracker_mask_policy="dynamic_categories",
+            tracker_mask_categories=["all"],
+            rollout_steps=2,
+            short_rollout_prob=0.5,
+            short_rollout_loss_weight=0.5,
+            long_rollout_prob=0.0,
+            long_rollout_loss_weight=0.0,
+            rollout_ddim_steps=10,
+        )
+    return values
 
 
 def run_pipeline(args: argparse.Namespace) -> None:

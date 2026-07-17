@@ -6,6 +6,8 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from collections.abc import Sequence
 from pathlib import Path
 
+from diffusion.realtime_pose import REALTIME_POSE_LOSS_DEFAULTS
+from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
@@ -43,7 +45,13 @@ def apply_data_path_defaults(
     value = str(getattr(args, "normalizer_dir", "") or "").strip()
     if force_normalizer_dir or not value:
         schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME) or DEFAULT_REALTIME_POSE_SCHEMA_NAME)
-        args.normalizer_dir = str(default_realtime_pose_normalizer_root(schema_name=schema_name))
+        artifact_roots_config = str(getattr(args, "artifact_roots_config", "") or "").strip() or None
+        args.normalizer_dir = str(
+            default_realtime_pose_normalizer_root(
+                schema_name=schema_name,
+                artifact_roots_config=artifact_roots_config,
+            )
+        )
         setattr(args, "_normalizer_dir_auto_default", True)
     return args
 
@@ -147,6 +155,7 @@ def parse_and_load_runtime_schema_from_model(
 
 def add_base_options(parser: ArgumentParser):
     group = parser.add_argument_group("base")
+    group.add_argument("--artifact_roots_config", default="", type=str)
     group.add_argument("--cuda", default=True, type=str2bool)
     group.add_argument("--device", default=0, type=int)
     group.add_argument("--seed", default=10, type=int)
@@ -168,7 +177,7 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--num_workers", default=0, type=int)
     group.add_argument("--tracker_pos_noise_std", default=0.0, type=float)
     group.add_argument("--tracker_rot_noise_std", default=0.0, type=float)
-    group.add_argument("--non_hip_tracker_dropout_prob", default=0.0, type=float)
+    group.add_argument("--non_head_tracker_dropout_prob", default=0.0, type=float)
     group.add_argument("--tracker_mask_policy", default="auto", choices=TRACKER_MASK_POLICIES, type=str)
     group.add_argument("--tracker_mask_seed", default=0, type=int)
     group.add_argument("--tracker_mask_fill", default="zero", choices=TRACKER_MASK_FILL_MODES, type=str)
@@ -216,7 +225,7 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--dropout", default=0.0, type=float)
     group.add_argument("--zero_init", action="store_true")
     group.add_argument("--max_seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
-    group.add_argument("--model_arch", default="full_feature_dit", choices=["full_feature_dit", "target_dit"], type=str)
+    group.add_argument("--model_arch", default="target_dit", choices=["full_feature_dit", "target_dit"], type=str)
 
 
 def add_diffusion_options(parser: ArgumentParser):
@@ -242,27 +251,16 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--checkpoint_max_keep", default=0, type=int)
     group.add_argument("--num_steps", default=1_000_000, type=int)
     group.add_argument("--resume_checkpoint", default="", type=str)
+    group.add_argument("--init_checkpoint", default="", type=str)
     group.add_argument("--gradient_clip", action="store_true")
     group.add_argument("--weighted_loss", action="store_true")
     group.add_argument("--feature_w_file", default="feature_w.pt", type=str)
     group.add_argument("--snr_gamma", default=0.0, type=float)
     group.add_argument("--l1_loss", action="store_true")
-    group.add_argument("--aux_loss_weight", default=1.0, type=float)
-    group.add_argument("--yaw_loss_weight", default=10.0, type=float)
-    group.add_argument("--fk_loss_weight", default=2.0, type=float)
-    group.add_argument("--joint_vel_loss_weight", default=0.5, type=float)
-    group.add_argument("--foot_lock_loss_weight", default=0.5, type=float)
-    group.add_argument("--root_delta_loss_weight", default=1.0, type=float)
-    group.add_argument("--root_height_loss_weight", default=1.0, type=float)
-    group.add_argument("--contact_loss_weight", default=0.5, type=float)
-    group.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
-    group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)
-    group.add_argument("--tracker_pos_timestep_min_weight", default=0.1, type=float)
-    group.add_argument("--tracker_pos_timestep_gamma", default=2.0, type=float)
-    group.add_argument("--tracker_rot_loss_weight", default=2.0, type=float)
-    group.add_argument("--rollout_loss_weight", default=0.0, type=float)
-    group.add_argument("--rollout_prob", default=0.0, type=float)
-    group.add_argument("--detach_rollout_history", default=True, type=str2bool)
+    for option_name, default in REALTIME_POSE_LOSS_DEFAULTS.items():
+        group.add_argument(f"--{option_name}", default=default, type=float)
+    for option_name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
+        group.add_argument(f"--{option_name}", default=default, type=type(default))
     group.add_argument("--model_ema", default=True, action=BooleanOptionalAction)
     group.add_argument("--model_ema_steps", type=int, default=10)
     group.add_argument("--model_ema_decay", type=float, default=0.995)

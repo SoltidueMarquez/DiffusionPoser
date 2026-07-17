@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from data_loaders.build_realtime_longseq_eval_set import (
+    build_copied_source_filename,
     build_arg_parser,
     build_realtime_longseq_eval_set,
     read_longseq_manifest,
@@ -12,6 +14,7 @@ from data_loaders.build_realtime_longseq_eval_set import (
 )
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.stationary_label_config import stationary_label_metadata
 from data_loaders.generate_realtime_pose_tasks import DEFAULT_SOURCE_SET_NAME, DEFAULT_TASK_SET_NAME
 from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
@@ -36,6 +39,18 @@ def normalized_path_text(value) -> str:
     return str(value).replace("\\", "/")
 
 
+def test_longseq_copied_filename_respects_windows_safe_path_budget():
+    sequence_dir = Path("D:/") / ("nested_" * 28)
+    filename = build_copied_source_filename(
+        sequence_dir=sequence_dir,
+        sequence_id="BioMotionLab_NTroje_rub010_0029_scamper_poses",
+        frame_count=2586,
+    )
+
+    assert filename.endswith("__2586f.npz")
+    assert len(str(sequence_dir / filename)) <= 248
+
+
 def assert_generated_layout_path(value, expected_suffix: str) -> None:
     text = normalized_path_text(value)
     expected = normalized_path_text(expected_suffix)
@@ -47,7 +62,7 @@ def assert_generated_layout_path(value, expected_suffix: str) -> None:
 def patch_generated_root(monkeypatch, tmp_path):
     generated_root = tmp_path / "configured_generated"
     monkeypatch.setattr(
-        "utils.default_artifact_paths.load_data_roots",
+        "utils.default_artifact_paths.load_artifact_roots",
         lambda: SimpleNamespace(generated_root=generated_root),
     )
     return generated_root
@@ -219,8 +234,12 @@ def test_longseq_eval_builder_selects_test_non_mirror_long_sources(tmp_path):
         assert entry["pose_representation"] == schema.pose_representation
         assert entry["root_y_policy"] == schema.root_y_policy
         assert entry["pelvis_height_mode"] == schema.pelvis_height_mode
+        for key, value in stationary_label_metadata().items():
+            assert entry[key] == value
 
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["sequence_count"] == 2
     assert summary["total_frames"] == 145
+    for key, value in stationary_label_metadata().items():
+        assert summary["config"][key] == value
     assert read_latest_pointer(output_root, "longseq_eval") == output_dir

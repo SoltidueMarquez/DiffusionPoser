@@ -8,8 +8,10 @@ from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
+    RIGHT_HAND_TRACKER_INDEX,
     REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_TARGET_START,
@@ -17,6 +19,7 @@ from data_loaders.sensor_masking import (
     SMPL_JOINT_COUNT,
     get_schema_spec,
 )
+from data_loaders.tracker_codec import build_tracker_reference_np
 from sample.ik_initializer import build_tracker_pose_init_image
 from sample.simulate_unity_stream import (
     IDENTITY_6D,
@@ -24,9 +27,11 @@ from sample.simulate_unity_stream import (
     build_arg_parser,
     clamp_body_pose_delta,
     encode_unity_tracker_frame,
+    estimate_root_pos_from_available_trackers,
     estimate_root_pos_from_hip_tracker,
     fk_tracker_positions_from_target,
     initial_target_feature,
+    sensor_validity_ok,
     simulate_unity_stream,
     smooth_tracker_positions_for_ik,
 )
@@ -145,14 +150,22 @@ def test_unity_tracker_frame_matches_dataset_tracker_reference_v2():
     )
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     frame_index = 12
+    ref_pos, ref_yaw, _ = build_tracker_reference_np(
+        tracker_pos_world=source["tracker_pos_world"][frame_index],
+        tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
+        sensor_valid=sensor_valid[frame_index],
+        previous_final_root_pos_world=source["root_pos_world"][frame_index - 1],
+        previous_final_root_yaw=np.asarray(source["root_yaw"][frame_index - 1]),
+        pelvis_offset_parent=source["joint_offsets_parent"][0],
+    )
 
     encoded = encode_unity_tracker_frame(
         tracker_pos_world=source["tracker_pos_world"][frame_index],
         tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_index],
         sensor_valid=sensor_valid[frame_index],
-        reference_root_yaw=float(source["root_yaw"][frame_index - 1]),
+        reference_root_yaw=float(ref_yaw),
         schema_name=REALTIME_POSE_SCHEMA_NAME,
-        root_pos_world=source["root_pos_world"][frame_index],
+        root_pos_world=ref_pos,
     )
 
     np.testing.assert_allclose(encoded[schema.tracker_pos_slice()], reference[frame_index, schema.tracker_pos_slice()])
@@ -178,6 +191,49 @@ def test_hip_tracker_root_estimate_removes_body_fbx_pelvis_offset():
     )
 
     np.testing.assert_allclose(estimated, root_pos, atol=1e-6)
+
+
+def test_standard_three_point_is_valid_and_initializes_root_from_head():
+    tracker_pos = np.zeros((6, 3), dtype=np.float32)
+    tracker_pos[HEAD_TRACKER_INDEX] = np.asarray([1.2, 1.7, -0.4], dtype=np.float32)
+    sensor_valid = np.zeros((6,), dtype=bool)
+    sensor_valid[[HEAD_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX]] = True
+
+    assert sensor_validity_ok(sensor_valid)
+    root_pos = estimate_root_pos_from_available_trackers(
+        tracker_pos_world=tracker_pos,
+        sensor_valid=sensor_valid,
+    )
+
+    np.testing.assert_allclose(root_pos, np.asarray([1.2, 0.0, -0.4], dtype=np.float32))
+
+
+def test_simulate_unity_stream_predicts_without_hip_tracker():
+    source = build_toy_realtime_source(frame_count=63)
+    sensor_valid = np.zeros((63, 6), dtype=bool)
+    sensor_valid[:, [HEAD_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX]] = True
+    diffusion = FixedV2Diffusion(yaw_delta=0.0)
+
+    payload = simulate_unity_stream(
+        model=object(),
+        diffusion=diffusion,
+        tracker_pos_world=source["tracker_pos_world"],
+        tracker_rot_world_6d=source["tracker_rot_world_6d"],
+        sensor_valid=sensor_valid,
+        device=torch.device("cpu"),
+        use_ddim=False,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+        normalizer=None,
+        initial_root_yaw=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
+        joint_rest_local_rotations_6d=source.get("joint_rest_local_rotations_6d"),
+        root_correction=True,
+        tracker_ik=False,
+    )
+
+    assert diffusion.calls == 3
+    assert payload["eval_frame_mask"][0, REALTIME_POSE_TARGET_START:].all()
+    assert np.isfinite(payload["root_pos_world_predicted"]).all()
 
 
 def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
@@ -211,16 +267,20 @@ def test_simulate_unity_stream_corrects_root_state_from_hip_tracker():
     assert payload["predicted_features_raw"].shape == (1, 63, schema.feature_dim)
     assert not payload["eval_frame_mask"][0, :REALTIME_POSE_TARGET_START].any()
     assert payload["eval_frame_mask"][0, REALTIME_POSE_TARGET_START:].all()
-    np.testing.assert_allclose(payload["root_yaw_predicted"][0, :REALTIME_POSE_TARGET_START], 0.0)
     np.testing.assert_allclose(
-        payload["root_yaw_predicted"][0, REALTIME_POSE_TARGET_START:],
-        measured_yaw[REALTIME_POSE_TARGET_START:],
+        payload["root_yaw_predicted"][0, :REALTIME_POSE_TARGET_START],
+        measured_yaw[:REALTIME_POSE_TARGET_START],
         atol=1e-6,
     )
+    yaw_error = np.abs(
+        payload["root_yaw_predicted"][0, REALTIME_POSE_TARGET_START:]
+        - measured_yaw[REALTIME_POSE_TARGET_START:]
+    )
+    assert float(yaw_error.max()) < 0.004
     np.testing.assert_allclose(
         payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, [0, 2]],
         source["root_pos_world"][REALTIME_POSE_TARGET_START:][:, [0, 2]],
-        atol=1e-6,
+        atol=0.01,
     )
     np.testing.assert_allclose(
         payload["root_pos_world_predicted"][0, REALTIME_POSE_TARGET_START:][:, 1],

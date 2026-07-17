@@ -8,7 +8,6 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 
 import enum
 import math
-from pickle import TRUE
 
 import numpy as np
 import torch
@@ -16,21 +15,9 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from data_loaders.realtime_pose_kinematics import (
-    JOINT_INDEX,
-    TRACKER_JOINT_INDICES,
-    fk_body_fbx_local_torch,
-    fk_root_global_torch,
-    make_yaw_rotation_torch,
-    rotation_6d_forward_up_torch,
-    rotation_6d_to_matrix_torch,
-)
-from data_loaders.sensor_masking import (
-    HIP_TRACKER_INDEX,
-    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
-    REALTIME_POSE_TARGET_START,
-    get_schema_spec,
-)
+from data_loaders.sensor_masking import get_schema_spec
+from diffusion.realtime_pose import RealtimePoseAuxiliaryLoss, RealtimePoseLossConfig
+
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -137,43 +124,20 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        aux_loss_weight=1.0,
-        yaw_loss_weight=10.0,
-        fk_loss_weight=2.0,
-        joint_vel_loss_weight=0.5,
-        foot_lock_loss_weight=0.5,
-        root_delta_loss_weight=1.0,
-        root_height_loss_weight=1.0,
-        contact_loss_weight=0.5,
-        tracker_pos_loss_weight=5.0,
-        tracker_pos_huber_beta=0.05,
-        tracker_pos_timestep_min_weight=0.1,
-        tracker_pos_timestep_gamma=2.0,
-        tracker_rot_loss_weight=2.0,
+        realtime_pose_loss_config: RealtimePoseLossConfig | None = None,
+        **realtime_loss_overrides,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
-        self.aux_loss_weight = float(aux_loss_weight)
-        self.yaw_loss_weight = float(yaw_loss_weight)
-        self.fk_loss_weight = float(fk_loss_weight)
-        self.joint_vel_loss_weight = float(joint_vel_loss_weight)
-        self.foot_lock_loss_weight = float(foot_lock_loss_weight)
-        self.root_delta_loss_weight = float(root_delta_loss_weight)
-        self.root_height_loss_weight = float(root_height_loss_weight)
-        self.contact_loss_weight = float(contact_loss_weight)
-        self.tracker_pos_loss_weight = float(tracker_pos_loss_weight)
-        self.tracker_pos_huber_beta = float(tracker_pos_huber_beta)
-        self.tracker_pos_timestep_min_weight = float(tracker_pos_timestep_min_weight)
-        self.tracker_pos_timestep_gamma = float(tracker_pos_timestep_gamma)
-        self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
-        if self.tracker_pos_huber_beta <= 0.0:
-            raise ValueError("tracker_pos_huber_beta 必须大于 0")
-        if not 0.0 <= self.tracker_pos_timestep_min_weight <= 1.0:
-            raise ValueError("tracker_pos_timestep_min_weight 必须在 [0, 1] 范围内")
-        if self.tracker_pos_timestep_gamma < 0.0:
-            raise ValueError("tracker_pos_timestep_gamma 必须大于等于 0")
+        if realtime_pose_loss_config is not None and realtime_loss_overrides:
+            raise ValueError("realtime_pose_loss_config cannot be combined with named loss overrides")
+        self.realtime_pose_loss_config = (
+            realtime_pose_loss_config
+            if realtime_pose_loss_config is not None
+            else RealtimePoseLossConfig.from_mapping(realtime_loss_overrides)
+        )
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -182,6 +146,10 @@ class GaussianDiffusion:
         assert (betas > 0).all() and (betas <= 1).all()
 
         self.num_timesteps = int(betas.shape[0])
+        self.realtime_pose_loss = RealtimePoseAuxiliaryLoss(
+            self.realtime_pose_loss_config,
+            num_timesteps=self.num_timesteps,
+        )
 
         alphas = 1.0 - betas
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
@@ -221,21 +189,42 @@ class GaussianDiffusion:
         # assuming a.shape == b.shape == bs, Jdim, seqlen
         # assuming mask.shape == bs, 1, seqlen
         # print(mask.shape, a.shape)
-        eps = 1e-6
-        if mask.dim() != a.dim():
-            mask = mask.squeeze()
-            mask = mask.unsqueeze(1)
-        # print(mask.shape == a.shape)
-        mask = torch.broadcast_to(mask, a.shape)
         if use_l1:
             loss = self.l1_loss(a, b)
         else:
             loss = self.l2_loss(a, b)
+        return self._masked_element_loss(loss, mask, feature_w=feature_w)
+
+    def masked_smooth_l1(self, a, b, mask, feature_w=None, beta: float = 1.0):
+        if float(beta) <= 0.0:
+            raise ValueError(f"smooth L1 beta 必须大于 0，实际为 {beta}")
+        loss = torch.nn.functional.smooth_l1_loss(
+            a,
+            b,
+            reduction="none",
+            beta=float(beta),
+        )
+        return self._masked_element_loss(loss, mask, feature_w=feature_w)
+
+    @staticmethod
+    def _masked_element_loss(loss, mask, feature_w=None):
+        eps = 1e-6
+        if mask.dim() != loss.dim():
+            mask = mask.squeeze()
+            mask = mask.unsqueeze(1)
+        mask = torch.broadcast_to(mask, loss.shape)
         if feature_w is not None:
+            feature_w = torch.broadcast_to(
+                feature_w.to(device=loss.device, dtype=loss.dtype),
+                loss.shape,
+            )
             loss = loss * feature_w
+            denominator_weight = mask.float() * feature_w
+        else:
+            denominator_weight = mask.float()
         loss = sum_flat(loss * mask.float())  # gives \sigma_euclidean over unmasked elements
 
-        non_zero_elements = sum_flat(mask) + eps
+        non_zero_elements = sum_flat(denominator_weight) + eps
         mse_loss_val = loss / non_zero_elements
 
         return mse_loss_val
@@ -1368,223 +1357,6 @@ class GaussianDiffusion:
         x_t = x_start * negnoise_level_mask + x_t * (1 - negnoise_level_mask)
         return x_t
 
-    def _realtime_pose_slice_to_raw(self, values, y, start, end):
-        """把归一化后的 realtime 特征切片还原到物理尺度。"""
-
-        mean = y.get("normalizer_mean")
-        std = y.get("normalizer_std")
-        if mean is None or std is None:
-            return values
-        return values * std[start:end].view(1, -1) + mean[start:end].view(1, -1)
-
-    def _tracker_pos_timestep_weight(self, timesteps, batch_size, device, dtype):
-        """低噪声阶段的 pred_xstart 更可信，因此给 tracker 位置重投影更高权重。"""
-
-        if timesteps is None:
-            return torch.ones(batch_size, device=device, dtype=dtype)
-        timesteps = timesteps.to(device=device, dtype=dtype).view(-1)
-        if timesteps.shape[0] != batch_size:
-            raise ValueError(f"tracker timestep batch 不匹配：t={tuple(timesteps.shape)} batch_size={batch_size}")
-        if self.num_timesteps <= 1:
-            progress = torch.ones_like(timesteps)
-        else:
-            progress = 1.0 - timesteps / float(self.num_timesteps - 1)
-        progress = progress.clamp(0.0, 1.0)
-        return self.tracker_pos_timestep_min_weight + (
-            1.0 - self.tracker_pos_timestep_min_weight
-        ) * progress.pow(self.tracker_pos_timestep_gamma)
-
-    def _realtime_pose_aux_losses(self, pred_xstart, x_start, model_kwargs, timesteps=None):
-        """计算 realtime_pose 第 61 帧的 yaw/FK/root/contact/sensor 辅助损失。"""
-
-        y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
-        if "schema_name" not in y:
-            return {}
-        schema = get_schema_spec(y.get("schema_name"))
-
-        required = (
-            "target_joints_world",
-            "prev_joints_world",
-            "target_root_pos_world",
-            "prev_root_yaw",
-            "joint_offsets_parent",
-        )
-        if schema.supports_stationary_prob:
-            required = (*required, "target_stationary_prob_5")
-        missing = [name for name in required if name not in y]
-        if missing:
-            raise KeyError(f"{schema.name} auxiliary loss 缺少 batch 字段：{missing}")
-
-        frame = REALTIME_POSE_TARGET_START
-        pose_slice = schema.body_pose_slice()
-        yaw_slice = schema.root_yaw_delta_slice()
-
-        pred_pose = pred_xstart[:, pose_slice, frame]
-        pred_yaw_delta = pred_xstart[:, yaw_slice, frame]
-        gt_yaw_delta = x_start[:, yaw_slice, frame]
-        pred_pose = self._realtime_pose_slice_to_raw(pred_pose, y, pose_slice.start, pose_slice.stop)
-        pred_yaw_delta = self._realtime_pose_slice_to_raw(pred_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
-        gt_yaw_delta = self._realtime_pose_slice_to_raw(gt_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
-
-        pred_yaw_delta = torch.nn.functional.normalize(pred_yaw_delta, dim=-1, eps=1e-8)
-        gt_yaw_delta = torch.nn.functional.normalize(gt_yaw_delta, dim=-1, eps=1e-8)
-        yaw_loss = 1.0 - (pred_yaw_delta * gt_yaw_delta).sum(dim=-1)
-
-        prev_root_yaw = y["prev_root_yaw"].to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
-        yaw_delta_angle = torch.atan2(pred_yaw_delta[:, 0], pred_yaw_delta[:, 1])
-        pred_root_yaw = prev_root_yaw + yaw_delta_angle
-
-        target_root_pos = y["target_root_pos_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        target_joints = y["target_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        prev_joints = y["prev_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        offsets = y["joint_offsets_parent"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        rest_local_rotations_6d = y.get("joint_rest_local_rotations_6d")
-        if rest_local_rotations_6d is not None:
-            rest_local_rotations_6d = rest_local_rotations_6d.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-
-        root_delta_loss = None
-        root_height_loss = None
-        if schema.supports_root_motion:
-            root_delta_slice = schema.root_delta_xz_slice()
-            root_height_slice = schema.root_height_slice()
-            pred_root_delta = pred_xstart[:, root_delta_slice, frame]
-            gt_root_delta = x_start[:, root_delta_slice, frame]
-            pred_root_height = pred_xstart[:, root_height_slice, frame]
-            gt_root_height = x_start[:, root_height_slice, frame]
-            pred_root_delta = self._realtime_pose_slice_to_raw(
-                pred_root_delta,
-                y,
-                root_delta_slice.start,
-                root_delta_slice.stop,
-            )
-            gt_root_delta = self._realtime_pose_slice_to_raw(gt_root_delta, y, root_delta_slice.start, root_delta_slice.stop)
-            pred_root_height = self._realtime_pose_slice_to_raw(
-                pred_root_height,
-                y,
-                root_height_slice.start,
-                root_height_slice.stop,
-            )
-            gt_root_height = self._realtime_pose_slice_to_raw(gt_root_height, y, root_height_slice.start, root_height_slice.stop)
-            root_delta_loss = torch.abs(pred_root_delta - gt_root_delta).mean(dim=1)
-            root_height_loss = torch.abs(pred_root_height - gt_root_height).mean(dim=1)
-
-            prev_root_pos = y["prev_root_pos_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            delta_3d = torch.zeros_like(prev_root_pos)
-            delta_3d[:, 0] = pred_root_delta[:, 0]
-            delta_3d[:, 2] = pred_root_delta[:, 1]
-            yaw_rot = make_yaw_rotation_torch(prev_root_yaw)
-            target_root_pos = prev_root_pos + torch.einsum("bij,bj->bi", yaw_rot, delta_3d)
-            target_root_pos = target_root_pos.clone()
-            # root-y0 schema 中 actor root y 永远为 0，高度通道只驱动 pelvis/root bone 的 local offset y。
-            target_root_pos[:, 1] = 0.0
-            offsets = offsets.clone()
-            offsets[:, 0, 1] = pred_root_height.view(-1)
-
-        if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-            pred_joints, pred_global_rot = fk_body_fbx_local_torch(
-                body_pose_local_delta_6d=pred_pose,
-                actor_root_pos_world=target_root_pos,
-                root_heading=pred_root_yaw,
-                rest_local_positions=offsets,
-                rest_local_rotations_6d=rest_local_rotations_6d,
-                return_global_rot=True,
-            )
-        else:
-            pred_joints, pred_global_rot = fk_root_global_torch(
-                body_pose_root_global_6d=pred_pose,
-                root_pos_world=target_root_pos,
-                root_yaw=pred_root_yaw,
-                parent_offsets=offsets,
-                return_global_rot=True,
-            )
-
-        fk_loss = ((pred_joints - target_joints) ** 2).flatten(1).mean(dim=1)
-        pred_joint_vel = pred_joints - prev_joints
-        gt_joint_vel = target_joints - prev_joints
-        joint_vel_loss = torch.abs(pred_joint_vel - gt_joint_vel).flatten(1).mean(dim=1)
-
-        foot_indices = torch.tensor(
-            [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
-            device=pred_xstart.device,
-            dtype=torch.long,
-        )
-        if schema.supports_stationary_prob:
-            stationary_prob = y["target_stationary_prob_5"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            if tuple(stationary_prob.shape) != (pred_xstart.shape[0], 5):
-                raise ValueError(f"target_stationary_prob_5 应为 [B, 5]，实际为 {tuple(stationary_prob.shape)}")
-            foot_lock_weight = stationary_prob[:, 1:3].clamp(0.0, 1.0)
-        else:
-            foot_lock_weight = torch.zeros((pred_xstart.shape[0], 2), device=pred_xstart.device, dtype=pred_xstart.dtype)
-        pred_foot_delta_xz = pred_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
-        foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * foot_lock_weight
-        foot_lock_count = foot_lock_weight.sum(dim=1).clamp_min(1.0)
-        foot_lock_loss = foot_lock_raw.sum(dim=1) / foot_lock_count
-
-        result = {
-            "yaw_loss": yaw_loss,
-            "fk_loss": fk_loss,
-            "joint_vel_loss": joint_vel_loss,
-            "foot_lock_loss": foot_lock_loss,
-        }
-        if root_delta_loss is not None and root_height_loss is not None:
-            result["root_delta_loss"] = root_delta_loss
-            result["root_height_loss"] = root_height_loss
-        target_tracker_pos_ref = y.get("target_tracker_pos_ref")
-        target_tracker_rot_ref = y.get("target_tracker_rot_ref_6d")
-        target_sensor_valid = y.get("target_sensor_valid")
-        if target_tracker_pos_ref is not None and target_sensor_valid is not None:
-            target_tracker_pos_ref = target_tracker_pos_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
-            tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
-            pred_tracker = pred_joints[:, tracker_indices]
-            # tracker_pos_ref 的定义是 `(tracker_world - current_root_world) @ R(prev_yaw)`。
-            # hip/waist tracker 已经用于 root correction，这里只让 head/hands/feet 约束姿态，
-            # 避免 pelvis pose 和 root 位移在同一个观测上抢解释权。
-            pred_tracker_ref = torch.einsum(
-                "btj,bjk->btk",
-                pred_tracker - target_root_pos[:, None],
-                make_yaw_rotation_torch(prev_root_yaw),
-            )
-            valid_nonhip = valid_target.clone()
-            valid_nonhip[:, HIP_TRACKER_INDEX] = False
-            tracker_distance = torch.linalg.norm(pred_tracker_ref - target_tracker_pos_ref, dim=-1)
-            beta = torch.as_tensor(self.tracker_pos_huber_beta, device=pred_xstart.device, dtype=pred_xstart.dtype)
-            reproj = torch.where(
-                tracker_distance < beta,
-                0.5 * tracker_distance.square() / beta,
-                tracker_distance - 0.5 * beta,
-            )
-            valid_weight = valid_nonhip.float()
-            denom = valid_weight.sum(dim=1).clamp_min(1.0)
-            tracker_loss = (reproj * valid_weight).sum(dim=1) / denom
-            timestep_weight = self._tracker_pos_timestep_weight(
-                timesteps,
-                batch_size=pred_xstart.shape[0],
-                device=pred_xstart.device,
-                dtype=pred_xstart.dtype,
-            )
-            result["sensor_reprojection_pos_loss"] = timestep_weight * tracker_loss
-        if target_tracker_rot_ref is not None and target_sensor_valid is not None:
-            target_tracker_rot_ref = target_tracker_rot_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
-            tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
-            pred_tracker_rot_world = pred_global_rot[:, tracker_indices]
-            # tracker_rot_ref_6d 的定义是 `R(prev_yaw)^T @ tracker_rot_world`。
-            # 这里把 FK 得到的关节全局旋转投到同一参考系，只对 valid tracker 做旋转对齐。
-            ref_inv = make_yaw_rotation_torch(prev_root_yaw).transpose(-1, -2)
-            pred_tracker_rot_ref = torch.einsum("bij,btjk->btik", ref_inv, pred_tracker_rot_world)
-            target_tracker_rot_ref = rotation_6d_to_matrix_torch(target_tracker_rot_ref)
-            pred_tracker_rot_ref_6d = rotation_6d_forward_up_torch(pred_tracker_rot_ref)
-            target_tracker_rot_ref_6d = rotation_6d_forward_up_torch(target_tracker_rot_ref)
-            rot_cos = (
-                pred_tracker_rot_ref_6d.reshape(pred_tracker_rot_ref_6d.shape[0], pred_tracker_rot_ref_6d.shape[1], 2, 3)
-                * target_tracker_rot_ref_6d.reshape(target_tracker_rot_ref_6d.shape[0], target_tracker_rot_ref_6d.shape[1], 2, 3)
-            ).sum(dim=-1)
-            rot_reproj = 1.0 - rot_cos.mean(dim=-1)
-            denom = valid_target.float().sum(dim=1).clamp_min(1.0)
-            result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
-        return result
-
     def training_losses(
         self,
         model,
@@ -1596,6 +1368,8 @@ class GaussianDiffusion:
         snr_gamma=5,
         use_l1=False,
         return_pred_xstart=False,
+        simple_loss_mode="mse",
+        simple_loss_huber_beta=1.0,
     ):
         """
         计算单个时间步的训练损失。
@@ -1685,7 +1459,60 @@ class GaussianDiffusion:
             else:
                 pred_xstart = None
 
-            terms["simple_loss"] = self.masked_l2(target, model_output, mask, feature_w, use_l1) 
+            if simple_loss_mode == "mse":
+                terms["simple_loss"] = self.masked_l2(
+                    target,
+                    model_output,
+                    mask,
+                    feature_w,
+                    use_l1,
+                )
+            elif simple_loss_mode == "smooth_l1":
+                if use_l1:
+                    raise ValueError("simple_loss_mode=smooth_l1 不能同时启用 use_l1")
+                terms["simple_loss"] = self.masked_smooth_l1(
+                    target,
+                    model_output,
+                    mask,
+                    feature_w,
+                    beta=simple_loss_huber_beta,
+                )
+            else:
+                raise ValueError(f"未知 simple_loss_mode={simple_loss_mode!r}")
+            schema_name = model_kwargs.get("y", {}).get("schema_name")
+            if schema_name:
+                schema = get_schema_spec(schema_name)
+                simple_groups = {
+                    "body": schema.body_pose_slice(),
+                    "root_yaw": schema.root_yaw_delta_slice(),
+                    "root_delta": schema.root_delta_xz_slice(),
+                    "height": schema.root_height_slice(),
+                }
+                if schema.supports_stationary_prob:
+                    simple_groups["stationary"] = schema.stationary_prob_slice()
+                for group_name, feature_slice in simple_groups.items():
+                    group_feature_w = (
+                        None
+                        if feature_w is None
+                        else feature_w[:, feature_slice, :]
+                    )
+                    if simple_loss_mode == "mse":
+                        group_loss = self.masked_l2(
+                            target[:, feature_slice, :],
+                            model_output[:, feature_slice, :],
+                            mask[:, feature_slice, :],
+                            group_feature_w,
+                            use_l1,
+                        )
+                    else:
+                        group_loss = self.masked_smooth_l1(
+                            target[:, feature_slice, :],
+                            model_output[:, feature_slice, :],
+                            mask[:, feature_slice, :],
+                            group_feature_w,
+                            beta=simple_loss_huber_beta,
+                        )
+                    terms[f"simple_{group_name}_loss"] = group_loss
 
             terms["loss"] = terms["simple_loss"] + terms.get('vb', 0.)
 
@@ -1701,28 +1528,9 @@ class GaussianDiffusion:
                 terms["loss"] *= mse_loss_weights
 
             if pred_xstart is not None:
-                aux_terms = self._realtime_pose_aux_losses(pred_xstart, x_start, model_kwargs, timesteps=t)
+                aux_terms = self.realtime_pose_loss.compute(pred_xstart, x_start, model_kwargs, timesteps=t)
                 if aux_terms:
-                    terms.update(aux_terms)
-                    aux_loss = (
-                        self.yaw_loss_weight * terms["yaw_loss"]
-                        + self.fk_loss_weight * terms["fk_loss"]
-                        + self.joint_vel_loss_weight * terms["joint_vel_loss"]
-                        + self.foot_lock_loss_weight * terms["foot_lock_loss"]
-                    )
-                    if "root_delta_loss" in terms:
-                        aux_loss = (
-                            aux_loss
-                            + self.root_delta_loss_weight * terms["root_delta_loss"]
-                            + self.root_height_loss_weight * terms["root_height_loss"]
-                        )
-                    if "contact_loss" in terms:
-                        aux_loss = aux_loss + self.contact_loss_weight * terms["contact_loss"]
-                    if "sensor_reprojection_pos_loss" in terms:
-                        aux_loss = aux_loss + self.tracker_pos_loss_weight * terms["sensor_reprojection_pos_loss"]
-                    if "sensor_reprojection_rot_loss" in terms:
-                        aux_loss = aux_loss + self.tracker_rot_loss_weight * terms["sensor_reprojection_rot_loss"]
-                    terms["aux_loss"] = self.aux_loss_weight * aux_loss
+                    terms.update(self.realtime_pose_loss.apply_weights(aux_terms))
                     terms["loss"] = terms["loss"] + terms["aux_loss"]
 
         else:

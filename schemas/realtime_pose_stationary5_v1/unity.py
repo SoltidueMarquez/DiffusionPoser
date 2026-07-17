@@ -23,10 +23,7 @@ from schemas.realtime_pose_stationary5_v1.contract import (
 )
 
 
-def build_stationary5_unity_feature_schema(
-    spec: SchemaSpec,
-    stationary_head_output_enabled: bool = False,
-) -> Mapping[str, Any]:
+def build_stationary5_unity_feature_schema(spec: SchemaSpec) -> Mapping[str, Any]:
     payload: dict[str, Any] = {
         "schemaVersion": 4,
         "schemaName": spec.name,
@@ -89,14 +86,15 @@ def build_stationary5_unity_feature_schema(
             "poseRepresentation": spec.pose_representation,
             "rootPositionY": spec.root_y_policy,
             "pelvisHeightApplication": spec.pelvis_height_mode,
-            "requiresHipTracker": True,
+            "requiresHeadTracker": True,
+            "requiresHipTracker": False,
             "requiresTotalValidTrackersAtLeast": MIN_VALID_TRACKERS,
-            "trackerReferenceYaw": "previous_frame_root_heading",
+            "trackerReferenceYaw": "hip_current_else_previous_final",
+            "trackerCodecVersion": "tracker_codec_v2",
+            "referencePolicyVersion": "hip_current_else_previous_final_v1",
+            "resolverContractVersion": "runtime_root_resolver_v1",
             "onnxDummyInputShape": [1, spec.feature_dim, spec.seq_len],
             "failSafe": "hold_previous_frame_when_tracker_validity_fails",
         },
     }
-    if stationary_head_output_enabled:
-        # 该标记只在实验性 stationary head 导出时写入，默认输出保持 Unity 旧结构兼容。
-        payload["runtimeRules"]["stationaryHeadOutputEnabled"] = True
     return payload

@@ -55,8 +55,16 @@ def main(argv: list[str] | None = None):
         save_args(args)
         enable_rollout_training = (
             args.rollout_steps > 1
-            and args.rollout_loss_weight > 0.0
-            and args.rollout_prob > 0.0
+            and (
+                (
+                    args.short_rollout_loss_weight > 0.0
+                    and args.short_rollout_prob > 0.0
+                )
+                or (
+                    args.long_rollout_loss_weight > 0.0
+                    and args.long_rollout_prob > 0.0
+                )
+            )
         )
 
         print("creating data loader...")
@@ -74,7 +82,7 @@ def main(argv: list[str] | None = None):
             schema_name=args.schema,
             tracker_pos_noise_std=args.tracker_pos_noise_std,
             tracker_rot_noise_std=args.tracker_rot_noise_std,
-            non_hip_tracker_dropout_prob=args.non_hip_tracker_dropout_prob,
+            non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
             history_pose_noise_std=args.history_pose_noise_std,
             history_yaw_noise_std=args.history_yaw_noise_std,
             root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
@@ -111,7 +119,7 @@ def main(argv: list[str] | None = None):
                 schema_name=args.schema,
                 tracker_pos_noise_std=args.tracker_pos_noise_std,
                 tracker_rot_noise_std=args.tracker_rot_noise_std,
-                non_hip_tracker_dropout_prob=args.non_hip_tracker_dropout_prob,
+                non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
                 history_pose_noise_std=args.history_pose_noise_std,
                 history_yaw_noise_std=args.history_yaw_noise_std,
                 root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
@@ -158,6 +166,9 @@ def prepare_save_dir(args):
 
 def resolve_save_dir(args, *, cli_schema_explicit: bool = False, normalizer_dir_explicit: bool = False):
     """把用户给的 save_dir 解析成本次训练实际写入的 run 目录。"""
+
+    if args.resume_checkpoint and getattr(args, "init_checkpoint", ""):
+        raise ValueError("--resume_checkpoint and --init_checkpoint are mutually exclusive.")
 
     if args.resume_checkpoint:
         resolve_resume_schema_and_paths(
@@ -241,9 +252,22 @@ def resolve_input_artifact_dirs(args):
 def resolve_run_label(args) -> str:
     run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
     if run_name.lower() in {"auto", ""}:
-        run_name = f"{getattr(args, 'schema', 'schema')}_{getattr(args, 'model_arch', 'model')}_seed{getattr(args, 'seed', 0)}"
+        run_name = build_auto_run_label(args)
     run_name = re.sub(r"[^A-Za-z0-9._-]+", "_", run_name).strip("._-")
     return run_name or "run"
+
+
+def build_auto_run_label(args) -> str:
+    schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
+    schema_alias = "s5" if schema.name == REALTIME_POSE_SCHEMA_NAME else schema.name
+    model_arch = str(getattr(args, "model_arch", "model"))
+    model_alias = {
+        "target_dit": "tdit",
+        "full_feature_dit": "dit",
+    }.get(model_arch, model_arch)
+    parts = [schema_alias]
+    parts.extend([model_alias, f"seed{getattr(args, 'seed', 0)}"])
+    return "_".join(parts)
 
 
 def write_latest_run_pointer(args):

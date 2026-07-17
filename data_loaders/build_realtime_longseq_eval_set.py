@@ -14,6 +14,7 @@ import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.stationary_label_config import stationary_label_metadata
 from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root, default_realtime_pose_task_root
 from utils.parser_util import has_explicit_option_arg
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
@@ -28,6 +29,7 @@ LONGSEQ_LATEST_KIND = "longseq_eval"
 PRESET_STRESS_LONG = "stress_long"
 SUPPORTED_PRESETS = (PRESET_STRESS_LONG,)
 MAX_LONGSEQ_FILE_STEM_CHARS = 32
+WINDOWS_SAFE_PATH_CHARS = 248
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -213,6 +215,7 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
             "root_y_policy": schema.root_y_policy,
             "pelvis_height_mode": schema.pelvis_height_mode,
             "pose_representation": schema.pose_representation,
+            **(stationary_label_metadata() if schema.supports_stationary_prob else {}),
         },
     )
     return output_dir
@@ -272,12 +275,15 @@ def copy_selected_sources(
 
         source_relative_path = normalize_slashes(str(task_entry["source_relative_path"]))
         sequence_id = unique_sequence_id(make_sequence_id(source_relative_path), used_sequence_ids)
-        copied_name = f"{shorten_path_token(sequence_id)}__{frame_count}f.npz"
+        copied_name = build_copied_source_filename(
+            sequence_dir=sequence_dir,
+            sequence_id=sequence_id,
+            frame_count=frame_count,
+        )
         copied_path = sequence_dir / copied_name
         shutil.copy2(original_source_path, copied_path)
 
-        manifest_entries.append(
-            {
+        manifest_entry = {
                 "sequence_id": sequence_id,
                 "source_path": normalize_slashes(copied_path.relative_to(output_dir).as_posix()),
                 "original_source_path": str(original_source_path),
@@ -296,7 +302,9 @@ def copy_selected_sources(
                 "task_run_dir": str(task_run_dir),
                 "task_manifest_path": str(task_manifest_path),
             }
-        )
+        if schema.supports_stationary_prob:
+            manifest_entry.update(stationary_label_metadata())
+        manifest_entries.append(manifest_entry)
     return manifest_entries
 
 
@@ -338,7 +346,7 @@ def build_config(
     schema_name: str,
 ) -> dict[str, Any]:
     schema = get_schema_spec(schema_name)
-    return {
+    config = {
         "kind": LONGSEQ_LATEST_KIND,
         "preset": str(args.preset),
         "split": str(args.split),
@@ -352,6 +360,9 @@ def build_config(
         "task_manifest_path": str(task_manifest_path),
         "storage_mode": "copied_npz",
     }
+    if schema.supports_stationary_prob:
+        config.update(stationary_label_metadata())
+    return config
 
 
 def build_summary(
@@ -431,13 +442,41 @@ def sanitize_path_token(value: str) -> str:
 
 def shorten_path_token(value: str, max_chars: int = MAX_LONGSEQ_FILE_STEM_CHARS) -> str:
     token = sanitize_path_token(value)
+    max_chars = int(max_chars)
+    if max_chars < 4:
+        raise ValueError(f"max_chars 至少为 4，实际为 {max_chars}")
     if len(token) <= max_chars:
         return token
-    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
-    keep = max(16, int(max_chars) - len(digest) - 1)
+    digest_chars = min(10, max_chars - 2)
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:digest_chars]
+    keep = max_chars - len(digest) - 1
     head = keep // 2
     tail = keep - head
-    return f"{token[:head]}_{token[-tail:]}_{digest}"
+    body = token[:head] if tail == 0 else f"{token[:head]}{token[-tail:]}"
+    return f"{body}_{digest}"
+
+
+def build_copied_source_filename(
+    *,
+    sequence_dir: Path,
+    sequence_id: str,
+    frame_count: int,
+    safe_path_chars: int = WINDOWS_SAFE_PATH_CHARS,
+) -> str:
+    """按完整目标路径预算缩短文件名，避免 Windows 260 字符边界失败。"""
+
+    suffix = f"__{int(frame_count)}f.npz"
+    separator_chars = 1
+    available = int(safe_path_chars) - len(str(sequence_dir)) - separator_chars - len(suffix)
+    token_chars = min(MAX_LONGSEQ_FILE_STEM_CHARS, available)
+    if token_chars < 4:
+        raise ValueError(
+            f"longseq output path 太长，无法生成安全文件名：sequence_dir={sequence_dir}"
+        )
+    filename = f"{shorten_path_token(sequence_id, max_chars=token_chars)}{suffix}"
+    if len(str(sequence_dir / filename)) > int(safe_path_chars):
+        raise RuntimeError(f"longseq copied path 仍超过安全长度：{sequence_dir / filename}")
+    return filename
 
 
 def unique_sequence_id(base_id: str, used: set[str]) -> str:

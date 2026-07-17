@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from data_loaders.realtime_pose_kinematics import JOINT_INDEX, TRACKER_JOINT_INDICES, make_yaw_rotation_np
+from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, HIP_TRACKER_INDEX, get_schema_spec
+from eval.evaluate_realtime_pose_rollout import (
+    compute_motion_quality_metrics,
+    compute_transition_pj_auj,
+    evaluate_rollout_file,
+    compute_preliminary_geometry_metrics,
+    foot_slide_m_per_second,
+    no_hip_duration_bucket_masks,
+    reconnect_peak_jump,
+    recovery_time,
+    root_drift_cm_per_minute,
+    tracker_state_group_masks,
+)
+from eval.stationary_signal_metrics import compute_stationary_signal_metrics
+from tests.smoke.realtime_pose_fixtures import IDENTITY_6D
+
+
+def test_root_drift_uses_closed_form_slope_and_excludes_reset_frames():
+    timestamps = np.arange(10, dtype=np.float64)[None]
+    error = (timestamps * 0.01).astype(np.float64)
+    mask = np.ones((1, 10), dtype=bool)
+    root_source = np.zeros((1, 10), dtype=np.int8)
+    root_source[0, 5] = 3
+    original_mask = mask.copy()
+    assert np.isclose(
+        root_drift_cm_per_minute(error, mask, timestamps, root_source=root_source),
+        60.0,
+        atol=1e-10,
+    )
+    np.testing.assert_array_equal(mask, original_mask)
+
+
+def test_reconnect_recovery_and_foot_slide_formulas():
+    root = np.zeros((1, 8, 3), dtype=np.float32)
+    root[0, :, 0] = np.asarray([0.0, 0.1, 0.3, 0.31, 0.32, 0.33, 0.34, 0.35])
+    yaw = np.zeros((1, 8), dtype=np.float32)
+    yaw[0, 2] = 0.25
+    source = np.asarray([[0, 2, 2, 0, 0, 0, 0, 0]], dtype=np.int8)
+    alpha = np.asarray([[0.0, 0.2, 0.7, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    jump_xz, jump_yaw = reconnect_peak_jump(root, yaw, source, alpha)
+    assert np.isclose(jump_xz, 0.2, atol=1e-6)
+    assert np.isclose(jump_yaw, 0.25, atol=1e-6)
+
+    root_error = np.asarray([[0.2, 0.2, 0.1, 0.04, 0.03, 0.02, 0.01, 0.01]], dtype=np.float32)
+    yaw_error = np.zeros_like(root_error)
+    seconds, frames = recovery_time(root_error, yaw_error, alpha, np.arange(8, dtype=np.float64))
+    assert seconds == 2.0
+    assert frames == 2
+
+    foot = np.zeros((1, 3, 3), dtype=np.float32)
+    foot[0, :, 0] = [0.0, 1.0, 2.0]
+    assert foot_slide_m_per_second(
+        foot,
+        np.ones((1, 3), dtype=bool),
+        np.zeros((1, 3), dtype=np.float32),
+        np.arange(3, dtype=np.float64),
+    ) == 1.0
+
+
+def test_foot_slide_uses_gt_contact_even_when_predicted_foot_is_floating():
+    foot = np.zeros((1, 3, 3), dtype=np.float32)
+    foot[0, :, 0] = [0.0, 1.0, 2.0]
+    foot[..., 1] = 1.0
+    assert foot_slide_m_per_second(
+        foot,
+        np.ones((1, 3), dtype=bool),
+        np.zeros((1, 3), dtype=np.float32),
+        np.arange(3, dtype=np.float64),
+        np.ones((1, 3), dtype=bool),
+    ) == 1.0
+
+
+def test_preliminary_lower_body_alignment_removes_pelvis_translation_and_own_heading():
+    reference = np.zeros((1, 1, 24, 3), dtype=np.float32)
+    for offset, joint_index in enumerate(
+        [
+            JOINT_INDEX["left_hip"],
+            JOINT_INDEX["right_hip"],
+            JOINT_INDEX["left_knee"],
+            JOINT_INDEX["right_knee"],
+            JOINT_INDEX["left_ankle"],
+            JOINT_INDEX["right_ankle"],
+            JOINT_INDEX["left_foot"],
+            JOINT_INDEX["right_foot"],
+        ]
+    ):
+        reference[0, 0, joint_index] = [0.1 * (offset + 1), -0.2 * offset, 0.05 * offset]
+    reference[0, 0, JOINT_INDEX["head"]] = [0.0, 1.0, 0.0]
+    yaw = np.asarray([[np.pi / 2]], dtype=np.float32)
+    rotation = make_yaw_rotation_np(yaw.reshape(-1))[0]
+    predicted = np.einsum("ij,btkj->btki", rotation, reference) + np.asarray([3.0, 0.4, -2.0])
+
+    metrics = compute_preliminary_geometry_metrics(
+        preliminary_joints=predicted,
+        reference_joints=reference,
+        preliminary_root_yaw=yaw,
+        reference_root_yaw=np.zeros_like(yaw),
+        common_ref_yaw=np.zeros_like(yaw),
+    )
+
+    assert np.max(metrics["lower_body_aligned_error"]) < 1e-6
+
+
+def test_no_hip_duration_buckets_use_whole_contiguous_run_length():
+    sensor_valid = np.ones((1, 50, 6), dtype=bool)
+    sensor_valid[:, 1:3, HIP_TRACKER_INDEX] = False
+    sensor_valid[:, 5:15, HIP_TRACKER_INDEX] = False
+    sensor_valid[:, 17:48, HIP_TRACKER_INDEX] = False
+
+    buckets = no_hip_duration_bucket_masks(sensor_valid)
+
+    assert buckets["1_2"].sum() == 2
+    assert buckets["3_10"].sum() == 10
+    assert buckets["11_30"].sum() == 0
+    assert buckets["gt30"].sum() == 31
+
+
+def test_motion_quality_reports_mpjre_mpjve_and_jitter_in_explicit_units():
+    schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    frames = 5
+    features = np.zeros((1, frames, schema.feature_dim), dtype=np.float32)
+    identity_pose = np.tile(np.asarray(IDENTITY_6D, dtype=np.float32), 24)
+    features[..., schema.body_pose_slice()] = identity_pose
+    predicted_features = features.copy()
+    predicted_features[:, :, 0:6] = np.asarray([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    joints = np.zeros((1, frames, 24, 3), dtype=np.float32)
+
+    metrics = compute_motion_quality_metrics(
+        predicted_features=predicted_features,
+        reference_features=features,
+        predicted_joints=joints,
+        reference_joints=joints,
+        pose_slice=schema.body_pose_slice(),
+        eval_frame_mask=np.ones((1, frames), dtype=bool),
+        timestamps=np.arange(frames, dtype=np.float64)[None] / 60.0,
+    )["summary"]
+
+    assert metrics["mpjre_deg"] == pytest.approx(90.0 / 24.0, abs=1e-5)
+    assert metrics["mpjve_cmps"] == 0.0
+    assert metrics["jitter_mps3"] == 0.0
+
+
+def test_tracker_state_groups_and_rpm_transition_pj_auj_cover_both_directions():
+    frames = 70
+    sensor_valid = np.ones((1, frames, 6), dtype=bool)
+    sensor_valid[:, 10:40, 3:] = False
+    eval_mask = np.ones((1, frames), dtype=bool)
+    masks = tracker_state_group_masks(sensor_valid=sensor_valid, eval_frame_mask=eval_mask)
+
+    assert masks["full_six"].sum() == 40
+    assert masks["standard_three"].sum() == 30
+    assert masks["transition_6_to_3"].sum() == 30
+    assert masks["transition_3_to_6_reconnect"].sum() == 30
+
+    reference = np.zeros((1, frames, 24, 3), dtype=np.float32)
+    predicted = reference.copy()
+    predicted[:, 10:40, :, 0] = 1.0
+    metrics = compute_transition_pj_auj(
+        predicted_joints=predicted,
+        reference_joints=reference,
+        sensor_valid=sensor_valid,
+        eval_frame_mask=eval_mask,
+        timestamps=np.arange(frames, dtype=np.float64)[None] / 60.0,
+    )
+
+    assert metrics["transition_event_count"] == 2
+    assert metrics["transition_6_to_3_event_count"] == 1
+    assert metrics["transition_3_to_6_reconnect_event_count"] == 1
+    assert metrics["pj"] > 0.0
+    assert metrics["auj"] > 0.0
+
+
+def test_stationary_reports_pre_clamp_out_of_bounds_ratio():
+    target = np.zeros((2, 5), dtype=np.float32)
+    predicted = target.copy()
+    predicted[0, 0] = -0.1
+    predicted[1, 1] = 1.1
+    metrics = compute_stationary_signal_metrics(target, predicted, thresholds=(0.5,))
+    assert np.isclose(metrics["clamp_pre_out_of_bounds_ratio"], 0.2)
+    assert np.isclose(
+        metrics["thresholds"]["0.5"]["aggregate"]["clamp_pre_out_of_bounds_ratio"],
+        0.2,
+    )
+
+
+def test_rollout_file_reports_valid_position_and_rotation_reprojection(tmp_path):
+    schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    frames = 6
+    features = np.zeros((1, frames, schema.feature_dim), dtype=np.float32)
+    features[..., schema.stationary_prob_slice()] = 1.0
+    joints = np.zeros((1, frames, 24, 3), dtype=np.float32)
+    joints[..., 1] = 0.01
+    tracker_positions = joints[..., np.asarray(TRACKER_JOINT_INDICES), :].copy()
+    identity_6d = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    tracker_rotations = np.broadcast_to(identity_6d, (1, frames, 6, 6)).copy()
+    joint_rotations = np.broadcast_to(np.eye(3, dtype=np.float32), (1, frames, 24, 3, 3)).copy()
+    sensor_valid = np.ones((1, frames, 6), dtype=bool)
+    path = tmp_path / "metrics.npz"
+    np.savez(
+        path,
+        reference_features_raw=features,
+        predicted_features_raw=features,
+        reference_joints_world=joints,
+        predicted_joints_world=joints,
+        predicted_joint_rot_world=joint_rotations,
+        root_yaw_reference=np.zeros((1, frames), dtype=np.float32),
+        root_yaw_predicted=np.zeros((1, frames), dtype=np.float32),
+        root_pos_world_reference=np.zeros((1, frames, 3), dtype=np.float32),
+        root_pos_world_predicted=np.zeros((1, frames, 3), dtype=np.float32),
+        tracker_pos_world=tracker_positions,
+        tracker_rot_world_6d=tracker_rotations,
+        sensor_valid=sensor_valid,
+        eval_frame_mask=np.ones((1, frames), dtype=bool),
+        timestamp_seconds=np.arange(frames, dtype=np.float64)[None] / 60.0,
+        floor_y=np.zeros((1, frames), dtype=np.float32),
+    )
+    result = evaluate_rollout_file(path)
+    assert result["tracker_reprojection_pos_mean_cm"] == 0.0
+    assert result["tracker_reprojection_rot_mean_deg"] == 0.0
+    assert result["stationary_f1"] == 1.0
+
+
+def test_rollout_file_reports_real_floating_penetration_and_no_hip_geometry(tmp_path):
+    schema = get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME)
+    frames = 6
+    identity_pose = np.tile(np.asarray(IDENTITY_6D, dtype=np.float32), 24)
+    features = np.zeros((1, frames, schema.feature_dim), dtype=np.float32)
+    features[..., schema.body_pose_slice()] = identity_pose
+    features[..., schema.stationary_prob_slice()] = 1.0
+    reference = np.zeros((1, frames, 24, 3), dtype=np.float32)
+    reference[..., JOINT_INDEX["head"], 1] = 1.0
+    reference[..., [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]], 1] = 0.01
+    predicted = reference.copy()
+    predicted[..., JOINT_INDEX["left_foot"], 1] = 0.10
+    predicted[..., JOINT_INDEX["left_foot"], 0] = np.arange(frames, dtype=np.float32)
+    predicted[..., JOINT_INDEX["right_foot"], 1] = -0.02
+    sensor_valid = np.ones((1, frames, 6), dtype=bool)
+    sensor_valid[..., HIP_TRACKER_INDEX] = False
+    path = tmp_path / "no_hip_metrics.npz"
+    np.savez(
+        path,
+        schema_name=np.asarray(DEFAULT_REALTIME_POSE_SCHEMA_NAME),
+        reference_features_raw=features,
+        predicted_features_raw=features.copy(),
+        reference_joints_world=reference,
+        predicted_joints_world=predicted,
+        preliminary_joints_world=predicted.copy(),
+        preliminary_root_yaw=np.zeros((1, frames), dtype=np.float32),
+        root_yaw_reference=np.zeros((1, frames), dtype=np.float32),
+        root_yaw_predicted=np.zeros((1, frames), dtype=np.float32),
+        tracker_ref_root_yaw=np.zeros((1, frames), dtype=np.float32),
+        sensor_valid=sensor_valid,
+        eval_frame_mask=np.ones((1, frames), dtype=bool),
+        timestamp_seconds=np.arange(frames, dtype=np.float64)[None],
+        floor_y=np.zeros((1, frames), dtype=np.float32),
+    )
+
+    result = evaluate_rollout_file(path)
+
+    assert result["foot_skating_left"] > 0.0
+    assert np.isclose(result["floating_foot_ratio"], 0.5)
+    assert np.isclose(result["ground_penetration_ratio"], 0.5)
+    assert result["no_hip_preliminary_frames"] == frames
+    assert result["no_hip_preliminary_p2h_height_error_cm"] == 0.0

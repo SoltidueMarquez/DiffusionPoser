@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from typing import Optional
 
@@ -122,4 +124,5 @@ class DiffusionPoserDiT(nn.Module):
         key_padding_mask = ~valid_frame_mask
         causal_mask = build_frame_causal_mask(seq_len, device=hidden_states.device)
         hidden = self.transformer(hidden, mask=causal_mask, src_key_padding_mask=key_padding_mask)
-        return self.output_proj(hidden).transpose(1, 2)
+        motion = self.output_proj(hidden).transpose(1, 2)
+        return motion

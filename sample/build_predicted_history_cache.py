@@ -10,6 +10,7 @@ from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
 from sample.reconstruct_stream import reconstruct_batch, tensor_bct_to_numpy_btc
 from sample.utils import load_checkpoint_model
 from utils import dist_util
+from utils.artifact_roots import load_artifact_roots
 from utils.model_util import create_model_and_diffusion
 from utils.parser_util import (
     add_base_options,
@@ -37,7 +38,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> dict[str, int]:
     args = parse_and_load_runtime_schema_from_model(build_arg_parser(), argv=argv)
-    output_dir = Path(args.output_dir or "output/pred_history_cache").resolve()
+    output_dir = (
+        Path(args.output_dir).resolve()
+        if args.output_dir
+        else (load_artifact_roots(args.artifact_roots_config or None).outputs_root / "pred_history_cache")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()

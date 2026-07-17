@@ -22,6 +22,12 @@ from data_loaders.sensor_masking import (  # noqa: E402
     get_schema_spec,
     validate_pose_representation,
 )
+from data_loaders.realtime_pose_contract import (  # noqa: E402
+    FEATURE_CONTRACT_VERSION,
+    RESOLVER_CONTRACT_VERSION,
+    validate_stationary_label_metadata,
+)
+from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION  # noqa: E402
 from schemas.registry import get_schema_adapter  # noqa: E402
 from utils.normalizer import enforce_realtime_pose_normalizer_contract  # noqa: E402
 
@@ -112,6 +118,17 @@ def validate_normalizer_metadata(normalizer_dir: Path, schema_name: str) -> dict
         raise ValueError(
             f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {schema.pelvis_height_mode!r}."
         )
+    expected_contract = {
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "tracker_codec_version": TRACKER_CODEC_VERSION,
+        "reference_policy_version": REFERENCE_POLICY_VERSION,
+        "resolver_contract_version": RESOLVER_CONTRACT_VERSION,
+    }
+    for key, expected in expected_contract.items():
+        if meta.get(key) != expected:
+            raise ValueError(f"normalizer {key}={meta.get(key)!r}, expected {expected!r}; rebuild normalizer")
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(meta, source=str(meta_path))
     return meta
 
 
@@ -221,7 +238,14 @@ def write_runtime_assets(
         "normalizer": output_dir / "normalizer.json",
         "ddim_schedule": output_dir / "ddim_schedule.json",
     }
-    write_json(assets["feature_schema"], build_realtime_pose_feature_schema(feature_dim, sequence_length, schema_name=schema.name))
+    write_json(
+        assets["feature_schema"],
+        build_realtime_pose_feature_schema(
+            feature_dim,
+            sequence_length,
+            schema_name=schema.name,
+        ),
+    )
     write_json(
         assets["normalizer"],
         build_normalizer(

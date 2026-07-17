@@ -49,6 +49,9 @@ def test_unity_replay_stream_exports_frame_major_flat_json(tmp_path):
 
     assert payload["schemaName"] == REALTIME_POSE_SCHEMA_NAME
     assert payload["poseRepresentation"] == get_schema_spec(REALTIME_POSE_SCHEMA_NAME).pose_representation
+    assert payload["featureContractVersion"] == 2
+    assert payload["trackerCodecVersion"] == "tracker_codec_v2"
+    assert payload["resolverContractVersion"] == "runtime_root_resolver_v1"
     assert payload["frameStart"] == 1
     assert payload["frameCount"] == 4
     assert payload["trackerCount"] == TRACKER_COUNT

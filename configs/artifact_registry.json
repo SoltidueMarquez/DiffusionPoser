@@ -1,0 +1,236 @@
+{
+  "assets": [
+    {
+      "dependencies": [],
+      "expected_file_count": 14230,
+      "expected_size_bytes": 26649296208,
+      "expected_tree_sha256": "a64d3160e96ea9ede62bffb2680835f9e6f0dbebcfc79ad9272ac68a945f50ba",
+      "id": "raw.amass",
+      "kind": "raw_motion_dataset",
+      "legacy_relative_path": "dataset/AMASS",
+      "relative_path": ".",
+      "retention": "active",
+      "root_key": "amass_root",
+      "schema_name": null,
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [],
+      "expected_file_count": 6,
+      "expected_size_bytes": 197382593,
+      "expected_tree_sha256": "c7b9d400a54f1dc83e38afdd6f8e75c809b4d8aeacee767c0c59695a17a3c089",
+      "id": "raw.body_models",
+      "kind": "body_model",
+      "legacy_relative_path": "dataset/body_models",
+      "relative_path": ".",
+      "retention": "active",
+      "root_key": "smpl_model_dir",
+      "schema_name": null,
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "raw.body_models"
+      ],
+      "expected_file_count": 1,
+      "expected_size_bytes": 7196,
+      "expected_tree_sha256": "c6f006d657cb1e18de5afbe954d5f4e2ed1fe09bbb5afbbbb6dcf4bdceae275c",
+      "id": "runtime.body_fbx_rest",
+      "kind": "body_fbx_rest_contract",
+      "legacy_relative_path": "SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/DiffusionPoser/body_fbx_rest.json",
+      "relative_path": "realtime_pose_stationary5_v1/body_fbx_rest.json",
+      "retention": "active",
+      "root_key": "runtime_contract_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_mirrored"
+    },
+    {
+      "dependencies": [
+        "raw.amass",
+        "raw.body_models",
+        "runtime.body_fbx_rest"
+      ],
+      "expected_file_count": 28189,
+      "expected_size_bytes": 24347700846,
+      "expected_tree_sha256": "b0ef7b2c1d994cb539cb11f281b8afa34be70647395602b34d1506c6ef367b48",
+      "id": "source.c04.causal_stationary",
+      "kind": "realtime_pose_source",
+      "legacy_relative_path": "dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary",
+      "relative_path": "c04/source",
+      "relocate_from_relative_path": "sources/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary",
+      "retention": "active",
+      "root_key": "generated_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "source.c04.causal_stationary"
+      ],
+      "expected_file_count": 181211,
+      "expected_size_bytes": 22237212971,
+      "expected_tree_sha256": "8f92bb8715eb4d8eace447758be28cd3442718edf98af3cdcab5f8c2e23c46c4",
+      "id": "task.c04.rollout9",
+      "kind": "realtime_pose_tasks",
+      "legacy_relative_path": "dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_rollout9_tasks/20260716_171854_causal_stationary_rollout9_seed10",
+      "relative_path": "c04/tasks",
+      "relocate_from_relative_path": "tasks/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_rollout9_tasks/20260716_171854_causal_stationary_rollout9_seed10",
+      "retention": "active",
+      "root_key": "generated_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "task.c04.rollout9"
+      ],
+      "expected_file_count": 3,
+      "expected_size_bytes": 8057,
+      "expected_tree_sha256": "e8051e3af668095ff02e7350c5965bb4d2cf12706e5e0f0553ea20d4cd1d4119",
+      "id": "normalizer.c04.train",
+      "kind": "realtime_pose_normalizer",
+      "legacy_relative_path": "dataset/generated/normalizers/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_train/20260716_172957_causal_stationary_train_seed10",
+      "relative_path": "c04/normalizer",
+      "relocate_from_relative_path": "normalizers/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_train/20260716_172957_causal_stationary_train_seed10",
+      "retention": "active",
+      "root_key": "generated_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "source.c04.causal_stationary"
+      ],
+      "expected_file_count": 21,
+      "expected_size_bytes": 56318223,
+      "expected_tree_sha256": "3b37c17e6cd7fd74d192b8744af3582ac5822e1a761fad238e4a3a4980d0c495",
+      "id": "longseq.c04.pre_stage_a",
+      "kind": "longseq_eval_set",
+      "legacy_relative_path": "dataset/generated/longseq_eval/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_pre_stage_a/20260716_pre_stage_a_seed10",
+      "relative_path": "c04/longseq/20260716_pre_stage_a_seed10",
+      "relocate_from_relative_path": "longseq_eval/realtime_pose_stationary5_v1/amass_60hz_v3_causal_stationary_pre_stage_a/20260716_pre_stage_a_seed10",
+      "retention": "active",
+      "root_key": "generated_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "longseq.c04.pre_stage_a"
+      ],
+      "expected_file_count": 21,
+      "expected_size_bytes": 56318223,
+      "expected_tree_sha256": "5b071d935e756f31659bf8d2133d1ae7188325af35b25cac6d6fe43394e09720",
+      "id": "longseq_root.c04.pre_stage_a",
+      "kind": "longseq_eval_root",
+      "relative_path": "c04/longseq",
+      "retention": "active",
+      "root_key": "generated_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "derived_parent"
+    },
+    {
+      "dependencies": [
+        "task.c04.rollout9",
+        "normalizer.c04.train"
+      ],
+      "expected_file_count": 7,
+      "expected_size_bytes": 209955043,
+      "expected_tree_sha256": "78c79f7167eb75c701c2dd1b0a1f70f71d6761ec49cdd9b5c83d89c22d7efb55",
+      "id": "run.c04",
+      "kind": "training_run",
+      "legacy_relative_path": "runs/realtime-loss-v3-causal-stationary-rollout/C04_causal_stationary_loss_v3_stable_rollout",
+      "relative_path": "c04",
+      "relocate_from_relative_path": "realtime-loss-v3-causal-stationary-rollout/C04_causal_stationary_loss_v3_stable_rollout",
+      "retention": "active",
+      "root_key": "runs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "verified_active"
+    },
+    {
+      "dependencies": [
+        "checkpoint.c04.model",
+        "task.c04.rollout9",
+        "normalizer.c04.train"
+      ],
+      "id": "run.c04.followup",
+      "kind": "writable_training_run_root",
+      "relative_path": "experiments/c04-followup",
+      "retention": "active",
+      "root_key": "runs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "writable_root"
+    },
+    {
+      "dependencies": [
+        "run.c04"
+      ],
+      "expected_file_count": 1,
+      "expected_size_bytes": 104251363,
+      "expected_tree_sha256": "fd7e0736153d46dcc7ab09f62fa71d02114724462bb47e5fe38e1d402a82cb5b",
+      "id": "checkpoint.c04.model",
+      "kind": "checkpoint",
+      "relative_path": "c04/20260716_183107_C04_causal_stationary_loss_v3_stable_rollout_seed10_5k/model000005000.pt",
+      "retention": "active",
+      "root_key": "runs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "derived_from_run"
+    },
+    {
+      "dependencies": [
+        "run.c04"
+      ],
+      "expected_file_count": 1,
+      "expected_size_bytes": 104254175,
+      "expected_tree_sha256": "9925ff8a1496560ee0eedb556b917a63d020f7051bc1fbfcd79744baa3846778",
+      "id": "checkpoint.c04.ema",
+      "kind": "ema_checkpoint",
+      "relative_path": "c04/20260716_183107_C04_causal_stationary_loss_v3_stable_rollout_seed10_5k/ema000005000.pt",
+      "retention": "active",
+      "root_key": "runs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "derived_from_run"
+    },
+    {
+      "dependencies": [
+        "checkpoint.c04.model",
+        "longseq.c04.pre_stage_a",
+        "normalizer.c04.train"
+      ],
+      "id": "output.c04.followup",
+      "kind": "writable_evaluation_output_root",
+      "relative_path": "experiments/c04-followup",
+      "retention": "active",
+      "root_key": "outputs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "writable_root"
+    },
+    {
+      "dependencies": [
+        "output.c04.followup"
+      ],
+      "id": "summary.c04.followup",
+      "kind": "writable_evaluation_summary",
+      "relative_path": "experiments/c04-followup/longseq_eval_summary.json",
+      "retention": "active",
+      "root_key": "outputs_root",
+      "schema_name": "realtime_pose_stationary5_v1",
+      "status": "writable_file"
+    },
+    {
+      "dependencies": [],
+      "expected_file_count": 1,
+      "expected_size_bytes": 9671454649,
+      "expected_tree_sha256": "68c80aef65fd6bd229deccb978d3e39d8adb139164a61a979c2a25c40b36baae",
+      "id": "raw.amass_archive",
+      "kind": "raw_motion_archive",
+      "legacy_relative_path": "dataset/AMASS.7z",
+      "relative_path": "archives/AMASS.7z",
+      "retention": "active",
+      "root_key": "archive_root",
+      "schema_name": null,
+      "status": "verified_active"
+    }
+  ],
+  "schema_version": 1
+}

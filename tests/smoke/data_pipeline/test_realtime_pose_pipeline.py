@@ -9,6 +9,7 @@ import pytest
 import data_loaders.compute_realtime_pose_normalizer as normalizer_computer
 import data_loaders.generate_realtime_pose_tasks as task_generator
 from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.stationary_label_config import stationary_label_metadata
 from scripts import run_realtime_pose_pipeline as pipeline
 from tests.smoke.realtime_pose_fixtures import write_toy_source_dataset
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
@@ -20,14 +21,16 @@ NORMALIZER_MODULE = "data_loaders.compute_realtime_pose_normalizer"
 EXPORT_MODULE = "export.write_unity_runtime_assets"
 
 
-def write_data_roots_config(tmp_path: Path) -> tuple[Path, Path]:
-    config_path = tmp_path / "data_roots.json"
+def write_artifact_roots_config(tmp_path: Path) -> tuple[Path, Path]:
+    config_path = tmp_path / "artifact_roots.json"
     generated_root = tmp_path / "generated"
     config_path.write_text(
         json.dumps(
             {
                 "amass_root": str(tmp_path / "AMASS"),
                 "generated_root": str(generated_root),
+                "runs_root": str(tmp_path / "runs"),
+                "outputs_root": str(tmp_path / "output"),
             }
         ),
         encoding="utf-8",
@@ -60,14 +63,14 @@ def parse_pipeline_args(tmp_path: Path, *extra: str):
 
 
 def parse_schema_aware_pipeline_args(tmp_path: Path, *extra: str):
-    config_path, _ = write_data_roots_config(tmp_path)
+    config_path, _ = write_artifact_roots_config(tmp_path)
     return pipeline.build_arg_parser().parse_args(
         [
             "--amass_dir",
             str(tmp_path / "AMASS"),
             "--smpl_model_dir",
             str(tmp_path / "body_models"),
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--source_set_name",
             "toy_sources",
@@ -208,7 +211,7 @@ def test_pipeline_default_schema_is_stationary5():
 
 
 def test_pipeline_schema_aware_commands_defer_paths_to_resolvers(tmp_path):
-    config_path = tmp_path / "data_roots.json"
+    config_path = tmp_path / "artifact_roots.json"
     args = parse_schema_aware_pipeline_args(
         tmp_path,
         "--schema",
@@ -221,7 +224,7 @@ def test_pipeline_schema_aware_commands_defer_paths_to_resolvers(tmp_path):
 
     for command in (convert_args, task_args, normalizer_args):
         assert_arg_value(command, "--schema", "realtime_pose_stationary5_v1")
-        assert_arg_value(command, "--data_roots_config", str(config_path))
+        assert_arg_value(command, "--artifact_roots_config", str(config_path))
 
     assert_arg_value(convert_args, "--source_set_name", "toy_sources")
     assert "--output_dir" not in convert_args
@@ -286,7 +289,52 @@ def test_pipeline_train_save_dir_uses_schema_and_experiment_name(tmp_path):
 
     train_args = pipeline.build_train_args(args)
 
-    assert_arg_value(train_args, "--save_dir", str(Path("runs") / "realtime_pose_stationary5_v1" / "toy_exp"))
+    assert_arg_value(
+        train_args,
+        "--save_dir",
+        str(tmp_path / "runs" / "realtime_pose_stationary5_v1" / "toy_exp"),
+    )
+
+
+def test_pipeline_task_defaults_rebuild_final_distribution_with_adjacent_rollout(tmp_path):
+    args = parse_schema_aware_pipeline_args(tmp_path)
+    task_args = pipeline.build_task_args(args)
+    assert_arg_value(task_args, "--mask_policy", "full")
+    assert_arg_value(task_args, "--patterns_per_window", "1")
+    assert_arg_value(task_args, "--rollout_steps", "2")
+    assert "--fixed_tracker_patterns" not in task_args
+
+
+def test_pipeline_training_stage_presets_match_sparse_root_plan(tmp_path):
+    expected = {
+        "A": ("20000", "5e-05", "1", "0.0", "dynamic_categories", ["full_six", "standard_three"]),
+        "B": ("20000", "5e-05", "2", "0.5", "dynamic_categories", ["full_six", "standard_three"]),
+        "C": ("20000", "2e-05", "2", "0.5", "dynamic_categories", ["all"]),
+    }
+    for stage, values in expected.items():
+        args = parse_schema_aware_pipeline_args(tmp_path, "--training_stage", stage)
+        train_args = pipeline.build_train_args(args)
+        num_steps, lr, rollout_steps, short_rollout_prob, mask_policy, categories = values
+        assert_arg_value(train_args, "--num_steps", num_steps)
+        assert_arg_value(train_args, "--lr", lr)
+        assert_arg_value(train_args, "--rollout_steps", rollout_steps)
+        assert_arg_value(train_args, "--short_rollout_prob", short_rollout_prob)
+        assert_arg_value(train_args, "--long_rollout_prob", "0.0")
+        assert_arg_value(train_args, "--tracker_mask_policy", mask_policy)
+        category_index = train_args.index("--tracker_mask_categories") + 1
+        assert train_args[category_index : category_index + len(categories)] == categories
+
+
+def test_pipeline_resumed_stage_presets_use_cumulative_global_step_targets(tmp_path):
+    for stage, expected_steps in (("A", "20000"), ("B", "40000"), ("C", "60000")):
+        args = parse_schema_aware_pipeline_args(
+            tmp_path,
+            "--training_stage",
+            stage,
+            "--resume_latest",
+        )
+        train_args = pipeline.build_train_args(args)
+        assert_arg_value(train_args, "--num_steps", expected_steps)
 
 
 def test_pipeline_explicit_save_dir_overrides_experiment_name(tmp_path):
@@ -317,14 +365,18 @@ def test_pipeline_export_command_uses_schema_and_export_name(tmp_path):
 
     assert module == EXPORT_MODULE
     assert_arg_value(export_args, "--schema", "realtime_pose_stationary5_v1")
-    assert_arg_value(export_args, "--output_dir", str(Path("output") / "realtime_pose_stationary5_v1" / "toy_export"))
+    assert_arg_value(
+        export_args,
+        "--output_dir",
+        str(tmp_path / "output" / "realtime_pose_stationary5_v1" / "toy_export"),
+    )
     assert_arg_value(export_args, "--diffusion_steps", str(args.diffusion_steps))
     assert_arg_value(export_args, "--normalizer_dir", str(pipeline.resolve_pipeline_normalizer_dir(args)))
     assert "--normalize_input" in export_args
 
 
 def test_pipeline_export_uses_latest_normalizer_artifact(tmp_path):
-    _, generated_root = write_data_roots_config(tmp_path)
+    _, generated_root = write_artifact_roots_config(tmp_path)
     normalizer_root = generated_root / "normalizers" / REALTIME_POSE_SCHEMA_NAME / "toy_norm"
     latest_normalizer_dir = write_latest_normalizer_artifact(normalizer_root)
     args = parse_schema_aware_pipeline_args(
@@ -377,12 +429,12 @@ def test_pipeline_skip_export_does_not_run_stage(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):
-    config_path, generated_root = write_data_roots_config(tmp_path)
+def test_task_generation_resolver_uses_schema_aware_defaults_from_artifact_roots(tmp_path):
+    config_path, generated_root = write_artifact_roots_config(tmp_path)
 
     args = task_generator.build_argument_parser().parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -399,13 +451,13 @@ def test_task_generation_resolver_uses_schema_aware_defaults_from_data_roots(tmp
 
 
 def test_task_generation_resolver_keeps_explicit_paths(tmp_path):
-    config_path, _ = write_data_roots_config(tmp_path)
+    config_path, _ = write_artifact_roots_config(tmp_path)
     explicit_source_dir = tmp_path / "explicit_sources"
     explicit_output_dir = tmp_path / "explicit_tasks"
 
     args = task_generator.build_argument_parser().parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--source_dir",
             str(explicit_source_dir),
@@ -425,12 +477,12 @@ def test_task_generation_resolver_keeps_explicit_paths(tmp_path):
     assert resolved.output_dir == explicit_output_dir
 
 
-def test_normalizer_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path):
-    config_path, generated_root = write_data_roots_config(tmp_path)
+def test_normalizer_resolver_uses_schema_aware_defaults_from_artifact_roots(tmp_path):
+    config_path, generated_root = write_artifact_roots_config(tmp_path)
 
     args = normalizer_computer.build_argument_parser().parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -447,13 +499,13 @@ def test_normalizer_resolver_uses_schema_aware_defaults_from_data_roots(tmp_path
 
 
 def test_normalizer_resolver_keeps_explicit_paths(tmp_path):
-    config_path, _ = write_data_roots_config(tmp_path)
+    config_path, _ = write_artifact_roots_config(tmp_path)
     explicit_task_dir = tmp_path / "explicit_tasks"
     explicit_output_dir = tmp_path / "explicit_normalizer"
 
     args = normalizer_computer.build_argument_parser().parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--task_dir",
             str(explicit_task_dir),
@@ -474,7 +526,7 @@ def test_normalizer_resolver_keeps_explicit_paths(tmp_path):
 
 
 def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
-    config_path, generated_root = write_data_roots_config(tmp_path)
+    config_path, generated_root = write_artifact_roots_config(tmp_path)
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source_dir = generated_root / "sources" / schema.name / "toy_source"
     task_root = generated_root / "tasks" / schema.name / "toy_tasks"
@@ -483,7 +535,7 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
 
     task_generator.main(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--source_set_name",
             "toy_source",
@@ -516,7 +568,7 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
 
     normalizer_computer.main(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--task_set_name",
             "toy_tasks",
@@ -541,3 +593,19 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
         assert payload["normalizer_name"] == "toy_norm"
         assert payload["task_dir"] == str(task_output_dir)
         assert payload["output_dir"] == str(normalizer_output_dir)
+        for key, value in stationary_label_metadata().items():
+            assert payload[key] == value
+def test_pipeline_allows_partial_conversion_by_default(tmp_path):
+    args = parse_pipeline_args(tmp_path)
+
+    convert_args = pipeline.build_convert_args(args)
+
+    assert "--allow_partial" in convert_args
+
+
+def test_pipeline_can_disable_partial_conversion_for_strict_runs(tmp_path):
+    args = parse_pipeline_args(tmp_path, "--no-allow_partial")
+
+    convert_args = pipeline.build_convert_args(args)
+
+    assert "--allow_partial" not in convert_args

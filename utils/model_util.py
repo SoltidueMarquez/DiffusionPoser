@@ -1,4 +1,5 @@
 from diffusion import gaussian_diffusion as gd
+from diffusion.realtime_pose import REALTIME_POSE_LOSS_DEFAULTS
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME
 from model.diffusionposer_dit import DiffusionPoserDiT
@@ -6,7 +7,7 @@ from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 
 
 def create_model_and_diffusion(args):
-    model_arch = getattr(args, "model_arch", "full_feature_dit")
+    model_arch = getattr(args, "model_arch", "target_dit")
     if model_arch == "target_dit":
         model = RealtimePoseTargetDiT(
             input_feats=args.input_feats,
@@ -41,6 +42,10 @@ def create_gaussian_diffusion(args):
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
     betas = gd.get_named_beta_schedule(args.noise_schedule, steps, scale_betas=1.0)
 
+    loss_options = {
+        name: getattr(args, name, default)
+        for name, default in REALTIME_POSE_LOSS_DEFAULTS.items()
+    }
     return SpacedDiffusion(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
@@ -48,17 +53,5 @@ def create_gaussian_diffusion(args):
         model_var_type=gd.ModelVarType.FIXED_SMALL if args.sigma_small else gd.ModelVarType.FIXED_LARGE,
         loss_type=gd.LossType.MSE,
         rescale_timesteps=False,
-        aux_loss_weight=getattr(args, "aux_loss_weight", 1.0),
-        yaw_loss_weight=getattr(args, "yaw_loss_weight", 10.0),
-        fk_loss_weight=getattr(args, "fk_loss_weight", 2.0),
-        joint_vel_loss_weight=getattr(args, "joint_vel_loss_weight", 0.5),
-        foot_lock_loss_weight=getattr(args, "foot_lock_loss_weight", 0.5),
-        root_delta_loss_weight=getattr(args, "root_delta_loss_weight", 1.0),
-        root_height_loss_weight=getattr(args, "root_height_loss_weight", 1.0),
-        contact_loss_weight=getattr(args, "contact_loss_weight", 0.5),
-        tracker_pos_loss_weight=getattr(args, "tracker_pos_loss_weight", 10.0),
-        tracker_pos_huber_beta=getattr(args, "tracker_pos_huber_beta", 0.05),
-        tracker_pos_timestep_min_weight=getattr(args, "tracker_pos_timestep_min_weight", 0.1),
-        tracker_pos_timestep_gamma=getattr(args, "tracker_pos_timestep_gamma", 2.0),
-        tracker_rot_loss_weight=getattr(args, "tracker_rot_loss_weight", 2.0),
+        **loss_options,
     )

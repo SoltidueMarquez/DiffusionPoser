@@ -33,6 +33,7 @@ from sample.simulate_unity_stream import (
 )
 from sample.utils import load_checkpoint_model
 from utils import dist_util
+from utils.artifact_roots import load_artifact_roots
 from utils.model_util import create_model_and_diffusion
 from utils.normalizer import RealtimePoseNormalizer
 from utils.parser_util import (
@@ -102,7 +103,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "--tracker_ik",
-        default=True,
+        default=False,
         action=BooleanOptionalAction,
         help="推理后用已知 head/hands/feet tracker 做 position IK。",
     )
@@ -171,24 +172,34 @@ def decode_features_to_joints(
     joint_offsets_parent: np.ndarray,
     schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     joint_rest_local_rotations_6d: np.ndarray | None = None,
-) -> np.ndarray:
+    return_global_rot: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     schema = get_schema_spec(schema_name)
     values = np.asarray(features, dtype=np.float32)
     roots = np.asarray(root_pos_world, dtype=np.float32).copy()
     yaw = np.asarray(root_yaw, dtype=np.float32)
     joints = []
+    rotations = []
     for frame_index in range(values.shape[0]):
-        joints.append(
-            fk_joints_from_target(
+        result = fk_joints_from_target(
                 target_raw=values[frame_index],
                 root_pos_world=roots[frame_index],
                 root_yaw=float(yaw[frame_index]),
                 joint_offsets_parent=joint_offsets_parent,
                 schema_name=schema.name,
                 joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+                return_global_rot=return_global_rot,
             )
-        )
-    return np.stack(joints, axis=0).astype(np.float32)
+        if return_global_rot:
+            frame_joints, frame_rotations = result
+            joints.append(frame_joints)
+            rotations.append(frame_rotations)
+        else:
+            joints.append(result)
+    stacked_joints = np.stack(joints, axis=0).astype(np.float32)
+    if return_global_rot:
+        return stacked_joints, np.stack(rotations, axis=0).astype(np.float32)
+    return stacked_joints
 
 
 def build_long_sequence_payload(
@@ -202,7 +213,7 @@ def build_long_sequence_payload(
     history_pose_source: str = HISTORY_POSE_SOURCE_REFERENCE,
     warmup_target_source: str = WARMUP_TARGET_SOURCE_FIRST_FRAME,
     root_correction: bool = True,
-    tracker_ik: bool = True,
+    tracker_ik: bool = False,
     tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
     tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
     tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
@@ -274,13 +285,14 @@ def build_long_sequence_payload(
     predicted_features = np.asarray(stream_payload["predicted_features_raw"][0], dtype=np.float32)
     root_yaw_predicted = np.asarray(stream_payload["root_yaw_predicted"][0], dtype=np.float32)
     root_pos_predicted = np.asarray(stream_payload["root_pos_world_predicted"][0], dtype=np.float32)
-    predicted_joints = decode_features_to_joints(
+    predicted_joints, predicted_joint_rotations = decode_features_to_joints(
         features=predicted_features,
         root_pos_world=root_pos_predicted,
         root_yaw=root_yaw_predicted,
         joint_offsets_parent=source["joint_offsets_parent"],
         schema_name=schema.name,
         joint_rest_local_rotations_6d=source.get("joint_rest_local_rotations_6d"),
+        return_global_rot=True,
     )
 
     return {
@@ -292,6 +304,9 @@ def build_long_sequence_payload(
         "conditioned_features_raw": stream_payload["conditioned_features_raw"],
         "reference_joints_world": np.asarray(source["joints_world"], dtype=np.float32)[None],
         "predicted_joints_world": predicted_joints[None],
+        "preliminary_joints_world": stream_payload["preliminary_joints_world"],
+        "preliminary_root_yaw": stream_payload["preliminary_root_yaw"],
+        "predicted_joint_rot_world": predicted_joint_rotations[None],
         "root_yaw_reference": np.asarray(source["root_yaw"], dtype=np.float32)[None],
         "root_yaw_predicted": root_yaw_predicted[None],
         "root_pos_world_reference": np.asarray(source["root_pos_world"], dtype=np.float32)[None],
@@ -299,6 +314,18 @@ def build_long_sequence_payload(
         "tracker_pos_world": np.asarray(source["tracker_pos_world"], dtype=np.float32)[None],
         "tracker_rot_world_6d": np.asarray(source["tracker_rot_world_6d"], dtype=np.float32)[None],
         "sensor_valid": np.asarray(source["sensor_valid"], dtype=bool)[None],
+        "timestamp_seconds": stream_payload["timestamp_seconds"],
+        "floor_y": stream_payload["floor_y"],
+        "tracking_origin_revision": stream_payload["tracking_origin_revision"],
+        "tracker_ref_root_pos_world": stream_payload["tracker_ref_root_pos_world"],
+        "tracker_ref_root_yaw": stream_payload["tracker_ref_root_yaw"],
+        "tracker_ref_source": stream_payload["tracker_ref_source"],
+        "root_source": stream_payload["root_source"],
+        "reconnect_alpha": stream_payload["reconnect_alpha"],
+        "codec_fk_elapsed_ms": stream_payload["codec_fk_elapsed_ms"],
+        "ddim_elapsed_ms": stream_payload["ddim_elapsed_ms"],
+        "resolver_elapsed_ms": stream_payload["resolver_elapsed_ms"],
+        "end_to_end_elapsed_ms": stream_payload["end_to_end_elapsed_ms"],
         "validity_ok": stream_payload["validity_ok"],
         "is_predicted": stream_payload["is_predicted"],
         "eval_frame_mask": stream_payload["eval_frame_mask"],
@@ -423,7 +450,14 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
     metadata.update({"weights": source_name, "loop_count": int(args.loop_count)})
     payload["metadata"] = np.asarray(metadata, dtype=object)
 
-    output_dir = Path(args.output_dir or "output/unity_stream_long_sequence").resolve()
+    output_dir = (
+        Path(args.output_dir).resolve()
+        if args.output_dir
+        else (
+            load_artifact_roots(args.artifact_roots_config or None).outputs_root
+            / "unity_stream_long_sequence"
+        )
+    )
     result_path = output_dir / "unity_stream_long_sequence_result.npz"
     summary_path = output_dir / "unity_stream_eval_summary.json"
     save_long_sequence_result(result_path, payload)

@@ -46,7 +46,7 @@ DEFAULT_MODEL_CONFIG = {
     "sigma_small": True,
     "predict_xstart": 1,
     "ts_respace": "",
-    "model_arch": "full_feature_dit",
+    "model_arch": "target_dit",
 }
 
 
@@ -273,14 +273,21 @@ def export_onnx(
     opset: int,
     device: torch.device,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     wrapper.eval()
     if hasattr(torch.backends, "mha") and hasattr(torch.backends.mha, "set_fastpath_enabled"):
         torch.backends.mha.set_fastpath_enabled(False)
 
     dummy_inputs = build_dummy_inputs(feature_dim, sequence_length, device, schema_name=schema_name)
     with torch.no_grad():
-        reference = wrapper(*dummy_inputs).detach().cpu()
+        raw_reference = wrapper(*dummy_inputs)
+        if isinstance(raw_reference, tuple):
+            if len(raw_reference) != 1:
+                raise RuntimeError("Sentis export contract requires exactly one motion output.")
+            reference = tuple(value.detach().cpu() for value in raw_reference)
+        else:
+            reference = (raw_reference.detach().cpu(),)
+    output_names = ["pred_x0"]
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -288,7 +295,7 @@ def export_onnx(
         dummy_inputs,
         str(onnx_path),
         input_names=["x_t", "timestep", "inpaint_mask", "valid_frame_mask"],
-        output_names=["pred_x0"],
+        output_names=output_names,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -297,7 +304,7 @@ def export_onnx(
 
 def check_onnx_alignment(
     onnx_path: Path,
-    reference: torch.Tensor,
+    reference: tuple[torch.Tensor, ...],
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     tolerance: float,
     strict: bool,
@@ -313,8 +320,11 @@ def check_onnx_alignment(
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     x_t, timestep, inpaint_mask, valid_frame_mask = inputs
+    output_names = ["pred_x0"]
+    if len(reference) != 1:
+        raise RuntimeError("Sentis alignment contract requires exactly one motion output.")
     outputs = session.run(
-        ["pred_x0"],
+        output_names,
         {
             "x_t": x_t.numpy(),
             "timestep": timestep.numpy(),
@@ -322,9 +332,13 @@ def check_onnx_alignment(
             "valid_frame_mask": valid_frame_mask.numpy(),
         },
     )
-    onnx_output = np.asarray(outputs[0], dtype=np.float32)
-    reference_np = reference.numpy().astype(np.float32, copy=False)
-    max_abs_error = float(np.max(np.abs(reference_np - onnx_output)))
+    max_abs_error = 0.0
+    for output_name, expected, actual in zip(output_names, reference, outputs):
+        onnx_output = np.asarray(actual, dtype=np.float32)
+        reference_np = expected.numpy().astype(np.float32, copy=False)
+        output_error = float(np.max(np.abs(reference_np - onnx_output)))
+        if output_error > max_abs_error:
+            max_abs_error = output_error
     if max_abs_error > tolerance:
         message = f"PyTorch vs ONNXRuntime max_abs_error={max_abs_error:.6g} exceeds tolerance={tolerance:.6g}."
         if strict:

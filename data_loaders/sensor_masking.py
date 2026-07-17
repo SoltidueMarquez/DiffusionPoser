@@ -86,20 +86,27 @@ RIGHT_HAND_TRACKER_INDEX = 2
 HIP_TRACKER_INDEX = 3
 LEFT_FOOT_TRACKER_INDEX = 4
 RIGHT_FOOT_TRACKER_INDEX = 5
-NON_HIP_TRACKER_INDICES = (0, 1, 2, 4, 5)
 HAND_TRACKER_INDICES = (1, 2)
 FOOT_TRACKER_INDICES = (4, 5)
+STANDARD_THREE_TRACKER_INDICES = (
+    HEAD_TRACKER_INDEX,
+    LEFT_HAND_TRACKER_INDEX,
+    RIGHT_HAND_TRACKER_INDEX,
+)
 
 MIN_VALID_TRACKERS = 3
 TRACKER_PATTERN_CATEGORIES = (
-    "head-present",
-    "hand-present",
-    "foot-present",
-    "upper-body",
-    "lower-body",
-    "mixed-sparse",
-    "full-trackers",
+    "full_six",
+    "standard_three",
+    "static_sparse",
+    "dynamic_dropout",
 )
+TRACKER_PATTERN_PROBABILITIES = {
+    "full_six": 0.30,
+    "standard_three": 0.30,
+    "static_sparse": 0.20,
+    "dynamic_dropout": 0.20,
+}
 TASK_MASK_POLICY_FULL = "full"
 TASK_MASK_POLICY_FIXED_PATTERNS = "fixed_patterns"
 TASK_MASK_POLICIES = (TASK_MASK_POLICY_FULL, TASK_MASK_POLICY_FIXED_PATTERNS)
@@ -176,15 +183,15 @@ def validate_realtime_target(target_start: int, target_length: int) -> None:
 def validate_sensor_valid(sensor_valid: np.ndarray, min_valid_trackers: int = MIN_VALID_TRACKERS) -> np.ndarray:
     valid = np.asarray(sensor_valid, dtype=bool)
     if valid.ndim != 2 or valid.shape[1] != TRACKER_COUNT:
-        raise ValueError(f"sensor_valid 应为 [T, {TRACKER_COUNT}]，实际为 {valid.shape}")
-    if not valid[:, HIP_TRACKER_INDEX].all():
-        raise ValueError("realtime_pose 要求 waist/hip tracker 在所有帧都有效。")
+        raise ValueError(f"sensor_valid must be [T,{TRACKER_COUNT}], got {valid.shape}")
+    if not valid[:, HEAD_TRACKER_INDEX].all():
+        raise ValueError("realtime_pose requires the Head tracker to be valid in every frame")
     counts = valid.sum(axis=1)
     if np.any(counts < int(min_valid_trackers)):
         first_bad = int(np.where(counts < int(min_valid_trackers))[0][0])
         raise ValueError(
-            f"每帧至少需要 {min_valid_trackers} 个有效 tracker；"
-            f"第 {first_bad} 帧只有 {int(counts[first_bad])} 个。"
+            f"every frame needs at least {min_valid_trackers} valid trackers; "
+            f"frame {first_bad} has {int(counts[first_bad])}"
         )
     return valid
 
@@ -202,7 +209,7 @@ def create_realtime_inpaint_mask(
 
 def _valid_tuple(indices: tuple[int, ...] | list[int]) -> tuple[bool, ...]:
     valid = [False] * TRACKER_COUNT
-    valid[HIP_TRACKER_INDEX] = True
+    valid[HEAD_TRACKER_INDEX] = True
     for index in indices:
         valid[int(index)] = True
     validate_sensor_valid(np.asarray(valid, dtype=bool)[None, :])
@@ -211,31 +218,24 @@ def _valid_tuple(indices: tuple[int, ...] | list[int]) -> tuple[bool, ...]:
 
 def make_tracker_pattern(category: str, rng: np.random.Generator) -> TrackerPattern:
     category = str(category)
-    if category == "full-trackers":
+    if category == "full_six":
         return TrackerPattern(category=category, sensor_valid=tuple([True] * TRACKER_COUNT))
-    if category == "head-present":
-        extra = int(rng.choice([*HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES]))
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([HEAD_TRACKER_INDEX, extra]))
-    if category == "hand-present":
-        hand = int(rng.choice(HAND_TRACKER_INDICES))
-        extra = int(rng.choice([HEAD_TRACKER_INDEX, *FOOT_TRACKER_INDICES]))
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([hand, extra]))
-    if category == "foot-present":
-        foot = int(rng.choice(FOOT_TRACKER_INDICES))
-        extra = int(rng.choice([HEAD_TRACKER_INDEX, *HAND_TRACKER_INDICES]))
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([foot, extra]))
-    if category == "upper-body":
-        hand = int(rng.choice(HAND_TRACKER_INDICES))
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([HEAD_TRACKER_INDEX, hand]))
-    if category == "lower-body":
-        if rng.random() < 0.5:
-            return TrackerPattern(category=category, sensor_valid=_valid_tuple(list(FOOT_TRACKER_INDICES)))
-        foot = int(rng.choice(FOOT_TRACKER_INDICES))
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([HEAD_TRACKER_INDEX, foot]))
-    if category == "mixed-sparse":
-        count = int(rng.integers(2, len(NON_HIP_TRACKER_INDICES) + 1))
-        indices = rng.choice(NON_HIP_TRACKER_INDICES, size=count, replace=False)
-        return TrackerPattern(category=category, sensor_valid=_valid_tuple([int(index) for index in indices]))
+    if category == "standard_three":
+        return TrackerPattern(category=category, sensor_valid=_valid_tuple(list(STANDARD_THREE_TRACKER_INDICES)))
+    if category == "static_sparse":
+        standard_three = _valid_tuple(list(STANDARD_THREE_TRACKER_INDICES))
+        while True:
+            count = int(rng.integers(MIN_VALID_TRACKERS, TRACKER_COUNT))
+            extras = rng.choice(
+                [index for index in range(TRACKER_COUNT) if index != HEAD_TRACKER_INDEX],
+                size=count - 1,
+                replace=False,
+            )
+            valid = _valid_tuple([HEAD_TRACKER_INDEX, *[int(index) for index in extras]])
+            if valid != standard_three:
+                return TrackerPattern(category=category, sensor_valid=valid)
+    if category == "dynamic_dropout":
+        return TrackerPattern(category=category, sensor_valid=tuple([True] * TRACKER_COUNT))
     raise ValueError(f"未知 tracker pattern category: {category}")
 
 
@@ -245,12 +245,26 @@ def make_window_patterns(
     ensure_pattern_categories: bool = True,
 ) -> list[TrackerPattern]:
     patterns: list[TrackerPattern] = []
-    if ensure_pattern_categories:
+    if ensure_pattern_categories and int(patterns_per_window) == 10:
+        for category, count in (
+            ("full_six", 3),
+            ("standard_three", 3),
+            ("static_sparse", 2),
+            ("dynamic_dropout", 2),
+        ):
+            patterns.extend(make_tracker_pattern(category, rng) for _ in range(count))
+    elif ensure_pattern_categories:
         patterns.extend(make_tracker_pattern(category, rng) for category in TRACKER_PATTERN_CATEGORIES)
 
     target_count = max(int(patterns_per_window), len(patterns))
     while len(patterns) < target_count:
-        patterns.append(make_tracker_pattern("mixed-sparse", rng))
+        category = str(
+            rng.choice(
+                TRACKER_PATTERN_CATEGORIES,
+                p=[TRACKER_PATTERN_PROBABILITIES[value] for value in TRACKER_PATTERN_CATEGORIES],
+            )
+        )
+        patterns.append(make_tracker_pattern(category, rng))
     return patterns
 
 
@@ -267,7 +281,58 @@ def normalize_tracker_pattern_categories(categories: list[str] | tuple[str, ...]
 
 
 def repeat_pattern_sensor_valid(pattern: TrackerPattern, seq_len: int = REALTIME_POSE_SEQ_LEN) -> np.ndarray:
-    validate_realtime_seq_len(seq_len)
+    if int(seq_len) <= 0:
+        raise ValueError("tracker pattern 的 seq_len 必须为正数。")
     sensor_valid = np.repeat(np.asarray(pattern.sensor_valid, dtype=bool)[None, :], seq_len, axis=0)
     validate_sensor_valid(sensor_valid)
     return sensor_valid
+
+
+def make_dynamic_dropout_sensor_valid(
+    rng: np.random.Generator,
+    seq_len: int = REALTIME_POSE_SEQ_LEN,
+    min_duration_frames: int = 2,
+    max_duration_frames: int = 30,
+    max_missing_trackers: int = 3,
+) -> np.ndarray:
+    """从完整六点开始生成可重叠的连续断线时间线。"""
+
+    if int(seq_len) <= 0:
+        raise ValueError("dynamic dropout 的 seq_len 必须为正数。")
+    min_duration = max(1, int(min_duration_frames))
+    first_dropout_frame = 1 if int(seq_len) > 1 else 0
+    max_duration = min(int(seq_len) - first_dropout_frame, int(max_duration_frames))
+    if min_duration > max_duration:
+        raise ValueError("dynamic dropout 的最短持续帧不能大于最长持续帧。")
+    max_missing = min(TRACKER_COUNT - MIN_VALID_TRACKERS, max(1, int(max_missing_trackers)))
+    valid = np.ones((int(seq_len), TRACKER_COUNT), dtype=bool)
+    droppable = np.asarray(
+        [index for index in range(TRACKER_COUNT) if index != HEAD_TRACKER_INDEX],
+        dtype=np.int64,
+    )
+    episode_count = max(1, int(rng.integers(1, max(2, seq_len // min_duration + 1))))
+    inserted = 0
+    for _ in range(episode_count * 12):
+        if inserted >= episode_count:
+            break
+        tracker_index = int(rng.choice(droppable))
+        duration = int(rng.integers(min_duration, max_duration + 1))
+        start = int(rng.integers(first_dropout_frame, seq_len - duration + 1))
+        end = start + duration
+        # Do not merge two intervals for the same tracker; every resulting run
+        # therefore remains independently bounded by [min_duration,max_duration].
+        neighbor_start = max(first_dropout_frame, start - 1)
+        neighbor_end = min(seq_len, end + 1)
+        if not valid[neighbor_start:neighbor_end, tracker_index].all():
+            continue
+        if np.any((~valid[start:end]).sum(axis=1) >= max_missing):
+            continue
+        valid[start:end, tracker_index] = False
+        inserted += 1
+    if inserted == 0:
+        duration = min_duration
+        valid[first_dropout_frame : first_dropout_frame + duration, int(droppable[0])] = False
+    valid[0] = True
+    valid[:, HEAD_TRACKER_INDEX] = True
+    validate_sensor_valid(valid)
+    return valid

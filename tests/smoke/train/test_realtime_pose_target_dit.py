@@ -13,7 +13,9 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
 )
 from export.export_sentis_denoiser import SentisDenoiserWrapper, export_onnx
+from model.diffusionposer_dit import DiffusionPoserDiT
 from utils.model_util import create_model_and_diffusion
+from train.training_loop import validate_loaded_state_dict_keys
 
 
 def test_target_dit_predicts_only_target_slice_shape():
@@ -71,6 +73,32 @@ def test_target_dit_without_schema_uses_current_default_schema():
     assert model.schema.name == DEFAULT_REALTIME_POSE_SCHEMA_NAME
 
 
+def test_models_have_single_motion_output_and_no_stationary_head():
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    model = DiffusionPoserDiT(
+        input_feats=schema.feature_dim,
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+    )
+    assert not hasattr(model, "stationary_head")
+    x = torch.zeros(1, schema.feature_dim, REALTIME_POSE_SEQ_LEN)
+    output = model(x, torch.zeros(1), inpaint_cond=torch.zeros_like(x, dtype=torch.bool))
+    assert torch.is_tensor(output)
+    assert output.shape == x.shape
+
+
+def test_checkpoint_loading_rejects_all_missing_or_unexpected_keys():
+    validate_loaded_state_dict_keys(missing_keys=[], unexpected_keys=[], source="checkpoint")
+    with pytest.raises(RuntimeError, match="stationary_head"):
+        validate_loaded_state_dict_keys(
+            missing_keys=[],
+            unexpected_keys=["stationary_head.net.0.weight"],
+            source="checkpoint",
+        )
+
+
 def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
     onnx = pytest.importorskip("onnx")
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
@@ -104,3 +132,5 @@ def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
     graph = onnx.load(str(onnx_path)).graph
     input_names = {value.name for value in graph.input}
     assert {"x_t", "timestep", "inpaint_mask", "valid_frame_mask"}.issubset(input_names)
+    assert [value.name for value in graph.output] == ["pred_x0"]
+    assert len(graph.output) == 1

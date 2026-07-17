@@ -9,6 +9,7 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_INDICES,
     STATIONARY_PROB_DIM,
 )
+from data_loaders.stationary_label_config import DEFAULT_STATIONARY_LABEL_CONFIG, StationaryLabelConfig
 
 
 SMPL_JOINT_NAMES = (
@@ -137,35 +138,86 @@ def integrate_root_delta_xz_ref(
 
 def derive_stationary_prob_5(
     joints_world: np.ndarray,
+    joint_rotations_world: np.ndarray,
     fps: float = 60.0,
-    speed_full_motion: float = 0.25,
-    median_window: int = 5,
+    config: StationaryLabelConfig = DEFAULT_STATIONARY_LABEL_CONFIG,
 ) -> np.ndarray:
-    """从 5 个 GlobalPose 候选接触关节的世界速度派生静止概率 `[T,5]`。
+    """用 5 个候选关节的中心速度派生因果静止概率 `[T,5]`。
 
-    概率只表达“近似静止”，后续物理模块可以再结合接触可行性决定最终 contact set。
+    标签只使用当前帧及过去帧。当前速度会直接限制最终概率，因此开始运动时会立即
+    释放 stationary；恢复静止则需要因果窗口内出现稳定的低速历史。
+
+    `joint_rotations_world` 保留在签名里是为了兼容转换阶段已有调用；纯速度标签只看
+    `joints_world[:, STATIONARY_JOINT_INDICES]` 的世界位移，不使用局部采样点或脚高度门控。
     """
+
+    joints = np.asarray(joints_world, dtype=np.float64)
+    if joints.ndim != 3 or joints.shape[1:] != (24, 3):
+        raise ValueError(f"joints_world 应为 [T,24,3]，实际为 {joints.shape}")
+    rotations = np.asarray(joint_rotations_world, dtype=np.float64)
+    if rotations.shape != (joints.shape[0], 24, 3, 3):
+        raise ValueError(f"joint_rotations_world 应为 [T,24,3,3]，实际为 {rotations.shape}")
+    return derive_stationary_prob_from_joints_world(
+        joints_world=joints,
+        fps=fps,
+        config=config,
+    )
+
+
+def derive_stationary_prob_from_joints_world(
+    joints_world: np.ndarray,
+    fps: float = 60.0,
+    config: StationaryLabelConfig = DEFAULT_STATIONARY_LABEL_CONFIG,
+) -> np.ndarray:
+    """从已落盘的 `[T,24,3]` joints 重新派生 stationary，不要求旋转数组。"""
 
     joints = np.asarray(joints_world, dtype=np.float64)
     if joints.ndim != 3 or joints.shape[1:] != (24, 3):
         raise ValueError(f"joints_world 应为 [T,24,3]，实际为 {joints.shape}")
     if float(fps) <= 0.0:
         raise ValueError(f"fps 必须为正数，实际为 {fps}")
-    if float(speed_full_motion) <= 0.0:
-        raise ValueError(f"speed_full_motion 必须为正数，实际为 {speed_full_motion}")
-
+    if float(config.static_speed) < 0.0:
+        raise ValueError(f"static_speed 必须大于等于 0，实际为 {config.static_speed}")
+    if float(config.moving_speed) <= float(config.static_speed):
+        raise ValueError(
+            "moving_speed 必须大于 static_speed，"
+            f"实际为 static={config.static_speed}, moving={config.moving_speed}"
+        )
+    if str(config.release_mode) != "fast_release_min":
+        raise ValueError(f"不支持 stationary release_mode={config.release_mode!r}")
     joint_indices = np.asarray(STATIONARY_JOINT_INDICES, dtype=np.int64)
     if joint_indices.shape != (STATIONARY_PROB_DIM,):
         raise ValueError(f"stationary joint 数量必须为 {STATIONARY_PROB_DIM}，实际为 {joint_indices.shape}")
-    joint_pos = joints[:, joint_indices]
-    speed = np.zeros((joints.shape[0], STATIONARY_PROB_DIM), dtype=np.float64)
-    if joints.shape[0] > 1:
-        speed[1:] = np.linalg.norm(joint_pos[1:] - joint_pos[:-1], axis=-1) * float(fps)
-        speed[0] = speed[1]
 
-    smoothed_speed = median_filter_time(speed, window=int(median_window))
-    stationary_prob = np.clip(1.0 - smoothed_speed / float(speed_full_motion), 0.0, 1.0)
+    joint_centers = joints[:, joint_indices]
+    speed = joint_center_speed(joint_centers, fps=float(fps))
+    raw_stationary = 1.0 - np.clip(
+        (speed - float(config.static_speed))
+        / (float(config.moving_speed) - float(config.static_speed)),
+        0.0,
+        1.0,
+    )
+    causal_median = causal_median_filter_time(
+        raw_stationary,
+        window=int(config.causal_window),
+    )
+    # 当前帧一旦运动就立即降低概率；重新进入 stationary 需要过去窗口共同确认。
+    stationary_prob = np.minimum(raw_stationary, causal_median)
     return stationary_prob.astype(np.float32)
+
+
+def joint_center_speed(joint_centers_world: np.ndarray, fps: float) -> np.ndarray:
+    """根据 5 个候选关节中心 `[T,5,3]` 计算逐关节速度 `[T,5]`。"""
+
+    joints = np.asarray(joint_centers_world, dtype=np.float64)
+    if joints.ndim != 3 or joints.shape[1:] != (STATIONARY_PROB_DIM, 3):
+        raise ValueError(f"joint_centers_world 应为 [T,{STATIONARY_PROB_DIM},3]，实际为 {joints.shape}")
+    speed = np.zeros(joints.shape[:2], dtype=np.float64)
+    if joints.shape[0] > 1:
+        speed[1:] = np.linalg.norm(joints[1:] - joints[:-1], axis=-1) * float(fps)
+        # 首帧没有过去观测，按“上一帧等于当前帧”处理为 0；不能复制 speed[1]，
+        # 否则第 2 帧运动会反向改写第 1 帧标签，破坏严格因果性。
+    return speed
 
 
 def median_filter_time(values: np.ndarray, window: int) -> np.ndarray:
@@ -183,6 +235,31 @@ def median_filter_time(values: np.ndarray, window: int) -> np.ndarray:
     padded = np.pad(array, ((radius, radius), (0, 0)), mode="edge")
     stacked = np.stack([padded[offset : offset + array.shape[0]] for offset in range(window)], axis=0)
     return np.median(stacked, axis=0)
+
+
+def causal_median_filter_time(values: np.ndarray, window: int) -> np.ndarray:
+    """只使用 `values[max(0,t-window+1):t+1]` 的因果中值滤波。"""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError(f"causal_median_filter_time 输入应为 [T,D]，实际为 {array.shape}")
+    window = int(window)
+    if window <= 1 or array.shape[0] <= 1:
+        return array.copy()
+    result = np.empty_like(array)
+    prefix_frames = min(window - 1, array.shape[0])
+    for frame in range(prefix_frames):
+        result[frame] = np.median(array[: frame + 1], axis=0)
+    if array.shape[0] >= window:
+        full_windows = np.stack(
+            [
+                array[offset : offset + array.shape[0] - window + 1]
+                for offset in range(window)
+            ],
+            axis=0,
+        )
+        result[window - 1 :] = np.median(full_windows, axis=0)
+    return result
 
 
 def rotation_6d_forward_up_np(rotations: np.ndarray) -> np.ndarray:

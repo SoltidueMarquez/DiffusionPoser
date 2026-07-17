@@ -36,7 +36,7 @@ def assert_generated_layout_path(value, expected_suffix: str) -> None:
 def patch_generated_root(monkeypatch, tmp_path):
     generated_root = tmp_path / "configured_generated"
     monkeypatch.setattr(
-        "utils.default_artifact_paths.load_data_roots",
+        "utils.default_artifact_paths.load_artifact_roots",
         lambda: SimpleNamespace(generated_root=generated_root),
     )
     return generated_root
@@ -97,6 +97,9 @@ def test_longseq_eval_unity_replay_export_writes_one_json_per_sequence(tmp_path)
     for item in summary["files"]:
         payload = json.loads(open(item["output_json"], "r", encoding="utf-8").read())
         assert payload["schemaName"] == schema.name
+        assert payload["featureContractVersion"] == 2
+        assert payload["trackerCodecVersion"] == "tracker_codec_v2"
+        assert payload["resolverContractVersion"] == "runtime_root_resolver_v1"
         assert payload["frameCount"] == item["num_frames"]
         assert payload["targetFeatureLength"] == schema.target_dim
         assert payload["trackerCount"] == TRACKER_COUNT
@@ -125,13 +128,13 @@ def test_longseq_eval_unity_replay_export_can_apply_dropout(tmp_path):
         dropout_config=LongseqDropoutConfig(
             preset="tracker_mask_train",
             tracker_mask_policy="fixed_categories",
-            tracker_mask_categories=("upper-body",),
+            tracker_mask_categories=("standard_three",),
         ),
     )
 
     payload = json.loads(open(summary["files"][0]["output_json"], "r", encoding="utf-8").read())
     valid = np.asarray(payload["sensorValid"], dtype=np.int32).reshape(payload["frameCount"], TRACKER_COUNT)
     assert not valid.all()
-    assert valid[:, 3].all()
+    assert valid[:, 0].all()
     assert valid.sum(axis=1).min() >= 3
     assert summary["files"][0]["valid_tracker_ratio"] < 1.0

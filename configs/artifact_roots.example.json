@@ -1,0 +1,13 @@
+{
+  "workspace_root": ".",
+  "amass_root": "../artifactStore/DiffusionPoser/active/raw/AMASS",
+  "smpl_model_dir": "../artifactStore/DiffusionPoser/active/raw/body_models",
+  "runtime_contract_root": "../artifactStore/DiffusionPoser/active/runtime_contracts",
+  "body_fbx_rest_json": "../artifactStore/DiffusionPoser/active/runtime_contracts/realtime_pose_stationary5_v1/body_fbx_rest.json",
+  "generated_root": "../artifactStore/DiffusionPoser/active/generated",
+  "runs_root": "../artifactStore/DiffusionPoser/active/runs",
+  "outputs_root": "../artifactStore/DiffusionPoser/active/output",
+  "external_root": "../artifactStore/DiffusionPoser/active/external",
+  "archive_root": "../artifactStore/DiffusionPoser/archive/2026-07-cleanup",
+  "manifest_root": "../artifactStore/DiffusionPoser/manifests"
+}

@@ -17,6 +17,7 @@ from sample.reconstruct_stream import build_realtime_inpaint_mask, reconstruct_b
 from sample.simulate_unity_stream import fk_joints_from_target
 from sample.utils import load_checkpoint_model
 from utils import dist_util
+from utils.artifact_roots import load_artifact_roots
 from utils.model_util import create_model_and_diffusion
 from utils.parser_util import (
     add_base_options,
@@ -26,9 +27,6 @@ from utils.parser_util import (
     add_sampling_options,
     parse_and_load_runtime_schema_from_model,
 )
-
-
-DEFAULT_ROLLOUT_OUTPUT_DIR = "output/realtime_pose_stationary5_rollout"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -269,7 +267,14 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         use_ddim=str(args.ts_respace).startswith("ddim"),
         limit=int(args.rollout_limit),
     )
-    output_dir = Path(args.output_dir or DEFAULT_ROLLOUT_OUTPUT_DIR).resolve()
+    output_dir = (
+        Path(args.output_dir).resolve()
+        if args.output_dir
+        else (
+            load_artifact_roots(args.artifact_roots_config or None).outputs_root
+            / "realtime_pose_stationary5_rollout"
+        )
+    )
     output_path = output_dir / "rollout_result.npz"
     save_rollout(output_path, payload)
     print(f"[reconstruct_rollout] weights={source} output={output_path}")

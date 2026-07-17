@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from diffusion.realtime_pose import REALTIME_POSE_LOSS_DEFAULTS
 import train.train_diffusionposer as train_entrypoint
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
@@ -57,7 +58,7 @@ class TrainEntrypointTest(unittest.TestCase):
             )
 
             with patch(
-                "utils.default_artifact_paths.load_data_roots",
+                "utils.default_artifact_paths.load_artifact_roots",
                 return_value=Namespace(generated_root=Path("dataset/generated")),
             ):
                 train_entrypoint.resolve_resume_schema_and_paths(
@@ -185,10 +186,20 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertEqual(args.run_name, "auto")
         self.assertEqual(args.save_interval, 5_000)
         self.assertTrue(args.model_ema)
-        self.assertEqual(args.tracker_pos_loss_weight, 10.0)
-        self.assertEqual(args.tracker_pos_huber_beta, 0.05)
-        self.assertEqual(args.tracker_pos_timestep_min_weight, 0.1)
-        self.assertEqual(args.tracker_pos_timestep_gamma, 2.0)
+        self.assertEqual(
+            args.tracker_relative_pos_loss_weight,
+            REALTIME_POSE_LOSS_DEFAULTS["tracker_relative_pos_loss_weight"],
+        )
+        self.assertEqual(args.tracker_relative_pos_huber_beta, 0.05)
+        self.assertEqual(args.aux_timestep_min_weight, 0.1)
+        self.assertEqual(args.aux_timestep_gamma, 2.0)
+        self.assertEqual(args.short_rollout_loss_weight, 0.5)
+        self.assertEqual(args.short_rollout_prob, 0.5)
+        self.assertEqual(args.long_rollout_loss_weight, 0.5)
+        self.assertEqual(args.long_rollout_prob, 0.25)
+        self.assertEqual(args.long_rollout_transition_prob, 0.5)
+        self.assertEqual(args.long_rollout_smooth_l1_beta, 1.0)
+        self.assertFalse(hasattr(args, "detach_rollout_history"))
 
     def test_training_options_can_disable_default_model_ema(self):
         parser = ArgumentParser()

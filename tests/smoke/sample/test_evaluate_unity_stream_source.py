@@ -92,8 +92,12 @@ def test_long_sequence_payload_aligns_gt_and_skips_warmup():
     assert payload["predicted_features_raw"].shape == (1, 62, schema.feature_dim)
     assert payload["reference_joints_world"].shape == (1, 62, 24, 3)
     assert payload["predicted_joints_world"].shape == (1, 62, 24, 3)
+    assert payload["preliminary_joints_world"].shape == (1, 62, 24, 3)
+    assert payload["preliminary_root_yaw"].shape == (1, 62)
     assert not payload["eval_frame_mask"][0, :REALTIME_POSE_TARGET_START].any()
     assert payload["eval_frame_mask"][0, REALTIME_POSE_TARGET_START:].all()
+    assert np.isfinite(payload["preliminary_joints_world"]).all()
+    assert np.isfinite(payload["preliminary_root_yaw"]).all()
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     reference_features = encode_realtime_pose_features(source, schema_name=REALTIME_POSE_SCHEMA_NAME)
     np.testing.assert_allclose(

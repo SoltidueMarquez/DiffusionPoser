@@ -47,8 +47,10 @@ from data_loaders.realtime_pose_kinematics import (
     wrap_radians,
 )
 from data_loaders.realtime_pose_contract import (
+    RUNTIME_CONTRACT_METADATA_FIELDS,
     load_source_metadata,
     required_realtime_source_fields,
+    runtime_contract_metadata,
     validate_realtime_source_contract,
     validate_root_y0_invariants,
     validate_schema_metadata,
@@ -62,12 +64,12 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_NAMES,
     get_schema_spec,
 )
+from data_loaders.stationary_label_config import stationary_label_metadata
 from utils.artifact_paths import source_root
-from utils.data_roots import load_data_roots
+from utils.artifact_roots import load_artifact_roots
 
 
 DEFAULT_SOURCE_SET_NAME = "amass_60hz"
-DEFAULT_SMPL_MODEL_DIR = Path("dataset/body_models")
 SOURCE_PROVENANCE_FIELDS = (
     "schema_canonical_name",
     "raw_dataset",
@@ -80,7 +82,7 @@ SOURCE_PROVENANCE_FIELDS = (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
-    parser.add_argument("--data_roots_config", default="", type=str)
+    parser.add_argument("--artifact_roots_config", default="", type=str)
     parser.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
     parser.add_argument("--amass_dir", default="", type=str)
     parser.add_argument("--smpl_model_dir", default="", type=str)
@@ -98,18 +100,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reuse_source_dir", default="", type=Path)
     parser.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     parser.add_argument("--body_fbx_rest_json", default="", type=str)
-    # 复用 shared validate_args 所需字段；当前转换链路不实际使用这些可视化参数。
-    parser.add_argument("--height_threshold", default=0.04, type=float)
-    parser.add_argument("--speed_threshold", default=0.15, type=float)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--visualize_limit", default=0, type=int)
-    parser.add_argument("--visualize_dir", default=Path("output/realtime_pose_visualization"), type=Path)
+    parser.add_argument("--visualize_dir", default="", type=str)
     parser.add_argument("--visualize_fps", default=20.0, type=float)
     return parser.parse_args(argv)
 
 
 def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
-    """根据显式 CLI 参数或 data_roots 配置补齐转换入口路径。
+    """根据显式 CLI 参数或 artifact roots 配置补齐转换入口路径。
 
     argparse 无法可靠区分“用户显式传了旧默认值”和“使用默认值”，所以路径参数先保留为空字符串；
     这里再把空值视为需要从 schema-aware 数据根推导的路径。
@@ -120,7 +119,7 @@ def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
     def get_roots():
         nonlocal roots
         if roots is None:
-            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+            roots = load_artifact_roots(getattr(args, "artifact_roots_config", "") or None)
         return roots
 
     schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
@@ -133,7 +132,9 @@ def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
 
     if _path_arg_is_empty(getattr(args, "smpl_model_dir", "")):
         roots_value = get_roots().smpl_model_dir
-        args.smpl_model_dir = roots_value if roots_value is not None else DEFAULT_SMPL_MODEL_DIR
+        if roots_value is None:
+            raise ValueError("smpl_model_dir must be provided by CLI or artifact roots")
+        args.smpl_model_dir = roots_value
     else:
         args.smpl_model_dir = Path(args.smpl_model_dir)
 
@@ -147,6 +148,11 @@ def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
         args.body_fbx_rest_json = roots_value if roots_value is not None else ""
     else:
         args.body_fbx_rest_json = Path(args.body_fbx_rest_json)
+
+    if _path_arg_is_empty(getattr(args, "visualize_dir", "")):
+        args.visualize_dir = get_roots().outputs_root / "visualization" / schema_name / source_set_name
+    else:
+        args.visualize_dir = Path(args.visualize_dir)
 
     return args
 
@@ -311,6 +317,7 @@ def build_realtime_pose_features(
         tracker_pos_world = joint_positions[:, TRACKER_JOINT_INDICES].astype(np.float32)
         tracker_rot_world_6d = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
         joints_world = joint_positions.astype(np.float32)
+        joint_rotations_world = joint_rotations.astype(np.float32)
         joint_offsets_parent = estimate_root_global_offsets(
             joints_world=joints_world,
             body_pose_root_global_6d=body_pose_6d,
@@ -347,6 +354,7 @@ def build_realtime_pose_features(
     if schema.supports_stationary_prob:
         features["stationary_prob_5"] = derive_stationary_prob_5(
             joints_world=joints_world,
+            joint_rotations_world=joint_rotations_world,
             fps=float(target_fps),
         )
     return features
@@ -384,10 +392,12 @@ def save_realtime_pose_motion(
         "frames": int(features[schema.body_pose_key].shape[0]),
         "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
     }
+    metadata.update(runtime_contract_metadata())
     metadata.update(build_source_provenance(source=source, args=provenance_args, schema=schema))
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+        metadata.update(stationary_label_metadata())
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D and "body_fbx_rest_json" in features:
         metadata["body_fbx_rest_json"] = str(features["body_fbx_rest_json"].item())
     np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
@@ -415,7 +425,15 @@ def resolve_body_fbx_rest_for_schema(args: argparse.Namespace) -> BodyFbxRest | 
     if cached is not None:
         return cached
     rest_arg = getattr(args, "body_fbx_rest_json", "")
-    rest_path = rest_arg if str(rest_arg).strip() else None
+    rest_text = str(rest_arg).strip()
+    # argparse 会把 default="" + type=Path 解析成 Path(".")；这里必须把空路径和当前目录都
+    # 视作“未显式提供”，否则会尝试把仓库目录当 JSON 文件打开并触发 PermissionError。
+    if rest_text in {"", "."}:
+        raise ValueError(
+            "canonical realtime_pose source conversion requires body_fbx_rest_json "
+            "from --body_fbx_rest_json or artifact roots"
+        )
+    rest_path = rest_arg
     rest = load_body_fbx_rest(rest_path)
     setattr(args, "_body_fbx_rest", rest)
     return rest
@@ -454,7 +472,7 @@ def record_for_output(
         schema=schema,
     )
     stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
-    return {
+    record = {
         "status": status,
         "schema_name": schema.name,
         "schema_canonical_name": str(schema.canonical_name),
@@ -470,6 +488,9 @@ def record_for_output(
         "frames": int(metadata.get("frames", frames)),
         **provenance,
     }
+    if schema.supports_stationary_prob:
+        record.update(stationary_label_metadata())
+    return record
 
 
 def reusable_source_path_for(path: Path, args: argparse.Namespace, mirror_variant: bool) -> Path | None:
@@ -486,8 +507,21 @@ def load_reusable_realtime_features(
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     schema = get_schema_spec(schema_name)
     with np.load(reuse_path, allow_pickle=False) as data:
-        validate_realtime_source_contract(data, schema=schema, source=str(reuse_path))
         metadata = load_source_metadata(data, source=str(reuse_path))
+        missing_runtime_fields = [key for key in RUNTIME_CONTRACT_METADATA_FIELDS if key not in metadata]
+        if missing_runtime_fields:
+            raise ValueError(
+                f"{reuse_path} metadata 缺少 v2 runtime 字段: {missing_runtime_fields}; "
+                "旧 source 不再自动升级，请重新转换。"
+            )
+
+        validation_payload = {
+            key: np.asarray(data[key])
+            for key in data.files
+            if key != "metadata"
+        }
+        validation_payload["metadata"] = np.asarray(json.dumps(metadata, ensure_ascii=False))
+        validate_realtime_source_contract(validation_payload, schema=schema, source=str(reuse_path))
         validate_schema_metadata(metadata, schema=schema, source=str(reuse_path))
         required = required_source_fields(schema_name)
         features = {
@@ -551,6 +585,7 @@ def save_reused_realtime_source(
             "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
         }
     )
+    next_metadata.update(runtime_contract_metadata())
     next_metadata.update(
         build_source_provenance_from_metadata(
             metadata=next_metadata,
@@ -562,6 +597,7 @@ def save_reused_realtime_source(
     if schema.supports_stationary_prob:
         next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+        next_metadata.update(stationary_label_metadata())
     np.savez(output_path, **features, metadata=json.dumps(next_metadata, ensure_ascii=False))
 
 

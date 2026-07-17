@@ -11,13 +11,23 @@ import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_smpl_utils import MotionSource
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset, encode_realtime_pose_features
-from data_loaders.realtime_pose_kinematics import integrate_root_delta_xz_ref
+from data_loaders.realtime_pose_kinematics import (
+    JOINT_INDEX,
+    derive_stationary_prob_5,
+    integrate_root_delta_xz_ref,
+    make_yaw_rotation_np,
+)
 from data_loaders.sensor_masking import (
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     REALTIME_POSE_SCHEMA_NAME,
+    STATIONARY_JOINT_NAMES,
     get_schema_spec,
+)
+from data_loaders.stationary_label_config import (
+    DEFAULT_STATIONARY_LABEL_CONFIG,
+    stationary_label_metadata,
 )
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source, write_toy_source_dataset
 from utils.normalizer import REALTIME_POSE_MIN_NORMALIZER_STD, RealtimePoseNormalizer
@@ -30,8 +40,8 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
     return latest
 
 
-def test_converter_resolves_schema_aware_source_root_from_data_roots(tmp_path):
-    config_path = tmp_path / "data_roots.json"
+def test_converter_resolves_schema_aware_source_root_from_artifact_roots(tmp_path):
+    config_path = tmp_path / "artifact_roots.json"
     generated_root = tmp_path / "generated"
     amass_root = tmp_path / "AMASS"
     smpl_model_dir = tmp_path / "body_models"
@@ -50,7 +60,7 @@ def test_converter_resolves_schema_aware_source_root_from_data_roots(tmp_path):
 
     args = amass_converter.parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--source_set_name",
             "toy_source",
@@ -66,8 +76,8 @@ def test_converter_resolves_schema_aware_source_root_from_data_roots(tmp_path):
     assert resolved.output_dir == generated_root / "sources" / "realtime_pose_stationary5_v1" / "toy_source"
 
 
-def test_converter_explicit_paths_override_data_roots_config(tmp_path):
-    config_path = tmp_path / "data_roots.json"
+def test_converter_explicit_paths_override_artifact_roots_config(tmp_path):
+    config_path = tmp_path / "artifact_roots.json"
     config_path.write_text(
         json.dumps(
             {
@@ -86,7 +96,7 @@ def test_converter_explicit_paths_override_data_roots_config(tmp_path):
 
     args = amass_converter.parse_args(
         [
-            "--data_roots_config",
+            "--artifact_roots_config",
             str(config_path),
             "--amass_dir",
             str(explicit_amass_dir),
@@ -207,6 +217,131 @@ def test_converter_source_provenance_is_json_safe_and_portable(tmp_path):
     assert provenance["converter_args"]["source_set_name"] == "toy_source"
     assert provenance["converter_args"]["target_fps"] == 30.0
     assert provenance["converter_args"]["mirror"] is True
+def identity_joint_rotations(frame_count: int) -> np.ndarray:
+    return np.tile(np.eye(3, dtype=np.float32), (frame_count, 24, 1, 1))
+
+
+def stationary_column(name: str) -> int:
+    return {joint_name: index for index, joint_name in enumerate(STATIONARY_JOINT_NAMES)}[name]
+
+
+def assert_stationary_metadata_value(actual, expected) -> None:
+    if isinstance(expected, float):
+        assert float(np.asarray(actual).item()) == pytest.approx(expected)
+    elif isinstance(expected, int):
+        assert int(np.asarray(actual).item()) == expected
+    else:
+        assert str(np.asarray(actual).item()) == str(expected)
+
+
+def test_stationary_labels_use_joint_center_speed_not_sampled_anchor():
+    config = DEFAULT_STATIONARY_LABEL_CONFIG
+    frame_count = 9
+    joints = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    rotations = identity_joint_rotations(frame_count)
+
+    # 旧 TIP-style 采样点方案会把这个局部点当成静止锚点；新方案只看 joint center 速度。
+    yaw = np.linspace(0.0, 1.2, frame_count, dtype=np.float32)
+    foot_rot = make_yaw_rotation_np(yaw).astype(np.float32)
+    stationary_offset = np.asarray([-0.05, -0.03, -0.10], dtype=np.float32)
+    anchor_world = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    rotations[:, JOINT_INDEX["left_foot"]] = foot_rot
+    joints[:, JOINT_INDEX["left_foot"]] = anchor_world - np.einsum("tij,j->ti", foot_rot, stationary_offset)
+
+    joint_center_speed = np.linalg.norm(
+        joints[1:, JOINT_INDEX["left_foot"]] - joints[:-1, JOINT_INDEX["left_foot"]],
+        axis=-1,
+    ) * 60.0
+    assert float(joint_center_speed.max()) > config.moving_speed
+
+    stationary = derive_stationary_prob_5(joints_world=joints, joint_rotations_world=rotations)
+
+    assert stationary.shape == (frame_count, 5)
+    assert np.all((stationary >= 0.0) & (stationary <= 1.0))
+    # 首帧没有过去速度，按 0 m/s 处理；从第 2 帧开始应立即识别运动。
+    assert stationary[0, stationary_column("left_foot")] == pytest.approx(1.0)
+    assert float(stationary[1:, stationary_column("left_foot")].max()) < 0.05
+
+
+def test_stationary_labels_do_not_gate_feet_by_height():
+    frame_count = 9
+    left_foot = stationary_column("left_foot")
+    right_foot = stationary_column("right_foot")
+    left_hand = stationary_column("left_hand")
+    pelvis = stationary_column("pelvis")
+
+    joints = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    rotations = identity_joint_rotations(frame_count)
+    joints[:, JOINT_INDEX["left_foot"], 1] = 0.35
+    joints[:, JOINT_INDEX["right_foot"], 1] = 0.03
+    joints[:, JOINT_INDEX["left_hand"], 1] = 2.0
+
+    airborne = derive_stationary_prob_5(joints_world=joints, joint_rotations_world=rotations)
+    assert float(airborne[:, left_foot].min()) > 0.95
+    assert float(airborne[:, right_foot].min()) > 0.95
+    assert float(airborne[:, left_hand].min()) > 0.95
+    assert float(airborne[:, pelvis].min()) > 0.95
+
+    sliding = joints.copy()
+    sliding[:, JOINT_INDEX["left_foot"], 1] = 0.03
+    sliding[:, JOINT_INDEX["right_foot"], 0] = np.linspace(0.0, 0.25, frame_count, dtype=np.float32)
+    sliding_prob = derive_stationary_prob_5(joints_world=sliding, joint_rotations_world=rotations)
+    assert sliding_prob[0, right_foot] == pytest.approx(1.0)
+    assert float(sliding_prob[1:, right_foot].max()) < 0.05
+    assert float(sliding_prob[:, left_foot].min()) > 0.95
+
+
+def test_stationary_labels_are_causal_and_future_changes_do_not_leak_backward():
+    frame_count = 12
+    rotations = identity_joint_rotations(frame_count)
+    baseline = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    changed = baseline.copy()
+    changed[8:, JOINT_INDEX["left_foot"], 0] = np.arange(4, dtype=np.float32) * 0.1
+
+    baseline_prob = derive_stationary_prob_5(baseline, rotations)
+    changed_prob = derive_stationary_prob_5(changed, rotations)
+
+    np.testing.assert_allclose(changed_prob[:8], baseline_prob[:8], atol=0.0)
+
+    changed_second_frame = baseline.copy()
+    changed_second_frame[1, JOINT_INDEX["left_foot"], 0] = 0.1
+    second_frame_prob = derive_stationary_prob_5(changed_second_frame, rotations)
+    np.testing.assert_allclose(second_frame_prob[0], baseline_prob[0], atol=0.0)
+
+
+def test_stationary_labels_release_immediately_and_reacquire_after_stable_history():
+    frame_count = 12
+    rotations = identity_joint_rotations(frame_count)
+    joints = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    foot = JOINT_INDEX["left_foot"]
+    left_foot = stationary_column("left_foot")
+    joints[4:, foot, 0] = 0.1
+    joints[5:, foot, 0] = 0.2
+    joints[6:, foot, 0] = 0.3
+    joints[7:, foot, 0] = 0.3
+
+    stationary = derive_stationary_prob_5(joints, rotations)
+
+    assert stationary[3, left_foot] == pytest.approx(1.0)
+    assert stationary[4, left_foot] == pytest.approx(0.0)
+    assert stationary[7, left_foot] < 0.5
+    assert stationary[9, left_foot] >= 0.7
+
+
+def test_stationary_speed_mapping_matches_unity_thresholds():
+    frame_count = 4
+    rotations = identity_joint_rotations(frame_count)
+    joints = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    foot = JOINT_INDEX["left_foot"]
+    left_foot = stationary_column("left_foot")
+    joints[1, foot, 0] = 0.03 / 60.0
+    joints[2, foot, 0] = joints[1, foot, 0] + 0.25 / 60.0
+    joints[3, foot, 0] = joints[2, foot, 0]
+
+    stationary = derive_stationary_prob_5(joints, rotations)
+
+    assert stationary[1, left_foot] == pytest.approx(1.0)
+    assert stationary[2, left_foot] == pytest.approx(0.0)
 
 
 def test_stationary5_feature_layout_and_root_integration():
@@ -256,6 +391,12 @@ def test_stationary5_task_dataset_and_normalizer_contract(tmp_path):
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     assert entry["feature_dim"] == schema.feature_dim
     assert entry[POSE_REPRESENTATION_KEY] == schema.pose_representation
+    expected_stationary_metadata = stationary_label_metadata()
+    for key, value in expected_stationary_metadata.items():
+        assert_stationary_metadata_value(entry[key], value)
+    with np.load(manifest_path.parent / entry["task_path"], allow_pickle=False) as data:
+        for key, value in expected_stationary_metadata.items():
+            assert_stationary_metadata_value(data[key], value)
 
     mean = torch.zeros(schema.feature_dim)
     std = torch.ones(schema.feature_dim)
@@ -263,6 +404,8 @@ def test_stationary5_task_dataset_and_normalizer_contract(tmp_path):
     normalizer.save(mean, std)
     normalizer_meta = json.loads((normalizer_dir / "normalizer_meta.json").read_text(encoding="utf-8"))
     assert normalizer_meta[POSE_REPRESENTATION_KEY] == schema.pose_representation
+    for key, value in expected_stationary_metadata.items():
+        assert_stationary_metadata_value(normalizer_meta[key], value)
     dataset = RealtimePoseTaskDataset(
         task_dir,
         split="train",

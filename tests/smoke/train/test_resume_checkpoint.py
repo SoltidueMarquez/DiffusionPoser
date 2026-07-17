@@ -218,6 +218,31 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
 
 
 class TrainLoopStepAccountingTest(unittest.TestCase):
+    def test_resume_optimizer_keeps_moments_but_uses_current_cli_lr(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint = Path(tmp_dir) / "model000000025.pt"
+            parameter = torch.nn.Parameter(torch.tensor([1.0]))
+            old_optimizer = torch.optim.AdamW([parameter], lr=5e-5)
+            (parameter.square().sum()).backward()
+            old_optimizer.step()
+            torch.save(old_optimizer.state_dict(), checkpoint.with_name("opt000000025.pt"))
+
+            new_parameter = torch.nn.Parameter(torch.tensor([1.0]))
+            loop = object.__new__(TrainLoop)
+            loop.resume_checkpoint = str(checkpoint)
+            loop.resume_step = 25
+            loop.device = torch.device("cpu")
+            loop.lr = 1e-5
+            loop.opt = torch.optim.AdamW([new_parameter], lr=1e-3)
+
+            loop._load_optimizer_state()
+
+            self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], 1e-5)
+            self.assertAlmostEqual(loop.opt.param_groups[0]["initial_lr"], 1e-5)
+            state = loop.opt.state[new_parameter]
+            self.assertIn("exp_avg", state)
+            self.assertTrue(torch.any(state["exp_avg"] != 0))
+
     def test_first_saved_checkpoint_uses_completed_step_one(self):
         loop = object.__new__(TrainLoop)
         loop.model = DummyModel()

@@ -18,6 +18,8 @@ from data_loaders.sensor_masking import (
     STATIONARY_JOINT_NAMES,
     get_schema_spec,
 )
+from data_loaders.stationary_label_config import stationary_label_metadata
+from data_loaders.realtime_pose_contract import runtime_contract_metadata
 
 
 IDENTITY_6D = np.asarray([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -36,10 +38,13 @@ def build_toy_source_metadata(frame_count: int = 70, schema_name: str = REALTIME
         "stablemotion_split_key": "ACCAD/toy_realtime",
         "output_path": "ACCAD/toy_realtime.npz",
         "frames": int(frame_count),
+        "target_fps": 60.0,
     }
+    metadata.update(runtime_contract_metadata())
     if schema.supports_stationary_prob:
         metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
         metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
+        metadata.update(stationary_label_metadata())
     return metadata
 
 
@@ -83,7 +88,16 @@ def build_toy_realtime_source(frame_count: int = 70, schema_name: str = REALTIME
         "joint_offsets_parent": offsets,
     }
     if schema.supports_stationary_prob:
-        source["stationary_prob_5"] = derive_stationary_prob_5(joints_world=joints)
+        joint_rotations_world = np.repeat(np.eye(3, dtype=np.float32)[None, None], frame_count * 24, axis=0).reshape(
+            frame_count,
+            24,
+            3,
+            3,
+        )
+        source["stationary_prob_5"] = derive_stationary_prob_5(
+            joints_world=joints,
+            joint_rotations_world=joint_rotations_world,
+        )
     if schema.pose_representation == "body_fbx_local_delta_6d":
         source["joint_rest_local_rotations_6d"] = rest_rotations_6d
     source["metadata"] = np.asarray(json.dumps(build_toy_source_metadata(frame_count=frame_count, schema_name=schema.name)))

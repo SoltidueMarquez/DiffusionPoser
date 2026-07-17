@@ -94,6 +94,8 @@ def body_fbx_rest_from_payload(payload: dict[str, Any], source_path: Path | None
     )
     if tracker_indices.shape != TRACKER_JOINT_INDICES.shape:
         raise ValueError(f"body_fbx_rest.json trackerJointIndices 必须是 [6]，实际为 {tracker_indices.shape}")
+    if not np.array_equal(tracker_indices, TRACKER_JOINT_INDICES):
+        raise ValueError("body_fbx_rest.json trackerJointIndices must match the runtime tracker order")
     return BodyFbxRest(
         bone_names=bone_names,
         parents=parents,

@@ -11,7 +11,10 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
 )
-from eval.evaluate_realtime_pose_rollout import main as evaluate_rollout_main
+from eval.evaluate_realtime_pose_rollout import (
+    evaluate_rollout_file,
+    main as evaluate_rollout_main,
+)
 from sample.reconstruct_rollout import save_rollout
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
@@ -100,3 +103,37 @@ def test_rollout_eval_respects_eval_frame_mask(tmp_path):
     assert summary["evaluated_frames"] == 1
     assert summary["warmup_frames"] == REALTIME_POSE_TARGET_START
     assert summary["mpjpe_mean"] == 0.0
+
+
+def test_rollout_eval_reports_legacy_and_runtime_stationary_thresholds(tmp_path):
+    source = build_toy_realtime_source(frame_count=REALTIME_POSE_SEQ_LEN)
+    source["sensor_valid"] = np.ones((REALTIME_POSE_SEQ_LEN, 6), dtype=bool)
+    schema_features = encode_realtime_pose_features(
+        source,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+    )
+    reference_features = schema_features[None].copy()
+    predicted_features = schema_features[None].copy()
+    reference_features[..., 149:154] = 0.75
+    predicted_features[..., 149:154] = 0.65
+    joints = source["joints_world"][None]
+    output_path = tmp_path / "thresholds.npz"
+    save_rollout(
+        output_path,
+        {
+            "reference_features_raw": reference_features,
+            "predicted_features_raw": predicted_features,
+            "reference_joints_world": joints,
+            "predicted_joints_world": joints.copy(),
+            "root_yaw_reference": source["root_yaw"][None],
+            "root_yaw_predicted": source["root_yaw"][None].copy(),
+            "sensor_valid": np.ones((1, REALTIME_POSE_SEQ_LEN, 6), dtype=np.float32),
+            "metadata": np.asarray({"schema_name": REALTIME_POSE_SCHEMA_NAME}, dtype=object),
+        },
+    )
+
+    metrics = evaluate_rollout_file(output_path)
+
+    assert metrics["stationary_f1"] == 1.0
+    assert metrics["stationary_f1_at_0_7"] == 0.0
+    assert metrics["stationary_missed_lock_rate_at_0_7"] == 1.0

@@ -25,6 +25,31 @@ from data_loaders.sensor_masking import (
     validate_realtime_seq_len,
     validate_realtime_target,
 )
+from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
+from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION
+
+
+FEATURE_CONTRACT_VERSION = 2
+JOINT_MAPPING_VERSION = "smpl24_tracker6_v1"
+COORDINATE_CONVENTION_VERSION = "realtime_pose_y_up_xright_zforward_v1"
+RESOLVER_CONTRACT_VERSION = "runtime_root_resolver_v1"
+RESOLVER_CONTEXT_FRAMES = 32
+TRACKER_SPACE_SYNTHETIC_JOINT_WORLD = "synthetic_joint_world"
+TRACKER_SPACE_CALIBRATED_JOINT_WORLD = "calibrated_joint_world"
+ALLOWED_TRACKER_SPACES = {
+    TRACKER_SPACE_SYNTHETIC_JOINT_WORLD,
+    TRACKER_SPACE_CALIBRATED_JOINT_WORLD,
+}
+RUNTIME_CONTRACT_METADATA_FIELDS = (
+    "feature_contract_version",
+    "tracker_space",
+    "calibration_version",
+    "joint_mapping_version",
+    "coordinate_convention_version",
+    "tracker_codec_version",
+    "reference_policy_version",
+    "resolver_contract_version",
+)
 
 
 SOURCE_STATIC_FIELDS = {
@@ -42,13 +67,21 @@ TASK_METADATA_FIELDS = {
     POSE_REPRESENTATION_KEY,
     "root_y_policy",
     "pelvis_height_mode",
+    *RUNTIME_CONTRACT_METADATA_FIELDS,
 }
-SCHEMA_METADATA_FIELDS = ("schema_name", POSE_REPRESENTATION_KEY, "root_y_policy", "pelvis_height_mode")
+SCHEMA_METADATA_FIELDS = (
+    "schema_name",
+    POSE_REPRESENTATION_KEY,
+    "root_y_policy",
+    "pelvis_height_mode",
+    *RUNTIME_CONTRACT_METADATA_FIELDS,
+)
 ROOT_Y0_ATOL = 1e-6
 
 
 def validate_schema_metadata(metadata: Mapping[str, Any], schema: SchemaSpec, source: str) -> None:
-    missing = [key for key in SCHEMA_METADATA_FIELDS if key not in metadata]
+    base_fields = ("schema_name", POSE_REPRESENTATION_KEY, "root_y_policy", "pelvis_height_mode")
+    missing = [key for key in base_fields if key not in metadata]
     if missing:
         raise ValueError(f"{source} metadata 缺少字段: {missing}")
 
@@ -65,6 +98,72 @@ def validate_schema_metadata(metadata: Mapping[str, Any], schema: SchemaSpec, so
         raise ValueError(
             f"{source} pelvis_height_mode={pelvis_height_mode!r}, expected {schema.pelvis_height_mode!r}."
         )
+    missing_runtime = [key for key in RUNTIME_CONTRACT_METADATA_FIELDS if key not in metadata]
+    if missing_runtime:
+        raise ValueError(f"{source} metadata 缺少 v2 runtime 字段: {missing_runtime}")
+    feature_contract_version = _scalar_int(metadata["feature_contract_version"], "feature_contract_version")
+    if feature_contract_version != FEATURE_CONTRACT_VERSION:
+        raise ValueError(
+            f"{source} feature_contract_version={feature_contract_version}, expected {FEATURE_CONTRACT_VERSION}."
+        )
+    tracker_space = scalar_string(metadata["tracker_space"], "tracker_space")
+    if tracker_space not in ALLOWED_TRACKER_SPACES:
+        raise ValueError(f"{source} tracker_space={tracker_space!r} 未标定或不受支持。")
+    expected_values = {
+        "joint_mapping_version": JOINT_MAPPING_VERSION,
+        "coordinate_convention_version": COORDINATE_CONVENTION_VERSION,
+        "tracker_codec_version": TRACKER_CODEC_VERSION,
+        "reference_policy_version": REFERENCE_POLICY_VERSION,
+        "resolver_contract_version": RESOLVER_CONTRACT_VERSION,
+    }
+    for key, expected in expected_values.items():
+        actual = scalar_string(metadata[key], key)
+        if actual != expected:
+            raise ValueError(f"{source} {key}={actual!r}, expected {expected!r}.")
+    if not scalar_string(metadata["calibration_version"], "calibration_version").strip():
+        raise ValueError(f"{source} calibration_version 不能为空。")
+
+
+def runtime_contract_metadata(
+    *,
+    tracker_space: str = TRACKER_SPACE_SYNTHETIC_JOINT_WORLD,
+    calibration_version: str = "synthetic_identity_v1",
+) -> dict[str, Any]:
+    if tracker_space not in ALLOWED_TRACKER_SPACES:
+        raise ValueError(f"不支持 tracker_space={tracker_space!r}")
+    return {
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "tracker_space": tracker_space,
+        "calibration_version": str(calibration_version),
+        "joint_mapping_version": JOINT_MAPPING_VERSION,
+        "coordinate_convention_version": COORDINATE_CONVENTION_VERSION,
+        "tracker_codec_version": TRACKER_CODEC_VERSION,
+        "reference_policy_version": REFERENCE_POLICY_VERSION,
+        "resolver_contract_version": RESOLVER_CONTRACT_VERSION,
+    }
+
+
+def validate_stationary_label_metadata(metadata: Mapping[str, Any], source: str) -> None:
+    """校验因果 stationary v2 配置，防止旧的居中标签数据混入训练链路。"""
+
+    expected = stationary_label_metadata()
+    missing = [key for key in STATIONARY_LABEL_METADATA_FIELDS if key not in metadata]
+    if missing:
+        raise ValueError(f"{source} stationary label metadata 缺少字段: {missing}")
+    for key, expected_value in expected.items():
+        value = metadata[key]
+        if isinstance(expected_value, str):
+            actual = scalar_string(value, key)
+            if actual != expected_value:
+                raise ValueError(f"{source} {key}={actual!r}, expected {expected_value!r}.")
+        elif isinstance(expected_value, int):
+            actual = _scalar_int(value, key)
+            if actual != int(expected_value):
+                raise ValueError(f"{source} {key}={actual!r}, expected {int(expected_value)!r}.")
+        else:
+            actual = _scalar_float(value, key)
+            if not np.isclose(actual, float(expected_value), rtol=0.0, atol=1e-8):
+                raise ValueError(f"{source} {key}={actual!r}, expected {float(expected_value)!r}.")
 
 
 def validate_root_y0_invariants(arrays: Mapping[str, Any], schema: SchemaSpec, source: str) -> None:
@@ -102,6 +201,8 @@ def validate_realtime_source_contract(data: Mapping[str, Any] | Any, schema: Sch
 
     metadata = load_source_metadata(data, source=source)
     validate_schema_metadata(metadata, schema=schema, source=source)
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(metadata, source=source)
     validate_pose_representation(_payload_value(data, POSE_REPRESENTATION_KEY), schema_name=schema.name, source=source)
 
     frame_count = int(np.asarray(_payload_value(data, schema.body_pose_key)).shape[0])
@@ -125,6 +226,8 @@ def validate_realtime_task_contract(task: Mapping[str, Any], schema: SchemaSpec,
 
     metadata = {key: task[key] for key in SCHEMA_METADATA_FIELDS}
     validate_schema_metadata(metadata, schema=schema, source=source)
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(task, source=source)
     task_format = scalar_string(task["task_format"], "task_format")
     if task_format != schema.task_format:
         raise ValueError(f"{source} task_format={task_format!r}, expected {schema.task_format!r}.")
@@ -172,9 +275,49 @@ def required_realtime_task_fields(schema: SchemaSpec | str) -> set[str]:
             "valid_length",
             "source_frames",
             "seq_len",
+            "tracker_ref_root_pos_world",
+            "tracker_ref_root_yaw",
+            "tracker_ref_source",
+            "timestamp_seconds",
+            "floor_y",
+            "tracking_origin_revision",
+            "resolver_window_start_root_pos_world",
+            "resolver_window_start_root_yaw",
+            "resolver_window_start_pelvis_height",
+            "resolver_window_start_joints_world",
+            "resolver_window_start_hip_valid",
+            "resolver_window_start_reconnect_start_root_pos_world",
+            "resolver_window_start_reconnect_start_root_yaw",
+            "resolver_window_start_reconnect_start_pelvis_height",
+            "resolver_window_start_reconnect_elapsed_seconds",
+            "resolver_window_start_last_timestamp_seconds",
+            "resolver_window_start_floor_y",
+            "resolver_window_start_tracking_origin_revision",
+            "resolver_before_target_root_pos_world",
+            "resolver_before_target_root_yaw",
+            "resolver_before_target_pelvis_height",
+            "resolver_before_target_joints_world",
+            "resolver_before_target_hip_valid",
+            "resolver_before_target_reconnect_start_root_pos_world",
+            "resolver_before_target_reconnect_start_root_yaw",
+            "resolver_before_target_reconnect_start_pelvis_height",
+            "resolver_before_target_reconnect_elapsed_seconds",
+            "resolver_before_target_last_timestamp_seconds",
+            "resolver_before_target_floor_y",
+            "resolver_before_target_tracking_origin_revision",
+            "resolver_context_frame_indices",
+            "resolver_context_root_pos_world",
+            "resolver_context_root_yaw",
+            "resolver_context_pelvis_height",
+            "resolver_context_joints_world",
+            "resolver_context_timestamp_seconds",
+            "resolver_context_floor_y",
+            "resolver_context_tracking_origin_revision",
         }
     )
     required.update(TASK_METADATA_FIELDS)
+    if schema.supports_stationary_prob:
+        required.update(STATIONARY_LABEL_METADATA_FIELDS)
     return required
 
 
@@ -203,6 +346,26 @@ def expected_realtime_task_shapes(schema: SchemaSpec, seq_len: int) -> dict[str,
     shapes = expected_realtime_source_shapes(schema=schema, frame_count=seq_len)
     shapes["sensor_valid"] = (seq_len, SENSOR_VALID_DIM)
     shapes["inpaint_mask"] = (seq_len, schema.feature_dim)
+    shapes["tracker_ref_root_pos_world"] = (seq_len, 3)
+    shapes["tracker_ref_root_yaw"] = (seq_len,)
+    shapes["tracker_ref_source"] = (seq_len,)
+    shapes["timestamp_seconds"] = (seq_len,)
+    shapes["floor_y"] = (seq_len,)
+    shapes["tracking_origin_revision"] = (seq_len,)
+    shapes["resolver_window_start_root_pos_world"] = (3,)
+    shapes["resolver_window_start_joints_world"] = (24, 3)
+    shapes["resolver_window_start_reconnect_start_root_pos_world"] = (3,)
+    shapes["resolver_before_target_root_pos_world"] = (3,)
+    shapes["resolver_before_target_joints_world"] = (24, 3)
+    shapes["resolver_before_target_reconnect_start_root_pos_world"] = (3,)
+    shapes["resolver_context_frame_indices"] = (RESOLVER_CONTEXT_FRAMES,)
+    shapes["resolver_context_root_pos_world"] = (RESOLVER_CONTEXT_FRAMES, 3)
+    shapes["resolver_context_root_yaw"] = (RESOLVER_CONTEXT_FRAMES,)
+    shapes["resolver_context_pelvis_height"] = (RESOLVER_CONTEXT_FRAMES, 1)
+    shapes["resolver_context_joints_world"] = (RESOLVER_CONTEXT_FRAMES, 24, 3)
+    shapes["resolver_context_timestamp_seconds"] = (RESOLVER_CONTEXT_FRAMES,)
+    shapes["resolver_context_floor_y"] = (RESOLVER_CONTEXT_FRAMES,)
+    shapes["resolver_context_tracking_origin_revision"] = (RESOLVER_CONTEXT_FRAMES,)
     return shapes
 
 
@@ -247,3 +410,12 @@ def _scalar_int(value: Any, name: str) -> int:
     if array.size == 1:
         return int(array.reshape(()).item())
     raise ValueError(f"{name} must be a scalar int, got shape={array.shape}")
+
+
+def _scalar_float(value: Any, name: str) -> float:
+    array = np.asarray(value)
+    if array.shape == ():
+        return float(array.item())
+    if array.size == 1:
+        return float(array.reshape(()).item())
+    raise ValueError(f"{name} must be a scalar float, got shape={array.shape}")

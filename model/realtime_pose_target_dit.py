@@ -129,7 +129,8 @@ class RealtimePoseTargetDiT(nn.Module):
             device=hidden_states.device,
         )
         hidden = self.transformer(tokens, mask=causal_mask, src_key_padding_mask=token_mask)
-        pred_target = self.output_proj(hidden[:, 0])
+        target_hidden = hidden[:, 0]
+        pred_target = self.output_proj(target_hidden)
         target_mask = inpaint_cond[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START].to(dtype=hidden_states.dtype)
         input_target = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
         pred_target = pred_target * target_mask + input_target * (1.0 - target_mask)

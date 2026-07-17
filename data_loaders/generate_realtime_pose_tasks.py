@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -12,11 +13,16 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.realtime_pose_contract import (
+    RESOLVER_CONTEXT_FRAMES,
+    RUNTIME_CONTRACT_METADATA_FIELDS,
+    load_source_metadata,
     required_realtime_source_fields,
     validate_realtime_source_contract,
 )
+from data_loaders.tracker_codec import build_tracker_reference_np
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+    HIP_TRACKER_INDEX,
     MIN_VALID_TRACKERS,
     POSE_REPRESENTATION_KEY,
     REALTIME_POSE_SCHEMA_NAMES,
@@ -31,28 +37,44 @@ from data_loaders.sensor_masking import (
     create_realtime_inpaint_mask,
     get_schema_spec,
     make_tracker_pattern,
+    make_dynamic_dropout_sensor_valid,
     make_window_patterns,
     normalize_tracker_pattern_categories,
     repeat_pattern_sensor_valid,
     validate_pose_representation,
     validate_sensor_valid,
 )
+from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 from utils.artifact_paths import source_root, task_root
-from utils.data_roots import load_data_roots
+from utils.artifact_roots import load_artifact_roots
 from utils.run_dirs import timestamped_child_dir, write_latest_pointer
 
 
 DEFAULT_SOURCE_SET_NAME = "amass_60hz"
 DEFAULT_TASK_SET_NAME = "amass_60hz_tasks"
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
-USABLE_SOURCE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
+USABLE_SOURCE_STATUSES = {
+    "converted",
+    "skipped_existing",
+    "reused_source",
+    "upgraded_existing_source",
+    "relabelled",
+}
 SHORT_SOURCE_POLICY_SKIP = "skip"
 SHORT_SOURCE_POLICY_ERROR = "error"
 SHORT_SOURCE_POLICIES = (SHORT_SOURCE_POLICY_SKIP, SHORT_SOURCE_POLICY_ERROR)
 SHORT_SOURCE_REPORT_NAME = "skipped_short_sources.jsonl"
-MAX_TASK_ID_STEM_CHARS = 28
+MAX_TASK_ID_STEM_CHARS = 16
 MAX_TASK_ID_CATEGORY_CHARS = 12
 TASK_ID_DIGEST_CHARS = 16
+STATIC_CLIP_FIELDS = {
+    "joint_offsets_parent",
+    "joint_rest_local_rotations_6d",
+    POSE_REPRESENTATION_KEY,
+    *STATIONARY_LABEL_METADATA_FIELDS,
+    *RUNTIME_CONTRACT_METADATA_FIELDS,
+    "target_fps",
+}
 
 
 @dataclass(frozen=True)
@@ -74,7 +96,7 @@ class TaskGenerationPlan:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--data_roots_config", default="", type=str)
+    paths.add_argument("--artifact_roots_config", default="", type=str)
     paths.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
     paths.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
     paths.add_argument("--source_dir", default="", type=str)
@@ -86,10 +108,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     task.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     task.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     task.add_argument("--samples_per_file", default=4, type=int)
-    task.add_argument("--rollout_steps", default=1, type=int)
+    # 默认物化 base + 1 个相邻窗口；长 rollout 实验显式传入 9。
+    task.add_argument("--rollout_steps", default=2, type=int)
     task.add_argument("--mask_policy", default=TASK_MASK_POLICY_FULL, choices=TASK_MASK_POLICIES, type=str)
-    task.add_argument("--fixed_tracker_patterns", nargs="+", default=["all"], type=str)
-    task.add_argument("--patterns_per_window", default=len(TRACKER_PATTERN_CATEGORIES), type=int)
+    task.add_argument("--fixed_tracker_patterns", nargs="+", default=[], type=str)
+    task.add_argument("--patterns_per_window", default=1, type=int)
     task.add_argument("--min_valid_trackers", default=MIN_VALID_TRACKERS, type=int)
     task.add_argument("--ensure_pattern_categories", default=True, type=str2bool)
     task.add_argument("--short_source_policy", default=SHORT_SOURCE_POLICY_SKIP, choices=SHORT_SOURCE_POLICIES, type=str)
@@ -123,7 +146,7 @@ def resolve_task_generation_paths(args: argparse.Namespace) -> argparse.Namespac
     def get_roots():
         nonlocal roots
         if roots is None:
-            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+            roots = load_artifact_roots(getattr(args, "artifact_roots_config", "") or None)
         return roots
 
     schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
@@ -140,11 +163,7 @@ def resolve_task_generation_paths(args: argparse.Namespace) -> argparse.Namespac
     else:
         args.output_dir = Path(args.output_dir)
 
-    if roots is not None or not _path_arg_is_empty(getattr(args, "data_roots_config", "")):
-        args.generated_root = get_roots().generated_root
-    else:
-        # 旧式显式路径没有 data_roots 来源，用 task root 作为可追踪的产物根记录。
-        args.generated_root = Path(args.output_dir)
+    args.generated_root = get_roots().generated_root
     return args
 
 
@@ -168,8 +187,11 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     args = resolve_task_generation_paths(args)
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"realtime_pose 固定 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {args.seq_len}")
-    if int(getattr(args, "rollout_steps", 1)) < 1:
+    rollout_steps = int(getattr(args, "rollout_steps", 2))
+    if rollout_steps < 1:
         raise ValueError(f"rollout_steps must be >= 1, got {args.rollout_steps}")
+    if rollout_steps > 9:
+        raise ValueError("rollout_steps 最多为 9（base + 8 个相邻窗口）。")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
         raise ValueError(f"min_valid_trackers 至少为 {MIN_VALID_TRACKERS}")
 
@@ -238,30 +260,44 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             rng=rng,
             args=args,
             source_split_dir=plan.split_dir,
+            split_seed=split_plan.seed,
         )
     schema = get_schema_spec(str(args.schema))
+    latest_metadata = {
+        "output_dir": str(plan.output_dir),
+        "task_dir": str(plan.output_dir),
+        "task_root": str(plan.output_root),
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "generated_root": str(Path(getattr(args, "generated_root", plan.output_root))),
+        "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
+        "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+        "source_dir": str(plan.source_dir),
+        "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
+        "splits": [split_plan.split for split_plan in plan.split_plans],
+        "max_rollout_steps": int(getattr(args, "rollout_steps", 2)),
+        "seed": int(getattr(args, "seed", 10)),
+        "patterns_per_window": int(getattr(args, "patterns_per_window", 1)),
+        "materialized_tracker_pattern": "full_six",
+        "online_tracker_mask_sampling": True,
+        "tracker_pattern_distribution": {
+            "full_six": 0.30,
+            "standard_three": 0.30,
+            "static_sparse": 0.20,
+            "dynamic_dropout": 0.20,
+        },
+        "counts": counts,
+    }
+    if schema.supports_stationary_prob:
+        latest_metadata.update(stationary_label_metadata())
     write_latest_pointer(
         root_dir=plan.output_root,
         kind="tasks",
         output_dir=plan.output_dir,
-        metadata={
-            "output_dir": str(plan.output_dir),
-            "task_dir": str(plan.output_dir),
-            "task_root": str(plan.output_root),
-            "schema_name": schema.name,
-            "schema_canonical_name": str(schema.canonical_name),
-            "pose_representation": schema.pose_representation,
-            "root_y_policy": schema.root_y_policy,
-            "pelvis_height_mode": schema.pelvis_height_mode,
-            "generated_root": str(Path(getattr(args, "generated_root", plan.output_root))),
-            "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
-            "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
-            "source_dir": str(plan.source_dir),
-            "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
-            "splits": [split_plan.split for split_plan in plan.split_plans],
-            "max_rollout_steps": int(getattr(args, "rollout_steps", 1)),
-            "counts": counts,
-        },
+        metadata=latest_metadata,
     )
     return counts
 
@@ -269,8 +305,10 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
 def resolve_task_run_label(args: argparse.Namespace) -> str:
     run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
     if run_name.lower() in {"", "auto"}:
-        if int(getattr(args, "rollout_steps", 1)) > 1:
-            return f"rtp_rollout_tasks_seed{getattr(args, 'seed', 0)}"
+        rollout_steps = int(getattr(args, "rollout_steps", 2))
+        if rollout_steps > 2:
+            # Windows 仍有部分 NumPy 调用受 MAX_PATH 影响，实验目录名保持短小。
+            return f"rtp_r{rollout_steps}_seed{getattr(args, 'seed', 0)}"
         return f"rtp_tasks_seed{getattr(args, 'seed', 0)}"
     return run_name
 
@@ -325,20 +363,10 @@ def validate_task_output_root_available(source_dir: Path, output_root: Path) -> 
         return
     if (output_root / "latest_tasks.json").exists() or (output_root / "latest_tasks.txt").exists():
         return
-    if output_root_contains_only_marked_task_runs(output_root):
-        return
     raise ValueError(
         f"拒绝使用非空且没有 latest_tasks 指针的 output_dir 根目录: {output_root}。"
         "请换一个目录，或先确认并清理旧内容。"
     )
-
-
-def output_root_contains_only_marked_task_runs(output_root: Path) -> bool:
-    """兼容旧版 task 根目录：只要子目录都是带 marker 的 task run，就允许继续追加新 run。"""
-
-    children = list(output_root.iterdir())
-    return bool(children) and all(child.is_dir() and is_marked_task_output_dir(child) for child in children)
-
 
 def is_marked_task_output_dir(path: Path) -> bool:
     marker_path = path / TASK_OUTPUT_MARKER
@@ -423,6 +451,8 @@ def write_task_output_marker(
         "output_dir": str(output_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
     }
+    if schema.supports_stationary_prob:
+        marker.update(stationary_label_metadata())
     marker_path = output_dir / TASK_OUTPUT_MARKER
     marker_path.write_text(json.dumps(marker, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
@@ -524,6 +554,7 @@ def generate_split_tasks(
     rng: np.random.Generator,
     args: argparse.Namespace,
     source_split_dir: Path | None,
+    split_seed: int,
 ) -> int:
     output_split_dir = output_dir / split
     task_dir = output_split_dir / "tasks"
@@ -531,7 +562,7 @@ def generate_split_tasks(
     manifest_path = output_split_dir / "manifest.jsonl"
     written = 0
     skipped_short_sources: list[dict] = []
-    rollout_steps = int(getattr(args, "rollout_steps", 1))
+    rollout_steps = int(getattr(args, "rollout_steps", 2))
     required_frames = REALTIME_POSE_SEQ_LEN + rollout_steps - 1
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         progress = tqdm(total=len(entries) * int(args.samples_per_file), desc=f"生成 {split} realtime tasks", unit="window")
@@ -590,8 +621,17 @@ def generate_split_tasks(
                     window_task_arrays.append(task_arrays)
                 patterns = build_window_patterns(rng=rng, args=args)
                 for pattern_index, pattern in enumerate(patterns):
-                    sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=REALTIME_POSE_SEQ_LEN)
-                    validate_sensor_valid(sensor_valid, min_valid_trackers=int(args.min_valid_trackers))
+                    if pattern.category == "dynamic_dropout":
+                        full_sensor_valid = make_dynamic_dropout_sensor_valid(
+                            rng=rng,
+                            seq_len=source_frames,
+                            min_duration_frames=2,
+                            max_duration_frames=30,
+                            max_missing_trackers=3,
+                        )
+                    else:
+                        full_sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=source_frames)
+                    validate_sensor_valid(full_sensor_valid, min_valid_trackers=int(args.min_valid_trackers))
                     task_id = make_task_id(
                         split=split,
                         stablemotion_split_key=entry["stablemotion_split_key"],
@@ -602,6 +642,16 @@ def generate_split_tasks(
                     task_rel_path = Path("tasks") / f"{task_id}.npz"
                     rollout_task_paths = []
                     for rollout_step, task_arrays in enumerate(window_task_arrays):
+                        sensor_valid = full_sensor_valid[
+                            start_frame + rollout_step : start_frame + rollout_step + REALTIME_POSE_SEQ_LEN
+                        ].copy()
+                        task_arrays = add_runtime_task_arrays(
+                            task_arrays=task_arrays,
+                            sensor_valid=sensor_valid,
+                            source=source,
+                            absolute_start_frame=start_frame + rollout_step,
+                            full_sensor_valid=full_sensor_valid,
+                        )
                         window_task_rel_path = (
                             task_rel_path
                             if rollout_step == 0
@@ -645,7 +695,7 @@ def generate_split_tasks(
                         "schema_canonical_name": str(schema.canonical_name),
                         POSE_REPRESENTATION_KEY: schema.pose_representation,
                         "root_y_policy": schema.root_y_policy,
-                        "pelvis_height_mode": schema.pelvis_height_mode,
+                            "pelvis_height_mode": schema.pelvis_height_mode,
                         "generated_root": str(Path(getattr(args, "generated_root", output_dir))),
                         "source_set_name": str(getattr(args, "source_set_name", DEFAULT_SOURCE_SET_NAME)),
                         "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
@@ -657,7 +707,29 @@ def generate_split_tasks(
                         "split_dir": str(source_split_dir) if source_split_dir is not None else "",
                         "tracker_pattern": pattern.category,
                         "tracker_pattern_detail": pattern.to_dict(),
+                        "generation_seed": int(split_seed),
+                        "patterns_per_window": int(args.patterns_per_window),
+                        "mask_timeline_sha256": hashlib.sha256(
+                            np.asarray(full_sensor_valid, dtype=np.uint8).tobytes()
+                        ).hexdigest(),
+                        "dynamic_dropout_min_frames": 2,
+                        "dynamic_dropout_max_frames": 30,
+                        "dynamic_dropout_max_missing": 3,
                     }
+                    manifest_entry.update(
+                        {
+                            key: scalar_manifest_value(window_task_arrays[0][key])
+                            for key in RUNTIME_CONTRACT_METADATA_FIELDS
+                        }
+                    )
+                    if schema.supports_stationary_prob:
+                        manifest_entry.update(
+                            {
+                                key: scalar_manifest_value(source[key])
+                                for key in STATIONARY_LABEL_METADATA_FIELDS
+                                if key in source
+                            }
+                        )
                     manifest_file.write(json.dumps(manifest_entry, ensure_ascii=False, sort_keys=True) + "\n")
                     written += 1
                     if args.manifest_flush_interval > 0 and written % int(args.manifest_flush_interval) == 0:
@@ -708,7 +780,7 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
     """根据 task 生成策略返回本窗口要写出的固定 tracker pattern。"""
 
     if str(args.mask_policy) == TASK_MASK_POLICY_FULL:
-        return [make_tracker_pattern("full-trackers", rng)]
+        return [make_tracker_pattern("full_six", rng)]
     if str(args.mask_policy) != TASK_MASK_POLICY_FIXED_PATTERNS:
         raise ValueError(f"未知 task mask_policy: {args.mask_policy}")
 
@@ -727,6 +799,7 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
     schema = get_schema_spec(schema_name)
     with np.load(path, allow_pickle=False) as data:
         validate_realtime_source_contract(data, schema=schema, source=str(path))
+        metadata = load_source_metadata(data, source=str(path))
         required_keys = required_realtime_source_fields(schema)
         source = {
             key: data[key].astype(np.float32, copy=True)
@@ -734,14 +807,145 @@ def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SC
             if key != POSE_REPRESENTATION_KEY
         }
         source[POSE_REPRESENTATION_KEY] = np.asarray(schema.pose_representation)
+        source.update({key: np.asarray(metadata[key]) for key in RUNTIME_CONTRACT_METADATA_FIELDS})
+        source["target_fps"] = np.asarray(float(metadata.get("target_fps", 60.0)), dtype=np.float32)
+        if schema.supports_stationary_prob:
+            source.update({key: np.asarray(metadata[key]) for key in STATIONARY_LABEL_METADATA_FIELDS})
     return source
+
+
+def add_runtime_task_arrays(
+    *,
+    task_arrays: dict[str, np.ndarray],
+    sensor_valid: np.ndarray,
+    source: dict[str, np.ndarray],
+    absolute_start_frame: int,
+    full_sensor_valid: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """补齐 v2 Tracker reference、时间轴和窗口边界 Resolver 状态。"""
+
+    result = {key: value.copy() if isinstance(value, np.ndarray) else value for key, value in task_arrays.items()}
+    schema = get_schema_spec(str(np.asarray(result["schema_name"]).item()))
+    frame_indices = np.arange(
+        int(absolute_start_frame),
+        int(absolute_start_frame) + REALTIME_POSE_SEQ_LEN,
+        dtype=np.int64,
+    )
+    previous_indices = np.maximum(frame_indices - 1, 0)
+    previous_root = np.asarray(source["root_pos_world"], dtype=np.float32)[previous_indices]
+    previous_yaw = np.asarray(source["root_yaw"], dtype=np.float32)[previous_indices]
+    ref_pos, ref_yaw, ref_source = build_tracker_reference_np(
+        tracker_pos_world=result["tracker_pos_world"],
+        tracker_rot_world_6d=result["tracker_rot_world_6d"],
+        sensor_valid=sensor_valid,
+        previous_final_root_pos_world=previous_root,
+        previous_final_root_yaw=previous_yaw,
+        pelvis_offset_parent=result["joint_offsets_parent"][0],
+        floor_y=0.0,
+    )
+    target_fps = float(np.asarray(result.get("target_fps", 60.0)).item())
+    context_indices = np.clip(
+        np.arange(
+            int(absolute_start_frame) - RESOLVER_CONTEXT_FRAMES,
+            int(absolute_start_frame),
+            dtype=np.int64,
+        ),
+        0,
+        int(np.asarray(source[schema.body_pose_key]).shape[0]) - 1,
+    )
+    before_target_source_index = max(int(absolute_start_frame) + REALTIME_POSE_TARGET_START - 1, 0)
+    window_start_source_index = max(int(absolute_start_frame) - 1, 0)
+    window_start_state = oracle_resolver_snapshot(
+        source=source,
+        sensor_valid=full_sensor_valid,
+        frame_index=window_start_source_index,
+        fps=target_fps,
+        schema_name=schema.name,
+        prefix="resolver_window_start",
+    )
+    before_target_state = oracle_resolver_snapshot(
+        source=source,
+        sensor_valid=full_sensor_valid,
+        frame_index=before_target_source_index,
+        fps=target_fps,
+        schema_name=schema.name,
+        prefix="resolver_before_target",
+    )
+    result.update(
+        {
+            "tracker_ref_root_pos_world": ref_pos,
+            "tracker_ref_root_yaw": ref_yaw,
+            "tracker_ref_source": ref_source,
+            "timestamp_seconds": (frame_indices.astype(np.float64) / max(target_fps, 1e-6)).astype(np.float64),
+            "floor_y": np.zeros(REALTIME_POSE_SEQ_LEN, dtype=np.float32),
+            "tracking_origin_revision": np.zeros(REALTIME_POSE_SEQ_LEN, dtype=np.int64),
+            "resolver_context_frame_indices": context_indices,
+            "resolver_context_root_pos_world": np.asarray(source["root_pos_world"], dtype=np.float32)[context_indices],
+            "resolver_context_root_yaw": np.asarray(source["root_yaw"], dtype=np.float32)[context_indices],
+            "resolver_context_pelvis_height": np.asarray(source[schema.pelvis_height_key], dtype=np.float32)[context_indices],
+            "resolver_context_joints_world": np.asarray(source["joints_world"], dtype=np.float32)[context_indices],
+            "resolver_context_timestamp_seconds": context_indices.astype(np.float64) / max(target_fps, 1e-6),
+            "resolver_context_floor_y": np.zeros(RESOLVER_CONTEXT_FRAMES, dtype=np.float32),
+            "resolver_context_tracking_origin_revision": np.zeros(RESOLVER_CONTEXT_FRAMES, dtype=np.int64),
+            **window_start_state,
+            **before_target_state,
+        }
+    )
+    return result
+
+
+def oracle_resolver_snapshot(
+    *,
+    source: dict[str, np.ndarray],
+    sensor_valid: np.ndarray,
+    frame_index: int,
+    fps: float,
+    schema_name: str,
+    prefix: str,
+) -> dict[str, np.ndarray]:
+    """Build a deterministic post-frame Resolver state from the full mask timeline and GT motion."""
+
+    schema = get_schema_spec(schema_name)
+    valid = np.asarray(sensor_valid, dtype=bool)
+    index = int(np.clip(frame_index, 0, valid.shape[0] - 1))
+    hip_valid = bool(valid[index, HIP_TRACKER_INDEX])
+    reconnect_start_index = index
+    reconnect_elapsed = 0.0
+    if hip_valid:
+        first_valid = index
+        while first_valid > 0 and valid[first_valid - 1, HIP_TRACKER_INDEX]:
+            first_valid -= 1
+        if first_valid > 0:
+            reconnect_start_index = first_valid - 1
+            elapsed = float(index - first_valid + 1) / max(float(fps), 1e-6)
+            reconnect_elapsed = elapsed if elapsed < 0.1 else 0.0
+    if prefix not in {"resolver_window_start", "resolver_before_target"}:
+        raise ValueError(f"unsupported Resolver snapshot prefix: {prefix}")
+    return {
+        f"{prefix}_root_pos_world": np.asarray(source["root_pos_world"][index], dtype=np.float32),
+        f"{prefix}_root_yaw": np.float32(source["root_yaw"][index]),
+        f"{prefix}_pelvis_height": np.float32(source[schema.pelvis_height_key][index, 0]),
+        f"{prefix}_joints_world": np.asarray(source["joints_world"][index], dtype=np.float32),
+        f"{prefix}_hip_valid": np.asarray(hip_valid),
+        f"{prefix}_reconnect_start_root_pos_world": np.asarray(
+            source["root_pos_world"][reconnect_start_index], dtype=np.float32
+        ),
+        f"{prefix}_reconnect_start_root_yaw": np.float32(source["root_yaw"][reconnect_start_index]),
+        f"{prefix}_reconnect_start_pelvis_height": np.float32(
+            source[schema.pelvis_height_key][reconnect_start_index, 0]
+        ),
+        f"{prefix}_reconnect_elapsed_seconds": np.float32(reconnect_elapsed),
+        f"{prefix}_last_timestamp_seconds": np.float64(index / max(float(fps), 1e-6)),
+        f"{prefix}_floor_y": np.float32(0.0),
+        f"{prefix}_tracking_origin_revision": np.int64(0),
+    }
 
 
 def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -> dict[str, np.ndarray]:
     end_frame = int(start_frame) + int(seq_len)
     return {
         key: value.copy()
-        if key in {"joint_offsets_parent", "joint_rest_local_rotations_6d", POSE_REPRESENTATION_KEY}
+        if key in STATIC_CLIP_FIELDS
         else value[start_frame:end_frame].copy()
         for key, value in source.items()
     }
@@ -750,20 +954,39 @@ def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -
 def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
     task_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = temporary_task_path(task_path)
-    if temp_path.exists():
-        temp_path.unlink()
-    with temp_path.open("wb") as file:
+    task_fs_path = windows_extended_path(task_path)
+    temp_fs_path = windows_extended_path(temp_path)
+    if temp_fs_path.exists():
+        temp_fs_path.unlink()
+    with temp_fs_path.open("wb") as file:
         if compress:
             np.savez_compressed(file, **arrays)
         else:
             np.savez(file, **arrays)
-    temp_path.replace(task_path)
+    temp_fs_path.replace(task_fs_path)
 
 
 def temporary_task_path(task_path: Path) -> Path:
     """临时文件名不能比最终 .npz 更长，避免 Windows 长路径边界下写入失败。"""
 
     return task_path.with_suffix(".tmp")
+
+
+def windows_extended_path(path: Path) -> Path:
+    resolved = path.resolve()
+    text = str(resolved)
+    if os.name == "nt" and not text.startswith("\\\\?\\") and len(text) >= 248:
+        return Path("\\\\?\\" + text)
+    return resolved
+
+
+def scalar_manifest_value(value) -> str | int | float:
+    array = np.asarray(value)
+    if array.shape == ():
+        return array.item()
+    if array.size == 1:
+        return array.reshape(()).item()
+    raise ValueError(f"manifest scalar value must be scalar, got shape={array.shape}")
 
 
 def make_task_id(split: str, stablemotion_split_key: str, sample_index: int, pattern_index: int, pattern_category: str) -> str:

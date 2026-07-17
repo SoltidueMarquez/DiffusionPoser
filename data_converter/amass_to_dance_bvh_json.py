@@ -27,11 +27,12 @@ from data_converter.amass_smpl_utils import (
     mirror_motion_source,
 )
 from data_loaders.realtime_pose_kinematics import SMPL_JOINT_NAMES
+from utils.artifact_roots import load_artifact_roots
 
 
 DANCE_BVH_JOINT_COUNT = 24
 DANCE_BVH_FRAME_DIM = DANCE_BVH_JOINT_COUNT * 9 + 3
-DEFAULT_OUTPUT_JSON = Path("export/dance_bvh/dance_output.json")
+DEFAULT_OUTPUT_FILENAME = "dance_output.json"
 RAW_AMASS_BASIS = "raw_amass"
 AMASS_ZUP_TO_SMPL_YUP_BASIS = "amass_zup_to_smpl_yup"
 COORDINATE_BASIS_CHOICES = (AMASS_ZUP_TO_SMPL_YUP_BASIS, RAW_AMASS_BASIS)
@@ -47,9 +48,10 @@ AMASS_ZUP_TO_SMPL_YUP_ROOT = np.array(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS motions to dance_bvh playable JSON.")
+    parser.add_argument("--artifact_roots_config", default="", type=str)
     parser.add_argument(
         "--amass_path",
-        default=Path("dataset/AMASS"),
+        default=None,
         type=Path,
         help="AMASS .npz file or directory. Directory mode converts motions recursively.",
     )
@@ -59,7 +61,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="AMASS root used for relative paths. Defaults to amass_path for directories or parent for files.",
     )
-    parser.add_argument("--output_json", default=DEFAULT_OUTPUT_JSON, type=Path)
+    parser.add_argument("--output_json", default=None, type=Path)
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--coordinate_basis", default=AMASS_ZUP_TO_SMPL_YUP_BASIS, choices=COORDINATE_BASIS_CHOICES)
     parser.add_argument("--translation_scale", default=100.0, type=float)
@@ -69,6 +71,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--indent", default=None, type=int)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
+
+
+def resolve_converter_paths(args: argparse.Namespace) -> argparse.Namespace:
+    roots = load_artifact_roots(getattr(args, "artifact_roots_config", "") or None)
+    if args.amass_path is None:
+        args.amass_path = roots.amass_root
+    if args.output_json is None:
+        args.output_json = roots.outputs_root / "dance_bvh" / DEFAULT_OUTPUT_FILENAME
+    return args
 
 
 def resolve_motion_inputs(amass_path: Path, amass_dir: Path | None) -> tuple[list[Path], Path]:
@@ -225,7 +236,7 @@ def write_dance_bvh_json(
 
 
 def main(argv: list[str] | None = None) -> dict[str, int]:
-    args = parse_args(argv)
+    args = resolve_converter_paths(parse_args(argv))
     if args.target_fps <= 0:
         raise ValueError("--target_fps 必须为正数")
     if args.translation_scale <= 0:

@@ -58,9 +58,15 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
     assert schema.canonical_name == CANONICAL_SCHEMA_NAME
 
     source_dir = tmp_path / schema_name / "sources"
-    source_path = write_toy_source_dataset(source_dir, frame_count=schema.seq_len, schema_name=schema_name)
+    # task generator 默认物化 base + 1 个相邻窗口，因此最小 source 比模型窗口多 1 帧。
+    source_frame_count = schema.seq_len + 1
+    source_path = write_toy_source_dataset(
+        source_dir,
+        frame_count=source_frame_count,
+        schema_name=schema_name,
+    )
 
-    fixture_metadata = build_toy_source_metadata(frame_count=schema.seq_len, schema_name=schema_name)
+    fixture_metadata = build_toy_source_metadata(frame_count=source_frame_count, schema_name=schema_name)
     assert fixture_metadata["schema_name"] == schema_name
     assert fixture_metadata["schema_canonical_name"] == CANONICAL_SCHEMA_NAME
 

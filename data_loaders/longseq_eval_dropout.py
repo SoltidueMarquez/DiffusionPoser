@@ -7,14 +7,16 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.realtime_pose_dataset import dropout_non_hip_trackers
+from data_loaders.realtime_pose_dataset import dropout_non_head_trackers
 from data_loaders.sensor_masking import (
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     TRACKER_COUNT,
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
     TRACKER_MASK_POLICY_FIXED_CATEGORIES,
     TRACKER_MASK_POLICY_TASK,
     make_tracker_pattern,
+    make_dynamic_dropout_sensor_valid,
     normalize_tracker_pattern_categories,
     validate_sensor_valid,
 )
@@ -32,14 +34,16 @@ class LongseqDropoutConfig:
     preset: str = DROPOUT_PRESET_NONE
     tracker_mask_policy: str = TRACKER_MASK_POLICY_TASK
     tracker_mask_seed: int = 10
-    tracker_mask_categories: tuple[str, ...] = ("full-trackers",)
+    tracker_mask_categories: tuple[str, ...] = ("full_six",)
     tracker_mask_segment_frames: int = 61
-    non_hip_tracker_dropout_prob: float = 0.0
+    non_head_tracker_dropout_prob: float = 0.0
     tracker_burst_dropout_prob: float = 0.0
     tracker_latency_max_frames: int = 0
     tracker_outlier_prob: float = 0.0
     tracker_pos_noise_std: float = 0.0
     tracker_rot_noise_std: float = 0.0
+    hip_dropout_duration_frames: int = 0
+    hip_dropout_interval_frames: int = 300
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -59,12 +63,14 @@ def add_longseq_dropout_options(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--tracker_mask_seed", default=10, type=int)
     group.add_argument("--tracker_mask_categories", nargs="+", default=["all"], type=str)
     group.add_argument("--tracker_mask_segment_frames", default=61, type=int)
-    group.add_argument("--non_hip_tracker_dropout_prob", default=0.0, type=float)
+    group.add_argument("--non_head_tracker_dropout_prob", default=0.0, type=float)
     group.add_argument("--tracker_burst_dropout_prob", default=0.0, type=float)
     group.add_argument("--tracker_latency_max_frames", default=0, type=int)
     group.add_argument("--tracker_outlier_prob", default=0.0, type=float)
     group.add_argument("--tracker_pos_noise_std", default=0.0, type=float)
     group.add_argument("--tracker_rot_noise_std", default=0.0, type=float)
+    group.add_argument("--hip_dropout_duration_frames", default=0, type=int)
+    group.add_argument("--hip_dropout_interval_frames", default=300, type=int)
     group.add_argument("--disable_dropout", default=False, type=str2bool)
 
 
@@ -84,12 +90,14 @@ def build_longseq_dropout_config(args: argparse.Namespace) -> LongseqDropoutConf
         tracker_mask_seed=int(getattr(args, "tracker_mask_seed", 10)),
         tracker_mask_categories=categories,
         tracker_mask_segment_frames=int(getattr(args, "tracker_mask_segment_frames", 61)),
-        non_hip_tracker_dropout_prob=float(getattr(args, "non_hip_tracker_dropout_prob", 0.0)),
+        non_head_tracker_dropout_prob=float(getattr(args, "non_head_tracker_dropout_prob", 0.0)),
         tracker_burst_dropout_prob=float(getattr(args, "tracker_burst_dropout_prob", 0.0)),
         tracker_latency_max_frames=int(getattr(args, "tracker_latency_max_frames", 0)),
         tracker_outlier_prob=float(getattr(args, "tracker_outlier_prob", 0.0)),
         tracker_pos_noise_std=float(getattr(args, "tracker_pos_noise_std", 0.0)),
         tracker_rot_noise_std=float(getattr(args, "tracker_rot_noise_std", 0.0)),
+        hip_dropout_duration_frames=int(getattr(args, "hip_dropout_duration_frames", 0)),
+        hip_dropout_interval_frames=int(getattr(args, "hip_dropout_interval_frames", 300)),
     )
     if preset == DROPOUT_PRESET_TRACKER_MASK_TRAIN:
         config = replace_config(
@@ -186,12 +194,59 @@ def build_longseq_sensor_valid(
             config=config,
         )
 
-    dropout_prob = max(float(config.non_hip_tracker_dropout_prob), float(config.tracker_burst_dropout_prob))
+    dropout_prob = max(float(config.non_head_tracker_dropout_prob), float(config.tracker_burst_dropout_prob))
     if dropout_prob > 0:
         rng = stable_rng(sequence_id=sequence_id, seed=config.tracker_mask_seed, salt="frame_dropout")
-        valid = dropout_non_hip_trackers(sensor_valid=valid, rng=rng, dropout_prob=dropout_prob)
+        valid = dropout_non_head_trackers(sensor_valid=valid, rng=rng, dropout_prob=dropout_prob)
+
+    if config.hip_dropout_duration_frames > 0:
+        valid = apply_seeded_hip_dropout_timeline(
+            sensor_valid=valid,
+            sequence_id=sequence_id,
+            seed=config.tracker_mask_seed,
+            duration_frames=config.hip_dropout_duration_frames,
+            interval_frames=config.hip_dropout_interval_frames,
+        )
 
     validate_sensor_valid(valid)
+    return valid
+
+
+def apply_seeded_hip_dropout_timeline(
+    sensor_valid: np.ndarray,
+    sequence_id: str,
+    seed: int,
+    duration_frames: int,
+    interval_frames: int = 300,
+) -> np.ndarray:
+    """生成可复现的 Hip 丢失/重连事件；其余 Tracker 有效性保持不变。"""
+
+    valid = np.asarray(sensor_valid, dtype=bool).copy()
+    duration = int(duration_frames)
+    interval = int(interval_frames)
+    if duration <= 0:
+        return valid
+    if interval <= duration:
+        raise ValueError(
+            f"hip_dropout_interval_frames 必须大于 duration，实际为 {interval} <= {duration}"
+        )
+    frame_count = int(valid.shape[0])
+    # 60 帧 warmup 后再制造断线，使每个事件都经过模型预测和 Resolver 重连。
+    first_candidate = min(60, max(frame_count - 1, 0))
+    rng = stable_rng(sequence_id=sequence_id, seed=seed, salt=f"hip_dropout:{duration}:{interval}")
+    phase_range = max(1, interval - duration)
+    start = first_candidate + int(rng.integers(0, phase_range))
+    while start + duration < frame_count:
+        window = valid[start : start + duration]
+        remaining_valid_count = window.sum(axis=1) - window[:, HIP_TRACKER_INDEX].astype(np.int64)
+        # 只生成完整的新 Hip 掉线事件；稀疏段若移除 Hip 会低于三点契约，则跳过该事件。
+        can_drop_full_window = bool(
+            window[:, HIP_TRACKER_INDEX].all()
+            and np.all(remaining_valid_count >= 3)
+        )
+        if can_drop_full_window:
+            valid[start : start + duration, HIP_TRACKER_INDEX] = False
+        start += interval
     return valid
 
 
@@ -229,8 +284,16 @@ def apply_segmented_tracker_patterns(
             seed=config.tracker_mask_seed,
             salt=f"segment_pattern:{segment_index}:{category}",
         )
-        pattern = make_tracker_pattern(category, rng)
-        valid[start:end] = np.asarray(pattern.sensor_valid, dtype=bool)[None, :]
+        if category == "dynamic_dropout":
+            # 长序列中的 dynamic_dropout 必须保留“持续掉线再重连”的时间语义，
+            # 不能退化成 make_tracker_pattern 返回的 full-six 基础模板。
+            valid[start:end] = make_dynamic_dropout_sensor_valid(
+                rng=rng,
+                seq_len=end - start,
+            )
+        else:
+            pattern = make_tracker_pattern(category, rng)
+            valid[start:end] = np.asarray(pattern.sensor_valid, dtype=bool)[None, :]
 
     valid &= base_sensor_valid
     validate_sensor_valid(valid)
@@ -253,12 +316,17 @@ def dynamic_segment_category(
 
 def build_dropout_metadata(source: dict[str, np.ndarray], config: LongseqDropoutConfig) -> dict[str, Any]:
     sensor_valid = np.asarray(source.get("sensor_valid"), dtype=bool)
+    hip_missing = ~sensor_valid[:, HIP_TRACKER_INDEX] if sensor_valid.size else np.zeros(0, dtype=bool)
+    hip_dropout_starts = hip_missing & np.concatenate(
+        [np.asarray([True]), ~hip_missing[:-1]]
+    ) if hip_missing.size else hip_missing
     return {
         "dropout_config": config.to_dict(),
         "valid_tracker_ratio": float(sensor_valid.mean()) if sensor_valid.size else 1.0,
         "min_valid_trackers": int(sensor_valid.sum(axis=1).min()) if sensor_valid.size else TRACKER_COUNT,
         "max_valid_trackers": int(sensor_valid.sum(axis=1).max()) if sensor_valid.size else TRACKER_COUNT,
-        "hip_valid_all": bool(sensor_valid[:, HIP_TRACKER_INDEX].all()) if sensor_valid.size else True,
+        "head_valid_all": bool(sensor_valid[:, HEAD_TRACKER_INDEX].all()) if sensor_valid.size else True,
+        "hip_dropout_event_count": int(hip_dropout_starts.sum()),
     }
 
 

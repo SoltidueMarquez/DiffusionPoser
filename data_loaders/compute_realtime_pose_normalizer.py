@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -8,11 +9,16 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.realtime_pose_dataset import (
+    RealtimePoseTaskDataset,
     encode_realtime_pose_features,
     find_manifest_path,
     load_materialized_task_npz,
     load_realtime_task_arrays,
     read_task_manifest,
+)
+from data_loaders.realtime_pose_contract import (
+    RUNTIME_CONTRACT_METADATA_FIELDS,
+    validate_stationary_label_metadata,
 )
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
@@ -23,8 +29,9 @@ from data_loaders.sensor_masking import (
     get_schema_spec,
     validate_pose_representation,
 )
+from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS
 from utils.artifact_paths import normalizer_root, task_root
-from utils.data_roots import load_data_roots
+from utils.artifact_roots import load_artifact_roots
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
 
@@ -36,7 +43,7 @@ DEFAULT_NORMALIZER_NAME = "amass_60hz_train"
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compute realtime_pose mean/std normalizer from materialized tasks.")
     group = parser.add_argument_group("paths")
-    group.add_argument("--data_roots_config", default="", type=str)
+    group.add_argument("--artifact_roots_config", default="", type=str)
     group.add_argument("--task_set_name", default=DEFAULT_TASK_SET_NAME, type=str)
     group.add_argument("--normalizer_name", default=DEFAULT_NORMALIZER_NAME, type=str)
     group.add_argument("--task_dir", default="", type=str)
@@ -46,6 +53,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
     group.add_argument("--split", default="train", type=str)
     group.add_argument("--eps", default=1e-8, type=float)
+    group.add_argument("--mask_samples_per_task", default=10, type=int)
+    group.add_argument("--tracker_mask_seed", default=10, type=int)
+    group.add_argument("--tracker_mask_epoch", default=0, type=int)
     group.add_argument("--run_name", default="auto", type=str)
     group.add_argument("--overwrite", action="store_true")
     return parser
@@ -59,7 +69,7 @@ def resolve_normalizer_paths(args: argparse.Namespace) -> argparse.Namespace:
     def get_roots():
         nonlocal roots
         if roots is None:
-            roots = load_data_roots(getattr(args, "data_roots_config", "") or None)
+            roots = load_artifact_roots(getattr(args, "artifact_roots_config", "") or None)
         return roots
 
     schema_name = str(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
@@ -76,11 +86,7 @@ def resolve_normalizer_paths(args: argparse.Namespace) -> argparse.Namespace:
     else:
         args.output_dir = Path(args.output_dir)
 
-    if roots is not None or not _path_arg_is_empty(getattr(args, "data_roots_config", "")):
-        args.generated_root = get_roots().generated_root
-    else:
-        # 旧式显式路径没有 data_roots 来源，用 normalizer root 作为可追踪的产物根记录。
-        args.generated_root = Path(args.output_dir)
+    args.generated_root = get_roots().generated_root
     return args
 
 
@@ -111,8 +117,26 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     running_count: np.ndarray | None = None
     total_frames = 0
     tracker_valid_observation_counts = np.zeros(TRACKER_COUNT, dtype=np.int64)
+    tracker_pattern_counts: dict[str, int] = {}
+    mask_samples_per_task = int(getattr(args, "mask_samples_per_task", 10))
+    if mask_samples_per_task <= 0:
+        raise ValueError("mask_samples_per_task must be positive")
+    online_dataset = RealtimePoseTaskDataset(
+        data_dir=task_dir,
+        split=str(args.split),
+        normalize_input=False,
+        cache_last_task=bool(getattr(args, "cache_last_task", True)),
+        tracker_mask_policy="dynamic_categories",
+        tracker_mask_seed=int(getattr(args, "tracker_mask_seed", 10)),
+        tracker_mask_categories=["all"],
+    )
+    online_dataset.set_epoch(int(getattr(args, "tracker_mask_epoch", 0)))
+    if len(online_dataset) != len(task_entries):
+        raise RuntimeError("normalizer Dataset/manifest task count mismatch")
 
-    for entry in tqdm(task_entries, desc=f"统计 split={args.split} realtime normalizer", unit="task"):
+    for task_index, entry in enumerate(
+        tqdm(task_entries, desc=f"统计 split={args.split} realtime normalizer", unit="task")
+    ):
         entry_schema = str(entry.get("schema_name", schema.name))
         if entry_schema != schema.name:
             raise ValueError(f"task {entry.get('task_id', '<unknown>')} schema_name={entry_schema}，期望 {schema.name}")
@@ -121,15 +145,22 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
             schema_name=schema.name,
             source=f"{manifest_path}:{entry.get('task_id', '<unknown>')}",
         )
-        task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"], schema_name=schema.name)
-        arrays = load_realtime_task_arrays(task=task, seq_len=REALTIME_POSE_SEQ_LEN, schema_name=schema.name)
-        features = encode_realtime_pose_features(arrays, schema_name=schema.name)
-        seq_sum, seq_sumsq, seq_count = masked_task_feature_stats(features=features, sensor_valid=arrays["sensor_valid"], schema_name=schema.name)
-        running_sum = seq_sum if running_sum is None else running_sum + seq_sum
-        running_sumsq = seq_sumsq if running_sumsq is None else running_sumsq + seq_sumsq
-        running_count = seq_count if running_count is None else running_count + seq_count
-        total_frames += int(features.shape[0])
-        tracker_valid_observation_counts += arrays["sensor_valid"].sum(axis=0).astype(np.int64)
+        for _ in range(mask_samples_per_task):
+            item = online_dataset[task_index]
+            features = item["x"].T.numpy()
+            sensor_valid = item["sensor_valid"].T.numpy().astype(bool)
+            seq_sum, seq_sumsq, seq_count = masked_task_feature_stats(
+                features=features,
+                sensor_valid=sensor_valid,
+                schema_name=schema.name,
+            )
+            running_sum = seq_sum if running_sum is None else running_sum + seq_sum
+            running_sumsq = seq_sumsq if running_sumsq is None else running_sumsq + seq_sumsq
+            running_count = seq_count if running_count is None else running_count + seq_count
+            total_frames += int(features.shape[0])
+            tracker_valid_observation_counts += sensor_valid.sum(axis=0).astype(np.int64)
+            pattern = str(item["tracker_pattern"])
+            tracker_pattern_counts[pattern] = tracker_pattern_counts.get(pattern, 0) + 1
 
     if running_sum is None or running_sumsq is None or running_count is None or total_frames <= 0:
         raise RuntimeError("没有成功统计到有效帧，无法生成 realtime_pose normalizer。")
@@ -152,33 +183,69 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         "output_dir": str(output_dir),
         "split": args.split,
         "matched_tasks": len(task_entries),
+        "mask_samples_per_task": mask_samples_per_task,
+        "normalizer_mask_samples": len(task_entries) * mask_samples_per_task,
+        "tracker_mask_seed": int(getattr(args, "tracker_mask_seed", 10)),
+        "tracker_mask_epoch": int(getattr(args, "tracker_mask_epoch", 0)),
+        "cache_last_task": bool(getattr(args, "cache_last_task", True)),
         "total_frames": total_frames,
         "tracker_valid_observation_counts": tracker_valid_observation_counts.astype(int).tolist(),
+        "tracker_pattern_counts": tracker_pattern_counts,
+        "tracker_pattern_distribution": {
+            key: float(value) / float(len(task_entries) * mask_samples_per_task)
+            for key, value in sorted(tracker_pattern_counts.items())
+        },
         "feature_dim": schema.feature_dim,
         "eps": float(args.eps),
         "std_definition": "population",
+        "task_manifest_path": str(manifest_path.resolve()),
+        "task_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     }
+    for key in RUNTIME_CONTRACT_METADATA_FIELDS:
+        if key not in task_entries[0]:
+            raise ValueError(f"task manifest entry missing runtime contract field {key!r}")
+        meta[key] = task_entries[0][key]
+    if schema.supports_stationary_prob:
+        for key in STATIONARY_LABEL_METADATA_FIELDS:
+            if key not in task_entries[0]:
+                raise ValueError(f"task manifest entry missing stationary label field {key!r}")
+            meta[key] = task_entries[0][key]
+        validate_stationary_label_metadata(meta, source=str(manifest_path))
+    meta["codec_reference_policy_hash"] = hashlib.sha256(
+        (
+            str(meta["tracker_codec_version"])
+            + "|"
+            + str(meta["reference_policy_version"])
+            + "|"
+            + str(meta["resolver_contract_version"])
+        ).encode("utf-8")
+    ).hexdigest()
     save_meta(output_dir=output_dir, meta=meta)
+    latest_metadata = {
+        "output_dir": str(output_dir),
+        "normalizer_dir": str(output_dir),
+        "normalizer_root": str(output_root),
+        "task_dir": str(task_dir),
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "generated_root": str(Path(getattr(args, "generated_root", output_root))),
+        "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
+        "normalizer_name": str(getattr(args, "normalizer_name", DEFAULT_NORMALIZER_NAME)),
+        "split": args.split,
+        "matched_tasks": len(task_entries),
+    }
+    if schema.supports_stationary_prob:
+        latest_metadata.update(
+            {key: meta[key] for key in STATIONARY_LABEL_METADATA_FIELDS}
+        )
     write_latest_pointer(
         root_dir=output_root,
         kind="normalizer",
         output_dir=output_dir,
-        metadata={
-            "output_dir": str(output_dir),
-            "normalizer_dir": str(output_dir),
-            "normalizer_root": str(output_root),
-            "task_dir": str(task_dir),
-            "schema_name": schema.name,
-            "schema_canonical_name": str(schema.canonical_name),
-            "pose_representation": schema.pose_representation,
-            "root_y_policy": schema.root_y_policy,
-            "pelvis_height_mode": schema.pelvis_height_mode,
-            "generated_root": str(Path(getattr(args, "generated_root", output_root))),
-            "task_set_name": str(getattr(args, "task_set_name", DEFAULT_TASK_SET_NAME)),
-            "normalizer_name": str(getattr(args, "normalizer_name", DEFAULT_NORMALIZER_NAME)),
-            "split": args.split,
-            "matched_tasks": len(task_entries),
-        },
+        metadata=latest_metadata,
     )
     return meta
 
