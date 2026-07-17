@@ -14,6 +14,7 @@ from data_loaders.sensor_masking import (
 )
 from export.export_sentis_denoiser import SentisDenoiserWrapper, export_onnx
 from model.diffusionposer_dit import DiffusionPoserDiT
+from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 from utils.model_util import create_model_and_diffusion
 from train.training_loop import validate_loaded_state_dict_keys
 
@@ -71,6 +72,52 @@ def test_target_dit_without_schema_uses_current_default_schema():
     )
     model, _diffusion = create_model_and_diffusion(args)
     assert model.schema.name == DEFAULT_REALTIME_POSE_SCHEMA_NAME
+
+
+def test_target_dit_projects_predicted_stationary_logits_before_inpaint_blending():
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    model = RealtimePoseTargetDiT(
+        input_feats=schema.feature_dim,
+        schema_name=schema.name,
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        dropout=0.0,
+        max_seq_len=REALTIME_POSE_SEQ_LEN,
+    )
+    target_slice = schema.target_slice()
+    stationary_slice = schema.stationary_prob_slice()
+    stationary_start = stationary_slice.start - target_slice.start
+    stationary_stop = stationary_slice.stop - target_slice.start
+    stationary_logits = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
+    with torch.no_grad():
+        model.output_proj.weight.zero_()
+        model.output_proj.bias.zero_()
+        model.output_proj.bias[0] = 2.0
+        model.output_proj.bias[stationary_start:stationary_stop] = stationary_logits
+
+    x = torch.zeros(1, schema.feature_dim, REALTIME_POSE_SEQ_LEN)
+    known_stationary = torch.tensor([0.05, 0.25, 0.50, 0.75, 0.95])
+    x[:, stationary_slice, REALTIME_POSE_TARGET_START] = known_stationary
+    predicted_mask = torch.zeros_like(x, dtype=torch.bool)
+    predicted_mask[:, target_slice, REALTIME_POSE_TARGET_START] = True
+
+    predicted = model(x, torch.zeros(1), inpaint_cond=predicted_mask)
+    predicted_stationary = predicted[:, stationary_slice, REALTIME_POSE_TARGET_START]
+    assert torch.allclose(predicted_stationary, torch.sigmoid(stationary_logits)[None])
+    assert torch.all((predicted_stationary >= 0.0) & (predicted_stationary <= 1.0))
+    assert predicted[0, target_slice.start, REALTIME_POSE_TARGET_START].item() == pytest.approx(2.0)
+
+    predicted_stationary.sum().backward()
+    stationary_grad = model.output_proj.bias.grad[stationary_start:stationary_stop]
+    assert torch.isfinite(stationary_grad).all()
+    assert torch.all(stationary_grad > 0.0)
+
+    known = model(x, torch.zeros(1), inpaint_cond=torch.zeros_like(x, dtype=torch.bool))
+    assert torch.equal(
+        known[:, stationary_slice, REALTIME_POSE_TARGET_START],
+        known_stationary[None],
+    )
 
 
 def test_models_have_single_motion_output_and_no_stationary_head():
@@ -134,3 +181,4 @@ def test_target_dit_onnx_keeps_sentis_input_contract(tmp_path):
     assert {"x_t", "timestep", "inpaint_mask", "valid_frame_mask"}.issubset(input_names)
     assert [value.name for value in graph.output] == ["pred_x0"]
     assert len(graph.output) == 1
+    assert any(node.op_type == "Sigmoid" for node in graph.node)

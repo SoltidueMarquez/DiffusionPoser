@@ -131,6 +131,7 @@ class RealtimePoseTargetDiT(nn.Module):
         hidden = self.transformer(tokens, mask=causal_mask, src_key_padding_mask=token_mask)
         target_hidden = hidden[:, 0]
         pred_target = self.output_proj(target_hidden)
+        pred_target = self._project_stationary_probabilities(pred_target)
         target_mask = inpaint_cond[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START].to(dtype=hidden_states.dtype)
         input_target = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
         pred_target = pred_target * target_mask + input_target * (1.0 - target_mask)
@@ -138,6 +139,25 @@ class RealtimePoseTargetDiT(nn.Module):
         output = hidden_states.clone()
         output[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START] = pred_target
         return output
+
+    def _project_stationary_probabilities(self, pred_target: torch.Tensor) -> torch.Tensor:
+        """把 stationary logits 映射到概率域，同时保持单一 motion 输出契约。"""
+
+        if not self.schema.supports_stationary_prob:
+            return pred_target
+        target_slice = self.schema.target_slice()
+        stationary_slice = self.schema.stationary_prob_slice()
+        stationary_start = stationary_slice.start - target_slice.start
+        stationary_stop = stationary_slice.stop - target_slice.start
+        # 在与已知值混合之前投影；被 inpaint mask 关闭的通道仍原样保留输入。
+        return torch.cat(
+            (
+                pred_target[:, :stationary_start],
+                torch.sigmoid(pred_target[:, stationary_start:stationary_stop]),
+                pred_target[:, stationary_stop:],
+            ),
+            dim=1,
+        )
 
     def _extract_sensor_values(self, hidden_states: torch.Tensor) -> torch.Tensor:
         values = []

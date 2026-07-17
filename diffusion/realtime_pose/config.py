@@ -21,7 +21,8 @@ class RealtimePoseLossConfig:
     nohip_height_loss_weight: float = 0.023221202705222908
     stationary_regression_loss_weight: float = 0.020235997785184236
     stationary_margin_loss_weight: float = 0.022660554661242633
-    stationary_range_loss_weight: float = 0.007606635301678543
+    # target_dit 已将 stationary logits 映射到 [0,1]，range loss 只保留为诊断兼容项。
+    stationary_range_loss_weight: float = 0.0
     contact_height_loss_weight: float = 0.015288775346708965
     contact_velocity_loss_weight: float = 2.0343500261020283e-05
     joint_velocity_loss_weight: float = 0.00038461258563439796
@@ -111,7 +112,6 @@ REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS: dict[str, float] = {
     "nohip_height_loss": 0.05,
     "stationary_regression_loss": 0.10,
     "stationary_margin_loss": 0.05,
-    "stationary_range_loss": 0.10,
     "contact_height_loss": 0.025,
     "contact_velocity_loss": 0.025,
     "joint_velocity_loss": 0.04,

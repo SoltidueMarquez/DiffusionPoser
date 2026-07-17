@@ -151,8 +151,8 @@ def test_realtime_aux_backward_is_finite_for_bfloat16_model_output():
     assert torch.isfinite(pred.grad).all()
 
 
-def test_c04_auxiliary_loss_fixed_input_regression():
-    """固定输入锁定 C04 配置下的逐项 Loss、timestep 衰减和 rollout 速度项。"""
+def test_default_auxiliary_loss_fixed_input_regression():
+    """固定输入锁定当前默认配置下的逐项 loss、timestep 衰减和 rollout 速度项。"""
 
     torch.manual_seed(20260716)
     diffusion = _make_loss_test_diffusion()
@@ -218,7 +218,7 @@ def test_c04_auxiliary_loss_fixed_input_regression():
         "rotation_velocity_loss": (1.1085032225, 1.1846578121),
         "yaw_velocity_loss": (0.0, 25.3074073792),
         "aux_timestep_weight": (1.0, 0.1000000015),
-        "aux_loss": (0.0214044861, 0.0555274896),
+        "aux_loss": (0.0211762871, 0.0555274896),
     }
     for loss_name, values in expected.items():
         assert torch.allclose(losses[loss_name], torch.tensor(values), rtol=1e-5, atol=1e-6)

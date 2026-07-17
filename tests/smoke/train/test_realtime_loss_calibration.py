@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from diffusion.realtime_pose import REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS
+from diffusion.realtime_pose import (
+    REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS,
+    RealtimePoseLossConfig,
+)
 from train.realtime_loss_calibration import (
     calibrate_realtime_loss_weights,
     expected_active_loss_terms,
@@ -26,10 +29,19 @@ def test_loss_weight_calibration_rejects_expected_term_with_zero_gradient():
     sample = {"simple_loss": 1.0}
     for loss_name in REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS:
         sample[loss_name] = 1.0
-    sample["stationary_range_loss"] = 0.0
+    sample["stationary_margin_loss"] = 0.0
 
-    with pytest.raises(RuntimeError, match="stationary_range_loss"):
+    with pytest.raises(RuntimeError, match="stationary_margin_loss"):
         calibrate_realtime_loss_weights([sample])
+
+
+def test_bounded_stationary_defaults_keep_runtime_boundary_and_disable_range_target():
+    config = RealtimePoseLossConfig()
+
+    assert config.stationary_runtime_threshold == pytest.approx(0.7)
+    assert config.stationary_runtime_margin == pytest.approx(0.1)
+    assert config.stationary_range_loss_weight == 0.0
+    assert "stationary_range_loss" not in REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS
 
 
 def test_calibration_activation_tracks_nohip_contact_and_predicted_history():
