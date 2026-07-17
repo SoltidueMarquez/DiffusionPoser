@@ -9,7 +9,8 @@
 ## 基本环境
 
 - 默认工作目录是仓库根目录。
-- Python、pytest、训练、采样、评估和导出命令优先使用 Anaconda 环境；给用户生成或实际执行 `conda run` 命令时，默认带 `--no-capture-output`，方便面板实时显示日志：
+- Python、pytest、训练、采样、评估和导出命令优先使用 Anaconda 环境：
+- 给用户生成或实际执行 `conda run` 命令时，检查是否包含 `--no-capture-output`；需要面板实时显示日志的命令默认使用该参数。
 
 ```powershell
 conda run --no-capture-output -n diffusionposer5070 <command>
@@ -54,7 +55,6 @@ conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/train
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/sample
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/eval
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/export
-conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/visual_editor
 conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/schemas
 ```
 
@@ -70,19 +70,22 @@ conda run --no-capture-output -n diffusionposer5070 pytest tests/smoke/schemas
 - resume checkpoint 必须 exact `schema_name` 匹配；不能因为 `schema_canonical_name` 相同而放宽恢复条件。
 - 固定为 60 帧历史条件 + 第 61 帧单帧补全。
 - `seq_len = 61`，`target_start = 60`，`target_length = 1`。
-- `feature_dim = 214`，模型输入输出均为 `[B, 214, 61]`。
+- `feature_dim = 214`，模型条件输入为 `[B, 214, 61]`，扩散目标是第 61 帧的 154 维主特征。
 - source/task/normalizer/runtime asset 必须包含所选 exact `schema_name` 和 `pose_representation="body_fbx_local_delta_6d"`。
 - source/task/normalizer/runtime asset 必须显式包含 `root_y_policy="fixed_zero"` 和 `pelvis_height_mode="pelvis_local_offset_y"`。
-- actor root 的 world y 固定为 0；`root_pos_world[:, 1]` 必须全为 0。
+- AMASS 数据坐标中 actor root y 固定为 0；运行时 Resolver 的 world root y 等于当前 `floor_y`。
 - `pelvis_height` 表示 pelvis bone 的 local offset y，必须等于 `joints_world[:, 0, 1]`。
 - 通道 `0:144` 是 `body_pose_body_fbx_local_delta_6d`，`144:146` 是 `root_heading_delta_sincos`。
 - 通道 `146:148` 是 `root_delta_xz_ref`，`148:149` 是 `pelvis_height`，`149:154` 是 `stationary_prob_5`。
 - 通道 `154:172` 是 `tracker_pos_ref`，`172:208` 是 `tracker_rot_ref_6d`，`208:214` 是 `sensor_valid`。
 - `inpaint_mask` 只允许覆盖第 61 帧的 `0:154`。
-- hip/waist tracker 必须始终 valid；每帧至少 3 个 tracker valid。
-- 默认 task generator 每个窗口只写 full-tracker task；训练随机遮盖在 `RealtimePoseTaskDataset` 中动态发生。
+- Head tracker 必须 valid，每帧至少 3 个 tracker valid；Hip/waist 可以缺失。
+- 默认 task generator 每个窗口只物化一份 `full_six` base task，并保存两步相邻 rollout task 与 32 帧 Resolver 前置 context；不得按 mask 模式复制任务文件。
+- Dataset 按 source absolute frame 在线生成可复现 mask timeline，10 次访问严格形成 30% `full_six` / 30% `standard_three` / 20% `static_sparse` / 20% `dynamic_dropout`，且主窗口与相邻 rollout 的重叠帧必须一致。
 - invalid tracker 的 `tracker_pos_ref/tracker_rot_ref_6d` 在归一化后置零，不使用 GT 或上一帧 stale fill。
-- 当前帧 tracker 只能用 `root_yaw_{t-1}` 转到参考局部系，不能使用 GT `root_yaw_t`。
+- Hip 有效时使用当前校准 Hip 可在推理前计算的 root reference；Hip 无效时使用上一帧最终 Root/yaw，不得依赖当前模型输出。
+- `feature_contract_version=2`，Tracker/Resolver 分别遵循 `tracker_codec_v2` 和 `runtime_root_resolver_v1`。
+- 保留主通道 `stationary_prob_5=149:154`；不得重新引入额外 `StationaryHead` 或第二 ONNX/Sentis 输出。
 - 必须保存 `stationary_prob_5`，由转换阶段从 `joints_world` 的 pelvis、左右脚、左右手速度派生。
 
 ## 变更原则

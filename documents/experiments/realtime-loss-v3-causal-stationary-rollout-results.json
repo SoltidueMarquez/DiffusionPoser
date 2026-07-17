@@ -1,0 +1,156 @@
+{
+  "schema_version": 2,
+  "experiment_id": "c04-loss-v3-stable-rollout",
+  "title": "Loss V3 + Causal Stationary + Stable Rollout",
+  "date": "2026-07-16",
+  "schema_name": "realtime_pose_stationary5_v1",
+  "baseline_status": "training_seed_unaccepted_stationary",
+  "accepted": false,
+  "code": {
+    "commit": "e8d93edc9d12e5725a6612a12891fc576538e8d6",
+    "tag": "baseline/c04-loss-v3-stable-rollout",
+    "profile_path": "configs/experiments/c04-loss-v3-stable-rollout.json",
+    "profile_sha256": "764be8d92bf354674c9c3fd89b50cd79d596987ae4488ba2fab3e8f5b9201a43",
+    "profile_file_sha256": "68a1b7f6848b913d7ef5166946dd7a06839b0b32617ea974cefc6a5a3555b122"
+  },
+  "comparison": {
+    "reference_id": "C00 A02 loss-v2 h1",
+    "reference_status": "historical_control_only",
+    "scope": "same 18-sequence longseq set, predicted-history rollout, non-EMA model weights, seed 10"
+  },
+  "artifacts": {
+    "runtime_contract": {
+      "id": "runtime.body_fbx_rest",
+      "raw_file_sha256": "c59d0251623c42080e0c231aae534d353406d97b08d9959fc1ba948f70f201d2",
+      "tree_sha256": "c6f006d657cb1e18de5afbe954d5f4e2ed1fe09bbb5afbbbb6dcf4bdceae275c"
+    },
+    "source": {
+      "id": "source.c04.causal_stationary",
+      "tree_sha256": "b0ef7b2c1d994cb539cb11f281b8afa34be70647395602b34d1506c6ef367b48"
+    },
+    "tasks": {
+      "id": "task.c04.rollout9",
+      "tree_sha256": "8f92bb8715eb4d8eace447758be28cd3442718edf98af3cdcab5f8c2e23c46c4"
+    },
+    "normalizer": {
+      "id": "normalizer.c04.train",
+      "tree_sha256": "e8051e3af668095ff02e7350c5965bb4d2cf12706e5e0f0553ea20d4cd1d4119"
+    },
+    "longseq_eval": {
+      "id": "longseq.c04.pre_stage_a",
+      "tree_sha256": "3b37c17e6cd7fd74d192b8744af3582ac5822e1a761fad238e4a3a4980d0c495"
+    },
+    "training_run": {
+      "id": "run.c04",
+      "tree_sha256": "78c79f7167eb75c701c2dd1b0a1f70f71d6761ec49cdd9b5c83d89c22d7efb55",
+      "args_json_sha256": "889d357c2e68613485324f1d4f1dc7a3f529f6d9c420f88458139b2db7da52e6"
+    },
+    "model_checkpoint": {
+      "id": "checkpoint.c04.model",
+      "raw_file_sha256": "0d336aad175ab4a4e94574f0acf5d246f509cb672c14d3c44cedf6d202dca532",
+      "tree_sha256": "fd7e0736153d46dcc7ab09f62fa71d02114724462bb47e5fe38e1d402a82cb5b"
+    },
+    "ema_checkpoint": {
+      "id": "checkpoint.c04.ema",
+      "raw_file_sha256": "76a57db9ddb9ad291014e4dc0602f5d049ec4cf25c2a0a4063107a3d25040784",
+      "tree_sha256": "9925ff8a1496560ee0eedb556b917a63d020f7051bc1fbfcd79744baa3846778"
+    },
+    "full_evaluation_output": {
+      "id": "output.c04.longseq",
+      "tree_sha256": "58170136bbb39190625e3e021aca93a46f078e0081064bd21708013e5c325662",
+      "status": "retirement_pending_after_predelete_review"
+    },
+    "evaluation_summary": {
+      "id": "summary.c04.longseq",
+      "raw_file_sha256": "d7f3c8f7a764d6fa1fa533e1f2081fc2143ffd6a5fe4374de48d554185ba9720",
+      "tree_sha256": "43f7f47b9e4cc4759388b93f754eb02d79014d907a90ecc3912b80f7f58ead55",
+      "status": "compacted_into_this_record_then_retirement_pending"
+    }
+  },
+  "training": {
+    "seed": 10,
+    "batch_size": 16,
+    "learning_rate": 0.00001,
+    "num_steps": 5000,
+    "rollout_steps": 9,
+    "rollout_ddim_steps": 10,
+    "weights": "model",
+    "final_step": 5000,
+    "last_1k": {
+      "loss": 0.010369534242432563,
+      "simple_loss": 0.0036914380134549,
+      "aux_loss": 0.0002917283019269234,
+      "grad_norm_pre_clip": 0.29095802292227746,
+      "grad_clipped_fraction": 0.0,
+      "short_rollout_event_fraction": 0.488,
+      "long_rollout_event_fraction": 0.264,
+      "long_rollout_average_horizon": 5.04343364310157
+    }
+  },
+  "evaluation": {
+    "sequence_count": 18,
+    "frames": 49326,
+    "evaluated_frames": 48246,
+    "dropout_policy": "dynamic_categories: full_six, standard_three, static_sparse, dynamic_dropout",
+    "metrics": {
+      "C00": {
+        "mpjpe_mean_m": 0.12006458308961657,
+        "mpjre_deg": 17.859859927658313,
+        "mpjve_cmps": 116.50779001964672,
+        "jitter_mps3": 5497.0669251314075,
+        "stationary_f1_at_0_7": 0.1809671236189172,
+        "stationary_false_lock_rate_at_0_7": 0.10082715665611404,
+        "stationary_preclamp_out_of_bounds_ratio": 0.4778095350587627
+      },
+      "C04": {
+        "mpjpe_mean_m": 0.10380152571532461,
+        "mpjre_deg": 17.355382129958908,
+        "mpjve_cmps": 68.36048026951649,
+        "jitter_mps3": 3040.4737587016652,
+        "stationary_f1_at_0_5": 0.3155043233183499,
+        "stationary_false_lock_rate_at_0_5": 0.3231924243048764,
+        "stationary_f1_at_0_7": 0.2543955535068383,
+        "stationary_false_lock_rate_at_0_7": 0.1813298866246846,
+        "stationary_missed_lock_rate_at_0_7": 0.6336599372023349,
+        "stationary_preclamp_out_of_bounds_ratio": 0.28399615040973364,
+        "full_six_mpjpe_cm": 4.000777666980578,
+        "standard_three_mpjpe_cm": 17.443531425691486,
+        "tracker_reprojection_pos_mean_cm": 3.96607772509257,
+        "tracker_reprojection_rot_mean_deg": 17.166742934316627
+      }
+    }
+  },
+  "acceptance": {
+    "thresholds": {
+      "stationary_preclamp_out_of_bounds_lt": 0.05,
+      "stationary_f1_at_0_7_gain_ge": 0.1,
+      "stationary_false_lock_at_0_7_regression_le": 0.03,
+      "pose_tracker_regression_le": 0.05
+    },
+    "results": {
+      "stationary_preclamp_out_of_bounds": false,
+      "stationary_f1_at_0_7_gain": 0.07342843338692187,
+      "stationary_f1_at_0_7_gain_pass": false,
+      "stationary_false_lock_at_0_7_regression": 0.08050273096857055,
+      "stationary_false_lock_at_0_7_pass": false,
+      "pose_and_tracker_protection_pass": true
+    },
+    "conclusion": "C04 remains a reusable training seed, but stationary acceptance is not met and it must not be reported as stationary-approved."
+  },
+  "retention": {
+    "keep": [
+      "runtime.body_fbx_rest",
+      "source.c04.causal_stationary",
+      "task.c04.rollout9",
+      "normalizer.c04.train",
+      "longseq.c04.pre_stage_a",
+      "run.c04",
+      "checkpoint.c04.model",
+      "checkpoint.c04.ema"
+    ],
+    "delete_after_manifest_review": [
+      "output.c04.longseq",
+      "summary.c04.longseq"
+    ]
+  }
+}
