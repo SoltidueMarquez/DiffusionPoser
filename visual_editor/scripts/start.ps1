@@ -129,12 +129,12 @@ Write-Host "[visual_editor] amass_dir=$env:REALTIME_POSE_EDITOR_AMASS_DIR"
 if ($env:REALTIME_POSE_EDITOR_DATA_DIR) {
     $DisplayDataDir = $env:REALTIME_POSE_EDITOR_DATA_DIR
 } else {
-    $DisplayDataDir = "<data_roots default>"
+    $DisplayDataDir = "<artifact_roots default>"
 }
 if ($env:REALTIME_POSE_EDITOR_SOURCE_DIR) {
     $DisplaySourceDir = $env:REALTIME_POSE_EDITOR_SOURCE_DIR
 } else {
-    $DisplaySourceDir = "<data_roots default>"
+    $DisplaySourceDir = "<artifact_roots default>"
 }
 Write-Host "[visual_editor] data_dir=$DisplayDataDir"
 Write-Host "[visual_editor] source_dir=$DisplaySourceDir"

@@ -9,7 +9,13 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.generate_realtime_pose_tasks import clip_source, load_realtime_source, normalize_slashes, save_task_npz
+from data_loaders.generate_realtime_pose_tasks import (
+    add_runtime_task_arrays,
+    clip_source,
+    load_realtime_source,
+    normalize_slashes,
+    save_task_npz,
+)
 from data_loaders.realtime_pose_contract import validate_realtime_task_contract, validate_root_y0_invariants
 from data_loaders.sensor_masking import (
     LEGACY_BODY_POSE_PARENT_KEY,
@@ -27,6 +33,7 @@ from data_loaders.sensor_masking import (
     TASK_MASK_POLICY_FULL,
     create_realtime_inpaint_mask,
     get_schema_spec,
+    make_dynamic_dropout_sensor_valid,
     make_tracker_pattern,
     repeat_pattern_sensor_valid,
     validate_pose_representation,
@@ -217,7 +224,7 @@ def write_realtime_task_dataset(
         raise FileExistsError(f"export directory already exists: {export_dir}")
 
     pattern_categories = resolve_pattern_categories(request)
-    mask_policy = TASK_MASK_POLICY_FULL if pattern_categories == ["full-trackers"] else TASK_MASK_POLICY_FIXED_PATTERNS
+    mask_policy = TASK_MASK_POLICY_FULL if pattern_categories == ["full_six"] else TASK_MASK_POLICY_FIXED_PATTERNS
     rng = np.random.default_rng(int(request.get("seed", 10)))
     split_dir = export_dir / split
     task_dir = split_dir / "tasks"
@@ -241,15 +248,33 @@ def write_realtime_task_dataset(
             )
             for pattern_index, category in enumerate(pattern_categories):
                 pattern = make_tracker_pattern(category, rng)
-                sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=REALTIME_POSE_SEQ_LEN)
+                if category == "dynamic_dropout":
+                    full_sensor_valid = make_dynamic_dropout_sensor_valid(
+                        rng=rng,
+                        seq_len=frame_count,
+                        min_duration_frames=2,
+                        max_duration_frames=30,
+                        max_missing_trackers=3,
+                    )
+                else:
+                    full_sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=frame_count)
+                sensor_valid = full_sensor_valid[start_frame : start_frame + REALTIME_POSE_SEQ_LEN].copy()
                 validate_sensor_valid(sensor_valid)
+                runtime_task_arrays = add_runtime_task_arrays(
+                    task_arrays=task_arrays,
+                    sensor_valid=sensor_valid,
+                    source=source,
+                    absolute_start_frame=start_frame,
+                    full_sensor_valid=full_sensor_valid,
+                )
                 task_id = f"{safe_token(project_id)}_f{target_frame:06d}_p{pattern_index:02d}_{safe_token(category)}"
                 task_rel_path = Path("tasks") / f"{task_id}.npz"
                 task_path = split_dir / task_rel_path
                 save_task_npz(
                     task_path=task_path,
                     compress=False,
-                    **task_arrays,
+                    **runtime_task_arrays,
+                    source_path=np.asarray(str(source_path)),
                     sensor_valid=sensor_valid,
                     inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
                     start_frame=np.int64(start_frame),
@@ -258,6 +283,8 @@ def write_realtime_task_dataset(
                     valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
                     source_frames=np.int64(frame_count),
                     seq_len=np.int64(REALTIME_POSE_SEQ_LEN),
+                    rollout_step=np.int64(0),
+                    max_rollout_steps=np.int64(1),
                 )
                 manifest_entry = {
                     "task_id": task_id,
@@ -271,6 +298,8 @@ def write_realtime_task_dataset(
                     "source_frames": frame_count,
                     "seq_len": REALTIME_POSE_SEQ_LEN,
                     "feature_dim": schema.feature_dim,
+                    "max_rollout_steps": 1,
+                    "rollout_task_paths": [],
                     "task_format": schema.task_format,
                     "schema_name": schema.name,
                     POSE_REPRESENTATION_KEY: schema.pose_representation,
@@ -327,7 +356,7 @@ def resolve_target_frames(request: dict[str, Any], frame_count: int) -> list[int
 
 
 def resolve_pattern_categories(request: dict[str, Any]) -> list[str]:
-    value = request.get("tracker_pattern") or request.get("tracker_patterns") or "full-trackers"
+    value = request.get("tracker_pattern") or request.get("tracker_patterns") or "full_six"
     if isinstance(value, str):
         categories = [value]
     else:

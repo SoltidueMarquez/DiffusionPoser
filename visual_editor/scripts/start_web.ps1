@@ -118,12 +118,12 @@ $env:REALTIME_POSE_EDITOR_SMPL_MODEL_DIR = [string]$SmplModelDir
 if ($DataDir.Trim() -ne "") {
     $DisplayDataDir = $DataDir
 } else {
-    $DisplayDataDir = "<data_roots default>"
+    $DisplayDataDir = "<artifact_roots default>"
 }
 if ($SourceDir.Trim() -ne "") {
     $DisplaySourceDir = $SourceDir
 } else {
-    $DisplaySourceDir = "<data_roots default>"
+    $DisplaySourceDir = "<artifact_roots default>"
 }
 Write-Host "[visual_editor_web] data_dir=$DisplayDataDir"
 Write-Host "[visual_editor_web] amass_dir=$AmassDir"

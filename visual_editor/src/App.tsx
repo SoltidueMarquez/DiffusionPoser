@@ -6,7 +6,7 @@ import { api } from "./api";
 import type { CompareFramesPayload, EditProject, FrameState, LibraryPayload, MotionAsset, MotionTrack, PaneSelection, Vec3 } from "./types";
 
 const TRACKER_NAMES = ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"];
-const TRACKER_PATTERN_CATEGORIES = ["head-present", "hand-present", "foot-present", "upper-body", "lower-body", "mixed-sparse", "full-trackers"];
+const TRACKER_PATTERN_CATEGORIES = ["full_six", "standard_three", "static_sparse", "dynamic_dropout"];
 const EDIT_TARGETS = ["root", ...TRACKER_NAMES];
 const ASSET_KINDS = ["source", "task", "result"] as const;
 type AssetKind = MotionAsset["kind"];
@@ -217,7 +217,7 @@ export function App() {
   const [exportStart, setExportStart] = useState(60);
   const [exportEnd, setExportEnd] = useState(60);
   const [exportStride, setExportStride] = useState(1);
-  const [trackerPatterns, setTrackerPatterns] = useState<string[]>(["full-trackers"]);
+  const [trackerPatterns, setTrackerPatterns] = useState<string[]>(["full_six"]);
   const [log, setLog] = useState("Connecting local API...");
   const [collapsedAssetKinds, setCollapsedAssetKinds] = useState<Record<AssetKind, boolean>>({
     source: false,
@@ -757,7 +757,7 @@ export function App() {
                   onChange={(event) =>
                     setTrackerPatterns((current) => {
                       const next = event.target.checked ? [...current, pattern] : current.filter((item) => item !== pattern);
-                      return next.length ? next : ["full-trackers"];
+                      return next.length ? next : ["full_six"];
                     })
                   }
                 />

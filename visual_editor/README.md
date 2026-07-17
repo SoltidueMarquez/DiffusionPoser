@@ -1,19 +1,26 @@
 # RealtimePose Studio
 
-`visual_editor/` 是本地 realtime pose source、task 和 result 查看/导出工具。默认 schema 是 `realtime_pose_stationary5_v1`，legacy exact schema `realtime_pose_body_fbx_local_root_y0_v1` 仍可读取。
+`visual_editor/` 是本地 realtime pose source、task 和 result 的查看与导出工具。默认 schema 为
+`realtime_pose_stationary5_v1`；已注册的 legacy exact schema
+`realtime_pose_body_fbx_local_root_y0_v1` 仍可读取。
 
 ## 启动 API
 
 ```powershell
-conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server --result_dir output --output_dir visual_editor/.runtime/exports
+conda run --no-capture-output -n diffusionposer5070 python -m visual_editor.server
 ```
 
-未显式传 `--source_dir/--data_dir` 时，API 会根据 `configs/data_roots.local.json` 或 `configs/data_roots.example.json` 的 `generated_root` 解析默认 source/task 目录。
+未显式指定 source 或 task 路径时，API 从
+`configs/artifact_roots.local.json` 或 `configs/artifact_roots.example.json` 解析
+AMASS、SMPL、source、task、结果和编辑器运行目录。环境变量
+`REALTIME_POSE_EDITOR_*` 仍可为单次启动覆盖对应路径。
 
-## 数据
+## 数据契约
 
-- Source：默认读取 default schema `realtime_pose_stationary5_v1` `.npz`，同时保留 legacy exact schema `realtime_pose_body_fbx_local_root_y0_v1` 读取能力；字段包含 `body_pose_body_fbx_local_delta_6d/pose_representation/root_pos_world/root_yaw/root_heading_delta_sincos/root_delta_xz_ref/pelvis_height/stationary_prob_5/tracker_pos_world/tracker_rot_world_6d/joints_world/joint_offsets_parent/joint_rest_local_rotations_6d`。
-- Task：默认读取 `materialized_realtime_pose_stationary5_v1` `.npz`，legacy exact `materialized_realtime_pose_body_fbx_local_root_y0_v1` 仍可读取；包含 source 数组、`sensor_valid`、`inpaint_mask` 和 61 帧窗口元数据。
-- Result：采样结果 `.npz`，建议包含 `reference_features`、`conditioned_features`、`reconstructed_features` 或对应 `*_raw` 字段。
-
-默认导出的 task 固定为 61 帧 full-tracker 窗口。训练阶段的随机遮盖由 Dataset 动态完成，不需要从编辑器导出多份训练 mask。
+- Source 和 task 必须携带所选 exact `schema_name`，以及
+  `pose_representation="body_fbx_local_delta_6d"`、`root_y_policy="fixed_zero"` 和
+  `pelvis_height_mode="pelvis_local_offset_y"`。
+- 编辑器导出的 task 固定为 61 帧窗口，第 61 帧补全；可选 tracker pattern 为
+  `full_six`、`standard_three`、`static_sparse` 和 `dynamic_dropout`。
+- Result 为采样输出 `.npz`，建议包含 `reference_features`、`conditioned_features`、
+  `reconstructed_features` 或对应的 `*_raw` 字段。

@@ -8,7 +8,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from utils.default_artifact_paths import default_realtime_pose_source_root, default_realtime_pose_task_root
+from utils.default_artifact_paths import (
+    default_amass_root,
+    default_outputs_root,
+    default_realtime_pose_editor_output_root,
+    default_realtime_pose_editor_runtime_root,
+    default_realtime_pose_source_root,
+    default_realtime_pose_task_root,
+    default_smpl_model_dir,
+)
 from visual_editor.models import ComparePane, StudioConfig
 from visual_editor.services import MotionStudioService
 
@@ -163,13 +171,13 @@ def env_or_default_path(name: str, default_factory) -> str:
 
 def config_from_env() -> StudioConfig:
     return StudioConfig.from_paths(
-        amass_dir=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"),
+        amass_dir=env_or_default_path("REALTIME_POSE_EDITOR_AMASS_DIR", default_amass_root),
         source_dir=env_or_default_path("REALTIME_POSE_EDITOR_SOURCE_DIR", default_realtime_pose_source_root),
         data_dir=env_or_default_path("REALTIME_POSE_EDITOR_DATA_DIR", default_realtime_pose_task_root),
-        result_dir=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"),
-        output_dir=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"),
-        smpl_model_dir=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"),
-        runtime_dir=os.environ.get("REALTIME_POSE_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"),
+        result_dir=env_or_default_path("REALTIME_POSE_EDITOR_RESULT_DIR", default_outputs_root),
+        output_dir=env_or_default_path("REALTIME_POSE_EDITOR_OUTPUT_DIR", default_realtime_pose_editor_output_root),
+        smpl_model_dir=env_or_default_path("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", default_smpl_model_dir),
+        runtime_dir=env_or_default_path("REALTIME_POSE_EDITOR_RUNTIME_DIR", default_realtime_pose_editor_runtime_root),
         realtime_pose_fps=float(os.environ.get("REALTIME_POSE_EDITOR_FPS", "60.0")),
     )
 
@@ -179,13 +187,13 @@ app = build_app(MotionStudioService(config_from_env())) if __name__ != "__main__
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local RealtimePose Studio API server.")
-    parser.add_argument("--amass_dir", default=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"))
+    parser.add_argument("--amass_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_AMASS_DIR", default_amass_root))
     parser.add_argument("--source_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_SOURCE_DIR", default_realtime_pose_source_root))
     parser.add_argument("--data_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_DATA_DIR", default_realtime_pose_task_root))
-    parser.add_argument("--result_dir", default=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"))
-    parser.add_argument("--output_dir", default=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"))
-    parser.add_argument("--smpl_model_dir", default=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"))
-    parser.add_argument("--runtime_dir", default=os.environ.get("REALTIME_POSE_EDITOR_RUNTIME_DIR", "visual_editor/.runtime"))
+    parser.add_argument("--result_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_RESULT_DIR", default_outputs_root))
+    parser.add_argument("--output_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_OUTPUT_DIR", default_realtime_pose_editor_output_root))
+    parser.add_argument("--smpl_model_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", default_smpl_model_dir))
+    parser.add_argument("--runtime_dir", default=env_or_default_path("REALTIME_POSE_EDITOR_RUNTIME_DIR", default_realtime_pose_editor_runtime_root))
     parser.add_argument("--realtime_pose_fps", default=60.0, type=float)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)

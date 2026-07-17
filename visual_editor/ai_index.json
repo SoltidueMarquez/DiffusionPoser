@@ -2,7 +2,7 @@
   "schema_name": "realtime_pose_studio_ai_index_v3",
   "purpose": "Local realtime_pose_stationary5_v1 source/task/result 3D viewer and task exporter with legacy body_fbx_local_root_y0 support.",
   "entrypoints": {
-    "api": "python -m visual_editor.server --result_dir output --output_dir visual_editor/.runtime/exports",
+    "api": "python -m visual_editor.server",
     "frontend": "npm --prefix visual_editor run viewer:dev"
   },
   "data_contract": {

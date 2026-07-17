@@ -43,8 +43,13 @@ def assert_generated_layout_path(value, expected_suffix: str) -> None:
 def patch_generated_root(monkeypatch, tmp_path):
     generated_root = tmp_path / "configured_generated"
     monkeypatch.setattr(
-        "utils.default_artifact_paths.load_data_roots",
-        lambda: SimpleNamespace(generated_root=generated_root),
+        "utils.default_artifact_paths.load_artifact_roots",
+        lambda: SimpleNamespace(
+            amass_root=tmp_path / "amass",
+            generated_root=generated_root,
+            outputs_root=tmp_path / "outputs",
+            smpl_model_dir=tmp_path / "body_models",
+        ),
     )
     return generated_root
 
@@ -266,7 +271,7 @@ def test_visual_editor_readme_examples_use_generated_layout():
 
     assert "--source_dir " not in readme
     assert "--data_dir " not in readme
-    assert "data_roots" in readme
+    assert "artifact_roots" in readme
     for marker in LEGACY_PARENT_LOCAL_MARKERS:
         assert marker not in readme
 
@@ -405,7 +410,7 @@ def test_realtime_pose_studio_scans_frames_and_exports_tasks(tmp_path):
             "output_dir": str(export_dir),
             "frame_start": 60,
             "frame_end": 60,
-            "tracker_patterns": ["full-trackers", "mixed-sparse"],
+            "tracker_patterns": ["full_six", "static_sparse"],
             "split": "train",
             "export_name": "studio_export",
         },
