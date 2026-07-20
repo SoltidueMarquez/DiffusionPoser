@@ -34,8 +34,6 @@ def get_dataset_loader(
     tracker_latency_max_frames: int = 0,
     tracker_burst_dropout_prob: float = 0.0,
     tracker_outlier_prob: float = 0.0,
-    predicted_history_cache_dir: str | None = None,
-    predicted_history_prob: float = 0.0,
     enable_rollout: bool = False,
     rollout_steps: int = 1,
 ):
@@ -73,8 +71,6 @@ def get_dataset_loader(
         tracker_latency_max_frames=tracker_latency_max_frames,
         tracker_burst_dropout_prob=tracker_burst_dropout_prob,
         tracker_outlier_prob=tracker_outlier_prob,
-        predicted_history_cache_dir=predicted_history_cache_dir,
-        predicted_history_prob=predicted_history_prob,
         enable_rollout=enable_rollout,
         rollout_steps=rollout_steps,
     )

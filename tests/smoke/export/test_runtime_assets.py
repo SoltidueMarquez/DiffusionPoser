@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,13 @@ from data_loaders.sensor_masking import (
 )
 from export.export_sentis_denoiser import (
     DEFAULT_MODEL_CONFIG,
+    UNITY_EXPORT_SOURCE_NAME,
+    UNITY_MODEL_PACKAGE_MANIFEST_NAME,
+    UNITY_MODEL_PROFILE_ASSET_NAME,
+    build_unity_export_source,
+    build_unity_model_package_manifest,
     build_model_config,
+    resolve_unity_model_id,
     validate_normalizer_export_contract,
 )
 from export.write_unity_runtime_assets import (
@@ -118,6 +125,43 @@ def test_sibling_unity_runtime_accepts_only_current_stationary5_schema_name():
     assert 'RealtimePoseSchemaName = "realtime_pose_stationary5_v1"' in source
     assert "LegacyRealtimePoseSchemaName" not in source
     assert "return value == RealtimePoseSchemaName;" in source
+
+
+def test_sibling_unity_auto_creates_one_profile_per_exported_model_package():
+    unity_root = __import__("pathlib").Path(__file__).resolve().parents[3].parent / "SIGGRAPH2024Unity"
+    scripts_root = unity_root / "Assets" / "Projects" / "RealtimePose" / "Scripts"
+    profile_path = scripts_root / "Core" / "RealtimePoseModelProfile.cs"
+    importer_path = scripts_root / "Editor" / "RealtimePoseModelProfileAutoImporter.cs"
+    driver_path = scripts_root / "Core" / "DiffusionPoserRealtimeDriver.cs"
+    if not profile_path.exists():
+        pytest.skip("Sibling Unity project is not available in this workspace.")
+
+    profile_source = profile_path.read_text(encoding="utf-8")
+    importer_source = importer_path.read_text(encoding="utf-8")
+    driver_source = driver_path.read_text(encoding="utf-8")
+
+    assert "CreateAssetMenu" in profile_source
+    assert "public ModelAsset DenoiserModel;" in profile_source
+    assert "public TextAsset FeatureSchemaJson;" in profile_source
+    assert "public TextAsset NormalizerJson;" in profile_source
+    assert "public TextAsset DdimScheduleJson;" in profile_source
+    assert "public TextAsset ExportSourceJson;" in profile_source
+    assert "ValidateRuntimeAssetMetadata(NormalizerJson" in profile_source
+    assert 'ManifestFileName = "realtime_pose_model_package.json"' in importer_source
+    assert "OnPostprocessAllAssets" in importer_source
+    assert "AssetDatabase.CreateAsset(profile, profilePath);" in importer_source
+    assert "profile.ApplyImportedPackage(" in importer_source
+    assert "public RealtimePoseModelProfile ModelProfile;" in driver_source
+    assert "ModelProfile.LoadRuntimeAssets" in driver_source
+    assert "TrySwitchModelProfile" in driver_source
+    assert "public ModelAsset DenoiserModel;" not in driver_source
+    assert "public TextAsset FeatureSchemaJson;" not in driver_source
+    assert "public TextAsset NormalizerJson;" not in driver_source
+    assert "public TextAsset DdimScheduleJson;" not in driver_source
+    assert "ModelProfile != null ?" not in driver_source
+    assert "GetEffectiveSampleSteps" not in driver_source
+    assert "GetEffectiveClipDenoised" not in driver_source
+    assert not list((scripts_root / "Editor").glob("RealtimePose*ModelProfileUpgrade.cs"))
 
 
 def test_sibling_unity_replay_and_schedule_require_current_exact_schema_name():
@@ -348,6 +392,60 @@ def test_runtime_assets_have_only_main_stationary_feature_channel(tmp_path):
     schema = json.loads(assets["feature_schema"].read_text(encoding="utf-8"))
     assert "stationaryProb5Output" not in schema
     assert "stationaryHeadOutputEnabled" not in schema["runtimeRules"]
+
+
+def test_sentis_export_writes_unity_profile_manifest_after_runtime_assets(tmp_path):
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    model_path = tmp_path / "model000000123.pt"
+    onnx_path = tmp_path / "diffusionposer_denoiser.onnx"
+    model_path.write_bytes(b"checkpoint")
+    onnx_path.write_bytes(b"onnx")
+    runtime_assets = {
+        "feature_schema": tmp_path / "feature_schema.json",
+        "normalizer": tmp_path / "normalizer.json",
+        "ddim_schedule": tmp_path / "ddim_schedule.json",
+    }
+    for path in runtime_assets.values():
+        path.write_text("{}", encoding="utf-8")
+
+    model_id = resolve_unity_model_id("", tmp_path)
+    export_source = build_unity_export_source(
+        model_id=model_id,
+        source_checkpoint_path=model_path,
+        checkpoint_args={"training_stage": "B", "step": 123},
+        normalizer_dir=tmp_path / "normalizer_source",
+        onnx_path=onnx_path,
+        model_source="ema",
+        schema=schema,
+    )
+    manifest = build_unity_model_package_manifest(
+        model_id=model_id,
+        display_name="Toy Profile",
+        default_sample_steps=10,
+        onnx_path=onnx_path,
+        runtime_assets=runtime_assets,
+        export_source=export_source,
+        schema=schema,
+    )
+
+    assert model_id == tmp_path.name
+    assert manifest["packageFormatVersion"] == 1
+    assert manifest["profileAssetFile"] == UNITY_MODEL_PROFILE_ASSET_NAME
+    assert manifest["onnxFile"] == onnx_path.name
+    assert manifest["featureSchemaFile"] == "feature_schema.json"
+    assert manifest["normalizerFile"] == "normalizer.json"
+    assert manifest["ddimScheduleFile"] == "ddim_schedule.json"
+    assert manifest["exportSourceFile"] == UNITY_EXPORT_SOURCE_NAME
+    assert manifest["schemaName"] == schema.name
+    assert manifest["featureDim"] == schema.feature_dim
+    assert manifest["sequenceLength"] == schema.seq_len
+    assert export_source["onnxSha256"] == manifest["onnxSha256"]
+    assert UNITY_MODEL_PACKAGE_MANIFEST_NAME == "realtime_pose_model_package.json"
+
+
+def test_unity_model_id_rejects_a_path(tmp_path):
+    with pytest.raises(ValueError, match="单一目录名"):
+        resolve_unity_model_id("packages/model_a", Path(tmp_path))
 
 
 def test_sentis_export_rejects_normalized_checkpoint_without_normalizer():

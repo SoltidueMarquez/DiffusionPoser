@@ -18,6 +18,7 @@ class RealtimePoseLossConfig:
     tracker_relative_pos_loss_weight: float = 0.06649022851925018
     tracker_relative_rot_loss_weight: float = 0.05810694589283483
     nohip_yaw_loss_weight: float = 8.72134586652926
+    nohip_root_xz_loss_weight: float = 1.0
     nohip_height_loss_weight: float = 0.023221202705222908
     stationary_regression_loss_weight: float = 0.020235997785184236
     stationary_margin_loss_weight: float = 0.022660554661242633
@@ -30,6 +31,7 @@ class RealtimePoseLossConfig:
     yaw_velocity_loss_weight: float = 0.0009690314102330362
     geometry_huber_beta: float = 0.05
     tracker_relative_pos_huber_beta: float = 0.05
+    nohip_root_xz_huber_beta: float = 0.05
     nohip_height_huber_beta: float = 0.05
     contact_velocity_huber_beta: float = 0.05
     contact_height_huber_beta: float = 0.01
@@ -91,6 +93,7 @@ REALTIME_POSE_LOSS_TERM_TO_WEIGHT: dict[str, str] = {
     "tracker_relative_pos_loss": "tracker_relative_pos_loss_weight",
     "tracker_relative_rot_loss": "tracker_relative_rot_loss_weight",
     "nohip_yaw_loss": "nohip_yaw_loss_weight",
+    "nohip_root_xz_loss": "nohip_root_xz_loss_weight",
     "nohip_height_loss": "nohip_height_loss_weight",
     "stationary_regression_loss": "stationary_regression_loss_weight",
     "stationary_margin_loss": "stationary_margin_loss_weight",
@@ -109,6 +112,7 @@ REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS: dict[str, float] = {
     "tracker_relative_pos_loss": 0.15,
     "tracker_relative_rot_loss": 0.05,
     "nohip_yaw_loss": 0.05,
+    "nohip_root_xz_loss": 0.05,
     "nohip_height_loss": 0.05,
     "stationary_regression_loss": 0.10,
     "stationary_margin_loss": 0.05,
@@ -123,6 +127,7 @@ REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS: dict[str, float] = {
 _POSITIVE_CONFIG_FIELDS = (
     "geometry_huber_beta",
     "tracker_relative_pos_huber_beta",
+    "nohip_root_xz_huber_beta",
     "nohip_height_huber_beta",
     "contact_velocity_huber_beta",
     "contact_height_huber_beta",

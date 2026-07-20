@@ -208,17 +208,18 @@ def test_default_auxiliary_loss_fixed_input_regression():
         "tracker_relative_pos_loss": (0.0934524313, 0.0521277189),
         "tracker_relative_rot_loss": (0.0034956932, 0.0045674741),
         "nohip_yaw_loss": (0.0, 0.0569578409),
+        "nohip_root_xz_loss": (0.0, 0.0010689230),
         "nohip_height_loss": (0.0, 0.2328828424),
         "stationary_regression_loss": (0.0255000032, 0.0069999993),
         "stationary_margin_loss": (0.0036363641, 0.0005000002),
         "stationary_range_loss": (0.0300000068, 0.0),
         "contact_height_loss": (0.0, 0.1162884235),
-        "contact_velocity_loss": (0.0, 4.3712043762),
-        "joint_velocity_loss": (2.4483196735, 3.1554059982),
+        "contact_velocity_loss": (0.0, 1.4444473982),
+        "joint_velocity_loss": (2.4483196735, 2.7352113724),
         "rotation_velocity_loss": (1.1085032225, 1.1846578121),
         "yaw_velocity_loss": (0.0, 25.3074073792),
         "aux_timestep_weight": (1.0, 0.1000000015),
-        "aux_loss": (0.0211762871, 0.0555274896),
+        "aux_loss": (0.0211762860, 0.0556122661),
     }
     for loss_name, values in expected.items():
         assert torch.allclose(losses[loss_name], torch.tensor(values), rtol=1e-5, atol=1e-6)
@@ -320,6 +321,7 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         "tracker_relative_pos_loss",
         "tracker_relative_rot_loss",
         "nohip_yaw_loss",
+        "nohip_root_xz_loss",
         "nohip_height_loss",
         "stationary_regression_loss",
         "stationary_margin_loss",
@@ -674,15 +676,18 @@ def test_nohip_endpoint_losses_are_only_active_without_hip():
         target_sensor_valid=target_sensor_valid,
     )
     model_kwargs["y"]["target_root_yaw"][:] = 0.4
+    model_kwargs["y"]["target_root_pos_world"][:] = torch.tensor([0.5, 0.0, -0.25])
     model_kwargs["y"]["target_joints_world"][:, 0, 1] = 0.8
 
     hip_valid_losses = diffusion.realtime_pose_loss.compute(pred_xstart, x_start, model_kwargs)
     assert torch.allclose(hip_valid_losses["nohip_yaw_loss"], torch.zeros(1))
+    assert torch.allclose(hip_valid_losses["nohip_root_xz_loss"], torch.zeros(1))
     assert torch.allclose(hip_valid_losses["nohip_height_loss"], torch.zeros(1))
 
     model_kwargs["y"]["target_sensor_valid"][:, HIP_TRACKER_INDEX] = False
     no_hip_losses = diffusion.realtime_pose_loss.compute(pred_xstart, x_start, model_kwargs)
     assert torch.all(no_hip_losses["nohip_yaw_loss"] > 0)
+    assert torch.all(no_hip_losses["nohip_root_xz_loss"] > 0)
     assert torch.all(no_hip_losses["nohip_height_loss"] > 0)
 
 

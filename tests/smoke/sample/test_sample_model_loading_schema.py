@@ -11,13 +11,12 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME,
     REALTIME_POSE_SCHEMA_NAME,
 )
-from sample import build_predicted_history_cache, reconstruct_rollout, reconstruct_stream
+from sample import reconstruct_rollout, reconstruct_stream
 
 
 SAMPLE_ENTRYPOINTS = (
     reconstruct_stream,
     reconstruct_rollout,
-    build_predicted_history_cache,
 )
 
 
@@ -119,33 +118,6 @@ def test_sample_model_loader_uses_checkpoint_exact_schema_when_cli_schema_omitte
         module.main(minimal_model_args(tmp_path, model_path))
 
     assert captured["schema_name"] == REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME
-
-
-def test_build_predicted_history_cache_omitted_schema_uses_temp_output_dir(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_path = write_checkpoint_args(tmp_path, REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0_SCHEMA_NAME)
-    created_dirs: list[Path] = []
-
-    def record_mkdir(self, *args, **kwargs):
-        del args, kwargs
-        created_dirs.append(self.resolve())
-
-    class StopAfterDatasetSchema:
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-            raise RuntimeError("stop after output dir capture")
-
-    monkeypatch.setattr(Path, "mkdir", record_mkdir)
-    monkeypatch.setattr(build_predicted_history_cache.dist_util, "setup_dist", lambda *args, **kwargs: None)
-    monkeypatch.setattr(build_predicted_history_cache.dist_util, "dev", lambda: torch.device("cpu"))
-    monkeypatch.setattr(build_predicted_history_cache, "RealtimePoseTaskDataset", StopAfterDatasetSchema)
-
-    with pytest.raises(RuntimeError, match="stop after output dir capture"):
-        build_predicted_history_cache.main(minimal_model_args(tmp_path, model_path))
-
-    assert created_dirs == [(tmp_path / "out").resolve()]
 
 
 def test_reconstruct_rollout_default_output_dir_uses_generic_stationary5_name(

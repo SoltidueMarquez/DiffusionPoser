@@ -192,8 +192,6 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--tracker_latency_max_frames", default=2, type=int)
     group.add_argument("--tracker_burst_dropout_prob", default=0.05, type=float)
     group.add_argument("--tracker_outlier_prob", default=0.01, type=float)
-    group.add_argument("--predicted_history_cache_dir", default="", type=str)
-    group.add_argument("--predicted_history_prob", default=0.0, type=float)
     group.add_argument("--rollout_steps", default=1, type=int)
     _install_data_path_default_parser(parser)
 

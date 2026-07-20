@@ -93,8 +93,6 @@ class RealtimePoseTaskDataset(Dataset):
         tracker_latency_max_frames: int = 0,
         tracker_burst_dropout_prob: float = 0.0,
         tracker_outlier_prob: float = 0.0,
-        predicted_history_cache_dir: str | Path | None = None,
-        predicted_history_prob: float = 0.0,
         enable_rollout: bool = False,
         rollout_steps: int = 1,
     ):
@@ -120,8 +118,6 @@ class RealtimePoseTaskDataset(Dataset):
         self.tracker_latency_max_frames = int(tracker_latency_max_frames)
         self.tracker_burst_dropout_prob = float(tracker_burst_dropout_prob)
         self.tracker_outlier_prob = float(tracker_outlier_prob)
-        self.predicted_history_cache_dir = Path(predicted_history_cache_dir) if predicted_history_cache_dir else None
-        self.predicted_history_prob = float(predicted_history_prob)
         self.rollout_steps = int(rollout_steps)
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {rollout_steps}")
@@ -258,20 +254,15 @@ class RealtimePoseTaskDataset(Dataset):
 
         conditioned = features.copy()
         if self.is_train_split:
-            rng = self.stable_rng(
+            history_rng = self.stable_rng(
                 entry=entry,
                 index=index,
                 salt=f"history_condition:e{random_context.epoch}:w{random_context.worker_id}:a{random_context.access_index}",
             )
-            conditioned = self.apply_predicted_history_cache(
-                conditioned=conditioned,
-                entry=entry,
-                rng=rng,
-            )
             apply_history_condition_corruption(
                 conditioned=conditioned,
                 schema=self.schema,
-                rng=rng,
+                rng=history_rng,
                 history_pose_noise_std=self.history_pose_noise_std,
                 history_yaw_noise_std=self.history_yaw_noise_std,
                 history_pose_dropout_prob=self.history_pose_dropout_prob,
@@ -345,10 +336,16 @@ class RealtimePoseTaskDataset(Dataset):
             ),
             **resolver_state_tensors(arrays, prefix="resolver_before_target"),
             "target_tracker_pos_ref": torch.from_numpy(
-                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_pos_slice()].reshape(TRACKER_COUNT, 3)
+                raw_features[
+                    REALTIME_POSE_TARGET_START,
+                    self.schema.tracker_pos_slice(),
+                ].reshape(TRACKER_COUNT, 3)
             ).float(),
             "target_tracker_rot_ref_6d": torch.from_numpy(
-                raw_features[REALTIME_POSE_TARGET_START, self.schema.tracker_rot_slice()].reshape(TRACKER_COUNT, 6)
+                raw_features[
+                    REALTIME_POSE_TARGET_START,
+                    self.schema.tracker_rot_slice(),
+                ].reshape(TRACKER_COUNT, 6)
             ).float(),
             "target_sensor_valid": torch.from_numpy(sensor_valid[REALTIME_POSE_TARGET_START]).bool(),
             "joint_offsets_parent": torch.from_numpy(arrays["joint_offsets_parent"]).float(),
@@ -362,6 +359,20 @@ class RealtimePoseTaskDataset(Dataset):
             "tracker_pattern": applied_tracker_pattern,
             "tracker_mask_policy": self.tracker_mask_policy,
         }
+        item.update(
+            {
+                "pred_prev_joints_world": torch.from_numpy(
+                    arrays["joints_world"][REALTIME_POSE_TARGET_START - 1]
+                ).float(),
+                "pred_prev_local_pose_6d": torch.from_numpy(
+                    raw_features[
+                        REALTIME_POSE_TARGET_START - 1,
+                        self.schema.body_pose_slice(),
+                    ]
+                ).float(),
+                "previous_state_is_predicted": torch.tensor(False, dtype=torch.bool),
+            }
+        )
         if "joint_rest_local_rotations_6d" in arrays:
             item["joint_rest_local_rotations_6d"] = torch.from_numpy(arrays["joint_rest_local_rotations_6d"]).float()
         if self.schema.supports_root_motion:
@@ -616,41 +627,6 @@ class RealtimePoseTaskDataset(Dataset):
             self._last_task_cache_index = int(index)
             self._last_task_cache = task
         return task
-
-    def apply_predicted_history_cache(
-        self,
-        conditioned: np.ndarray,
-        entry: dict,
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        """用离线 rollout 预测 history 替换 GT history，只接受 normalized 特征缓存。"""
-        if self.predicted_history_cache_dir is None or self.predicted_history_prob <= 0:
-            return conditioned
-        if rng.random() >= self.predicted_history_prob:
-            return conditioned
-        task_id = entry.get("task_id")
-        if not task_id:
-            raise KeyError("predicted history cache 需要 manifest entry 包含 task_id。")
-        cache_path = self.predicted_history_cache_dir / f"{task_id}.npz"
-        if not cache_path.exists():
-            raise FileNotFoundError(f"predicted history cache 不存在: {cache_path}")
-        with np.load(cache_path, allow_pickle=False) as data:
-            if "predicted_features_normalized" not in data.files:
-                raise KeyError(f"{cache_path} 缺少 predicted_features_normalized 字段。")
-            if "schema_name" not in data.files or str(np.asarray(data["schema_name"]).item()) != self.schema.name:
-                raise ValueError(f"{cache_path} schema_name 必须为 {self.schema.name}。")
-            if "feature_space" not in data.files or str(np.asarray(data["feature_space"]).item()) != "normalized":
-                raise ValueError(f"{cache_path} feature_space 必须为 normalized。")
-            cached = np.asarray(data["predicted_features_normalized"], dtype=np.float32)
-        if cached.ndim == 3:
-            cached = cached[0]
-        if cached.shape != conditioned.shape:
-            raise ValueError(f"{cache_path} cache shape 应为 {conditioned.shape}，实际为 {cached.shape}")
-        conditioned[:REALTIME_POSE_TARGET_START, self.schema.target_slice()] = cached[
-            :REALTIME_POSE_TARGET_START,
-            self.schema.target_slice(),
-        ]
-        return conditioned
 
     def set_epoch(self, epoch: int) -> None:
         """训练循环在 epoch 开头调用，使动态 mask 和增强能随 epoch 可复现地变化。"""

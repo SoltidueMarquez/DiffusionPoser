@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,6 +51,10 @@ DEFAULT_MODEL_CONFIG = {
     "model_arch": "target_dit",
 }
 
+UNITY_MODEL_PACKAGE_MANIFEST_NAME = "realtime_pose_model_package.json"
+UNITY_MODEL_PROFILE_ASSET_NAME = "RealtimePoseModelProfile.asset"
+UNITY_EXPORT_SOURCE_NAME = "export_source.json"
+
 
 class SentisDenoiserWrapper(nn.Module):
     """Unity Sentis 固定调用合约：输入 `[1,C,61]`，输出 `pred_x0`。"""
@@ -76,6 +82,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export a realtime_pose DiffusionPoser denoiser for Unity Sentis.")
     parser.add_argument("--model_path", required=True, type=str, help="Path to model*.pt checkpoint.")
     parser.add_argument("--output_dir", default=str(default_unity_model_dir()), type=str)
+    parser.add_argument(
+        "--model_id",
+        default="",
+        type=str,
+        help="Unity ModelProfile 的稳定标识；未指定时使用 output_dir 的目录名。",
+    )
+    parser.add_argument("--model_display_name", default="", type=str)
+    parser.add_argument("--unity_default_sample_steps", default=10, type=int)
     parser.add_argument("--normalizer_dir", default="", type=str)
     parser.add_argument("--normalize_input", default=True, type=str2bool)
     parser.add_argument("--strict_normalizer", action="store_true")
@@ -201,7 +215,12 @@ def build_model_config(
     return SimpleNamespace(**config)
 
 
-def load_export_model(model: nn.Module, model_path: Path, device: torch.device, use_ema: bool) -> tuple[nn.Module, str]:
+def load_export_model(
+    model: nn.Module,
+    model_path: Path,
+    device: torch.device,
+    use_ema: bool,
+) -> tuple[nn.Module, str, Path]:
     if use_ema:
         ema_path = model_path.with_name(model_path.name.replace("model", "ema", 1))
         if ema_path.exists():
@@ -215,7 +234,7 @@ def load_export_model(model: nn.Module, model_path: Path, device: torch.device, 
             export_model = getattr(ema, "ema_model", ema)
             export_model.to(device)
             export_model.eval()
-            return export_model, "ema"
+            return export_model, "ema", ema_path
 
     state_dict = unwrap_state_dict(torch_load(model_path))
     incompatible = model.load_state_dict(state_dict, strict=False)
@@ -225,7 +244,7 @@ def load_export_model(model: nn.Module, model_path: Path, device: torch.device, 
         raise RuntimeError(f"Checkpoint does not match realtime_pose model. missing={missing}, unexpected={unexpected}")
     model.to(device)
     model.eval()
-    return model, "model"
+    return model, "model", model_path
 
 
 def torch_load(path: Path):
@@ -347,10 +366,111 @@ def check_onnx_alignment(
     return max_abs_error
 
 
+def resolve_unity_model_id(model_id: str, output_dir: Path) -> str:
+    """返回可稳定定位 Unity 模型包的标识，禁止把路径混入资产身份。"""
+    resolved = str(model_id).strip() or output_dir.name
+    if not resolved:
+        raise ValueError("Unity model_id 不能为空，output_dir 也必须具有目录名。")
+    if Path(resolved).name != resolved or resolved in {".", ".."}:
+        raise ValueError(f"Unity model_id 必须是单一目录名，实际为 {resolved!r}。")
+    return resolved
+
+
+def compute_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest().upper()
+
+
+def write_json_atomically(path: Path, payload: dict[str, Any]) -> Path:
+    """最后提交清单，避免 Unity 在 ONNX/JSON 尚未写完时创建不完整的 SO。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = path.with_name(f".{path.name}.tmp")
+    with staging_path.open("w", encoding="utf-8", newline="\n") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    staging_path.replace(path)
+    return path
+
+
+def build_unity_export_source(
+    *,
+    model_id: str,
+    source_checkpoint_path: Path,
+    checkpoint_args: dict[str, Any],
+    normalizer_dir: Path | None,
+    onnx_path: Path,
+    model_source: str,
+    schema: SchemaSpec,
+) -> dict[str, Any]:
+    """记录可追溯信息；它不参与推理，但必须与该 ONNX 放在同一模型包内。"""
+    return {
+        "modelName": model_id,
+        "trainingStage": str(checkpoint_args.get("training_stage", checkpoint_args.get("experiment_name", ""))),
+        "trainingStep": int(checkpoint_args.get("num_steps", checkpoint_args.get("step", 0)) or 0),
+        "weightSource": str(model_source),
+        "emaDecay": checkpoint_args.get("ema_decay", checkpoint_args.get("model_ema_decay")),
+        "sourceCheckpoint": str(source_checkpoint_path),
+        "sourceCheckpointSha256": compute_sha256(source_checkpoint_path),
+        "onnxSha256": compute_sha256(onnx_path),
+        "schemaName": schema.name,
+        "featureDim": schema.feature_dim,
+        "sequenceLength": schema.seq_len,
+        "normalizer": str(normalizer_dir) if normalizer_dir is not None else "",
+        "exportedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def build_unity_model_package_manifest(
+    *,
+    model_id: str,
+    display_name: str,
+    default_sample_steps: int,
+    onnx_path: Path,
+    runtime_assets: dict[str, Path],
+    export_source: dict[str, Any],
+    schema: SchemaSpec,
+) -> dict[str, Any]:
+    """供 Unity AssetPostprocessor 消费的提交标记；必须在全部模型资产成功生成后再写入。"""
+    if not 1 <= int(default_sample_steps) <= 50:
+        raise ValueError(f"unity_default_sample_steps 必须位于 [1, 50]，实际为 {default_sample_steps}。")
+
+    return {
+        "packageFormatVersion": 1,
+        "modelId": model_id,
+        "displayName": display_name or model_id,
+        "profileAssetFile": UNITY_MODEL_PROFILE_ASSET_NAME,
+        "onnxFile": onnx_path.name,
+        "featureSchemaFile": runtime_assets["feature_schema"].name,
+        "normalizerFile": runtime_assets["normalizer"].name,
+        "ddimScheduleFile": runtime_assets["ddim_schedule"].name,
+        "exportSourceFile": UNITY_EXPORT_SOURCE_NAME,
+        "schemaName": schema.name,
+        "poseRepresentation": schema.pose_representation,
+        "rootYPolicy": schema.root_y_policy,
+        "pelvisHeightMode": schema.pelvis_height_mode,
+        "featureDim": schema.feature_dim,
+        "sequenceLength": schema.seq_len,
+        "defaultSampleSteps": int(default_sample_steps),
+        "clipDenoised": False,
+        "xInputName": "x_t",
+        "timestepInputName": "timestep",
+        "inpaintMaskInputName": "inpaint_mask",
+        "validFrameMaskInputName": "valid_frame_mask",
+        "predX0OutputName": "pred_x0",
+        "sentisTensorDataTimeMajor": False,
+        "onnxSha256": export_source["onnxSha256"],
+        "sourceCheckpointSha256": export_source["sourceCheckpointSha256"],
+    }
+
+
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     cli_args = build_arg_parser().parse_args(argv)
     model_path = Path(cli_args.model_path).resolve()
     output_dir = Path(cli_args.output_dir).resolve()
+    model_id = resolve_unity_model_id(cli_args.model_id, output_dir)
     normalizer_dir = Path(cli_args.normalizer_dir).resolve() if cli_args.normalizer_dir else None
     checkpoint_args = load_checkpoint_args(model_path)
     validate_normalizer_export_contract(cli_args=cli_args, checkpoint_args=checkpoint_args)
@@ -359,7 +479,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     schema = get_schema_spec(model_config.schema)
 
     model, _diffusion = create_model_and_diffusion(model_config)
-    export_model, model_source = load_export_model(model, model_path, device=device, use_ema=cli_args.use_ema)
+    export_model, model_source, source_checkpoint_path = load_export_model(
+        model,
+        model_path,
+        device=device,
+        use_ema=cli_args.use_ema,
+    )
     wrapper = SentisDenoiserWrapper(export_model).to(device).eval()
 
     onnx_path = output_dir / "diffusionposer_denoiser.onnx"
@@ -399,6 +524,29 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         strict_normalizer=bool(cli_args.strict_normalizer or cli_args.normalize_input),
         schema_name=schema.name,
     )
+    export_source = build_unity_export_source(
+        model_id=model_id,
+        source_checkpoint_path=source_checkpoint_path,
+        checkpoint_args=checkpoint_args,
+        normalizer_dir=normalizer_dir,
+        onnx_path=onnx_path,
+        model_source=model_source,
+        schema=schema,
+    )
+    export_source_path = write_json_atomically(output_dir / UNITY_EXPORT_SOURCE_NAME, export_source)
+    model_package_manifest = build_unity_model_package_manifest(
+        model_id=model_id,
+        display_name=str(cli_args.model_display_name).strip(),
+        default_sample_steps=int(cli_args.unity_default_sample_steps),
+        onnx_path=onnx_path,
+        runtime_assets=runtime_assets,
+        export_source=export_source,
+        schema=schema,
+    )
+    model_package_manifest_path = write_json_atomically(
+        output_dir / UNITY_MODEL_PACKAGE_MANIFEST_NAME,
+        model_package_manifest,
+    )
 
     result = {
         "onnx_path": onnx_path,
@@ -409,6 +557,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "schema_canonical_name": schema.canonical_name,
         "feature_dim": schema.feature_dim,
         "sequence_length": REALTIME_POSE_SEQ_LEN,
+        "export_source_path": export_source_path,
+        "model_package_manifest_path": model_package_manifest_path,
     }
     print(f"[export_sentis_denoiser] ONNX: {onnx_path}")
     print(f"[export_sentis_denoiser] weights: {model_source}")
@@ -417,6 +567,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         print(f"[export_sentis_denoiser] PyTorch/ONNXRuntime max_abs_error={max_abs_error:.6g}")
     for name, path in runtime_assets.items():
         print(f"[export_sentis_denoiser] {name}: {path}")
+    print(f"[export_sentis_denoiser] export_source: {export_source_path}")
+    print(f"[export_sentis_denoiser] Unity ModelProfile manifest: {model_package_manifest_path}")
     return result
 
 

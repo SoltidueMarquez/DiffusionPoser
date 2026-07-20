@@ -99,7 +99,7 @@ def test_longseq_eval_unity_replay_export_writes_one_json_per_sequence(tmp_path)
         assert payload["schemaName"] == schema.name
         assert payload["featureContractVersion"] == 2
         assert payload["trackerCodecVersion"] == "tracker_codec_v2"
-        assert payload["resolverContractVersion"] == "runtime_root_resolver_v1"
+        assert payload["resolverContractVersion"] == "runtime_root_resolver_v2"
         assert payload["frameCount"] == item["num_frames"]
         assert payload["targetFeatureLength"] == schema.target_dim
         assert payload["trackerCount"] == TRACKER_COUNT

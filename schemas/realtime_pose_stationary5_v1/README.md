@@ -10,5 +10,5 @@ realtime_pose_stationary5_v1：固定 body_fbx_local + root_y0 前提下，使�
 - stationary 仅使用当前帧和过去 4 帧：`≤0.03 m/s` 映射为 1，`≥0.25 m/s` 映射为 0，并用当前 raw 与因果中值的最小值实现快速解除、延迟恢复。
 - stationary 不包含脚高度或旋转速度；Unity 与训练 contact loss 另以 `stationary >= 0.7` 且脚高 `≤5 cm` 判断接触。
 - `feature_contract_version=2`；Head 始终有效且每帧至少三个 Tracker，Hip 可缺失。
-- Tracker 编解码使用 `tracker_codec_v2`，Root 后处理使用模型外的 `runtime_root_resolver_v1`。
+- Tracker 编解码使用 `tracker_codec_v2`，Root 后处理使用模型外的 `runtime_root_resolver_v2`。
 - 额外 `StationaryHead` 已删除；ONNX/Sentis 只有一个 motion 输出，主通道 149:154 继续训练和评测。

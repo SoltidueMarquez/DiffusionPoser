@@ -56,6 +56,7 @@ def test_calibration_activation_tracks_nohip_contact_and_predicted_history():
     )
 
     assert active["nohip_yaw_loss"]
+    assert active["nohip_root_xz_loss"]
     assert active["contact_height_loss"]
     assert active["contact_velocity_loss"]
     assert active["yaw_velocity_loss"]

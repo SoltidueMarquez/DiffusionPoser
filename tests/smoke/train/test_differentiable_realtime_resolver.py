@@ -123,7 +123,7 @@ def test_differentiable_resolver_matches_numpy_runtime_paths(
     np.testing.assert_allclose(actual.final_joints_world[0].detach().numpy(), expected.final_joints_world, atol=1e-5)
 
 
-def test_nohip_head_correction_cancels_model_root_delta_but_keeps_pose_gradient():
+def test_nohip_head_anchor_keeps_root_delta_and_pose_gradients():
     pose, root_delta, yaw_delta, pelvis_height, y = _build_case(
         hip_valid=False,
         previous_hip_valid=False,
@@ -140,7 +140,9 @@ def test_nohip_head_correction_cancels_model_root_delta_but_keeps_pose_gradient(
     )
     result.final_joints_world.square().sum().backward()
 
-    assert torch.allclose(root_delta.grad, torch.zeros_like(root_delta.grad), atol=1e-6)
+    assert root_delta.grad is not None
+    assert torch.isfinite(root_delta.grad).all()
+    assert torch.any(root_delta.grad.abs() > 1e-6)
     assert pose.grad is not None
     assert torch.isfinite(pose.grad).all()
 

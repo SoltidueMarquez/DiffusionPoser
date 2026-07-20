@@ -1,4 +1,0 @@
-interface:
-  display_name: "DiffusionPoser Experiment Branch"
-  short_description: "Workflow for branch-based DiffusionPoser model experiments"
-  default_prompt: "Use $diffusionposer-experiment-branch when starting or documenting a DiffusionPoser model/loss ablation branch, creating experiment records, or preserving baseline tags."

@@ -154,6 +154,7 @@ class RealtimePoseAuxiliaryLoss:
             "previous_state_is_predicted",
             "target_frame_dt_seconds",
             "target_root_yaw",
+            "target_root_pos_world",
             "gt_prev_root_yaw",
             "prev_root_yaw",
             "target_sensor_valid",
@@ -328,6 +329,13 @@ class RealtimePoseAuxiliaryLoss:
 
         nohip_yaw_raw = 1.0 - torch.cos(wrap_angle_torch(resolver.final_root_yaw - gt_root_yaw))
         nohip_yaw_loss = _normalize_masked_samples(nohip_yaw_raw, hip_missing)
+        target_root_pos = y["target_root_pos_world"].to(device=device, dtype=dtype)
+        nohip_root_xz_raw = _smooth_l1(
+            resolver.final_root_pos_world[:, [0, 2]],
+            target_root_pos[:, [0, 2]],
+            self.config.nohip_root_xz_huber_beta,
+        ).mean(dim=1)
+        nohip_root_xz_loss = _normalize_masked_samples(nohip_root_xz_raw, hip_missing)
         floor_y = y["target_floor_y"].to(device=device, dtype=dtype).view(-1)
         target_pelvis_height = target_joints[:, pelvis_index, 1] - floor_y
         nohip_height_raw = _smooth_l1(
@@ -458,6 +466,7 @@ class RealtimePoseAuxiliaryLoss:
             "tracker_relative_pos_loss": tracker_relative_pos_loss,
             "tracker_relative_rot_loss": tracker_relative_rot_loss,
             "nohip_yaw_loss": nohip_yaw_loss,
+            "nohip_root_xz_loss": nohip_root_xz_loss,
             "nohip_height_loss": nohip_height_loss,
             "stationary_regression_loss": stationary_regression_loss,
             "stationary_margin_loss": stationary_margin_loss,

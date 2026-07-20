@@ -137,8 +137,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--tracker_latency_max_frames", default=0, type=int)
     train.add_argument("--tracker_burst_dropout_prob", default=0.0, type=float)
     train.add_argument("--tracker_outlier_prob", default=0.0, type=float)
-    train.add_argument("--predicted_history_cache_dir", default="", type=str)
-    train.add_argument("--predicted_history_prob", default=0.0, type=float)
     train.add_argument("--rollout_steps", default=1, type=int)
     for option_name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
         train.add_argument(f"--{option_name}", default=default, type=type(default))
@@ -541,9 +539,6 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
     command.extend(["--device", str(args.device)])
     if args.ts_respace:
         command.extend(["--ts_respace", args.ts_respace])
-    if args.predicted_history_cache_dir:
-        command.extend(["--predicted_history_cache_dir", normalize_path(args.predicted_history_cache_dir)])
-        command.extend(["--predicted_history_prob", str(args.predicted_history_prob)])
     if args.init_checkpoint:
         command.extend(["--init_checkpoint", normalize_path(args.init_checkpoint)])
     add_flag(command, bool(args.model_ema), "--model_ema")

@@ -232,10 +232,17 @@ def resolve_realtime_pose_frame_torch(
 
     predicted_head = preliminary_joints[:, 15]
     root_to_head = predicted_head - model_root
-    head_final_root = model_root.clone()
-    head_final_root_x = head[:, 0] - root_to_head[:, 0]
-    head_final_root_z = head[:, 2] - root_to_head[:, 2]
-    head_final_root = torch.stack((head_final_root_x, floor_y, head_final_root_z), dim=-1)
+    head_candidate_root = torch.stack(
+        (
+            head[:, 0] - root_to_head[:, 0],
+            floor_y,
+            head[:, 2] - root_to_head[:, 2],
+        ),
+        dim=-1,
+    )
+    head_weight = float(cfg.nohip_head_anchor_weight)
+    head_final_root = (1.0 - head_weight) * model_root + head_weight * head_candidate_root
+    head_final_root = torch.stack((head_final_root[:, 0], floor_y, head_final_root[:, 2]), dim=-1)
     height_correction = (head[:, 1] - predicted_head[:, 1]).clamp(
         -float(cfg.max_head_height_correction_m),
         float(cfg.max_head_height_correction_m),

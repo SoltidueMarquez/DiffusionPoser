@@ -27,12 +27,12 @@ from data_loaders.sensor_masking import (
 )
 from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION
+from schemas.realtime_pose_stationary5_v1.contract import RESOLVER_CONTRACT_VERSION
 
 
 FEATURE_CONTRACT_VERSION = 2
 JOINT_MAPPING_VERSION = "smpl24_tracker6_v1"
 COORDINATE_CONVENTION_VERSION = "realtime_pose_y_up_xright_zforward_v1"
-RESOLVER_CONTRACT_VERSION = "runtime_root_resolver_v1"
 RESOLVER_CONTEXT_FRAMES = 32
 TRACKER_SPACE_SYNTHETIC_JOINT_WORLD = "synthetic_joint_world"
 TRACKER_SPACE_CALIBRATED_JOINT_WORLD = "calibrated_joint_world"

@@ -39,8 +39,12 @@ def valid_standard_three() -> np.ndarray:
     return valid
 
 
-def test_missing_hip_uses_head_fk_and_previous_final_yaw_for_delta():
-    resolver = RuntimeRootResolver(PELVIS_OFFSET, RuntimeRootResolverConfig(hip_filter_time_constant_seconds=0.0))
+def test_missing_hip_blends_model_root_with_head_fk_anchor():
+    config = RuntimeRootResolverConfig(
+        hip_filter_time_constant_seconds=0.0,
+        nohip_head_anchor_weight=0.5,
+    )
+    resolver = RuntimeRootResolver(PELVIS_OFFSET, config)
     positions = np.zeros((TRACKER_COUNT, 3), dtype=np.float32)
     positions[HEAD_TRACKER_INDEX] = np.asarray([2.0, 1.7, -1.0], dtype=np.float32)
 
@@ -58,13 +62,25 @@ def test_missing_hip_uses_head_fk_and_previous_final_yaw_for_delta():
     )
 
     assert result.root_source == RootSource.RESET
+    model_root = np.asarray([3.0, 0.0, -1.0], dtype=np.float32)
     predicted_offset = fake_fk(np.zeros(3, dtype=np.float32), np.pi / 2.0, 0.9)[15]
+    head_candidate = positions[HEAD_TRACKER_INDEX, [0, 2]] - predicted_offset[[0, 2]]
+    expected_root_xz = 0.5 * model_root[[0, 2]] + 0.5 * head_candidate
     np.testing.assert_allclose(
         result.final_root_pos_world[[0, 2]],
-        positions[HEAD_TRACKER_INDEX, [0, 2]] - predicted_offset[[0, 2]],
+        expected_root_xz,
         atol=1e-5,
     )
     np.testing.assert_allclose(result.final_root_delta_xz_ref, 0.0, atol=1e-6)
+
+
+def test_nohip_head_anchor_weight_must_be_a_probability():
+    for value in (-0.1, 1.1):
+        try:
+            RuntimeRootResolverConfig(nohip_head_anchor_weight=value)
+        except ValueError:
+            continue
+        raise AssertionError(f"nohip_head_anchor_weight={value} 应被拒绝")
 
 
 def test_hip_reconnect_uses_time_based_smoothstep_and_finishes_on_target():

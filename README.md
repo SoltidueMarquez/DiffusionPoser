@@ -1,5 +1,7 @@
 # DiffusionPoser RealtimePose
 
+论文长期研究任务与验收方向见 [`documents/PAPER_LONG_TERM_GOAL.md`](documents/PAPER_LONG_TERM_GOAL.md)。该文档定义“论文要解决什么问题”；本 README 主要记录工程入口与当前 schema 契约。
+
 当前默认 schema 是 `realtime_pose_stationary5_v1`，姿态表示为 `body_fbx_local_delta_6d`。legacy exact name `realtime_pose_body_fbx_local_root_y0_v1` 仍在 registry 中注册，可继续训练和导出；该 alias 共享 `schemas/realtime_pose_stationary5_v1/` 下的 canonical adapter 和 README。恢复 checkpoint、读取 task/normalizer 和导出 Unity runtime asset 时必须使用产物里记录的 exact `schema_name`，不能只按 canonical name 放宽匹配。
 
 `schema_name` 只描述数据产物和 Unity runtime 必须共同理解的稳定契约。实验名、模型结构、loss 或训练超参变化应放在 run/config 名称中，不应写进 `schema_name`。
@@ -128,9 +130,12 @@ conda run --no-capture-output -n diffusionposer5070 python -m export.export_sent
   --schema realtime_pose_stationary5_v1 `
   --model_arch target_dit `
   --model_path <model_checkpoint> `
-  --output_dir <outputs_root/realtime_pose_stationary5_v1/stationary5_unity> `
+  --output_dir <SIGGRAPH2024Unity/Assets/Projects/RealtimePose/Models/Packages/model_id> `
+  --model_id <model_id> `
   --normalizer_dir <normalizer_dir>
 ```
+
+`export_sentis_denoiser` 会在 ONNX、`feature_schema.json`、`normalizer.json` 和 `ddim_schedule.json` 全部成功写入后，最后生成 `realtime_pose_model_package.json`。Unity 检测该清单后会自动创建或更新同目录的 `RealtimePoseModelProfile.asset`；不需要手动拖拽五个引用或调用 Editor 菜单。场景中的 `DiffusionPoserRealtimeDriver.ModelProfile` 只需引用这个 SO；切换模型时替换该引用即可。
 
 Unity runtime 直接解码 body.fbx local delta：`bone.localRotation = restLocalRotation * decodedDelta`。Actor root y 固定为 0，`pelvis_height` 通过 pelvis bone `localPosition.y` 生效；`WorldOffset` 只用于显示偏移，不参与模型语义。
 

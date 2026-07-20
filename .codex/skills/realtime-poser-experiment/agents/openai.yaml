@@ -1,0 +1,4 @@
+interface:
+  display_name: "Realtime Poser Experiment"
+  short_description: "Record paired DiffusionPoser and Unity experiments"
+  default_prompt: "Use $realtime-poser-experiment to prepare and record a paired DiffusionPoser and Unity experiment without creating branches."

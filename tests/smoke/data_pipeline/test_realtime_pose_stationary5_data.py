@@ -10,7 +10,10 @@ import torch
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_smpl_utils import MotionSource
 from data_loaders.generate_realtime_pose_tasks import main as generate_realtime_pose_tasks_main
-from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset, encode_realtime_pose_features
+from data_loaders.realtime_pose_dataset import (
+    RealtimePoseTaskDataset,
+    encode_realtime_pose_features,
+)
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     derive_stationary_prob_5,
@@ -438,70 +441,3 @@ def test_realtime_normalizer_does_not_amplify_near_constant_channels(tmp_path):
     normalized = loaded.normalize(features)
     assert torch.isfinite(normalized).all()
     assert float(normalized[0, 0]) < 1e-3
-
-
-def test_predicted_history_cache_requires_normalized_feature_space(tmp_path):
-    source_dir = tmp_path / "sources"
-    task_dir = tmp_path / "tasks"
-    cache_dir = tmp_path / "cache"
-    write_toy_source_dataset(source_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
-    generate_realtime_pose_tasks_main(
-        [
-            "--source_dir",
-            str(source_dir),
-            "--output_dir",
-            str(task_dir),
-            "--splits",
-            "train",
-            "--samples_per_file",
-            "1",
-            "--schema",
-            REALTIME_POSE_SCHEMA_NAME,
-            "--split_dir",
-            "",
-            "--overwrite",
-        ]
-    )
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    base_dataset = RealtimePoseTaskDataset(
-        task_dir,
-        split="train",
-        normalize_input=False,
-        schema_name=schema.name,
-        tracker_mask_policy="task",
-    )
-    base_item = base_dataset[0]
-    task_id = base_dataset.entries[0]["task_id"]
-    cached = base_item["x"].T.numpy().copy()
-    cached[:REALTIME_POSE_TARGET_START, schema.target_slice()] += 0.25
-    cache_dir.mkdir()
-    np.savez(
-        cache_dir / f"{task_id}.npz",
-        predicted_features_normalized=cached,
-        schema_name=np.asarray(schema.name),
-        feature_space=np.asarray("normalized"),
-    )
-    cached_dataset = RealtimePoseTaskDataset(
-        task_dir,
-        split="train",
-        normalize_input=False,
-        schema_name=schema.name,
-        tracker_mask_policy="task",
-        predicted_history_cache_dir=cache_dir,
-        predicted_history_prob=1.0,
-    )
-    cached_item = cached_dataset[0]
-    assert torch.allclose(cached_item["x"], base_item["x"])
-    assert not torch.allclose(
-        cached_item["conditioned_x"][schema.target_slice(), :REALTIME_POSE_TARGET_START],
-        base_item["conditioned_x"][schema.target_slice(), :REALTIME_POSE_TARGET_START],
-    )
-
-    np.savez(
-        cache_dir / f"{task_id}.npz",
-        predicted_features_raw=cached,
-        schema_name=np.asarray(schema.name),
-        feature_space=np.asarray("raw"),
-    )
-    with pytest.raises(KeyError, match="predicted_features_normalized"):
-        _ = cached_dataset[0]

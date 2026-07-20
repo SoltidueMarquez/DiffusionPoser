@@ -1,7 +1,0 @@
-interface:
-  display_name: "DiffusionPoser Python Style"
-  short_description: "Coding rules for the DiffusionPoser reproduction"
-  default_prompt: "Use $diffusionposer-repro when editing DiffusionPoser Python code so the implementation follows the project style and coding rules."
-
-policy:
-  allow_implicit_invocation: true

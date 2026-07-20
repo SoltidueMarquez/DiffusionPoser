@@ -9,9 +9,7 @@ import numpy as np
 from data_loaders.realtime_pose_kinematics import integrate_root_delta_xz_ref, make_yaw_rotation_np
 from data_loaders.sensor_masking import HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX, TRACKER_COUNT, validate_sensor_valid
 from data_loaders.tracker_codec import yaw_from_rotation_6d_np
-
-
-RESOLVER_CONTRACT_VERSION = "runtime_root_resolver_v1"
+from schemas.realtime_pose_stationary5_v1.contract import RESOLVER_CONTRACT_VERSION
 
 
 class RootSource(IntEnum):
@@ -25,8 +23,13 @@ class RootSource(IntEnum):
 class RuntimeRootResolverConfig:
     reconnect_duration_seconds: float = 0.1
     hip_filter_time_constant_seconds: float = 0.03
+    nohip_head_anchor_weight: float = 0.5
     max_head_height_correction_m: float = 0.10
     timestamp_reset_threshold_seconds: float = 0.25
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= float(self.nohip_head_anchor_weight) <= 1.0:
+            raise ValueError("nohip_head_anchor_weight 必须位于 [0,1]")
 
 
 @dataclass
@@ -213,8 +216,13 @@ class RuntimeRootResolver:
         else:
             predicted_head = preliminary_joints[15]
             root_to_head = predicted_head - model_root
-            final_root = model_root.copy()
-            final_root[[0, 2]] = tracker_pos[HEAD_TRACKER_INDEX, [0, 2]] - root_to_head[[0, 2]]
+            head_candidate_root = model_root.copy()
+            head_candidate_root[[0, 2]] = (
+                tracker_pos[HEAD_TRACKER_INDEX, [0, 2]] - root_to_head[[0, 2]]
+            )
+            # Head-FK 仅作绝对位置锚点，保留模型 root delta 的有效作用。
+            head_weight = float(self.config.nohip_head_anchor_weight)
+            final_root = (1.0 - head_weight) * model_root + head_weight * head_candidate_root
             final_root[1] = float(floor_y)
             head_residual_y = float(tracker_pos[HEAD_TRACKER_INDEX, 1] - predicted_head[1])
             correction = float(
