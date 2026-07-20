@@ -47,7 +47,6 @@ $CommonTrainingArgs = @(
     "--log_interval", "100",
     "--save_interval", "5000",
     "--checkpoint_max_keep", "8",
-    "--stationary_range_loss_weight", "0",
     "--gradient_clip",
     "--eval_during_training",
     "--eval_num_batches", "4",

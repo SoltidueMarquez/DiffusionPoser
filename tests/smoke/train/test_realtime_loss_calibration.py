@@ -35,12 +35,15 @@ def test_loss_weight_calibration_rejects_expected_term_with_zero_gradient():
         calibrate_realtime_loss_weights([sample])
 
 
-def test_bounded_stationary_defaults_keep_runtime_boundary_and_disable_range_target():
+def test_bounded_stationary_defaults_use_main_mse_channel_weight_without_range_target():
     config = RealtimePoseLossConfig()
 
     assert config.stationary_runtime_threshold == pytest.approx(0.7)
     assert config.stationary_runtime_margin == pytest.approx(0.1)
-    assert config.stationary_range_loss_weight == 0.0
+    assert config.stationary_simple_loss_channel_weight == pytest.approx(1.6232687317836745)
+    assert not hasattr(config, "stationary_regression_loss_weight")
+    assert not hasattr(config, "stationary_range_loss_weight")
+    assert "stationary_regression_loss" not in REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS
     assert "stationary_range_loss" not in REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS
 
 
@@ -51,7 +54,6 @@ def test_calibration_activation_tracks_nohip_contact_and_predicted_history():
             "temporal_sample_fraction": torch.tensor([1.0, 1.0]),
             "contact_active_foot_count": torch.tensor([0.0, 1.0]),
             "stationary_margin_loss": torch.tensor([0.0, 0.1]),
-            "stationary_range_loss": torch.tensor([0.0, 0.1]),
         }
     )
 
@@ -61,4 +63,5 @@ def test_calibration_activation_tracks_nohip_contact_and_predicted_history():
     assert active["contact_velocity_loss"]
     assert active["yaw_velocity_loss"]
     assert active["stationary_margin_loss"]
-    assert active["stationary_range_loss"]
+    assert "stationary_regression_loss" not in active
+    assert "stationary_range_loss" not in active

@@ -31,9 +31,6 @@ def expected_active_loss_terms(losses: Mapping[str, torch.Tensor]) -> dict[str, 
     stationary_margin = bool(
         (losses["stationary_margin_loss"].detach().abs() > 1e-12).any().item()
     )
-    stationary_range = bool(
-        (losses["stationary_range_loss"].detach().abs() > 1e-12).any().item()
-    )
     return {
         "local_rotation_loss": True,
         "body_geometry_loss": True,
@@ -42,9 +39,7 @@ def expected_active_loss_terms(losses: Mapping[str, torch.Tensor]) -> dict[str, 
         "nohip_yaw_loss": hip_missing,
         "nohip_root_xz_loss": hip_missing,
         "nohip_height_loss": hip_missing,
-        "stationary_regression_loss": True,
         "stationary_margin_loss": stationary_margin,
-        "stationary_range_loss": stationary_range,
         "contact_height_loss": contact,
         "contact_velocity_loss": contact and temporal,
         "joint_velocity_loss": temporal,

@@ -1514,6 +1514,35 @@ class GaussianDiffusion:
                         )
                     terms[f"simple_{group_name}_loss"] = group_loss
 
+                if schema.supports_stationary_prob and pred_xstart is not None:
+                    stationary_slice = schema.stationary_prob_slice()
+                    # stationary 通道按契约不做标准化；这里把原 regression 辅助项等价折算为
+                    # 主 MSE 的通道增量权重，并继续沿用低噪声更强的 timestep schedule。
+                    stationary_mse = self.masked_l2(
+                        x_start[:, stationary_slice, :].float(),
+                        pred_xstart[:, stationary_slice, :].float(),
+                        mask[:, stationary_slice, :],
+                        feature_w=None,
+                        use_l1=False,
+                    )
+                    stationary_channel_weight = self.realtime_pose_loss.stationary_simple_loss_channel_weight(
+                        t,
+                        batch_size=x_start.shape[0],
+                        device=stationary_mse.device,
+                        dtype=stationary_mse.dtype,
+                    )
+                    target_slice = schema.target_slice()
+                    target_dim = int(target_slice.stop - target_slice.start)
+                    stationary_dim = int(stationary_slice.stop - stationary_slice.start)
+                    stationary_upweight = (
+                        (stationary_channel_weight - 1.0)
+                        * (float(stationary_dim) / float(target_dim))
+                        * stationary_mse
+                    )
+                    terms["simple_stationary_channel_weight"] = stationary_channel_weight
+                    terms["simple_stationary_upweight"] = stationary_upweight
+                    terms["simple_loss"] = terms["simple_loss"] + stationary_upweight
+
             terms["loss"] = terms["simple_loss"] + terms.get('vb', 0.)
 
             if snr_gamma:

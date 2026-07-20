@@ -8,8 +8,8 @@ from typing import Mapping
 class RealtimePoseLossConfig:
     """实时姿态辅助损失的唯一配置来源。
 
-    权重和阈值属于实验 profile；这里的默认值固定为 C04 训练时使用的数值，
-    使没有显式覆盖项的训练仍能复现同一损失定义。
+    权重和阈值属于实验 profile；这里提供当前训练入口的默认基线，正式实验仍应
+    在参数记录中保存完整配置，避免后续默认值变化影响复现。
     """
 
     aux_loss_weight: float = 1.0
@@ -20,10 +20,10 @@ class RealtimePoseLossConfig:
     nohip_yaw_loss_weight: float = 8.72134586652926
     nohip_root_xz_loss_weight: float = 1.0
     nohip_height_loss_weight: float = 0.023221202705222908
-    stationary_regression_loss_weight: float = 0.020235997785184236
+    # 原 stationary regression 等价折算为主 MSE 中五个 stationary 通道的最大相对权重。
+    # 低噪声时为 1.6232687，高噪声时按 aux timestep schedule 向 1.0 衰减。
+    stationary_simple_loss_channel_weight: float = 1.6232687317836745
     stationary_margin_loss_weight: float = 0.022660554661242633
-    # target_dit 已将 stationary logits 映射到 [0,1]，range loss 只保留为诊断兼容项。
-    stationary_range_loss_weight: float = 0.0
     contact_height_loss_weight: float = 0.015288775346708965
     contact_velocity_loss_weight: float = 2.0343500261020283e-05
     joint_velocity_loss_weight: float = 0.00038461258563439796
@@ -41,7 +41,6 @@ class RealtimePoseLossConfig:
     foot_contact_height_threshold: float = 0.05
     stationary_runtime_threshold: float = 0.70
     stationary_runtime_margin: float = 0.10
-    stationary_range_huber_beta: float = 0.05
     aux_timestep_min_weight: float = 0.10
     aux_timestep_gamma: float = 2.0
 
@@ -57,6 +56,8 @@ class RealtimePoseLossConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.aux_loss_weight < 0.0:
             raise ValueError("aux_loss_weight must be non-negative")
+        if self.stationary_simple_loss_channel_weight < 1.0:
+            raise ValueError("stationary_simple_loss_channel_weight must be at least 1.0")
         if not 0.0 < self.stationary_runtime_threshold < 1.0:
             raise ValueError("stationary_runtime_threshold must be in (0, 1)")
         if not 0.0 < self.stationary_runtime_margin < min(
@@ -95,9 +96,7 @@ REALTIME_POSE_LOSS_TERM_TO_WEIGHT: dict[str, str] = {
     "nohip_yaw_loss": "nohip_yaw_loss_weight",
     "nohip_root_xz_loss": "nohip_root_xz_loss_weight",
     "nohip_height_loss": "nohip_height_loss_weight",
-    "stationary_regression_loss": "stationary_regression_loss_weight",
     "stationary_margin_loss": "stationary_margin_loss_weight",
-    "stationary_range_loss": "stationary_range_loss_weight",
     "contact_height_loss": "contact_height_loss_weight",
     "contact_velocity_loss": "contact_velocity_loss_weight",
     "joint_velocity_loss": "joint_velocity_loss_weight",
@@ -114,7 +113,6 @@ REALTIME_POSE_LOSS_GRADIENT_TARGET_RATIOS: dict[str, float] = {
     "nohip_yaw_loss": 0.05,
     "nohip_root_xz_loss": 0.05,
     "nohip_height_loss": 0.05,
-    "stationary_regression_loss": 0.10,
     "stationary_margin_loss": 0.05,
     "contact_height_loss": 0.025,
     "contact_velocity_loss": 0.025,
@@ -135,7 +133,6 @@ _POSITIVE_CONFIG_FIELDS = (
     "rotation_velocity_huber_beta",
     "yaw_velocity_huber_beta",
     "foot_contact_height_threshold",
-    "stationary_range_huber_beta",
 )
 
 

@@ -126,6 +126,13 @@ class RealtimePoseAuxiliaryLoss:
             1.0 - self.config.aux_timestep_min_weight
         ) * progress.pow(self.config.aux_timestep_gamma)
 
+    def stationary_simple_loss_channel_weight(self, timesteps, batch_size, device, dtype):
+        """返回主 MSE 中 stationary 通道随噪声阶段变化的相对权重。"""
+
+        timestep_weight = self._aux_timestep_weight(timesteps, batch_size, device, dtype)
+        maximum_excess = self.config.stationary_simple_loss_channel_weight - 1.0
+        return 1.0 + maximum_excess * timestep_weight
+
     def compute(self, pred_xstart, x_start, model_kwargs, timesteps=None):
         # FK、rotation log 和速度差分在 BF16 下会把接近单位旋转的 acos 上界舍入到 1，
         # loss 本身仍 finite，但反向导数可能发散。辅助几何统一以 FP32 计算并保留回模型的梯度。
@@ -349,7 +356,6 @@ class RealtimePoseAuxiliaryLoss:
         target_stationary = y["target_stationary_prob_5"].to(device=device, dtype=dtype)
         if target_stationary.shape != (batch_size, 5):
             raise ValueError(f"target_stationary_prob_5 应为 [B,5]，实际为 {tuple(target_stationary.shape)}")
-        stationary_regression_loss = (pred_stationary - target_stationary).square().mean(dim=1)
         threshold = float(self.config.stationary_runtime_threshold)
         margin = float(self.config.stationary_runtime_margin)
         confidence = (target_stationary - threshold).abs()
@@ -375,13 +381,6 @@ class RealtimePoseAuxiliaryLoss:
         stationary_margin_loss = (
             active_margin_loss + inactive_margin_loss
         ) / active_class_count.clamp_min(1.0)
-        stationary_range_target = pred_stationary.detach().clamp(0.0, 1.0)
-        stationary_range_loss = _smooth_l1(
-            pred_stationary,
-            stationary_range_target,
-            self.config.stationary_range_huber_beta,
-        ).mean(dim=1)
-
         dt = frame_dt[:, None, None]
         pred_velocity = (resolver.final_joints_world - pred_prev_joints) / dt
         gt_velocity = (target_joints - gt_prev_joints) / dt
@@ -468,9 +467,7 @@ class RealtimePoseAuxiliaryLoss:
             "nohip_yaw_loss": nohip_yaw_loss,
             "nohip_root_xz_loss": nohip_root_xz_loss,
             "nohip_height_loss": nohip_height_loss,
-            "stationary_regression_loss": stationary_regression_loss,
             "stationary_margin_loss": stationary_margin_loss,
-            "stationary_range_loss": stationary_range_loss,
             "contact_height_loss": contact_height_loss,
             "contact_velocity_loss": contact_velocity_loss,
             "joint_velocity_loss": joint_velocity_loss,

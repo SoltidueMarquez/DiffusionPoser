@@ -210,16 +210,14 @@ def test_default_auxiliary_loss_fixed_input_regression():
         "nohip_yaw_loss": (0.0, 0.0569578409),
         "nohip_root_xz_loss": (0.0, 0.0010689230),
         "nohip_height_loss": (0.0, 0.2328828424),
-        "stationary_regression_loss": (0.0255000032, 0.0069999993),
         "stationary_margin_loss": (0.0036363641, 0.0005000002),
-        "stationary_range_loss": (0.0300000068, 0.0),
         "contact_height_loss": (0.0, 0.1162884235),
         "contact_velocity_loss": (0.0, 1.4444473982),
         "joint_velocity_loss": (2.4483196735, 2.7352113724),
         "rotation_velocity_loss": (1.1085032225, 1.1846578121),
         "yaw_velocity_loss": (0.0, 25.3074073792),
         "aux_timestep_weight": (1.0, 0.1000000015),
-        "aux_loss": (0.0211762860, 0.0556122661),
+        "aux_loss": (0.0206602681, 0.0555981025),
     }
     for loss_name, values in expected.items():
         assert torch.allclose(losses[loss_name], torch.tensor(values), rtol=1e-5, atol=1e-6)
@@ -323,14 +321,14 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         "nohip_yaw_loss",
         "nohip_root_xz_loss",
         "nohip_height_loss",
-        "stationary_regression_loss",
         "stationary_margin_loss",
-        "stationary_range_loss",
         "contact_velocity_loss",
         "contact_height_loss",
         "joint_velocity_loss",
         "rotation_velocity_loss",
         "yaw_velocity_loss",
+        "simple_stationary_channel_weight",
+        "simple_stationary_upweight",
         "aux_loss",
     }.issubset(losses)
     assert torch.allclose(losses["loss"], losses["simple_loss"] + losses["aux_loss"])
@@ -798,7 +796,7 @@ def test_weighted_foot_loss_normalizes_left_and_right_independently():
     assert normalized.mean().item() == pytest.approx(20.5)
 
 
-def test_stationary_soft_target_adds_explicit_out_of_range_penalty():
+def test_stationary_soft_target_only_uses_runtime_margin_in_auxiliary_losses():
     diffusion = _make_loss_test_diffusion()
     pred_xstart, x_start, model_kwargs = _make_sensor_reprojection_aux_inputs(
         target_tracker_pos_ref=torch.zeros(1, TRACKER_COUNT, 3),
@@ -811,9 +809,48 @@ def test_stationary_soft_target_adds_explicit_out_of_range_penalty():
 
     losses = diffusion.realtime_pose_loss.compute(pred_xstart, x_start, model_kwargs)
 
-    assert losses["stationary_range_loss"].item() == pytest.approx(0.19)
-    assert losses["stationary_regression_loss"].item() > 0.0
     assert losses["stationary_margin_loss"].item() > 0.0
+    assert "stationary_regression_loss" not in losses
+    assert "stationary_range_loss" not in losses
+
+
+def test_stationary_regression_is_folded_into_simple_mse_channel_weight():
+    diffusion = _make_loss_test_diffusion()
+    pred_xstart, x_start, model_kwargs = _make_sensor_reprojection_aux_inputs(
+        target_tracker_pos_ref=torch.zeros(1, TRACKER_COUNT, 3),
+        target_sensor_valid=torch.ones(1, TRACKER_COUNT, dtype=torch.bool),
+    )
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    pred_xstart[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START] = 0.1
+    mask = torch.zeros_like(x_start, dtype=torch.bool)
+    mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
+    model_kwargs["y"]["mask"] = mask
+    model_kwargs["y"]["inpainted_motion"] = x_start
+    model_kwargs["inpaint_cond"] = mask
+
+    class FixedPrediction(torch.nn.Module):
+        def forward(self, x, timesteps, **kwargs):
+            return pred_xstart
+
+    losses = diffusion.training_losses(
+        FixedPrediction(),
+        x_start,
+        torch.zeros(1, dtype=torch.long),
+        model_kwargs=model_kwargs,
+        noise=torch.zeros_like(x_start),
+        snr_gamma=0.0,
+    )
+
+    stationary_mse = torch.tensor([0.01])
+    old_regression_weight = 0.020235997785184236
+    base_mse = stationary_mse * (5.0 / 154.0)
+    expected_upweight = stationary_mse * old_regression_weight
+    assert torch.allclose(losses["simple_stationary_loss"], stationary_mse)
+    assert torch.allclose(losses["simple_stationary_upweight"], expected_upweight)
+    assert torch.allclose(losses["simple_loss"], base_mse + expected_upweight)
+    assert losses["simple_stationary_channel_weight"].item() == pytest.approx(1.6232687317836745)
+    assert "stationary_regression_loss" not in losses
+    assert "stationary_range_loss" not in losses
 
 
 def test_masked_l2_feature_weight_uses_weighted_denominator():
