@@ -2,6 +2,8 @@
 param(
     [switch]$DryRun,
     [switch]$Resume,
+    [ValidateRange(0, 1000000)]
+    [int]$CanarySteps = 0,
     [switch]$SkipConversion,
     [switch]$SkipFinalEvaluationMatrix,
     [int]$Device = -1,
@@ -24,6 +26,14 @@ $UnityRoot = if ([string]::IsNullOrWhiteSpace($UnityRootOverride)) {
 } else {
     (Resolve-Path -LiteralPath $UnityRootOverride).Path
 }
+
+# Codex 沙箱用户与仓库所有者不同；只为本脚本及其子进程声明安全目录，
+# 不写入用户的 global Git config。
+$env:GIT_CONFIG_COUNT = "2"
+$env:GIT_CONFIG_KEY_0 = "safe.directory"
+$env:GIT_CONFIG_VALUE_0 = $RepoRoot -replace "\\", "/"
+$env:GIT_CONFIG_KEY_1 = "safe.directory"
+$env:GIT_CONFIG_VALUE_1 = $UnityRoot -replace "\\", "/"
 
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "找不到实验配置：$ConfigPath"
@@ -187,13 +197,17 @@ function Write-RuntimeManifest {
     } else {
         $null
     }
-    $finalCheckpoint = Get-CheckpointPath -Step 130000
+    $finalStep = if ($CanaryMode) { $CanarySteps } else { 130000 }
+    $finalCheckpoint = Get-CheckpointPath -Step $finalStep
     if (-not (Test-Path -LiteralPath $finalCheckpoint -PathType Leaf)) {
         $finalCheckpoint = $null
     }
     $manifest = [ordered]@{
         schema_version = 1
         experiment_id = $ExperimentId
+        mode = if ($CanaryMode) { "canary" } else { "full" }
+        batch_size = $EffectiveBatchSize
+        canary_steps = if ($CanaryMode) { $CanarySteps } else { $null }
         status = $Status
         exit_code = $ExitCode
         failure_reason = if ([string]::IsNullOrWhiteSpace($FailureReason)) { $null } else { $FailureReason }
@@ -270,15 +284,21 @@ function Invoke-Stage {
 
     $exitCode = 1
     $failureReason = ""
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
+        # Windows PowerShell 会把 native stderr 的每一行包装成 ErrorRecord；
+        # 此处允许它完整通过 2>&1 进入日志，再用 exit code 决定阶段成败。
+        $ErrorActionPreference = "Continue"
         & conda @CommandArgs 2>&1 | Tee-Object -FilePath $logPath
         $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
-            $failureReason = "$Description 失败，exit_code=$exitCode"
+            $failureReason = "$Description 失败，exit_code=$exitCode；详见 $logPath"
         }
     } catch {
         $exitCode = 1
         $failureReason = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 
     $finishedAt = [DateTimeOffset]::Now.ToString("o")
@@ -391,16 +411,22 @@ function Get-TrainingArguments {
     param(
         [Parameter(Mandatory = $true)]$Stage,
         [Parameter(Mandatory = $true)][bool]$ResumeStage,
-        [object[]]$LossArguments = @()
+        [object[]]$LossArguments = @(),
+        [string]$RunName = ""
     )
 
+    $resolvedRunName = if ([string]::IsNullOrWhiteSpace($RunName)) {
+        "$ExperimentId-direct-baseline"
+    } else {
+        $RunName
+    }
     $arguments = @(
         "--data_dir", $TrainTaskRoot,
         "--data_split", "train",
         "--normalizer_dir", $NormalizerRoot,
         "--normalize_input", "true",
         "--save_dir", $TrainingRunRoot,
-        "--run_name", "$ExperimentId-direct-baseline",
+        "--run_name", $resolvedRunName,
         "--seed", (ConvertTo-InvariantString $Seed),
         "--batch_size", (ConvertTo-InvariantString $EffectiveBatchSize),
         "--num_workers", (ConvertTo-InvariantString $EffectiveNumWorkers),
@@ -577,19 +603,37 @@ $NormalizerRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.normalize
 $LongseqRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.longseq_root)
 $LongseqSetDir = $LongseqRoot
 $CalibrationRunRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.calibration_run_root)
-$TrainingRunRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.training_run_root)
+$OfficialTrainingRunRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.training_run_root)
 $EvaluationOutputRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.evaluation_output_root)
-$RunDir = Join-Path $RepoRoot "runs\$ExperimentId"
-$LogDir = Join-Path $RunDir "logs"
-$ManifestPath = Join-Path $RunDir "experiment_runtime.json"
 $CalibrationReport = Resolve-ConfiguredPath -Value ([string]$Config.calibration.report)
-$CalibrationWorkDir = Join-Path $RunDir "calibration\work"
-$EvaluationIndexPath = Join-Path $RunDir "evaluation_index.json"
 $Seed = [int]$Config.seed
 $EffectiveDevice = if ($Device -ge 0) { $Device } else { [int]$Config.device }
 $EffectiveBatchSize = if ($BatchSize -gt 0) { $BatchSize } else { [int]$Config.batch_size }
 $EffectiveNumWorkers = if ($NumWorkers -ge 0) { $NumWorkers } else { [int]$Config.num_workers }
 $EffectiveConverterWorkers = if ($ConverterWorkers -gt 0) { $ConverterWorkers } else { [int]$Config.data.converter_num_workers }
+$CanaryMode = $CanarySteps -gt 0
+if ($CanaryMode -and $Resume) {
+    throw "Canary 模式不允许与 -Resume 混用；每次 canary 必须写入独立的新目录。"
+}
+$CanaryName = if ($CanaryMode) {
+    "canary-b{0}-h8-s{1}" -f $EffectiveBatchSize, $CanarySteps
+} else {
+    ""
+}
+$TrainingRunRoot = if ($CanaryMode) {
+    Join-Path (Split-Path -Parent $OfficialTrainingRunRoot) $CanaryName
+} else {
+    $OfficialTrainingRunRoot
+}
+$RunDir = if ($CanaryMode) {
+    Join-Path (Join-Path $RepoRoot "runs\$ExperimentId") $CanaryName
+} else {
+    Join-Path $RepoRoot "runs\$ExperimentId"
+}
+$LogDir = Join-Path $RunDir "logs"
+$ManifestPath = Join-Path $RunDir "experiment_runtime.json"
+$CalibrationWorkDir = Join-Path $RunDir "calibration\work"
+$EvaluationIndexPath = Join-Path $RunDir "evaluation_index.json"
 $DiffusionPoserCommit = (git -c "safe.directory=$RepoRoot" -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "无法读取 DiffusionPoser commit。"
@@ -634,6 +678,9 @@ Write-Host "Config:                 $ConfigPath"
 Write-Host "Runtime manifest:       $ManifestPath"
 Write-Host "Training artifacts:     $TrainingRunRoot"
 Write-Host "Evaluation outputs:     $EvaluationOutputRoot"
+if ($CanaryMode) {
+    Write-Host "Mode:                   canary（batch=$EffectiveBatchSize, H8, steps=$CanarySteps）" -ForegroundColor Yellow
+}
 $artifactDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($SourceDir))
 $availableGiB = $artifactDrive.AvailableFreeSpace / 1GB
 $minimumFreeGiB = [double]$Config.resource_estimate.minimum_free_space_gib
@@ -712,28 +759,30 @@ try {
     }
     Invoke-Stage -Name "tasks-train" -Description "生成 train source-reference manifest：每 source 两个在线窗口、支持 H8" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $trainTaskArguments)
 
-    $evalTaskArguments = @(
-        "--artifact_roots_config", $ArtifactRootsConfig,
-        "--schema", [string]$Config.schema_name,
-        "--source_set_name", $ExperimentId,
-        "--task_set_name", "$ExperimentId-eval",
-        "--source_dir", $SourceDir,
-        "--output_dir", $EvalTaskRoot,
-        "--output_split_name", [string]$Config.data.eval_task_output_name,
-        "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
-        "--splits", "test",
-        "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
-        "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
-        "--mask_policy", [string]$Config.data.mask_policy,
-        "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
-        "--short_source_policy", "skip",
-        "--seed", (ConvertTo-InvariantString $Seed),
-        "--run_name", "$ExperimentId-eval"
-    )
-    if ([bool]$Config.data.direct_task_output) {
-        $evalTaskArguments += "--direct_output"
+    if (-not $CanaryMode) {
+        $evalTaskArguments = @(
+            "--artifact_roots_config", $ArtifactRootsConfig,
+            "--schema", [string]$Config.schema_name,
+            "--source_set_name", $ExperimentId,
+            "--task_set_name", "$ExperimentId-eval",
+            "--source_dir", $SourceDir,
+            "--output_dir", $EvalTaskRoot,
+            "--output_split_name", [string]$Config.data.eval_task_output_name,
+            "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
+            "--splits", "test",
+            "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
+            "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
+            "--mask_policy", [string]$Config.data.mask_policy,
+            "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
+            "--short_source_policy", "skip",
+            "--seed", (ConvertTo-InvariantString $Seed),
+            "--run_name", "$ExperimentId-eval"
+        )
+        if ([bool]$Config.data.direct_task_output) {
+            $evalTaskArguments += "--direct_output"
+        }
+        Invoke-Stage -Name "tasks-eval" -Description "生成固定 sampling epoch 0 的 test source-reference manifest" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
     }
-    Invoke-Stage -Name "tasks-eval" -Description "生成固定 sampling epoch 0 的 test source-reference manifest" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
 
     $normalizerArguments = @(
         "--artifact_roots_config", $ArtifactRootsConfig,
@@ -754,24 +803,67 @@ try {
     }
     Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K2 正式统计与 K4 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
 
-    $longseqArguments = @(
-        "--task_dir", $EvalTaskRoot,
-        "--task_run", "latest",
-        "--task_subdir", [string]$Config.data.eval_task_output_name,
-        "--output_root", $LongseqRoot,
-        "--run_name", "longseq",
-        "--preset", [string]$Config.data.longseq_preset,
-        "--split", "test",
-        "--min_frames", (ConvertTo-InvariantString $Config.data.longseq_min_frames),
-        "--schema", [string]$Config.schema_name
-    )
-    if ([bool]$Config.data.direct_longseq_output) {
-        $longseqArguments += "--direct_output"
+    if (-not $CanaryMode) {
+        $longseqArguments = @(
+            "--task_dir", $EvalTaskRoot,
+            "--task_run", "latest",
+            "--task_subdir", [string]$Config.data.eval_task_output_name,
+            "--output_root", $LongseqRoot,
+            "--run_name", "longseq",
+            "--preset", [string]$Config.data.longseq_preset,
+            "--split", "test",
+            "--min_frames", (ConvertTo-InvariantString $Config.data.longseq_min_frames),
+            "--schema", [string]$Config.schema_name
+        )
+        if ([bool]$Config.data.direct_longseq_output) {
+            $longseqArguments += "--direct_output"
+        }
+        if ([bool]$Config.data.longseq_include_mirror) {
+            $longseqArguments += "--include_mirror"
+        }
+        Invoke-Stage -Name "longseq-set" -Description "冻结 stress-long 长序列评估集合" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.build_realtime_longseq_eval_set" -Arguments $longseqArguments)
     }
-    if ([bool]$Config.data.longseq_include_mirror) {
-        $longseqArguments += "--include_mirror"
+
+    if ($CanaryMode) {
+        $configuredStages = @($Config.training.stages)
+        $finalTrainingStage = $configuredStages[$configuredStages.Count - 1]
+        $canaryStage = [pscustomobject][ordered]@{
+            name = $CanaryName
+            target_steps = $CanarySteps
+            lr = [double]$finalTrainingStage.lr
+            tracker_categories = @("all")
+            rollout_steps = 9
+            short_rollout_prob = 0.0
+            short_rollout_loss_weight = 0.0
+            long_rollout_prob = 1.0
+            long_rollout_loss_weight = [double]$Config.training.long_rollout_loss_weight
+            long_rollout_phase1_steps = 0
+            long_rollout_phase2_steps = 0
+            long_rollout_phase1_max_horizon = 8
+            long_rollout_phase2_max_horizon = 8
+        }
+        $canaryArguments = Get-TrainingArguments `
+            -Stage $canaryStage `
+            -ResumeStage $false `
+            -RunName "$ExperimentId-$CanaryName"
+        Invoke-Stage `
+            -Name $CanaryName `
+            -Description "独立 batch=$EffectiveBatchSize H8 canary，训练 $CanarySteps step" `
+            -CommandArgs (New-CondaModuleCommand -Module "train.train_diffusionposer" -Arguments $canaryArguments)
+
+        if ($DryRun) {
+            Write-Host ""
+            Write-Host "Canary Dry-run 完成：不会创建运行目录、checkpoint 或 latest pointer。" -ForegroundColor Yellow
+            exit 0
+        }
+
+        Write-RuntimeManifest -Status "completed" -ExitCode 0
+        Write-Host ""
+        Write-Host "Canary 执行完成；正式训练目录和 latest pointer 未修改。" -ForegroundColor Green
+        Write-Host "Runtime manifest: $ManifestPath"
+        Write-Host "Canary artifacts: $TrainingRunRoot"
+        exit 0
     }
-    Invoke-Stage -Name "longseq-set" -Description "冻结 stress-long 长序列评估集合" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.build_realtime_longseq_eval_set" -Arguments $longseqArguments)
 
     $warmupArguments = @(
         "--data_dir", $TrainTaskRoot,
