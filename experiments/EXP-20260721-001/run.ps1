@@ -16,8 +16,8 @@ $ErrorActionPreference = "Stop"
 
 $ExperimentId = "EXP-20260721-001"
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
-$ConfigPath = Join-Path $RepoRoot "configs\experiments\$ExperimentId\experiment.json"
-$RecordPath = Join-Path $RepoRoot "documents\experiments\$ExperimentId.md"
+$ConfigPath = Join-Path $PSScriptRoot "experiment.json"
+$RecordPath = Join-Path $PSScriptRoot "README.md"
 $SkillValidatorPath = Join-Path $RepoRoot ".codex\skills\realtime-poser-experiment\scripts\experiment_record.py"
 $UnityRoot = if ([string]::IsNullOrWhiteSpace($UnityRootOverride)) {
     (Resolve-Path -LiteralPath (Join-Path $RepoRoot "..\SIGGRAPH2024Unity")).Path
@@ -364,7 +364,6 @@ function Get-CalibratedLossArguments {
         "nohip_yaw_loss_weight",
         "nohip_root_xz_loss_weight",
         "nohip_height_loss_weight",
-        "stationary_margin_loss_weight",
         "contact_height_loss_weight",
         "contact_velocity_loss_weight",
         "joint_velocity_loss_weight",
@@ -382,6 +381,8 @@ function Get-CalibratedLossArguments {
         $weights[$name] = $value
         $arguments += @("--$name", (ConvertTo-InvariantString $value))
     }
+    # 本实验仅用主 MSE 监督 stationary_prob_5，不采用 runtime 阈值 margin 辅助项。
+    $weights["stationary_margin_loss_weight"] = [double]$Config.calibration.stationary_margin_loss_weight
     $script:CalibratedLossWeights = $weights
     return $arguments
 }
@@ -403,6 +404,7 @@ function Get-TrainingArguments {
         "--seed", (ConvertTo-InvariantString $Seed),
         "--batch_size", (ConvertTo-InvariantString $EffectiveBatchSize),
         "--num_workers", (ConvertTo-InvariantString $EffectiveNumWorkers),
+        "--source_cache_max_mib", (ConvertTo-InvariantString $Config.source_cache_max_mib),
         "--cuda", "true",
         "--device", (ConvertTo-InvariantString $EffectiveDevice),
         "--lr", (ConvertTo-InvariantString $Stage.lr),
@@ -425,6 +427,7 @@ function Get-TrainingArguments {
         "--long_rollout_smooth_l1_beta", (ConvertTo-InvariantString $Config.training.long_rollout_smooth_l1_beta),
         "--rollout_ddim_steps", (ConvertTo-InvariantString $Config.training.rollout_ddim_steps),
         "--stationary_simple_loss_channel_weight", (ConvertTo-InvariantString $Config.calibration.official_stationary_simple_loss_channel_weight),
+        "--stationary_margin_loss_weight", (ConvertTo-InvariantString $Config.calibration.stationary_margin_loss_weight),
         "--aux_loss_weight", "1",
         "--model_ema_decay", (ConvertTo-InvariantString $Config.model.model_ema_decay),
         "--model_ema_steps", (ConvertTo-InvariantString $Config.model.model_ema_steps),
@@ -472,7 +475,7 @@ function Invoke-CheckpointEvaluation {
         "--model_path", $checkpoint,
         "--output_dir", $outputDir,
         "--eval_root", $LongseqRoot,
-        "--eval_set", $ExperimentId,
+        "--eval_set", "latest",
         "--schema", [string]$Config.schema_name,
         "--normalizer_dir", $NormalizerRoot,
         "--normalize_input", "true",
@@ -572,7 +575,7 @@ $TrainTaskRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.train_task
 $EvalTaskRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.eval_task_root)
 $NormalizerRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.normalizer_root)
 $LongseqRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.longseq_root)
-$LongseqSetDir = Join-Path $LongseqRoot $ExperimentId
+$LongseqSetDir = $LongseqRoot
 $CalibrationRunRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.calibration_run_root)
 $TrainingRunRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.training_run_root)
 $EvaluationOutputRoot = Resolve-ConfiguredPath -Value ([string]$Config.paths.evaluation_output_root)
@@ -596,7 +599,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "无法读取 Unity commit。"
 }
 $LaunchCommand = if ([string]::IsNullOrWhiteSpace($MyInvocation.Line)) {
-    "powershell -ExecutionPolicy Bypass -File scripts/experiments/$ExperimentId.ps1"
+    "powershell -ExecutionPolicy Bypass -File experiments/$ExperimentId/run.ps1"
 } else {
     $MyInvocation.Line.Trim()
 }
@@ -635,7 +638,7 @@ $artifactDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($SourceDir))
 $availableGiB = $artifactDrive.AvailableFreeSpace / 1GB
 $minimumFreeGiB = [double]$Config.resource_estimate.minimum_free_space_gib
 Write-Host ("Artifact disk free:     {0:N1} GiB（脚本阈值 {1:N1} GiB）" -f $availableGiB, $minimumFreeGiB)
-if (-not $DryRun -and -not $SkipConversion -and $availableGiB -lt $minimumFreeGiB) {
+if (-not $DryRun -and $availableGiB -lt $minimumFreeGiB) {
     throw ("artifact 盘剩余空间不足：{0:N1} GiB；本实验至少要求 {1:N1} GiB。" -f $availableGiB, $minimumFreeGiB)
 }
 
@@ -660,7 +663,14 @@ try {
     )
     Invoke-Stage -Name "preflight-environment" -Description "检查训练环境核心依赖" -CommandArgs $preflightCommand
 
-    if (-not $SkipConversion) {
+    if ([bool]$Config.data.reuse_existing_source) {
+        $sourceManifest = Join-Path $SourceDir "manifest.jsonl"
+        if (-not (Test-Path -LiteralPath $sourceManifest -PathType Leaf)) {
+            throw "配置要求复用 source，但 manifest 不存在：$sourceManifest"
+        }
+        Write-Host ""
+        Write-Host "[source-reuse] 复用实验目录中已完成的 exact-schema source：$SourceDir" -ForegroundColor Cyan
+    } elseif (-not $SkipConversion) {
         $convertArguments = @(
             "--artifact_roots_config", $ArtifactRootsConfig,
             "--schema", [string]$Config.schema_name,
@@ -686,17 +696,21 @@ try {
         "--task_set_name", "$ExperimentId-train",
         "--source_dir", $SourceDir,
         "--output_dir", $TrainTaskRoot,
+        "--output_split_name", [string]$Config.data.train_task_output_name,
         "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
         "--splits", "train",
-        "--samples_per_file", (ConvertTo-InvariantString $Config.data.train_samples_per_file),
+        "--samples_per_source", (ConvertTo-InvariantString $Config.data.train_samples_per_source),
         "--rollout_steps", (ConvertTo-InvariantString $Config.data.train_rollout_steps),
         "--mask_policy", [string]$Config.data.mask_policy,
-        "--patterns_per_window", (ConvertTo-InvariantString $Config.data.patterns_per_window),
+        "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
         "--short_source_policy", "skip",
         "--seed", (ConvertTo-InvariantString $Seed),
         "--run_name", "$ExperimentId-train"
     )
-    Invoke-Stage -Name "tasks-train" -Description "生成每动作四起点、支持 H8 的训练 task" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $trainTaskArguments)
+    if ([bool]$Config.data.direct_task_output) {
+        $trainTaskArguments += "--direct_output"
+    }
+    Invoke-Stage -Name "tasks-train" -Description "生成 train source-reference manifest：每 source 两个在线窗口、支持 H8" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $trainTaskArguments)
 
     $evalTaskArguments = @(
         "--artifact_roots_config", $ArtifactRootsConfig,
@@ -705,17 +719,21 @@ try {
         "--task_set_name", "$ExperimentId-eval",
         "--source_dir", $SourceDir,
         "--output_dir", $EvalTaskRoot,
+        "--output_split_name", [string]$Config.data.eval_task_output_name,
         "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
         "--splits", "test",
-        "--samples_per_file", (ConvertTo-InvariantString $Config.data.eval_samples_per_file),
+        "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
         "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
         "--mask_policy", [string]$Config.data.mask_policy,
-        "--patterns_per_window", (ConvertTo-InvariantString $Config.data.patterns_per_window),
+        "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
         "--short_source_policy", "skip",
         "--seed", (ConvertTo-InvariantString $Seed),
         "--run_name", "$ExperimentId-eval"
     )
-    Invoke-Stage -Name "tasks-eval" -Description "生成轻量 test task 以冻结长序列评估集合" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
+    if ([bool]$Config.data.direct_task_output) {
+        $evalTaskArguments += "--direct_output"
+    }
+    Invoke-Stage -Name "tasks-eval" -Description "生成固定 sampling epoch 0 的 test source-reference manifest" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
 
     $normalizerArguments = @(
         "--artifact_roots_config", $ArtifactRootsConfig,
@@ -725,23 +743,31 @@ try {
         "--task_dir", $TrainTaskRoot,
         "--output_dir", $NormalizerRoot,
         "--split", "train",
-        "--mask_samples_per_task", (ConvertTo-InvariantString $Config.data.normalizer_mask_samples_per_task),
+        "--windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_windows_per_source),
+        "--convergence_windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_convergence_windows_per_source),
+        "--check_convergence", (ConvertTo-InvariantString $Config.data.normalizer_check_convergence),
         "--tracker_mask_seed", (ConvertTo-InvariantString $Seed),
-        "--tracker_mask_epoch", "0",
         "--run_name", $ExperimentId
     )
-    Invoke-Stage -Name "normalizer" -Description "按新时间窗口与在线 mask 分布重算 normalizer" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
+    if ([bool]$Config.data.direct_normalizer_output) {
+        $normalizerArguments += "--direct_output"
+    }
+    Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K2 正式统计与 K4 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
 
     $longseqArguments = @(
         "--task_dir", $EvalTaskRoot,
         "--task_run", "latest",
+        "--task_subdir", [string]$Config.data.eval_task_output_name,
         "--output_root", $LongseqRoot,
-        "--run_name", $ExperimentId,
+        "--run_name", "longseq",
         "--preset", [string]$Config.data.longseq_preset,
         "--split", "test",
         "--min_frames", (ConvertTo-InvariantString $Config.data.longseq_min_frames),
         "--schema", [string]$Config.schema_name
     )
+    if ([bool]$Config.data.direct_longseq_output) {
+        $longseqArguments += "--direct_output"
+    }
     if ([bool]$Config.data.longseq_include_mirror) {
         $longseqArguments += "--include_mirror"
     }
@@ -757,6 +783,7 @@ try {
         "--seed", (ConvertTo-InvariantString $Seed),
         "--batch_size", (ConvertTo-InvariantString $EffectiveBatchSize),
         "--num_workers", (ConvertTo-InvariantString $EffectiveNumWorkers),
+        "--source_cache_max_mib", (ConvertTo-InvariantString $Config.source_cache_max_mib),
         "--cuda", "true",
         "--device", (ConvertTo-InvariantString $EffectiveDevice),
         "--lr", (ConvertTo-InvariantString $Config.calibration.warmup_lr),
@@ -801,6 +828,7 @@ try {
         "--seed", (ConvertTo-InvariantString $Seed),
         "--batch_size", (ConvertTo-InvariantString $EffectiveBatchSize),
         "--num_workers", (ConvertTo-InvariantString $EffectiveNumWorkers),
+        "--source_cache_max_mib", (ConvertTo-InvariantString $Config.source_cache_max_mib),
         "--cuda", "true",
         "--device", (ConvertTo-InvariantString $EffectiveDevice),
         "--stationary_simple_loss_channel_weight", (ConvertTo-InvariantString $Config.calibration.official_stationary_simple_loss_channel_weight)

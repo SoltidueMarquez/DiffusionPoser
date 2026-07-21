@@ -413,10 +413,17 @@ class TrainLoop:
             return
 
         last_step_end = time.perf_counter()
+        sampling_epoch_offset = (
+            (int(self.resume_step) + int(self.data_num_batches) - 1) // int(self.data_num_batches)
+            if self.resume_step > 0
+            else 0
+        )
         for epoch in range(self.num_epochs):
             dataset = getattr(self.data, "dataset", None)
             if hasattr(dataset, "set_epoch"):
-                dataset.set_epoch(epoch)
+                # 阶段恢复位于半个数据 epoch 时直接进入下一个在线采样 epoch，
+                # 避免 source-reference task 再次从 epoch 0 重放同一批窗口。
+                dataset.set_epoch(sampling_epoch_offset + epoch)
             for batch in self.data:
                 batch_ready_time = time.perf_counter()
                 batch = move_batch_to_device(batch, self.device)

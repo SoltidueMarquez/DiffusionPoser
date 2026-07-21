@@ -8,7 +8,6 @@ import numpy as np
 from schemas.base import SchemaSpec
 from schemas.realtime_pose_stationary5_v1.contract import (
     LEGACY_SCHEMA_NAME,
-    LEGACY_TASK_FORMAT,
     SCHEMA_NAME,
     TASK_FORMAT,
     build_stationary5_spec,
@@ -83,7 +82,7 @@ realtime_pose_stationary5_v1 = build_stationary5_adapter()
 realtime_pose_body_fbx_local_root_y0_v1 = build_stationary5_adapter(
     name=LEGACY_SCHEMA_NAME,
     canonical_name=SCHEMA_NAME,
-    task_format=LEGACY_TASK_FORMAT,
+    task_format=TASK_FORMAT,
     one_line="Legacy exact name for the stationary5 canonical schema.",
 )
 

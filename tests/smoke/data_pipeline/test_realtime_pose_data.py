@@ -11,7 +11,11 @@ import torch
 import data_converter.amass_to_realtime_pose as amass_converter
 from data_converter.amass_to_realtime_pose import build_realtime_pose_features
 from data_converter.amass_smpl_utils import MotionSource, SMPL_JOINT_COUNT, SMPL_PARENTS, run_smpl_forward
-from data_loaders.compute_realtime_pose_normalizer import compute_realtime_pose_normalizer
+from data_loaders.compute_realtime_pose_normalizer import (
+    build_convergence_report,
+    compute_realtime_pose_normalizer,
+    masked_task_feature_stats,
+)
 from data_loaders.generate_realtime_pose_tasks import (
     TASK_OUTPUT_MARKER,
     make_task_id,
@@ -19,8 +23,6 @@ from data_loaders.generate_realtime_pose_tasks import (
     main as generate_realtime_pose_tasks_main,
     read_source_entries,
     resolve_manifest_file,
-    save_task_npz,
-    temporary_task_path,
 )
 from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest, fk_body_fbx_local_delta
 from data_loaders.realtime_pose_kinematics import fk_body_fbx_local_torch
@@ -30,7 +32,6 @@ from data_loaders.realtime_pose_contract import (
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     encode_realtime_pose_features,
-    load_materialized_task_npz,
     load_realtime_task_arrays,
     refresh_tracker_reference,
 )
@@ -63,14 +64,6 @@ def latest_artifact_dir(root: Path, kind: str) -> Path:
     return latest
 
 
-def write_task_variant(source_task: Path, output_task: Path, drop_keys: set[str] | None = None, **overrides) -> None:
-    drop_keys = drop_keys or set()
-    with np.load(source_task, allow_pickle=False) as data:
-        payload = {key: data[key].copy() for key in data.files if key not in drop_keys}
-    payload.update(overrides)
-    np.savez(output_task, **payload)
-
-
 def generate_single_task_manifest(tmp_path: Path) -> tuple[Path, dict]:
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
@@ -83,7 +76,7 @@ def generate_single_task_manifest(tmp_path: Path) -> tuple[Path, dict]:
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -551,7 +544,7 @@ def test_task_generation_scan_rejects_old_body_fbx_source_without_manifest(tmp_p
     )
     np.savez(source_path, **source)
 
-    with pytest.raises(ValueError, match="schema_name"):
+    with pytest.raises(FileNotFoundError, match="source manifest"):
         generate_realtime_pose_tasks_main(
             [
                 "--source_dir",
@@ -560,7 +553,7 @@ def test_task_generation_scan_rejects_old_body_fbx_source_without_manifest(tmp_p
                 str(output_dir),
                 "--splits",
                 "train",
-                "--samples_per_file",
+                "--samples_per_source",
                 "1",
                 "--schema",
                 REALTIME_POSE_SCHEMA_NAME,
@@ -644,7 +637,7 @@ def test_body_fbx_numpy_fk_matches_torch_fk():
     np.testing.assert_allclose(numpy_rotations, torch_rotations.detach().numpy(), atol=1e-6)
 
 
-def test_task_generator_defaults_to_single_full_observation_per_window(tmp_path):
+def test_task_generator_writes_only_source_reference_manifest(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
     write_toy_source_dataset(source_dir)
@@ -657,7 +650,7 @@ def test_task_generator_defaults_to_single_full_observation_per_window(tmp_path)
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "2",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -670,65 +663,65 @@ def test_task_generator_defaults_to_single_full_observation_per_window(tmp_path)
     assert (output_dir / "latest_tasks.json").exists()
     manifest_path = task_output_dir / "train" / "manifest.jsonl"
     entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
-    assert len(entries) == 2
+    assert len(entries) == 1
     assert {entry["tracker_pattern"] for entry in entries} == {"full_six"}
     assert {entry["mask_policy"] for entry in entries} == {"full"}
-    counts = {category: sum(entry["tracker_pattern"] == category for entry in entries) for category in TRACKER_PATTERN_CATEGORIES}
-    assert counts == {"full_six": 2, "standard_three": 0, "static_sparse": 0, "dynamic_dropout": 0}
+    assert entries[0]["samples_per_source"] == 2
+    assert entries[0]["task_format"] == get_schema_spec(REALTIME_POSE_SCHEMA_NAME).task_format
+    assert "task_path" not in entries[0]
+    assert "rollout_task_paths" not in entries[0]
+    assert not list(task_output_dir.rglob("*.npz"))
     assert {entry[POSE_REPRESENTATION_KEY] for entry in entries} == {get_schema_spec(REALTIME_POSE_SCHEMA_NAME).pose_representation}
 
-    for entry in entries:
-        task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"])
-        sensor_valid = task["sensor_valid"].astype(bool)
-        assert sensor_valid.all()
-        assert sensor_valid[:, HEAD_TRACKER_INDEX].all()
-        assert (sensor_valid.sum(axis=1) >= 3).all()
-        assert task["inpaint_mask"].shape == (REALTIME_POSE_SEQ_LEN, REALTIME_POSE_INPUT_DIM)
-        assert task["inpaint_mask"][REALTIME_POSE_TARGET_START, :REALTIME_POSE_TARGET_DIM].all()
-        assert not task["inpaint_mask"][:, REALTIME_POSE_TARGET_DIM:].any()
-        assert int(np.asarray(task["target_start"]).item()) == REALTIME_POSE_TARGET_START
-        assert int(np.asarray(task["target_length"]).item()) == REALTIME_POSE_TARGET_LENGTH
+    dataset = RealtimePoseTaskDataset(output_dir, split="train", normalize_input=False)
+    assert len(dataset) == 2
+    task = dataset.load_task(0, dataset.entries[0])
+    assert task["sensor_valid"].all()
+    assert task["inpaint_mask"].shape == (REALTIME_POSE_SEQ_LEN, REALTIME_POSE_INPUT_DIM)
 
 
-def test_task_loader_rejects_missing_root_y_policy(tmp_path):
-    manifest_path, entry = generate_single_task_manifest(tmp_path)
-    broken_task = manifest_path.parent / "missing_root_y_policy.npz"
-    write_task_variant(manifest_path.parent / entry["task_path"], broken_task, drop_keys={"root_y_policy"})
-
-    with pytest.raises(KeyError, match="root_y_policy"):
-        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=broken_task.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
-
-
-def test_task_loader_rejects_missing_or_wrong_target_contract(tmp_path):
-    manifest_path, entry = generate_single_task_manifest(tmp_path)
-    source_task = manifest_path.parent / entry["task_path"]
-    missing_target = manifest_path.parent / "missing_target_start.npz"
-    write_task_variant(source_task, missing_target, drop_keys={"target_start"})
-    with pytest.raises(KeyError, match="target_start"):
-        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=missing_target.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
-
-    wrong_target = manifest_path.parent / "wrong_target_start.npz"
-    write_task_variant(source_task, wrong_target, target_start=np.int64(0))
-    with pytest.raises(ValueError, match="target_start"):
-        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=wrong_target.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
-
-    missing_length = manifest_path.parent / "missing_target_length.npz"
-    write_task_variant(source_task, missing_length, drop_keys={"target_length"})
-    with pytest.raises(KeyError, match="target_length"):
-        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=missing_length.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda entry: entry.__setitem__("task_format", "materialized_realtime_pose"), "task_format"),
+        (lambda entry: entry.pop("task_format"), "task_format"),
+        (lambda entry: entry.__setitem__("task_path", "files/old.npz"), "materialized"),
+        (lambda entry: entry.__setitem__("rollout_task_paths", []), "materialized"),
+        (lambda entry: entry.pop("source_relative_path"), "缺少字段"),
+    ],
+)
+def test_dataset_rejects_non_source_reference_manifest_entries(tmp_path, mutation, match):
+    manifest_path, _entry = generate_single_task_manifest(tmp_path)
+    entry = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
+    mutation(entry)
+    manifest_path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        RealtimePoseTaskDataset(manifest_path.parent.parent, split="train", normalize_input=False)
 
 
-def test_task_loader_rejects_root_y0_invariant_error(tmp_path):
-    manifest_path, entry = generate_single_task_manifest(tmp_path)
-    source_task = manifest_path.parent / entry["task_path"]
-    with np.load(source_task, allow_pickle=False) as data:
-        bad_root_pos = data["root_pos_world"].copy()
-    bad_root_pos[:, 1] = 0.25
-    broken_task = manifest_path.parent / "bad_root_y0.npz"
-    write_task_variant(source_task, broken_task, root_pos_world=bad_root_pos)
+def test_dataset_rejects_old_or_missing_task_format_marker(tmp_path):
+    manifest_path, _entry = generate_single_task_manifest(tmp_path)
+    marker_path = manifest_path.parent.parent / TASK_OUTPUT_MARKER
+    for old_value in ("materialized_realtime_pose", None):
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if old_value is None:
+            marker.pop("task_format", None)
+        else:
+            marker["task_format"] = old_value
+        marker_path.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(ValueError, match="task_format"):
+            RealtimePoseTaskDataset(manifest_path.parent.parent, split="train", normalize_input=False)
+        marker["task_format"] = get_schema_spec(REALTIME_POSE_SCHEMA_NAME).task_format
+        marker_path.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="root-y0"):
-        load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=broken_task.name, schema_name=REALTIME_POSE_SCHEMA_NAME)
+
+def test_dataset_rejects_changed_source_manifest_sha(tmp_path):
+    manifest_path, _entry = generate_single_task_manifest(tmp_path)
+    marker = json.loads((manifest_path.parent.parent / TASK_OUTPUT_MARKER).read_text(encoding="utf-8"))
+    source_manifest = Path(marker["source_manifest_path"])
+    source_manifest.write_text(source_manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA256"):
+        RealtimePoseTaskDataset(manifest_path.parent.parent, split="train", normalize_input=False)
 
 
 def test_task_id_stays_short_for_long_amass_paths():
@@ -750,22 +743,6 @@ def test_task_id_stays_short_for_long_amass_paths():
     assert all(char in "0123456789abcdef" for char in digest)
 
 
-def test_task_npz_temp_path_does_not_exceed_final_path_length(tmp_path):
-    task_dir = tmp_path / "tasks"
-    task_dir.mkdir()
-    target_len = 259
-    stem_len = target_len - len(str(task_dir)) - 1 - len(".npz")
-    if stem_len < 8:
-        pytest.skip("临时目录路径过长，无法构造接近 Windows MAX_PATH 的最终文件名")
-    task_path = task_dir / (("x" * stem_len) + ".npz")
-    temp_path = temporary_task_path(task_path)
-
-    assert len(str(temp_path)) <= len(str(task_path))
-    save_task_npz(task_path, compress=False, value=np.asarray([1], dtype=np.float32))
-    assert task_path.exists()
-    assert not temp_path.exists()
-
-
 def test_task_generator_skips_short_sources_by_default(tmp_path):
     source_dir = tmp_path / "sources"
     output_dir = tmp_path / "tasks"
@@ -779,7 +756,7 @@ def test_task_generator_skips_short_sources_by_default(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "2",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -813,7 +790,7 @@ def test_task_generator_strict_short_source_policy_raises(tmp_path):
                 str(output_dir),
                 "--splits",
                 "train",
-                "--samples_per_file",
+                "--samples_per_source",
                 "1",
                 "--schema",
                 REALTIME_POSE_SCHEMA_NAME,
@@ -840,7 +817,7 @@ def test_task_generator_default_split_filter_rejects_unmatched_source(tmp_path):
                 str(output_dir),
                 "--splits",
                 "train",
-                "--samples_per_file",
+                "--samples_per_source",
                 "1",
                 "--schema",
                 REALTIME_POSE_SCHEMA_NAME,
@@ -912,7 +889,7 @@ def test_task_generator_rejects_marker_only_task_root_without_latest_pointer(tmp
                 str(output_dir),
                 "--splits",
                 "train",
-                "--samples_per_file",
+                "--samples_per_source",
                 "1",
                 "--schema",
                 REALTIME_POSE_SCHEMA_NAME,
@@ -939,7 +916,7 @@ def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(t
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -959,9 +936,14 @@ def test_task_generator_fixed_patterns_keeps_constraints_and_covers_categories(t
     assert set(TRACKER_PATTERN_CATEGORIES).issubset(categories)
     assert {entry["mask_policy"] for entry in entries} == {"fixed_patterns"}
 
-    for entry in entries:
-        task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"])
-        sensor_valid = task["sensor_valid"].astype(bool)
+    dataset = RealtimePoseTaskDataset(
+        output_dir,
+        split="train",
+        normalize_input=False,
+        tracker_mask_policy="task",
+    )
+    for index in range(len(dataset)):
+        sensor_valid = dataset[index]["sensor_valid"].T.numpy().astype(bool)
         assert sensor_valid[:, HEAD_TRACKER_INDEX].all()
         assert (sensor_valid.sum(axis=1) >= 3).all()
 
@@ -978,7 +960,7 @@ def test_dataset_outputs_schema_dim_by_61_and_uses_explicit_tracker_reference(tm
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1030,7 +1012,7 @@ def test_rollout_task_generation_and_dataset_shapes(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "3",
             "--rollout_steps",
             "2",
@@ -1045,21 +1027,11 @@ def test_rollout_task_generation_and_dataset_shapes(tmp_path):
     task_run_dir = latest_artifact_dir(output_dir, "tasks")
     manifest_path = task_run_dir / "train" / "manifest.jsonl"
     entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
-    assert entries
-    for entry in entries:
-        assert entry["max_rollout_steps"] == 2
-        assert len(entry["rollout_task_paths"]) == 1
-        assert entry["start_frame"] == 0
-        base_task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"])
-        rollout_task = load_materialized_task_npz(
-            manifest_dir=manifest_path.parent,
-            task_path=entry["rollout_task_paths"][0],
-        )
-        assert int(np.asarray(base_task["start_frame"]).item()) == 0
-        assert int(np.asarray(rollout_task["start_frame"]).item()) == 1
-        assert int(np.asarray(rollout_task["start_frame"]).item()) + REALTIME_POSE_SEQ_LEN <= int(
-            np.asarray(rollout_task["source_frames"]).item()
-        )
+    assert len(entries) == 1
+    assert entries[0]["max_rollout_steps"] == 2
+    assert entries[0]["samples_per_source"] == 3
+    assert "task_path" not in entries[0]
+    assert "rollout_task_paths" not in entries[0]
 
     dataset = RealtimePoseTaskDataset(
         output_dir,
@@ -1069,11 +1041,61 @@ def test_rollout_task_generation_and_dataset_shapes(tmp_path):
         rollout_steps=2,
     )
     item = dataset[0]
+    assert len(dataset) == 3
     assert tuple(item["x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
     assert tuple(item["conditioned_x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
     assert len(item["rollout"]) == 1
     assert tuple(item["rollout"][0]["x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
     assert tuple(item["rollout"][0]["conditioned_x"].shape) == (REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN)
+
+
+def test_source_window_sampling_is_reproducible_epoch_aware_and_nested(tmp_path):
+    source_dir = tmp_path / "sources"
+    output_dir = tmp_path / "tasks"
+    write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN + 40)
+    generate_realtime_pose_tasks_main(
+        [
+            "--source_dir", str(source_dir),
+            "--output_dir", str(output_dir),
+            "--splits", "train", "test",
+            "--samples_per_source", "4",
+            "--rollout_steps", "9",
+            "--schema", REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir", "",
+            "--overwrite",
+        ]
+    )
+    train_k2 = RealtimePoseTaskDataset(
+        output_dir,
+        split="train",
+        normalize_input=False,
+        rollout_steps=1,
+        samples_per_source_override=2,
+    )
+    train_k4 = RealtimePoseTaskDataset(
+        output_dir,
+        split="train",
+        normalize_input=False,
+        rollout_steps=1,
+        samples_per_source_override=4,
+    )
+    entry_k2 = train_k2.entries[0]
+    entry_k4 = train_k4.entries[0]
+    starts_k2 = [train_k2.sample_start_frame(entry_k2, slot) for slot in range(2)]
+    starts_k4 = [train_k4.sample_start_frame(entry_k4, slot) for slot in range(4)]
+    assert starts_k4[:2] == starts_k2
+    assert len(set(starts_k4)) == 4
+
+    train_k2.set_epoch(1)
+    starts_epoch1 = [train_k2.sample_start_frame(entry_k2, slot) for slot in range(2)]
+    assert starts_epoch1 != starts_k2
+
+    evaluation = RealtimePoseTaskDataset(output_dir, split="test", normalize_input=False)
+    eval_entry = evaluation.entries[0]
+    starts_eval0 = [evaluation.sample_start_frame(eval_entry, slot) for slot in range(4)]
+    evaluation.set_epoch(99)
+    starts_eval99 = [evaluation.sample_start_frame(eval_entry, slot) for slot in range(4)]
+    assert starts_eval99 == starts_eval0
 
 
 def test_dataset_dynamic_tracker_mask_samples_legal_categories(tmp_path):
@@ -1088,7 +1110,7 @@ def test_dataset_dynamic_tracker_mask_samples_legal_categories(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1137,7 +1159,7 @@ def test_online_dynamic_timeline_is_absolute_frame_consistent_across_rollout(tmp
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--rollout_steps",
             "2",
@@ -1181,7 +1203,7 @@ def test_rollout_h8_keeps_all_adjacent_mask_overlaps_and_temporal_fields(tmp_pat
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--rollout_steps",
             "9",
@@ -1226,7 +1248,7 @@ def test_rollout_h8_keeps_augmented_dropout_aligned_by_absolute_frame(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--rollout_steps",
             "9",
@@ -1244,6 +1266,17 @@ def test_rollout_h8_keeps_augmented_dropout_aligned_by_absolute_frame(tmp_path):
         tracker_mask_policy="task",
         tracker_mask_seed=91,
         non_head_tracker_dropout_prob=0.5,
+        tracker_pos_noise_std=0.01,
+        tracker_rot_noise_std=0.01,
+        tracker_latency_max_frames=3,
+        tracker_outlier_prob=0.2,
+        root_yaw_ref_noise_std=0.01,
+        history_pose_noise_std=0.01,
+        history_yaw_noise_std=0.01,
+        history_pose_dropout_prob=0.1,
+        history_pose_replace_prob=0.1,
+        history_yaw_replace_prob=0.1,
+        history_root_yaw_drift_std=0.005,
         enable_rollout=True,
         rollout_steps=9,
     )
@@ -1255,11 +1288,14 @@ def test_rollout_h8_keeps_augmented_dropout_aligned_by_absolute_frame(tmp_path):
         current_valid = current["sensor_valid"].T.numpy().astype(bool)
         following_valid = following["sensor_valid"].T.numpy().astype(bool)
         np.testing.assert_array_equal(current_valid[1:], following_valid[:-1])
+        torch.testing.assert_close(current["x"][:, 1:], following["x"][:, :-1])
+        torch.testing.assert_close(current["conditioned_x"][:, 1:], following["conditioned_x"][:, :-1])
 
 
 def test_online_timeline_rebuilds_window_and_target_resolver_boundary_state(tmp_path):
     manifest_path, entry = generate_single_task_manifest(tmp_path)
-    task = load_materialized_task_npz(manifest_path.parent, entry["task_path"])
+    dataset = RealtimePoseTaskDataset(manifest_path.parent.parent, split="train", normalize_input=False)
+    task = dataset.load_task(0, dataset.entries[0])
     arrays = load_realtime_task_arrays(
         task,
         seq_len=REALTIME_POSE_SEQ_LEN,
@@ -1307,7 +1343,7 @@ def test_dataset_dynamic_mask_and_augmentation_are_seed_reproducible(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1361,7 +1397,7 @@ def test_dataset_history_condition_corruption_only_indexes_history_frames(tmp_pa
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1402,7 +1438,7 @@ def test_dataset_fixed_tracker_mask_is_reproducible_and_zero_fills_invalid_chann
             str(output_dir),
             "--splits",
             "test",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1461,7 +1497,7 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             str(output_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1477,6 +1513,9 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
             split="train",
             schema=REALTIME_POSE_SCHEMA_NAME,
             eps=1e-8,
+            windows_per_source=2,
+            convergence_windows_per_source=4,
+            check_convergence=False,
             overwrite=True,
         )
     )
@@ -1509,91 +1548,91 @@ def test_normalizer_keeps_sensor_valid_as_binary_condition(tmp_path):
     assert set(np.unique(sensor_values).tolist()).issubset({0.0, 1.0})
 
 
-def test_task_normalizer_ignores_invalid_tracker_zero_fill_in_stats(tmp_path):
+def test_normalizer_stats_ignore_invalid_tracker_values():
+    features = np.ones((3, REALTIME_POSE_INPUT_DIM), dtype=np.float32)
+    sensor_valid = np.ones((3, 6), dtype=bool)
+    sensor_valid[1:, 1] = False
+    tracker_slice = get_schema_spec(REALTIME_POSE_SCHEMA_NAME).tracker_pos_slice(1)
+    features[1:, tracker_slice] = 1000.0
+    running_sum, _running_sumsq, running_count = masked_task_feature_stats(
+        features,
+        sensor_valid,
+        schema_name=REALTIME_POSE_SCHEMA_NAME,
+    )
+    np.testing.assert_allclose(running_sum[tracker_slice], np.ones(3))
+    np.testing.assert_allclose(running_count[tracker_slice], np.ones(3))
+
+
+def test_normalizer_convergence_report_has_reproducible_success_and_failure():
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+    mean = np.zeros(schema.feature_dim, dtype=np.float32)
+    std = np.ones(schema.feature_dim, dtype=np.float32)
+    passed = build_convergence_report(
+        official_mean=mean,
+        official_std=std,
+        comparison_mean=mean,
+        comparison_std=std,
+        schema_name=schema.name,
+        official_windows=2,
+        comparison_windows=4,
+    )
+    assert passed["passed"] is True
+
+    shifted_mean = mean.copy()
+    shifted_mean[0] = 0.2
+    failed = build_convergence_report(
+        official_mean=shifted_mean,
+        official_std=std,
+        comparison_mean=mean,
+        comparison_std=std,
+        schema_name=schema.name,
+        official_windows=2,
+        comparison_windows=4,
+    )
+    assert failed["passed"] is False
+    assert failed["failed_conditions"]
+
+
+def test_normalizer_failed_gate_keeps_report_but_not_stats_or_latest(tmp_path):
     source_dir = tmp_path / "sources"
     task_dir = tmp_path / "tasks"
-    normalizer_dir = tmp_path / "meta"
+    output_dir = tmp_path / "normalizer"
     write_toy_source_dataset(source_dir)
     generate_realtime_pose_tasks_main(
         [
-            "--source_dir",
-            str(source_dir),
-            "--output_dir",
-            str(task_dir),
-            "--splits",
-            "train",
-            "--samples_per_file",
-            "1",
-            "--schema",
-            REALTIME_POSE_SCHEMA_NAME,
-            "--split_dir",
-            "",
+            "--source_dir", str(source_dir),
+            "--output_dir", str(task_dir),
+            "--splits", "train",
+            "--samples_per_source", "2",
+            "--schema", REALTIME_POSE_SCHEMA_NAME,
+            "--split_dir", "",
             "--overwrite",
         ]
     )
-
-    meta = compute_realtime_pose_normalizer(
-        SimpleNamespace(
-            task_dir=str(task_dir),
-            output_dir=str(normalizer_dir),
-            split="train",
-            schema=REALTIME_POSE_SCHEMA_NAME,
-            eps=1e-8,
-            overwrite=True,
+    with pytest.raises(RuntimeError, match="收敛门禁失败"):
+        compute_realtime_pose_normalizer(
+            SimpleNamespace(
+                task_dir=str(task_dir),
+                output_dir=str(output_dir),
+                direct_output=True,
+                split="train",
+                schema=REALTIME_POSE_SCHEMA_NAME,
+                eps=1e-8,
+                windows_per_source=2,
+                convergence_windows_per_source=4,
+                check_convergence=True,
+                tracker_mask_seed=10,
+                tracker_mask_epoch=0,
+                overwrite=True,
+            )
         )
-    )
-    assert meta["matched_tasks"] == 1
-    assert meta["normalizer_mask_samples"] == 10
-    assert meta["tracker_pattern_counts"] == {
-        "dynamic_dropout": 2,
-        "full_six": 3,
-        "standard_three": 3,
-        "static_sparse": 2,
-    }
-
-    task_output_dir = latest_artifact_dir(task_dir, kind="tasks")
-    manifest_path = task_output_dir / "train" / "manifest.jsonl"
-    entries = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    online_dataset = RealtimePoseTaskDataset(
-        task_dir,
-        split="train",
-        normalize_input=False,
-        tracker_mask_policy="dynamic_categories",
-        tracker_mask_seed=10,
-    )
-    tracker_valid_counts = np.zeros(6, dtype=np.int64)
-    all_features = []
-    all_valid = []
-    for _ in range(10):
-        item = online_dataset[0]
-        features = item["x"].T.numpy()
-        valid = item["sensor_valid"].T.numpy().astype(bool)
-        all_features.append(features)
-        all_valid.append(valid)
-        tracker_valid_counts += valid.sum(axis=0).astype(np.int64)
-    assert meta["tracker_valid_observation_counts"] == tracker_valid_counts.astype(int).tolist()
-
-    features = np.concatenate(all_features, axis=0)
-    valid_all = np.concatenate(all_valid, axis=0)
-    partial_trackers = np.where((tracker_valid_counts > 0) & (tracker_valid_counts < 10 * REALTIME_POSE_SEQ_LEN))[0]
-    assert partial_trackers.size > 0
-    chosen = None
-    for tracker_index in partial_trackers.tolist():
-        candidate_slice = slice(TRACKER_POS_REF_START + tracker_index * 3, TRACKER_POS_REF_START + tracker_index * 3 + 3)
-        expected = features[valid_all[:, tracker_index], candidate_slice].mean(axis=0)
-        biased = features[:, candidate_slice].mean(axis=0)
-        if not np.allclose(expected, biased, atol=1e-6):
-            chosen = (candidate_slice, expected, biased)
-            break
-    assert chosen is not None
-    pos_slice, expected_mean, biased_mean = chosen
-    normalizer_output_dir = latest_artifact_dir(normalizer_dir, kind="normalizer")
-    saved_mean = torch.load(normalizer_output_dir / "mean.pt", map_location="cpu", weights_only=True).numpy()[pos_slice]
-    np.testing.assert_allclose(saved_mean, expected_mean, atol=1e-5)
-    assert not np.allclose(saved_mean, biased_mean, atol=1e-6)
+    assert (output_dir / "normalizer_convergence.json").exists()
+    assert not (output_dir / "mean.pt").exists()
+    assert not (output_dir / "std.pt").exists()
+    assert not (output_dir / "latest_normalizer.json").exists()
 
 
-def test_normalizer_last_task_cache_is_immutable_and_does_not_cross_tasks(tmp_path):
+def test_source_lru_is_bounded_and_matches_uncached_dataset(tmp_path):
     source_dir = tmp_path / "sources"
     task_dir = tmp_path / "tasks"
     write_toy_source_dataset(source_dir, frame_count=REALTIME_POSE_SEQ_LEN + 20)
@@ -1605,7 +1644,7 @@ def test_normalizer_last_task_cache_is_immutable_and_does_not_cross_tasks(tmp_pa
             str(task_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "2",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -1619,101 +1658,24 @@ def test_normalizer_last_task_cache_is_immutable_and_does_not_cross_tasks(tmp_pa
         task_dir,
         split="train",
         normalize_input=False,
-        cache_last_task=True,
-        tracker_mask_policy="dynamic_categories",
-        tracker_mask_seed=10,
-    )
-    patterns = []
-    items = []
-    for _ in range(10):
-        item = cached[0]
-        patterns.append(str(item["tracker_pattern"]))
-        items.append(item)
-    assert {name: patterns.count(name) for name in set(patterns)} == {
-        "dynamic_dropout": 2,
-        "full_six": 3,
-        "standard_three": 3,
-        "static_sparse": 2,
-    }
-    assert items[0]["x"].data_ptr() != items[1]["x"].data_ptr()
-    expected_target = items[1]["target_joints_world"].clone()
-    items[0]["target_joints_world"].fill_(123.0)
-    torch.testing.assert_close(cached[0]["target_joints_world"], expected_target)
-    assert cached._last_task_cache is not None
-    assert all(not value.flags.writeable for value in cached._last_task_cache.values() if isinstance(value, np.ndarray))
-
-    cached_full = RealtimePoseTaskDataset(
-        task_dir,
-        split="train",
-        normalize_input=False,
-        cache_last_task=True,
+        source_cache_max_mib=1,
         tracker_mask_policy="task",
     )
-    uncached_full = RealtimePoseTaskDataset(
+    uncached = RealtimePoseTaskDataset(
         task_dir,
         split="train",
         normalize_input=False,
-        cache_last_task=False,
+        source_cache_max_mib=0,
         tracker_mask_policy="task",
     )
     for index in (0, 1, 0):
-        cached_item = cached_full[index]
-        uncached_item = uncached_full[index]
+        cached_item = cached[index]
+        uncached_item = uncached[index]
         torch.testing.assert_close(cached_item["x"], uncached_item["x"])
         torch.testing.assert_close(cached_item["target_joints_world"], uncached_item["target_joints_world"])
-        assert cached_full._last_task_cache_index == index
-
-
-def test_normalizer_last_task_cache_matches_uncached_statistics(tmp_path):
-    source_dir = tmp_path / "sources"
-    task_dir = tmp_path / "tasks"
-    cached_root = tmp_path / "normalizer_cached"
-    uncached_root = tmp_path / "normalizer_uncached"
-    write_toy_source_dataset(source_dir)
-    generate_realtime_pose_tasks_main(
-        [
-            "--source_dir",
-            str(source_dir),
-            "--output_dir",
-            str(task_dir),
-            "--splits",
-            "train",
-            "--samples_per_file",
-            "1",
-            "--schema",
-            REALTIME_POSE_SCHEMA_NAME,
-            "--split_dir",
-            "",
-            "--overwrite",
-        ]
-    )
-
-    common = dict(
-        task_dir=str(task_dir),
-        split="train",
-        schema=REALTIME_POSE_SCHEMA_NAME,
-        eps=1e-8,
-        overwrite=True,
-        mask_samples_per_task=10,
-        tracker_mask_seed=10,
-        tracker_mask_epoch=0,
-    )
-    cached_meta = compute_realtime_pose_normalizer(
-        SimpleNamespace(**common, output_dir=str(cached_root), cache_last_task=True)
-    )
-    uncached_meta = compute_realtime_pose_normalizer(
-        SimpleNamespace(**common, output_dir=str(uncached_root), cache_last_task=False)
-    )
-    cached_dir = latest_artifact_dir(cached_root, kind="normalizer")
-    uncached_dir = latest_artifact_dir(uncached_root, kind="normalizer")
-    for filename in ("mean.pt", "std.pt"):
-        cached_value = torch.load(cached_dir / filename, map_location="cpu", weights_only=True)
-        uncached_value = torch.load(uncached_dir / filename, map_location="cpu", weights_only=True)
-        torch.testing.assert_close(cached_value, uncached_value, rtol=0.0, atol=1e-7)
-    assert cached_meta["cache_last_task"] is True
-    assert uncached_meta["cache_last_task"] is False
-    assert cached_meta["tracker_pattern_counts"] == uncached_meta["tracker_pattern_counts"]
-    assert cached_meta["tracker_valid_observation_counts"] == uncached_meta["tracker_valid_observation_counts"]
+    assert len(cached._source_cache) == 1
+    assert cached._source_cache_bytes <= 1024 * 1024
+    assert not uncached._source_cache
 
 
 def test_converter_fails_on_partial_conversion_by_default(monkeypatch, tmp_path):

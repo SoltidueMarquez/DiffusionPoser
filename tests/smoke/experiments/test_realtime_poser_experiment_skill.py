@@ -70,7 +70,7 @@ def _record_payload(
         "experiment_type": "code_change",
         "status": "ready",
         "created_at": "2026-07-20T12:00:00+08:00",
-        "script": f"scripts/experiments/{experiment_id}.ps1",
+        "script": f"experiments/{experiment_id}/run.ps1",
         "repositories": {
             "diffusionposer": {
                 "root": ".",
@@ -120,7 +120,7 @@ def _record_payload(
 
 
 def _write_record(repo: Path, payload: dict[str, Any]) -> Path:
-    record_path = repo / "documents/experiments" / f"{payload['experiment_id']}.md"
+    record_path = repo / "experiments" / payload["experiment_id"] / "README.md"
     record_path.parent.mkdir(parents=True, exist_ok=True)
     frontmatter = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).rstrip()
     record_path.write_text(
@@ -137,10 +137,18 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
     unity_commit, unity_subject = _init_repo(unity_repo, "unity")
 
     experiment_id = "EXP-20260720-001"
-    script_path = dp_repo / "scripts/experiments" / f"{experiment_id}.ps1"
-    script_path.parent.mkdir(parents=True)
+    experiment_dir = dp_repo / "experiments" / experiment_id
+    script_path = experiment_dir / "run.ps1"
+    config_path = experiment_dir / "experiment.json"
+    experiment_dir.mkdir(parents=True)
     script_path.write_text("Write-Host 'fixture'\n", encoding="utf-8")
-    _git(dp_repo, "add", script_path.relative_to(dp_repo).as_posix())
+    config_path.write_text(json.dumps({"experiment_id": experiment_id}), encoding="utf-8")
+    _git(
+        dp_repo,
+        "add",
+        script_path.relative_to(dp_repo).as_posix(),
+        config_path.relative_to(dp_repo).as_posix(),
+    )
     _git(dp_repo, "commit", "-m", f"experiment({experiment_id}): fixture")
     dp_experiment = _git(dp_repo, "rev-parse", "HEAD")
     dp_experiment_subject = _git(dp_repo, "show", "-s", "--format=%s", "HEAD")
@@ -159,10 +167,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, Any]]:
 
 
 def test_next_id_uses_date_and_highest_existing_sequence(tmp_path: Path):
-    records = tmp_path / "documents/experiments"
+    records = tmp_path / "experiments"
     records.mkdir(parents=True)
-    (records / "EXP-20260720-001.md").write_text("", encoding="utf-8")
-    (records / "EXP-20260720-003.md").write_text("", encoding="utf-8")
+    (records / "EXP-20260720-001").mkdir()
+    (records / "EXP-20260720-003").mkdir()
     (records / "legacy-name.md").write_text("", encoding="utf-8")
     (records / "EXP-20260719-099.md").write_text("", encoding="utf-8")
 
@@ -181,6 +189,7 @@ def test_markdown_template_has_parseable_yaml_frontmatter():
 
     assert payload["schema_version"] == 1
     assert payload["experiment_id"] == "{{EXPERIMENT_ID}}"
+    assert payload["script"] == "experiments/{{EXPERIMENT_ID}}/run.ps1"
     assert payload["repositories"]["unity"]["changed"] is False
 
 
@@ -251,6 +260,19 @@ def test_validate_rejects_script_missing_from_worktree(tmp_path: Path):
     (dp_repo / payload["script"]).unlink()
 
     with pytest.raises(MODULE.RecordValidationError, match="实验脚本不存在"):
+        MODULE.validate_record(
+            record_path,
+            diffusionposer_root=dp_repo,
+            unity_root=unity_repo,
+            phase="record",
+        )
+
+
+def test_validate_rejects_config_missing_from_experiment_directory(tmp_path: Path):
+    dp_repo, unity_repo, record_path, payload = _fixture(tmp_path)
+    (record_path.parent / "experiment.json").unlink()
+
+    with pytest.raises(MODULE.RecordValidationError, match="实验配置不存在"):
         MODULE.validate_record(
             record_path,
             diffusionposer_root=dp_repo,

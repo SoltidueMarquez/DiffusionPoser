@@ -9,8 +9,7 @@ SCHEMA_NAME: Final = "realtime_pose_stationary5_v1"
 LEGACY_SCHEMA_NAME: Final = "realtime_pose_body_fbx_local_root_y0_v1"
 RESOLVER_CONTRACT_VERSION: Final = "runtime_root_resolver_v2"
 
-TASK_FORMAT: Final = "materialized_realtime_pose_stationary5_v1"
-LEGACY_TASK_FORMAT: Final = "materialized_realtime_pose_body_fbx_local_root_y0_v1"
+TASK_FORMAT: Final = "realtime_pose_source_reference"
 
 POSE_REPRESENTATION: Final = "body_fbx_local_delta_6d"
 BODY_POSE_KEY: Final = "body_pose_body_fbx_local_delta_6d"

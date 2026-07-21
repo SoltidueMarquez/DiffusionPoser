@@ -218,6 +218,7 @@ def _build_category_loader(args, category: str):
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
         preload_data=args.preload_data,
+        source_cache_max_mib=args.source_cache_max_mib,
         num_workers=args.num_workers,
         pin_memory=args.cuda,
         schema_name=args.schema,

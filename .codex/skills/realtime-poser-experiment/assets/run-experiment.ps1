@@ -8,6 +8,8 @@ $ErrorActionPreference = "Stop"
 $ExperimentId = "{{EXPERIMENT_ID}}"
 $UnityParticipation = "{{UNITY_PARTICIPATION}}"
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+$ConfigPath = Join-Path $PSScriptRoot "experiment.json"
+$RecordPath = Join-Path $PSScriptRoot "README.md"
 $UnityRoot = if ($UnityRootOverride) {
     (Resolve-Path -LiteralPath $UnityRootOverride).Path
 } else {
@@ -18,6 +20,13 @@ $LogDir = Join-Path $RunDir "logs"
 $OutputDir = Join-Path $RepoRoot "output\$ExperimentId"
 $ManifestPath = Join-Path $RunDir "experiment_runtime.json"
 $LogPath = Join-Path $LogDir "console.log"
+
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "Experiment config not found: $ConfigPath"
+}
+if (-not (Test-Path -LiteralPath $RecordPath -PathType Leaf)) {
+    throw "Experiment record not found: $RecordPath"
+}
 
 # Replace only the experiment module and arguments. Keep conda and --no-capture-output.
 $CommandArgs = @(
@@ -85,6 +94,8 @@ try {
         command = $CommandText
         command_args = $CommandArgs
         paths = [ordered]@{
+            config = $ConfigPath
+            record = $RecordPath
             run_dir = $RunDir
             log_dir = $LogDir
             output_dir = $OutputDir

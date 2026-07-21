@@ -53,7 +53,7 @@ def test_explicit_standard_three_and_dynamic_dropout_contract():
 
 
 def test_final_mask_distribution_and_dynamic_run_lengths_are_reproducible():
-    patterns = make_window_patterns(np.random.default_rng(10), patterns_per_window=10, ensure_pattern_categories=True)
+    patterns = make_window_patterns(np.random.default_rng(10), patterns_per_source=10, ensure_pattern_categories=True)
     categories = [pattern.category for pattern in patterns]
     assert categories.count("full_six") == 3
     assert categories.count("standard_three") == 3

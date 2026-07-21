@@ -15,15 +15,12 @@ from data_loaders.sensor_masking import (
     ROOT_HEIGHT_DIM,
     ROOT_Y_POLICY_FIXED_ZERO,
     ROOT_YAW_DELTA_DIM,
-    SENSOR_VALID_DIM,
     STATIONARY_PROB_DIM,
     TRACKER_COUNT,
     SchemaSpec,
     get_schema_spec,
     scalar_string,
     validate_pose_representation,
-    validate_realtime_seq_len,
-    validate_realtime_target,
 )
 from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 from data_loaders.tracker_codec import REFERENCE_POLICY_VERSION, TRACKER_CODEC_VERSION
@@ -60,14 +57,6 @@ SOURCE_STATIC_FIELDS = {
     "tracker_rot_world_6d",
     "joints_world",
     "joint_offsets_parent",
-}
-TASK_METADATA_FIELDS = {
-    "schema_name",
-    "task_format",
-    POSE_REPRESENTATION_KEY,
-    "root_y_policy",
-    "pelvis_height_mode",
-    *RUNTIME_CONTRACT_METADATA_FIELDS,
 }
 SCHEMA_METADATA_FIELDS = (
     "schema_name",
@@ -214,40 +203,6 @@ def validate_realtime_source_contract(data: Mapping[str, Any] | Any, schema: Sch
     validate_root_y0_invariants(data, schema=schema, source=source)
 
 
-def validate_realtime_task_contract(task: Mapping[str, Any], schema: SchemaSpec, source: str) -> None:
-    keys = set(task.keys())
-    if LEGACY_BODY_POSE_PARENT_KEY in keys:
-        raise ValueError(f"{source} contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate realtime_pose tasks.")
-
-    required = required_realtime_task_fields(schema)
-    missing = sorted(required.difference(keys))
-    if missing:
-        raise KeyError(f"{source} 缺少 {schema.name} task 字段: {missing}")
-
-    metadata = {key: task[key] for key in SCHEMA_METADATA_FIELDS}
-    validate_schema_metadata(metadata, schema=schema, source=source)
-    if schema.supports_stationary_prob:
-        validate_stationary_label_metadata(task, source=source)
-    task_format = scalar_string(task["task_format"], "task_format")
-    if task_format != schema.task_format:
-        raise ValueError(f"{source} task_format={task_format!r}, expected {schema.task_format!r}.")
-
-    seq_len = _scalar_int(task["seq_len"], "seq_len")
-    validate_realtime_seq_len(seq_len)
-    valid_length = _scalar_int(task["valid_length"], "valid_length")
-    validate_realtime_seq_len(valid_length)
-    target_start = _scalar_int(task["target_start"], "target_start")
-    target_length = _scalar_int(task["target_length"], "target_length")
-    validate_realtime_target(target_start, target_length)
-
-    _validate_shapes(
-        payload=task,
-        expected=expected_realtime_task_shapes(schema=schema, seq_len=seq_len),
-        source=source,
-    )
-    validate_root_y0_invariants(task, schema=schema, source=source)
-
-
 def required_realtime_source_fields(schema: SchemaSpec | str) -> set[str]:
     schema = get_schema_spec(schema if isinstance(schema, str) else schema.name)
     required = set(SOURCE_STATIC_FIELDS)
@@ -259,65 +214,6 @@ def required_realtime_source_fields(schema: SchemaSpec | str) -> set[str]:
         required.add("stationary_prob_5")
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         required.add("joint_rest_local_rotations_6d")
-    return required
-
-
-def required_realtime_task_fields(schema: SchemaSpec | str) -> set[str]:
-    schema = get_schema_spec(schema if isinstance(schema, str) else schema.name)
-    required = required_realtime_source_fields(schema)
-    required.update(
-        {
-            "sensor_valid",
-            "inpaint_mask",
-            "start_frame",
-            "target_start",
-            "target_length",
-            "valid_length",
-            "source_frames",
-            "seq_len",
-            "tracker_ref_root_pos_world",
-            "tracker_ref_root_yaw",
-            "tracker_ref_source",
-            "timestamp_seconds",
-            "floor_y",
-            "tracking_origin_revision",
-            "resolver_window_start_root_pos_world",
-            "resolver_window_start_root_yaw",
-            "resolver_window_start_pelvis_height",
-            "resolver_window_start_joints_world",
-            "resolver_window_start_hip_valid",
-            "resolver_window_start_reconnect_start_root_pos_world",
-            "resolver_window_start_reconnect_start_root_yaw",
-            "resolver_window_start_reconnect_start_pelvis_height",
-            "resolver_window_start_reconnect_elapsed_seconds",
-            "resolver_window_start_last_timestamp_seconds",
-            "resolver_window_start_floor_y",
-            "resolver_window_start_tracking_origin_revision",
-            "resolver_before_target_root_pos_world",
-            "resolver_before_target_root_yaw",
-            "resolver_before_target_pelvis_height",
-            "resolver_before_target_joints_world",
-            "resolver_before_target_hip_valid",
-            "resolver_before_target_reconnect_start_root_pos_world",
-            "resolver_before_target_reconnect_start_root_yaw",
-            "resolver_before_target_reconnect_start_pelvis_height",
-            "resolver_before_target_reconnect_elapsed_seconds",
-            "resolver_before_target_last_timestamp_seconds",
-            "resolver_before_target_floor_y",
-            "resolver_before_target_tracking_origin_revision",
-            "resolver_context_frame_indices",
-            "resolver_context_root_pos_world",
-            "resolver_context_root_yaw",
-            "resolver_context_pelvis_height",
-            "resolver_context_joints_world",
-            "resolver_context_timestamp_seconds",
-            "resolver_context_floor_y",
-            "resolver_context_tracking_origin_revision",
-        }
-    )
-    required.update(TASK_METADATA_FIELDS)
-    if schema.supports_stationary_prob:
-        required.update(STATIONARY_LABEL_METADATA_FIELDS)
     return required
 
 
@@ -339,33 +235,6 @@ def expected_realtime_source_shapes(schema: SchemaSpec, frame_count: int) -> dic
         shapes["stationary_prob_5"] = (frame_count, STATIONARY_PROB_DIM)
     if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
         shapes["joint_rest_local_rotations_6d"] = (24, 6)
-    return shapes
-
-
-def expected_realtime_task_shapes(schema: SchemaSpec, seq_len: int) -> dict[str, tuple[int, ...]]:
-    shapes = expected_realtime_source_shapes(schema=schema, frame_count=seq_len)
-    shapes["sensor_valid"] = (seq_len, SENSOR_VALID_DIM)
-    shapes["inpaint_mask"] = (seq_len, schema.feature_dim)
-    shapes["tracker_ref_root_pos_world"] = (seq_len, 3)
-    shapes["tracker_ref_root_yaw"] = (seq_len,)
-    shapes["tracker_ref_source"] = (seq_len,)
-    shapes["timestamp_seconds"] = (seq_len,)
-    shapes["floor_y"] = (seq_len,)
-    shapes["tracking_origin_revision"] = (seq_len,)
-    shapes["resolver_window_start_root_pos_world"] = (3,)
-    shapes["resolver_window_start_joints_world"] = (24, 3)
-    shapes["resolver_window_start_reconnect_start_root_pos_world"] = (3,)
-    shapes["resolver_before_target_root_pos_world"] = (3,)
-    shapes["resolver_before_target_joints_world"] = (24, 3)
-    shapes["resolver_before_target_reconnect_start_root_pos_world"] = (3,)
-    shapes["resolver_context_frame_indices"] = (RESOLVER_CONTEXT_FRAMES,)
-    shapes["resolver_context_root_pos_world"] = (RESOLVER_CONTEXT_FRAMES, 3)
-    shapes["resolver_context_root_yaw"] = (RESOLVER_CONTEXT_FRAMES,)
-    shapes["resolver_context_pelvis_height"] = (RESOLVER_CONTEXT_FRAMES, 1)
-    shapes["resolver_context_joints_world"] = (RESOLVER_CONTEXT_FRAMES, 24, 3)
-    shapes["resolver_context_timestamp_seconds"] = (RESOLVER_CONTEXT_FRAMES,)
-    shapes["resolver_context_floor_y"] = (RESOLVER_CONTEXT_FRAMES,)
-    shapes["resolver_context_tracking_origin_revision"] = (RESOLVER_CONTEXT_FRAMES,)
     return shapes
 
 

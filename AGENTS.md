@@ -26,6 +26,7 @@ conda run --no-capture-output -n diffusionposer5070 <command>
 - `sample/`：实时 61 帧窗口重建、采样辅助、可视化辅助。
 - `eval/`：realtime pose 评估入口和指标计算。
 - `export/`：Unity/Sentis 运行时资产导出。
+- `experiments/<EXP-ID>/`：编号实验的统一可复现包，固定包含 `run.ps1`、`experiment.json` 和 `README.md`。
 - `tests/smoke/`：主链路冒烟测试。
 - `dataset/`、`runs/`、`save/`、`output/`：数据和训练/导出产物，默认不要改动或提交。
 

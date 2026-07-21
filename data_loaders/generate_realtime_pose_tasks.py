@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -17,7 +16,10 @@ from data_loaders.realtime_pose_contract import (
     RUNTIME_CONTRACT_METADATA_FIELDS,
     load_source_metadata,
     required_realtime_source_fields,
+    runtime_contract_metadata,
+    validate_schema_metadata,
     validate_realtime_source_contract,
+    validate_stationary_label_metadata,
 )
 from data_loaders.tracker_codec import build_tracker_reference_np
 from data_loaders.sensor_masking import (
@@ -34,15 +36,11 @@ from data_loaders.sensor_masking import (
     TASK_MASK_POLICY_FULL,
     TASK_MODE_REALTIME_POSE,
     TRACKER_PATTERN_CATEGORIES,
-    create_realtime_inpaint_mask,
     get_schema_spec,
     make_tracker_pattern,
-    make_dynamic_dropout_sensor_valid,
     make_window_patterns,
     normalize_tracker_pattern_categories,
-    repeat_pattern_sensor_valid,
     validate_pose_representation,
-    validate_sensor_valid,
 )
 from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS, stationary_label_metadata
 from utils.artifact_paths import source_root, task_root
@@ -80,6 +78,7 @@ STATIC_CLIP_FIELDS = {
 @dataclass(frozen=True)
 class SplitTaskPlan:
     split: str
+    output_name: str
     entries: list[dict]
     seed: int
 
@@ -94,7 +93,7 @@ class TaskGenerationPlan:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate realtime_pose materialized tasks.")
+    parser = argparse.ArgumentParser(description="Generate realtime_pose source-reference tasks.")
     paths = parser.add_argument_group("paths")
     paths.add_argument("--artifact_roots_config", default="", type=str)
     paths.add_argument("--source_set_name", default=DEFAULT_SOURCE_SET_NAME, type=str)
@@ -102,17 +101,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     paths.add_argument("--source_dir", default="", type=str)
     paths.add_argument("--output_dir", default="", type=str)
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
+    paths.add_argument("--direct_output", action="store_true")
+    paths.add_argument("--output_split_name", default="", type=str)
 
     task = parser.add_argument_group("task")
     task.add_argument("--splits", nargs="+", default=["train"], type=str)
     task.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     task.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    task.add_argument("--samples_per_file", default=4, type=int)
-    # 默认物化 base + 1 个相邻窗口；长 rollout 实验显式传入 9。
+    task.add_argument("--samples_per_source", default=2, type=int)
     task.add_argument("--rollout_steps", default=2, type=int)
     task.add_argument("--mask_policy", default=TASK_MASK_POLICY_FULL, choices=TASK_MASK_POLICIES, type=str)
     task.add_argument("--fixed_tracker_patterns", nargs="+", default=[], type=str)
-    task.add_argument("--patterns_per_window", default=1, type=int)
+    task.add_argument("--patterns_per_source", default=1, type=int)
     task.add_argument("--min_valid_trackers", default=MIN_VALID_TRACKERS, type=int)
     task.add_argument("--ensure_pattern_categories", default=True, type=str2bool)
     task.add_argument("--short_source_policy", default=SHORT_SOURCE_POLICY_SKIP, choices=SHORT_SOURCE_POLICIES, type=str)
@@ -120,7 +120,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--seed", default=10, type=int)
-    runtime.add_argument("--compress_tasks", action="store_true")
     runtime.add_argument("--manifest_flush_interval", default=100, type=int)
     runtime.add_argument("--run_name", default="auto", type=str)
     runtime.add_argument("--overwrite", action="store_true")
@@ -194,11 +193,16 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         raise ValueError("rollout_steps 最多为 9（base + 8 个相邻窗口）。")
     if int(args.min_valid_trackers) < MIN_VALID_TRACKERS:
         raise ValueError(f"min_valid_trackers 至少为 {MIN_VALID_TRACKERS}")
+    if int(args.samples_per_source) <= 0:
+        raise ValueError("samples_per_source must be positive")
+    if int(args.patterns_per_source) <= 0:
+        raise ValueError("patterns_per_source must be positive")
 
     source_dir = Path(args.source_dir).resolve()
     output_root = Path(args.output_dir).resolve()
     validate_task_output_root_available(source_dir=source_dir, output_root=output_root)
-    output_dir = timestamped_child_dir(output_root, resolve_task_run_label(args))
+    direct_output = bool(getattr(args, "direct_output", False))
+    output_dir = output_root if direct_output else timestamped_child_dir(output_root, resolve_task_run_label(args))
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     if not source_dir.exists():
         raise FileNotFoundError(f"{args.schema} 源目录不存在: {source_dir}")
@@ -208,6 +212,9 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         raise RuntimeError(f"{source_dir} 中没有 {args.schema} 源数据。")
 
     split_plans: list[SplitTaskPlan] = []
+    explicit_output_split_name = str(getattr(args, "output_split_name", "") or "").strip()
+    if explicit_output_split_name and len(args.splits) != 1:
+        raise ValueError("--output_split_name 只允许在单 split 生成时使用。")
     for split_index, split in enumerate(args.splits):
         split_keys = read_split_keys(split_dir, split)
         split_entries = filter_entries_by_split(source_entries, split_keys)
@@ -218,16 +225,29 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         split_plans.append(
             SplitTaskPlan(
                 split=split,
+                output_name=validate_output_component(
+                    explicit_output_split_name or split,
+                    option_name="--output_split_name",
+                ),
                 entries=split_entries,
                 seed=int(args.seed) + split_index,
             )
         )
 
-    validate_task_output_dir_available(
-        source_dir=source_dir,
-        output_dir=output_dir,
-        overwrite=bool(args.overwrite),
-    )
+    if direct_output:
+        validate_direct_task_output_dir(source_dir=source_dir, output_dir=output_dir)
+        for split_plan in split_plans:
+            validate_task_split_output_dir(
+                output_dir=output_dir,
+                split_output_name=split_plan.output_name,
+                overwrite=bool(args.overwrite),
+            )
+    else:
+        validate_task_output_dir_available(
+            source_dir=source_dir,
+            output_dir=output_dir,
+            overwrite=bool(args.overwrite),
+        )
     return TaskGenerationPlan(
         source_dir=source_dir,
         output_root=output_root,
@@ -239,7 +259,8 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
 
 def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argparse.Namespace) -> dict[str, int]:
     args.output_dir = str(plan.output_dir)
-    prepare_task_output_dir(
+    prepare_task_output = prepare_direct_task_output_dir if bool(getattr(args, "direct_output", False)) else prepare_task_output_dir
+    prepare_task_output(
         source_dir=plan.source_dir,
         output_dir=plan.output_dir,
         overwrite=bool(args.overwrite),
@@ -257,6 +278,7 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
             entries=split_plan.entries,
             output_dir=plan.output_dir,
             split=split_plan.split,
+            split_output_name=split_plan.output_name,
             rng=rng,
             args=args,
             source_split_dir=plan.split_dir,
@@ -278,10 +300,13 @@ def execute_realtime_pose_task_generation(plan: TaskGenerationPlan, args: argpar
         "source_dir": str(plan.source_dir),
         "split_dir": str(plan.split_dir) if plan.split_dir is not None else "",
         "splits": [split_plan.split for split_plan in plan.split_plans],
+        "split_output_names": {
+            split_plan.split: split_plan.output_name for split_plan in plan.split_plans
+        },
         "max_rollout_steps": int(getattr(args, "rollout_steps", 2)),
         "seed": int(getattr(args, "seed", 10)),
-        "patterns_per_window": int(getattr(args, "patterns_per_window", 1)),
-        "materialized_tracker_pattern": "full_six",
+        "samples_per_source": int(getattr(args, "samples_per_source", 2)),
+        "patterns_per_source": int(getattr(args, "patterns_per_source", 1)),
         "online_tracker_mask_sampling": True,
         "tracker_pattern_distribution": {
             "full_six": 0.30,
@@ -311,6 +336,69 @@ def resolve_task_run_label(args: argparse.Namespace) -> str:
             return f"rtp_r{rollout_steps}_seed{getattr(args, 'seed', 0)}"
         return f"rtp_tasks_seed{getattr(args, 'seed', 0)}"
     return run_name
+
+
+def validate_output_component(value: str, *, option_name: str) -> str:
+    """限制目录别名为单个安全路径分量，避免实验参数逃逸 output root。"""
+
+    component = str(value or "").strip()
+    if not component or component in {".", ".."}:
+        raise ValueError(f"{option_name} 必须是非空目录名。")
+    if Path(component).name != component or any(separator in component for separator in ("/", "\\")):
+        raise ValueError(f"{option_name} 必须是单个目录名，实际为 {component!r}。")
+    return component
+
+
+def validate_direct_task_output_dir(source_dir: Path, output_dir: Path) -> None:
+    """direct 模式复用 task root，但绝不接受未知非空目录。"""
+
+    if not output_dir.exists():
+        return
+    if not output_dir.is_dir():
+        raise NotADirectoryError(f"output_dir 必须是目录: {output_dir}")
+    children = list(output_dir.iterdir())
+    if not children:
+        return
+    if not is_marked_task_output_dir(output_dir):
+        raise ValueError(f"direct output_dir 不是已标记的 task root：{output_dir}")
+    marker = json.loads((output_dir / TASK_OUTPUT_MARKER).read_text(encoding="utf-8"))
+    if Path(str(marker.get("source_dir", ""))).resolve() != source_dir.resolve():
+        raise ValueError(f"direct output_dir 的 source_dir 与当前实验不一致：{output_dir}")
+    validate_task_marker_source_manifest(marker=marker, marker_path=output_dir / TASK_OUTPUT_MARKER)
+
+
+def validate_task_split_output_dir(output_dir: Path, split_output_name: str, overwrite: bool) -> None:
+    split_output_dir = output_dir / split_output_name
+    if split_output_dir.exists() and not overwrite:
+        raise FileExistsError(f"task split 输出已存在：{split_output_dir}，如需重建请添加 --overwrite")
+
+
+def prepare_direct_task_output_dir(
+    source_dir: Path,
+    output_dir: Path,
+    overwrite: bool,
+    split_dir: Path | None,
+    schema_name: str,
+    generated_root: Path,
+    source_set_name: str,
+    task_set_name: str,
+) -> None:
+    """直接在实验 task root 下写 split，不创建 timestamp 子目录。"""
+
+    del overwrite
+    validate_direct_task_output_dir(source_dir=source_dir, output_dir=output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = output_dir / TASK_OUTPUT_MARKER
+    if not marker_path.exists():
+        write_task_output_marker(
+            source_dir=source_dir,
+            output_dir=output_dir,
+            split_dir=split_dir,
+            schema_name=schema_name,
+            generated_root=generated_root,
+            source_set_name=source_set_name,
+            task_set_name=task_set_name,
+        )
 
 
 def prepare_task_output_dir(
@@ -379,6 +467,9 @@ def is_marked_task_output_dir(path: Path) -> bool:
         schema = get_schema_spec(marker.get("schema_name"))
         if marker.get("task_format") != schema.task_format:
             return False
+        validate_schema_metadata(marker, schema=schema, source=str(marker_path))
+        if schema.supports_stationary_prob:
+            validate_stationary_label_metadata(marker, source=str(marker_path))
         validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return False
@@ -424,7 +515,21 @@ def validate_task_output_dir_for_overwrite(source_dir: Path, output_dir: Path) -
     schema = get_schema_spec(marker.get("schema_name"))
     if marker.get("task_format") != schema.task_format:
         raise ValueError(f"output_dir 标记不是合法 realtime_pose task 目录: {marker_path}")
+    validate_schema_metadata(marker, schema=schema, source=str(marker_path))
+    if schema.supports_stationary_prob:
+        validate_stationary_label_metadata(marker, source=str(marker_path))
+    validate_task_marker_source_manifest(marker=marker, marker_path=marker_path)
     validate_pose_representation(marker.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(marker_path))
+
+
+def validate_task_marker_source_manifest(marker: dict, marker_path: Path) -> None:
+    source_manifest_path = Path(str(marker.get("source_manifest_path", "")))
+    expected_sha = str(marker.get("source_manifest_sha256", ""))
+    if not source_manifest_path.is_file() or not expected_sha:
+        raise ValueError(f"task marker 缺少有效 source manifest 绑定：{marker_path}")
+    actual_sha = hashlib.sha256(source_manifest_path.read_bytes()).hexdigest()
+    if actual_sha != expected_sha:
+        raise ValueError(f"source manifest SHA256 与 task marker 不一致：{marker_path}")
 
 
 def write_task_output_marker(
@@ -437,6 +542,9 @@ def write_task_output_marker(
     task_set_name: str,
 ) -> None:
     schema = get_schema_spec(schema_name)
+    source_manifest_path = source_dir / "manifest.jsonl"
+    if not source_manifest_path.exists():
+        raise FileNotFoundError(f"source-reference task 要求 source manifest：{source_manifest_path}")
     marker = {
         "schema_name": schema.name,
         "schema_canonical_name": str(schema.canonical_name),
@@ -448,8 +556,11 @@ def write_task_output_marker(
         "source_set_name": str(source_set_name),
         "task_set_name": str(task_set_name),
         "source_dir": str(source_dir),
+        "source_manifest_path": str(source_manifest_path.resolve()),
+        "source_manifest_sha256": hashlib.sha256(source_manifest_path.read_bytes()).hexdigest(),
         "output_dir": str(output_dir),
         "split_dir": str(split_dir) if split_dir is not None else "",
+        **runtime_contract_metadata(),
     }
     if schema.supports_stationary_prob:
         marker.update(stationary_label_metadata())
@@ -460,47 +571,35 @@ def write_task_output_marker(
 def read_source_entries(source_dir: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> list[dict]:
     schema = get_schema_spec(schema_name)
     manifest_path = source_dir / "manifest.jsonl"
-    if manifest_path.exists():
-        entries = []
-        with manifest_path.open("r", encoding="utf-8") as file:
-            for line in file:
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                if entry.get("status", "converted") not in USABLE_SOURCE_STATUSES:
-                    continue
-                if str(entry.get("schema_name", schema.name)) != schema.name:
-                    raise ValueError(f"{manifest_path} contains schema_name={entry.get('schema_name')}, expected {schema.name}.")
-                validate_pose_representation(
-                    entry.get(POSE_REPRESENTATION_KEY),
-                    schema_name=schema.name,
-                    source=f"{manifest_path}:{entry.get('source_relative_path', '<unknown>')}",
-                )
-                path = resolve_manifest_file(source_dir, entry.get("output_path") or entry.get("source_relative_path"))
-                entries.append(
-                    {
-                        "source_path": str(path),
-                        "source_relative_path": normalize_slashes(str(entry.get("source_relative_path") or path.name)),
-                        "stablemotion_split_key": normalize_split_key(
-                            str(entry.get("stablemotion_split_key") or Path(entry.get("source_relative_path") or path.name).with_suffix(".npy"))
-                        ),
-                        "frames": int(entry.get("frames") or 0),
-                    }
-                )
-        return entries
-
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"source-reference task 要求 source manifest：{manifest_path}")
     entries = []
-    for path in sorted(source_dir.rglob("*.npz")):
-        if "tasks" in path.parts:
-            continue
-        entries.append(
-            {
-                "source_path": str(path),
-                "source_relative_path": path.relative_to(source_dir).as_posix(),
-                "stablemotion_split_key": normalize_split_key(path.relative_to(source_dir).with_suffix(".npy").as_posix()),
-                "frames": 0,
-            }
-        )
+    with manifest_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if entry.get("status", "converted") not in USABLE_SOURCE_STATUSES:
+                continue
+            if str(entry.get("schema_name", schema.name)) != schema.name:
+                raise ValueError(f"{manifest_path} contains schema_name={entry.get('schema_name')}, expected {schema.name}.")
+            validate_pose_representation(
+                entry.get(POSE_REPRESENTATION_KEY),
+                schema_name=schema.name,
+                source=f"{manifest_path}:{entry.get('source_relative_path', '<unknown>')}",
+            )
+            path = resolve_manifest_file(source_dir, entry.get("output_path") or entry.get("source_relative_path"))
+            entries.append(
+                {
+                    **entry,
+                    "source_path": str(path),
+                    "source_relative_path": normalize_slashes(str(entry.get("source_relative_path") or path.name)),
+                    "stablemotion_split_key": normalize_split_key(
+                        str(entry.get("stablemotion_split_key") or Path(entry.get("source_relative_path") or path.name).with_suffix(".npy"))
+                    ),
+                    "frames": int(entry.get("frames") or 0),
+                }
+            )
     return entries
 
 
@@ -551,21 +650,25 @@ def generate_split_tasks(
     entries: list[dict],
     output_dir: Path,
     split: str,
+    split_output_name: str,
     rng: np.random.Generator,
     args: argparse.Namespace,
     source_split_dir: Path | None,
     split_seed: int,
 ) -> int:
-    output_split_dir = output_dir / split
-    task_dir = output_split_dir / "tasks"
-    task_dir.mkdir(parents=True, exist_ok=True)
+    output_split_dir = output_dir / split_output_name
+    if output_split_dir.exists():
+        if not bool(args.overwrite):
+            raise FileExistsError(f"task split 输出已存在：{output_split_dir}")
+        shutil.rmtree(output_split_dir)
+    output_split_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_split_dir / "manifest.jsonl"
     written = 0
     skipped_short_sources: list[dict] = []
     rollout_steps = int(getattr(args, "rollout_steps", 2))
     required_frames = REALTIME_POSE_SEQ_LEN + rollout_steps - 1
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
-        progress = tqdm(total=len(entries) * int(args.samples_per_file), desc=f"生成 {split} realtime tasks", unit="window")
+        progress = tqdm(total=len(entries), desc=f"生成 {split} realtime source references", unit="source")
         for entry in entries:
             source_path = Path(entry["source_path"])
             known_frames = int(entry.get("frames") or 0)
@@ -579,12 +682,12 @@ def generate_split_tasks(
                         )
                     )
                 skipped_short_sources.append(make_short_source_record(entry, source_path, known_frames, required_frames))
-                progress.update(int(args.samples_per_file))
+                progress.update(1)
                 continue
 
             schema = get_schema_spec(args.schema)
-            source = load_realtime_source(source_path, schema_name=schema.name)
-            source_frames = int(source[schema.body_pose_key].shape[0])
+            source_meta = load_realtime_source_reference_metadata(source_path, schema_name=schema.name)
+            source_frames = int(source_meta["frames"])
             if source_frames < required_frames:
                 if should_raise_for_short_source(args):
                     raise ValueError(
@@ -595,101 +698,33 @@ def generate_split_tasks(
                         )
                     )
                 skipped_short_sources.append(make_short_source_record(entry, source_path, source_frames, required_frames))
-                progress.update(int(args.samples_per_file))
+                progress.update(1)
                 continue
 
-            for sample_index in range(int(args.samples_per_file)):
-                start_frame = int(rng.integers(0, source_frames - required_frames + 1))
-                window_task_arrays = []
-                for rollout_step in range(rollout_steps):
-                    task_arrays = dict(
-                        clip_source(
-                            source,
-                            start_frame=start_frame + rollout_step,
-                            seq_len=REALTIME_POSE_SEQ_LEN,
-                        )
-                    )
-                    task_arrays.update(
-                        {
-                            "schema_name": np.asarray(schema.name),
-                            "task_format": np.asarray(schema.task_format),
-                            POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
-                            "root_y_policy": np.asarray(schema.root_y_policy),
-                            "pelvis_height_mode": np.asarray(schema.pelvis_height_mode),
-                        }
-                    )
-                    window_task_arrays.append(task_arrays)
-                patterns = build_window_patterns(rng=rng, args=args)
-                for pattern_index, pattern in enumerate(patterns):
-                    if pattern.category == "dynamic_dropout":
-                        full_sensor_valid = make_dynamic_dropout_sensor_valid(
-                            rng=rng,
-                            seq_len=source_frames,
-                            min_duration_frames=2,
-                            max_duration_frames=30,
-                            max_missing_trackers=3,
-                        )
-                    else:
-                        full_sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=source_frames)
-                    validate_sensor_valid(full_sensor_valid, min_valid_trackers=int(args.min_valid_trackers))
+            patterns = build_window_patterns(rng=rng, args=args)
+            for pattern_index, pattern in enumerate(patterns):
                     task_id = make_task_id(
                         split=split,
                         stablemotion_split_key=entry["stablemotion_split_key"],
-                        sample_index=sample_index,
+                        sample_index=0,
                         pattern_index=pattern_index,
                         pattern_category=pattern.category,
                     )
-                    task_rel_path = Path("tasks") / f"{task_id}.npz"
-                    rollout_task_paths = []
-                    for rollout_step, task_arrays in enumerate(window_task_arrays):
-                        sensor_valid = full_sensor_valid[
-                            start_frame + rollout_step : start_frame + rollout_step + REALTIME_POSE_SEQ_LEN
-                        ].copy()
-                        task_arrays = add_runtime_task_arrays(
-                            task_arrays=task_arrays,
-                            sensor_valid=sensor_valid,
-                            source=source,
-                            absolute_start_frame=start_frame + rollout_step,
-                            full_sensor_valid=full_sensor_valid,
-                        )
-                        window_task_rel_path = (
-                            task_rel_path
-                            if rollout_step == 0
-                            else Path("tasks") / f"{task_id}_r{rollout_step:02d}.npz"
-                        )
-                        if rollout_step > 0:
-                            rollout_task_paths.append(window_task_rel_path.as_posix())
-                        save_task_npz(
-                            task_path=output_split_dir / window_task_rel_path,
-                            compress=bool(args.compress_tasks),
-                            **task_arrays,
-                            source_path=np.asarray(str(source_path)),
-                            sensor_valid=sensor_valid,
-                            inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
-                            start_frame=np.int64(start_frame + rollout_step),
-                            target_start=np.int64(REALTIME_POSE_TARGET_START),
-                            target_length=np.int64(REALTIME_POSE_TARGET_LENGTH),
-                            valid_length=np.int64(REALTIME_POSE_SEQ_LEN),
-                            source_frames=np.int64(source_frames),
-                            seq_len=np.int64(REALTIME_POSE_SEQ_LEN),
-                            rollout_step=np.int64(rollout_step),
-                            max_rollout_steps=np.int64(rollout_steps),
-                        )
                     manifest_entry = {
                         "task_id": task_id,
-                        "task_path": task_rel_path.as_posix(),
                         "split": split,
                         "source_path": str(source_path),
                         "source_dir": str(Path(getattr(args, "source_dir", "")).resolve()),
                         "source_relative_path": normalize_slashes(entry["source_relative_path"]),
                         "stablemotion_split_key": normalize_slashes(entry["stablemotion_split_key"]),
-                        "start_frame": start_frame,
-                        "valid_length": REALTIME_POSE_SEQ_LEN,
+                        "is_mirrored": bool(entry.get("is_mirrored", False)),
+                        "source_status": str(entry.get("status", "")),
                         "source_frames": source_frames,
+                        "samples_per_source": int(args.samples_per_source),
+                        "sampling_seed": int(split_seed),
                         "seq_len": REALTIME_POSE_SEQ_LEN,
                         "feature_dim": schema.feature_dim,
                         "max_rollout_steps": rollout_steps,
-                        "rollout_task_paths": rollout_task_paths,
                         "task_format": schema.task_format,
                         "schema_name": schema.name,
                         "schema_canonical_name": str(schema.canonical_name),
@@ -708,33 +743,19 @@ def generate_split_tasks(
                         "tracker_pattern": pattern.category,
                         "tracker_pattern_detail": pattern.to_dict(),
                         "generation_seed": int(split_seed),
-                        "patterns_per_window": int(args.patterns_per_window),
-                        "mask_timeline_sha256": hashlib.sha256(
-                            np.asarray(full_sensor_valid, dtype=np.uint8).tobytes()
-                        ).hexdigest(),
+                        "patterns_per_source": int(args.patterns_per_source),
                         "dynamic_dropout_min_frames": 2,
                         "dynamic_dropout_max_frames": 30,
                         "dynamic_dropout_max_missing": 3,
                     }
-                    manifest_entry.update(
-                        {
-                            key: scalar_manifest_value(window_task_arrays[0][key])
-                            for key in RUNTIME_CONTRACT_METADATA_FIELDS
-                        }
-                    )
+                    manifest_entry.update({key: source_meta[key] for key in RUNTIME_CONTRACT_METADATA_FIELDS})
                     if schema.supports_stationary_prob:
-                        manifest_entry.update(
-                            {
-                                key: scalar_manifest_value(source[key])
-                                for key in STATIONARY_LABEL_METADATA_FIELDS
-                                if key in source
-                            }
-                        )
+                        manifest_entry.update({key: source_meta[key] for key in STATIONARY_LABEL_METADATA_FIELDS})
                     manifest_file.write(json.dumps(manifest_entry, ensure_ascii=False, sort_keys=True) + "\n")
-                    written += 1
+                    written += int(args.samples_per_source)
                     if args.manifest_flush_interval > 0 and written % int(args.manifest_flush_interval) == 0:
                         manifest_file.flush()
-                progress.update(1)
+            progress.update(1)
         progress.close()
     write_short_source_report(output_split_dir=output_split_dir, split=split, records=skipped_short_sources)
     return written
@@ -777,7 +798,7 @@ def write_short_source_report(output_split_dir: Path, split: str, records: list[
 
 
 def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
-    """根据 task 生成策略返回本窗口要写出的固定 tracker pattern。"""
+    """根据 source-reference 生成策略返回要记录的 tracker pattern。"""
 
     if str(args.mask_policy) == TASK_MASK_POLICY_FULL:
         return [make_tracker_pattern("full_six", rng)]
@@ -790,9 +811,27 @@ def build_window_patterns(rng: np.random.Generator, args: argparse.Namespace):
         return [make_tracker_pattern(category, rng) for category in categories]
     return make_window_patterns(
         rng=rng,
-        patterns_per_window=int(args.patterns_per_window),
+        patterns_per_source=int(args.patterns_per_source),
         ensure_pattern_categories=bool(args.ensure_pattern_categories),
     )
+
+
+def load_realtime_source_reference_metadata(
+    path: Path,
+    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
+) -> dict[str, object]:
+    schema = get_schema_spec(schema_name)
+    with np.load(path, allow_pickle=False) as data:
+        validate_realtime_source_contract(data, schema=schema, source=str(path))
+        metadata = load_source_metadata(data, source=str(path))
+        frames = int(np.asarray(data[schema.body_pose_key]).shape[0])
+    result: dict[str, object] = {"frames": frames}
+    for key in RUNTIME_CONTRACT_METADATA_FIELDS:
+        result[key] = metadata[key]
+    if schema.supports_stationary_prob:
+        for key in STATIONARY_LABEL_METADATA_FIELDS:
+            result[key] = metadata[key]
+    return result
 
 
 def load_realtime_source(path: Path, schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME) -> dict[str, np.ndarray]:
@@ -949,35 +988,6 @@ def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -
         else value[start_frame:end_frame].copy()
         for key, value in source.items()
     }
-
-
-def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
-    task_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = temporary_task_path(task_path)
-    task_fs_path = windows_extended_path(task_path)
-    temp_fs_path = windows_extended_path(temp_path)
-    if temp_fs_path.exists():
-        temp_fs_path.unlink()
-    with temp_fs_path.open("wb") as file:
-        if compress:
-            np.savez_compressed(file, **arrays)
-        else:
-            np.savez(file, **arrays)
-    temp_fs_path.replace(task_fs_path)
-
-
-def temporary_task_path(task_path: Path) -> Path:
-    """临时文件名不能比最终 .npz 更长，避免 Windows 长路径边界下写入失败。"""
-
-    return task_path.with_suffix(".tmp")
-
-
-def windows_extended_path(path: Path) -> Path:
-    resolved = path.resolve()
-    text = str(resolved)
-    if os.name == "nt" and not text.startswith("\\\\?\\") and len(text) >= 248:
-        return Path("\\\\?\\" + text)
-    return resolved
 
 
 def scalar_manifest_value(value) -> str | int | float:

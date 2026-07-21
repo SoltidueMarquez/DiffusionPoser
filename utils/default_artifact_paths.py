@@ -19,29 +19,6 @@ def default_amass_root(artifact_roots_config: str | Path | None = None) -> Path:
     return _load_roots(artifact_roots_config).amass_root
 
 
-def default_smpl_model_dir(artifact_roots_config: str | Path | None = None) -> Path:
-    smpl_model_dir = _load_roots(artifact_roots_config).smpl_model_dir
-    if smpl_model_dir is None:
-        raise ValueError("smpl_model_dir must be configured for the realtime pose editor")
-    return smpl_model_dir
-
-
-def default_outputs_root(artifact_roots_config: str | Path | None = None) -> Path:
-    return _load_roots(artifact_roots_config).outputs_root
-
-
-def default_realtime_pose_editor_output_root(
-    artifact_roots_config: str | Path | None = None,
-) -> Path:
-    return default_outputs_root(artifact_roots_config) / "visual_editor"
-
-
-def default_realtime_pose_editor_runtime_root(
-    artifact_roots_config: str | Path | None = None,
-) -> Path:
-    return default_realtime_pose_editor_output_root(artifact_roots_config) / "runtime"
-
-
 def default_realtime_pose_source_root(
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     artifact_roots_config: str | Path | None = None,

@@ -80,7 +80,7 @@ conda run --no-capture-output -n diffusionposer5070 python -u -m train.realtime_
 conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_tasks `
   --source_dir dataset/generated/sources/realtime_pose_stationary5_v1/amass_60hz_v2 `
   --output_dir dataset/generated/tasks/realtime_pose_stationary5_v1/amass_60hz_v2_rollout8_tasks `
-  --splits train test --samples_per_file 4 --rollout_steps 9 `
+  --splits train test --samples_per_source 2 --rollout_steps 9 `
   --schema realtime_pose_stationary5_v1 --seed 10 --run_name loss_v2_rollout8_seed10
 ```
 

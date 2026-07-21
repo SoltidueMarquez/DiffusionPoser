@@ -13,6 +13,11 @@ from typing import Any
 import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
+from data_loaders.realtime_pose_dataset import (
+    load_source_reference_task_marker,
+    reject_materialized_entry,
+    validate_source_reference_entry,
+)
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from data_loaders.stationary_label_config import stationary_label_metadata
 from utils.default_artifact_paths import default_realtime_pose_longseq_eval_root, default_realtime_pose_task_root
@@ -37,8 +42,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("paths")
     paths.add_argument("--task_dir", default=DEFAULT_TASK_ROOT, type=str)
     paths.add_argument("--task_run", default="latest", type=str, help="'latest', a run name under task_dir, or a direct path.")
+    paths.add_argument("--task_subdir", default="", type=str, help="Task manifest 子目录；默认与 --split 相同。")
     paths.add_argument("--output_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     paths.add_argument("--run_name", default=DEFAULT_LONGSEQ_RUN_NAME, type=str)
+    paths.add_argument("--direct_output", action="store_true")
 
     selection = parser.add_argument_group("selection")
     selection.add_argument("--preset", default=PRESET_STRESS_LONG, choices=SUPPORTED_PRESETS, type=str)
@@ -156,11 +163,16 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
     schema = get_schema_spec(str(args.schema))
     apply_schema_path_defaults(args)
     task_run_dir = resolve_task_run_dir(task_dir=args.task_dir, task_run=args.task_run)
-    manifest_path = task_run_dir / str(args.split) / "manifest.jsonl"
+    task_subdir = str(getattr(args, "task_subdir", "") or "").strip() or str(args.split)
+    manifest_path = task_run_dir / task_subdir / "manifest.jsonl"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Task manifest not found: {manifest_path}")
 
     entries = read_jsonl(manifest_path)
+    load_source_reference_task_marker(manifest_path, schema_name=schema.name)
+    for entry in entries:
+        reject_materialized_entry(entry, source=str(manifest_path))
+        validate_source_reference_entry(entry, schema=schema, required_rollout_steps=1)
     selected = select_longseq_entries(
         entries=entries,
         split=str(args.split),
@@ -175,7 +187,11 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
         )
 
     output_root = Path(args.output_root).resolve()
-    output_dir = (output_root / str(args.run_name)).resolve()
+    output_dir = (
+        output_root
+        if bool(getattr(args, "direct_output", False))
+        else (output_root / str(args.run_name)).resolve()
+    )
     reset_output_dir(output_root=output_root, output_dir=output_dir, overwrite=bool(args.overwrite))
 
     sequence_dir = output_dir / "sequences"
@@ -321,16 +337,24 @@ def resolve_task_source_path(task_entry: dict[str, Any], task_manifest_path: Pat
 
 
 def reset_output_dir(output_root: Path, output_dir: Path, overwrite: bool) -> None:
+    root = output_root.resolve()
+    target = output_dir.resolve()
+    if target == root:
+        if not root.exists():
+            root.mkdir(parents=True)
+            return
+        if not any(root.iterdir()):
+            return
+        if not overwrite:
+            raise FileExistsError(f"Output dir already exists: {target}; pass --overwrite to rebuild it.")
+        raise ValueError(f"Refusing to overwrite direct output root: {target}")
+
     output_root.mkdir(parents=True, exist_ok=True)
     if not output_dir.exists():
         output_dir.mkdir(parents=True)
         return
     if not overwrite:
         raise FileExistsError(f"Output dir already exists: {output_dir}; pass --overwrite to rebuild it.")
-    root = output_root.resolve()
-    target = output_dir.resolve()
-    if target == root:
-        raise ValueError(f"Refusing to overwrite output root directly: {target}")
     try:
         target.relative_to(root)
     except ValueError as exc:
@@ -350,8 +374,10 @@ def build_config(
         "kind": LONGSEQ_LATEST_KIND,
         "preset": str(args.preset),
         "split": str(args.split),
+        "task_subdir": str(getattr(args, "task_subdir", "") or "").strip() or str(args.split),
         "min_frames": int(args.min_frames),
         "include_mirror": bool(args.include_mirror),
+        "direct_output": bool(getattr(args, "direct_output", False)),
         "schema_name": schema.name,
         "pose_representation": schema.pose_representation,
         "root_y_policy": schema.root_y_policy,

@@ -39,7 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_model_options(parser)
     add_diffusion_options(parser)
     add_sampling_options(parser)
-    parser.add_argument("--rollout_limit", default=0, type=int, help="最多处理多少个 materialized windows；0 表示全量。")
+    parser.add_argument("--rollout_limit", default=0, type=int, help="最多处理多少个在线 source window；0 表示全量。")
     return parser
 
 
@@ -130,7 +130,7 @@ def rollout_dataset(
     limit: int = 0,
 ) -> dict[str, np.ndarray]:
     """
-    对 materialized windows 执行显式 rollout 重建。
+    对在线 source windows 执行显式 rollout 重建。
 
     输出按“每个窗口的 target 帧”组织为 `[1, N, ...]`，N 是处理过的窗口数。
     当后续窗口 history 覆盖到已经预测过的绝对帧时，会用预测 target slice 替换 GT history。

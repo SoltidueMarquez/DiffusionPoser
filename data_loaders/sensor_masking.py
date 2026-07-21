@@ -23,8 +23,6 @@ PELVIS_HEIGHT_MODE_PELVIS_LOCAL_OFFSET_Y = "pelvis_local_offset_y"
 BODY_POSE_ROOT_GLOBAL_KEY = "body_pose_root_global_6d"
 BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY = "body_pose_body_fbx_local_delta_6d"
 LEGACY_BODY_POSE_PARENT_KEY = "body_pose_parent_6d"
-TASK_FORMAT_REALTIME_POSE_V2_MOTION = "materialized_realtime_pose_v2_motion"
-TASK_FORMAT_REALTIME_POSE_BODY_FBX_LOCAL_ROOT_Y0 = "materialized_realtime_pose_body_fbx_local_root_y0_v1"
 TASK_MODE_REALTIME_POSE = "realtime_pose_reconstruction"
 TASK_MODES = (TASK_MODE_REALTIME_POSE,)
 
@@ -241,11 +239,11 @@ def make_tracker_pattern(category: str, rng: np.random.Generator) -> TrackerPatt
 
 def make_window_patterns(
     rng: np.random.Generator,
-    patterns_per_window: int,
+    patterns_per_source: int,
     ensure_pattern_categories: bool = True,
 ) -> list[TrackerPattern]:
     patterns: list[TrackerPattern] = []
-    if ensure_pattern_categories and int(patterns_per_window) == 10:
+    if ensure_pattern_categories and int(patterns_per_source) == 10:
         for category, count in (
             ("full_six", 3),
             ("standard_three", 3),
@@ -256,7 +254,7 @@ def make_window_patterns(
     elif ensure_pattern_categories:
         patterns.extend(make_tracker_pattern(category, rng) for category in TRACKER_PATTERN_CATEGORIES)
 
-    target_count = max(int(patterns_per_window), len(patterns))
+    target_count = max(int(patterns_per_source), len(patterns))
     while len(patterns) < target_count:
         category = str(
             rng.choice(

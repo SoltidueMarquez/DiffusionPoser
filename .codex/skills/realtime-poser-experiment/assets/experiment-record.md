@@ -5,7 +5,7 @@ summary: "{{SUMMARY}}"
 experiment_type: "{{EXPERIMENT_TYPE}}"
 status: "ready"
 created_at: "{{CREATED_AT_ISO8601}}"
-script: "scripts/experiments/{{EXPERIMENT_ID}}.ps1"
+script: "experiments/{{EXPERIMENT_ID}}/run.ps1"
 repositories:
   diffusionposer:
     root: "."
@@ -93,7 +93,7 @@ result:
 
 ## 执行与测试
 
-- 实验脚本：`scripts/experiments/{{EXPERIMENT_ID}}.ps1`
+- 实验脚本：`experiments/{{EXPERIMENT_ID}}/run.ps1`
 - 启动命令：{{RUN_COMMAND}}
 - 测试结果：{{TEST_RESULTS}}
 

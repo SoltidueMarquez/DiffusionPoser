@@ -15,7 +15,6 @@ from data_loaders.generate_realtime_pose_tasks import load_realtime_source, main
 from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     encode_realtime_pose_features,
-    load_materialized_task_npz,
     load_realtime_task_arrays,
 )
 from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, get_schema_spec
@@ -58,7 +57,7 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
     assert schema.canonical_name == CANONICAL_SCHEMA_NAME
 
     source_dir = tmp_path / schema_name / "sources"
-    # task generator 默认物化 base + 1 个相邻窗口，因此最小 source 比模型窗口多 1 帧。
+    # 默认在线链包含 base + 1 个相邻窗口，因此最小 source 比模型窗口多 1 帧。
     source_frame_count = schema.seq_len + 1
     source_path = write_toy_source_dataset(
         source_dir,
@@ -92,7 +91,7 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
             str(task_root),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             schema_name,
@@ -106,9 +105,8 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
     task_entry = read_jsonl(task_manifest_path)[0]
     assert task_entry["schema_name"] == schema_name
     assert task_entry["schema_canonical_name"] == CANONICAL_SCHEMA_NAME
-    with np.load(task_manifest_path.parent / task_entry["task_path"], allow_pickle=False) as task:
-        assert str(task["schema_name"].item()) == schema_name
-        assert str(task["task_format"].item()) == schema.task_format
+    assert task_entry["task_format"] == schema.task_format
+    assert "task_path" not in task_entry
 
     normalizer_dir = tmp_path / schema_name / "normalizer"
     RealtimePoseNormalizer(normalizer_dir, disable=True, schema_name=schema_name).save(
@@ -137,7 +135,7 @@ def test_stationary5_schema_toy_source_task_normalizer_export(tmp_path, schema_n
     assert item["inpaint_mask"][: schema.target_dim, schema.target_start].all()
     assert not item["inpaint_mask"][schema.target_dim :, :].any()
 
-    task = load_materialized_task_npz(task_manifest_path.parent, task_entry["task_path"], schema_name=schema_name)
+    task = dataset.load_task(0, dataset.entries[0])
     arrays = load_realtime_task_arrays(task=task, seq_len=schema.seq_len, schema_name=schema_name)
     features = encode_realtime_pose_features(arrays, schema_name=schema_name)
     assert features.shape == (schema.seq_len, schema.feature_dim)

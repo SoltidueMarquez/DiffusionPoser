@@ -45,9 +45,9 @@ def next_experiment_id(records_dir: Path, target_date: date | None = None) -> st
     highest = 0
     if records_dir.exists():
         for path in records_dir.iterdir():
-            if not path.is_file():
-                continue
-            match = EXPERIMENT_ID_PATTERN.fullmatch(path.stem)
+            # 新布局按目录编号；同时识别旧的 EXP-*.md，避免编号迁移期间发生碰撞。
+            candidate = path.name if path.is_dir() else path.stem if path.is_file() else ""
+            match = EXPERIMENT_ID_PATTERN.fullmatch(candidate)
             if match is None or match.group(1) != date_token:
                 continue
             highest = max(highest, int(match.group(2)))
@@ -86,8 +86,10 @@ def validate_record(
     experiment_id = _required_string(payload, "experiment_id", errors)
     if experiment_id and EXPERIMENT_ID_PATTERN.fullmatch(experiment_id) is None:
         errors.append("experiment_id 必须匹配 EXP-YYYYMMDD-NNN。")
-    if experiment_id and record_path.name != f"{experiment_id}.md":
-        errors.append(f"记录文件名必须是 {experiment_id}.md。")
+    if experiment_id and (
+        record_path.name != "README.md" or record_path.parent.name != experiment_id
+    ):
+        errors.append(f"记录文件必须是 experiments/{experiment_id}/README.md。")
     summary = _required_string(payload, "summary", errors)
     if summary and (len(summary) > 80 or "\n" in summary):
         errors.append("summary 必须是一句不超过 80 个字符的简洁说明。")
@@ -136,13 +138,32 @@ def validate_record(
     if unity_record.get("participation") == "reference_only" and unity_record.get("changed") is not False:
         errors.append("reference_only Unity 必须设置 changed: false。")
     if dp_root is not None:
-        expected_record = dp_root / "documents/experiments" / f"{experiment_id}.md"
+        expected_record = dp_root / "experiments" / experiment_id / "README.md"
         if record_path != expected_record.resolve():
             errors.append(f"实验记录必须位于 {expected_record}。")
 
+    experiment_commit = dp_commits.get("experiment")
+    if experiment_id and dp_root is not None:
+        config_relative = Path("experiments") / experiment_id / "experiment.json"
+        config_path = dp_root / config_relative
+        if not config_path.is_file():
+            errors.append(f"实验配置不存在：{config_path}")
+        else:
+            try:
+                config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(f"实验配置无法读取：{exc}")
+            else:
+                if config_payload.get("experiment_id") != experiment_id:
+                    errors.append("experiment.json 的 experiment_id 与实验目录不一致。")
+        if experiment_commit and not _git_object_exists(
+            dp_root, f"{experiment_commit}:{config_relative.as_posix()}"
+        ):
+            errors.append("DiffusionPoser experiment_commit 中不包含实验配置。")
+
     script = _required_string(payload, "script", errors)
-    if experiment_id and script and script != f"scripts/experiments/{experiment_id}.ps1":
-        errors.append(f"script 必须是 scripts/experiments/{experiment_id}.ps1。")
+    if experiment_id and script and script != f"experiments/{experiment_id}/run.ps1":
+        errors.append(f"script 必须是 experiments/{experiment_id}/run.ps1。")
     if script and dp_root is not None:
         script_path = _safe_repo_path(dp_root, script, "script", errors)
         if script_path is not None and not script_path.is_file():
@@ -151,7 +172,6 @@ def validate_record(
             script_text = script_path.read_text(encoding="utf-8")
             if "{{" in script_text or "}}" in script_text:
                 errors.append("实验脚本仍包含模板占位符。")
-        experiment_commit = dp_commits.get("experiment")
         if experiment_commit and not _git_object_exists(dp_root, f"{experiment_commit}:{Path(script).as_posix()}"):
             errors.append("DiffusionPoser experiment_commit 中不包含实验脚本。")
 
@@ -555,7 +575,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     next_id = subparsers.add_parser("next-id", help="Print the next EXP-YYYYMMDD-NNN identifier.")
-    next_id.add_argument("--records-dir", default=Path("documents/experiments"), type=Path)
+    next_id.add_argument("--records-dir", default=Path("experiments"), type=Path)
     next_id.add_argument("--date", default=None, type=_parse_date)
 
     validate = subparsers.add_parser("validate", help="Validate an experiment record and repo state.")

@@ -84,7 +84,7 @@ def test_relabel_realtime_pose_stationary_rewrites_only_label_and_metadata(tmp_p
             "toy_causal_stationary_rollout2",
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--rollout_steps",
             "2",

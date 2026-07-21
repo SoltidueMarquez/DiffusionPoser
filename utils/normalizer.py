@@ -97,8 +97,12 @@ class RealtimePoseNormalizer:
         )
         self._validate_stats(mean=mean_tensor, std=std_tensor)
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(mean_tensor, self.mean_path)
-        torch.save(torch.clamp(std_tensor, min=self.eps), self.std_path)
+        mean_temporary_path = self.mean_path.with_suffix(self.mean_path.suffix + ".tmp")
+        std_temporary_path = self.std_path.with_suffix(self.std_path.suffix + ".tmp")
+        torch.save(mean_tensor, mean_temporary_path)
+        torch.save(torch.clamp(std_tensor, min=self.eps), std_temporary_path)
+        mean_temporary_path.replace(self.mean_path)
+        std_temporary_path.replace(self.std_path)
         self._write_meta()
         self.mean = mean_tensor
         self.std = torch.clamp(std_tensor, min=self.eps)
@@ -162,8 +166,10 @@ class RealtimePoseNormalizer:
         }
         if self.schema.supports_stationary_prob:
             meta.update(stationary_label_metadata())
-        with self.meta_path.open("w", encoding="utf-8") as file:
+        temporary_path = self.meta_path.with_suffix(self.meta_path.suffix + ".tmp")
+        with temporary_path.open("w", encoding="utf-8") as file:
             json.dump(meta, file, indent=2, ensure_ascii=False, sort_keys=True)
+        temporary_path.replace(self.meta_path)
 
     def _validate_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         expected_dim = self.schema.feature_dim

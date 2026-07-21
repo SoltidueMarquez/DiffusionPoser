@@ -11,6 +11,12 @@ from pathlib import Path
 from data_converter.amass_to_realtime_pose import DEFAULT_SOURCE_SET_NAME
 from data_loaders.compute_realtime_pose_normalizer import DEFAULT_NORMALIZER_NAME
 from data_loaders.generate_realtime_pose_tasks import DEFAULT_TASK_SET_NAME
+from data_loaders.realtime_pose_dataset import (
+    load_source_reference_task_marker,
+    read_task_manifest,
+    reject_materialized_entry,
+    validate_source_reference_entry,
+)
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
 from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS
 from utils.artifact_paths import export_root, normalizer_root, run_root, source_root, task_root
@@ -92,17 +98,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     normalizer = parser.add_argument_group("normalizer")
     normalizer.add_argument("--skip_normalizer", action="store_true")
     normalizer.add_argument("--normalizer_split", default="train", type=str)
-    normalizer.add_argument("--normalizer_mask_samples_per_task", default=10, type=int)
+    normalizer.add_argument("--normalizer_windows_per_source", default=2, type=int)
+    normalizer.add_argument("--normalizer_convergence_windows_per_source", default=4, type=int)
+    normalizer.add_argument("--normalizer_check_convergence", default=True, type=str2bool)
     normalizer.add_argument("--normalizer_tracker_mask_seed", default=10, type=int)
-    normalizer.add_argument("--normalizer_tracker_mask_epoch", default=0, type=int)
 
     tasks = parser.add_argument_group("tasks")
     tasks.add_argument("--skip_tasks", action="store_true")
     tasks.add_argument("--splits", nargs="+", default=["train", "test"])
-    tasks.add_argument("--samples_per_file", default=4, type=int)
+    tasks.add_argument("--samples_per_source", default=2, type=int)
     tasks.add_argument("--mask_policy", default="full", choices=["full", "fixed_patterns"])
     tasks.add_argument("--fixed_tracker_patterns", nargs="+", default=[])
-    tasks.add_argument("--patterns_per_window", default=1, type=int)
+    tasks.add_argument("--patterns_per_source", default=1, type=int)
     tasks.add_argument("--task_rollout_steps", default=2, type=int)
     tasks.add_argument("--short_source_policy", default="skip", choices=["skip", "error"])
 
@@ -116,6 +123,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--device", default=0, type=int)
     train.add_argument("--train_batch_size", default=64, type=int)
     train.add_argument("--num_workers", default=0, type=int)
+    train.add_argument("--source_cache_max_mib", default=512, type=int)
     train.add_argument("--num_steps", default=1_000_000, type=int)
     train.add_argument("--save_interval", default=5_000, type=int)
     train.add_argument("--log_interval", default=1_000, type=int)
@@ -320,7 +328,7 @@ def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[b
             return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
     if stage == "tasks":
         task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
-        if has_task_manifests(task_dir=task_dir, splits=list(args.splits)):
+        if has_task_manifests(task_dir=task_dir, splits=list(args.splits), schema_name=str(args.schema)):
             return True, f"复用已有 task 产物: {task_dir}"
     if stage == "normalizer":
         normalizer_dir = resolve_latest_or_self(resolve_pipeline_normalizer_dir(args), kind="normalizer")
@@ -338,13 +346,17 @@ def dependency_block_message(stage: str, failed_stages: set[str], args: argparse
         return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
     if stage == "normalizer" and "tasks" in failed_stages:
         task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
-        if has_task_manifests(task_dir=task_dir, splits=[str(args.normalizer_split)]):
+        if has_task_manifests(
+            task_dir=task_dir,
+            splits=[str(args.normalizer_split)],
+            schema_name=str(args.schema),
+        ):
             return ""
         return "tasks 失败且找不到可用于 normalizer_split 的 task manifest，跳过 normalizer。"
     if stage == "train":
         if "tasks" in failed_stages:
             task_dir = resolve_latest_or_self(resolve_pipeline_task_dir(args), kind="tasks")
-            if not has_task_manifests(task_dir=task_dir, splits=["train"]):
+            if not has_task_manifests(task_dir=task_dir, splits=["train"], schema_name=str(args.schema)):
                 return "tasks 失败且找不到 train task manifest，跳过 train。"
         if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
             normalizer_dir = resolve_latest_or_self(resolve_pipeline_normalizer_dir(args), kind="normalizer")
@@ -373,12 +385,23 @@ def has_usable_source_manifest(source_dir: Path, schema_name: str) -> bool:
     return False
 
 
-def has_task_manifests(task_dir: Path, splits: list[str]) -> bool:
+def has_task_manifests(task_dir: Path, splits: list[str], schema_name: str) -> bool:
     if not task_dir.exists():
         return False
+    schema = get_schema_spec(schema_name)
     for split in splits:
         manifest_path = task_dir / str(split) / "manifest.jsonl"
         if not manifest_path.exists():
+            return False
+        try:
+            load_source_reference_task_marker(manifest_path, schema_name=schema.name)
+            entries = read_task_manifest(manifest_path)
+            if not entries:
+                return False
+            for entry in entries:
+                reject_materialized_entry(entry, source=str(manifest_path))
+                validate_source_reference_entry(entry, schema=schema, required_rollout_steps=1)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return False
     return True
 
@@ -387,13 +410,23 @@ def has_normalizer_artifact(normalizer_dir: Path, schema_name: str) -> bool:
     mean_path = normalizer_dir / "mean.pt"
     std_path = normalizer_dir / "std.pt"
     meta_path = normalizer_dir / "normalizer_meta.json"
-    if not (mean_path.exists() and std_path.exists() and meta_path.exists()):
+    convergence_path = normalizer_dir / "normalizer_convergence.json"
+    if not (mean_path.exists() and std_path.exists() and meta_path.exists() and convergence_path.exists()):
         return False
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        convergence = json.loads(convergence_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return str(meta.get("schema_name", schema_name)) == schema_name
+    return bool(
+        str(meta.get("schema_name", "")) == schema_name
+        and meta.get("normalizer_convergence_passed") is True
+        and int(meta.get("windows_per_source", 0)) == 2
+        and int(meta.get("convergence_windows_per_source", 0)) == 4
+        and str(meta.get("task_manifest_sha256", ""))
+        and str(meta.get("source_manifest_sha256", ""))
+        and convergence.get("passed") is True
+    )
 
 
 def format_pipeline_failures(failures: list[StageResult]) -> str:
@@ -439,9 +472,10 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
         "--task_set_name", str(args.task_set_name),
         "--normalizer_name", str(args.normalizer_name),
         "--split", args.normalizer_split,
-        "--mask_samples_per_task", str(args.normalizer_mask_samples_per_task),
+        "--windows_per_source", str(args.normalizer_windows_per_source),
+        "--convergence_windows_per_source", str(args.normalizer_convergence_windows_per_source),
+        "--check_convergence", str(bool(args.normalizer_check_convergence)).lower(),
         "--tracker_mask_seed", str(args.normalizer_tracker_mask_seed),
-        "--tracker_mask_epoch", str(args.normalizer_tracker_mask_epoch),
         "--run_name", args.run_name,
     ]
     add_artifact_roots_arg(command, args)
@@ -458,9 +492,9 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--task_set_name", str(args.task_set_name),
         "--split_dir", normalize_path(args.split_dir),
         "--splits", *[str(split) for split in args.splits],
-        "--samples_per_file", str(args.samples_per_file),
+        "--samples_per_source", str(args.samples_per_source),
         "--mask_policy", args.mask_policy,
-        "--patterns_per_window", str(args.patterns_per_window),
+        "--patterns_per_source", str(args.patterns_per_source),
         "--rollout_steps", str(args.task_rollout_steps),
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
@@ -501,6 +535,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
         "--num_workers", str(args.num_workers),
+        "--source_cache_max_mib", str(args.source_cache_max_mib),
         "--num_steps", str(stage["num_steps"]),
         "--save_interval", str(args.save_interval),
         "--log_interval", str(args.log_interval),

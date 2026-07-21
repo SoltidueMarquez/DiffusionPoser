@@ -379,7 +379,7 @@ def test_stationary5_task_dataset_and_normalizer_contract(tmp_path):
             str(task_dir),
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--schema",
             REALTIME_POSE_SCHEMA_NAME,
@@ -397,9 +397,8 @@ def test_stationary5_task_dataset_and_normalizer_contract(tmp_path):
     expected_stationary_metadata = stationary_label_metadata()
     for key, value in expected_stationary_metadata.items():
         assert_stationary_metadata_value(entry[key], value)
-    with np.load(manifest_path.parent / entry["task_path"], allow_pickle=False) as data:
-        for key, value in expected_stationary_metadata.items():
-            assert_stationary_metadata_value(data[key], value)
+    assert entry["task_format"] == schema.task_format
+    assert "task_path" not in entry
 
     mean = torch.zeros(schema.feature_dim)
     std = torch.ones(schema.feature_dim)

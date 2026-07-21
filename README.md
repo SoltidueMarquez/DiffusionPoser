@@ -73,8 +73,9 @@ conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.gener
   --source_set_name amass_60hz `
   --task_set_name amass_60hz_tasks `
   --split_dir data_loaders/splits `
-  --splits train test `
-  --samples_per_file 4 `
+  --splits train `
+  --samples_per_source 2 `
+  --rollout_steps 9 `
   --mask_policy full `
   --overwrite
 
@@ -83,6 +84,9 @@ conda run --no-capture-output -n diffusionposer5070 python -m data_loaders.compu
   --task_set_name amass_60hz_tasks `
   --normalizer_name amass_60hz_train `
   --split train `
+  --windows_per_source 2 `
+  --convergence_windows_per_source 4 `
+  --check_convergence true `
   --overwrite
 ```
 

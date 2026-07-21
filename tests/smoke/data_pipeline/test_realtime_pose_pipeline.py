@@ -8,7 +8,15 @@ import pytest
 
 import data_loaders.compute_realtime_pose_normalizer as normalizer_computer
 import data_loaders.generate_realtime_pose_tasks as task_generator
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.realtime_pose_contract import runtime_contract_metadata
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_LENGTH,
+    REALTIME_POSE_TARGET_START,
+    TASK_MODE_REALTIME_POSE,
+    get_schema_spec,
+)
 from data_loaders.stationary_label_config import stationary_label_metadata
 from scripts import run_realtime_pose_pipeline as pipeline
 from tests.smoke.realtime_pose_fixtures import write_toy_source_dataset
@@ -106,10 +114,50 @@ def write_usable_source_manifest(source_dir: Path) -> None:
 
 
 def write_latest_task_artifact(task_root: Path, split: str = "train") -> Path:
+    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     task_dir = task_root / "20260101_000000_rtp_tasks"
     split_dir = task_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
-    (split_dir / "manifest.jsonl").write_text("", encoding="utf-8")
+    source_dir = task_root.parent / "sources"
+    source_manifest = source_dir / "manifest.jsonl"
+    if not source_manifest.exists():
+        write_usable_source_manifest(source_dir)
+    entry = {
+        "task_id": "toy_source_reference",
+        "task_format": schema.task_format,
+        "schema_name": schema.name,
+        "schema_canonical_name": str(schema.canonical_name),
+        "pose_representation": schema.pose_representation,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+        "source_path": str(source_dir / "toy.npz"),
+        "source_relative_path": "toy.npz",
+        "stablemotion_split_key": "toy",
+        "source_frames": 70,
+        "samples_per_source": 2,
+        "sampling_seed": 10,
+        "max_rollout_steps": 1,
+        "seq_len": REALTIME_POSE_SEQ_LEN,
+        "feature_dim": schema.feature_dim,
+        "target_start": REALTIME_POSE_TARGET_START,
+        "target_length": REALTIME_POSE_TARGET_LENGTH,
+        "task_mode": TASK_MODE_REALTIME_POSE,
+        **runtime_contract_metadata(),
+        **stationary_label_metadata(),
+    }
+    (split_dir / "manifest.jsonl").write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    task_generator.write_task_output_marker(
+        source_dir=source_dir,
+        output_dir=task_dir,
+        split_dir=None,
+        schema_name=schema.name,
+        generated_root=task_root.parent,
+        source_set_name="toy",
+        task_set_name="toy",
+    )
     write_latest_pointer(
         root_dir=task_root,
         kind="tasks",
@@ -126,7 +174,21 @@ def write_latest_normalizer_artifact(normalizer_root: Path) -> Path:
     (normalizer_dir / "mean.pt").write_bytes(b"mean")
     (normalizer_dir / "std.pt").write_bytes(b"std")
     (normalizer_dir / "normalizer_meta.json").write_text(
-        json.dumps({"schema_name": schema.name}, ensure_ascii=False),
+        json.dumps(
+            {
+                "schema_name": schema.name,
+                "windows_per_source": 2,
+                "convergence_windows_per_source": 4,
+                "normalizer_convergence_passed": True,
+                "task_manifest_sha256": "task-sha",
+                "source_manifest_sha256": "source-sha",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (normalizer_dir / "normalizer_convergence.json").write_text(
+        json.dumps({"passed": True}),
         encoding="utf-8",
     )
     write_latest_pointer(
@@ -300,7 +362,7 @@ def test_pipeline_task_defaults_rebuild_final_distribution_with_adjacent_rollout
     args = parse_schema_aware_pipeline_args(tmp_path)
     task_args = pipeline.build_task_args(args)
     assert_arg_value(task_args, "--mask_policy", "full")
-    assert_arg_value(task_args, "--patterns_per_window", "1")
+    assert_arg_value(task_args, "--patterns_per_source", "1")
     assert_arg_value(task_args, "--rollout_steps", "2")
     assert "--fixed_tracker_patterns" not in task_args
 
@@ -547,7 +609,7 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
             "",
             "--splits",
             "train",
-            "--samples_per_file",
+            "--samples_per_source",
             "1",
             "--overwrite",
         ]
@@ -578,6 +640,12 @@ def test_task_and_normalizer_metadata_record_schema_aware_roots(tmp_path):
             schema.name,
             "--split",
             "train",
+            "--windows_per_source",
+            "2",
+            "--convergence_windows_per_source",
+            "4",
+            "--check_convergence",
+            "false",
             "--overwrite",
         ]
     )
