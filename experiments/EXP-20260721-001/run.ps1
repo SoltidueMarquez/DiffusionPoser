@@ -801,7 +801,7 @@ try {
     if ([bool]$Config.data.direct_normalizer_output) {
         $normalizerArguments += "--direct_output"
     }
-    Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K2 正式统计与 K4 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
+    Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K4 正式统计与 K8 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
 
     if (-not $CanaryMode) {
         $longseqArguments = @(

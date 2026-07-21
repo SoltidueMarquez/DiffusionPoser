@@ -1,8 +1,26 @@
+import json
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUN_SCRIPT = REPO_ROOT / "experiments" / "EXP-20260721-001" / "run.ps1"
+EXPERIMENT_CONFIG = REPO_ROOT / "experiments" / "EXP-20260721-001" / "experiment.json"
+
+
+def test_normalizer_uses_converged_k4_k8_sampling() -> None:
+    config = json.loads(EXPERIMENT_CONFIG.read_text(encoding="utf-8"))
+
+    assert config["data"]["normalizer_windows_per_source"] == 4
+    assert config["data"]["normalizer_convergence_windows_per_source"] == 8
+    assert config["data"]["normalizer_check_convergence"] is True
+
+    script = RUN_SCRIPT.read_text(encoding="utf-8")
+    assert '"--windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_windows_per_source)' in script
+    assert (
+        '"--convergence_windows_per_source", '
+        '(ConvertTo-InvariantString $Config.data.normalizer_convergence_windows_per_source)'
+    ) in script
+    assert "执行 K4 正式统计与 K8 收敛门禁" in script
 
 
 def test_canary_mode_uses_isolated_h8_training_run() -> None:

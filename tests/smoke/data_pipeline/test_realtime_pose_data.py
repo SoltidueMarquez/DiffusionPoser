@@ -1567,6 +1567,8 @@ def test_normalizer_convergence_report_has_reproducible_success_and_failure():
     schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     mean = np.zeros(schema.feature_dim, dtype=np.float32)
     std = np.ones(schema.feature_dim, dtype=np.float32)
+    official_counts = np.full(schema.feature_dim, 122, dtype=np.int64)
+    comparison_counts = np.full(schema.feature_dim, 244, dtype=np.int64)
     passed = build_convergence_report(
         official_mean=mean,
         official_std=std,
@@ -1575,22 +1577,43 @@ def test_normalizer_convergence_report_has_reproducible_success_and_failure():
         schema_name=schema.name,
         official_windows=2,
         comparison_windows=4,
+        official_valid_counts=official_counts,
+        comparison_valid_counts=comparison_counts,
     )
     assert passed["passed"] is True
+    assert passed["top_channel_diagnostics"]["top_k"] == 10
 
     shifted_mean = mean.copy()
     shifted_mean[0] = 0.2
+    shifted_std = std.copy()
+    tracker_channel = schema.tracker_pos_slice(1).start
+    shifted_std[tracker_channel] = 1.2
+    official_counts[tracker_channel] = 40
+    comparison_counts[tracker_channel] = 80
     failed = build_convergence_report(
         official_mean=shifted_mean,
-        official_std=std,
+        official_std=shifted_std,
         comparison_mean=mean,
         comparison_std=std,
         schema_name=schema.name,
         official_windows=2,
         comparison_windows=4,
+        official_valid_counts=official_counts,
+        comparison_valid_counts=comparison_counts,
     )
     assert failed["passed"] is False
     assert failed["failed_conditions"]
+    mean_outlier = failed["top_channel_diagnostics"]["normalized_mean_shift"][0]
+    assert mean_outlier["channel_index"] == 0
+    assert mean_outlier["feature_group"] == "body_pose_body_fbx_local_delta_6d"
+    std_outlier = failed["top_channel_diagnostics"]["relative_std_shift"][0]
+    assert std_outlier["channel_index"] == tracker_channel
+    assert std_outlier["channel_name"] == "tracker_pos_ref.left_wrist.x"
+    assert std_outlier["official_valid_count"] == 40
+    assert std_outlier["comparison_valid_count"] == 80
+    assert std_outlier["official_valid_fraction"] == pytest.approx(40 / 122)
+    assert std_outlier["comparison_valid_fraction"] == pytest.approx(80 / 244)
+    assert std_outlier["exceeds_max_threshold"] is True
 
 
 def test_normalizer_failed_gate_keeps_report_but_not_stats_or_latest(tmp_path):
@@ -1626,7 +1649,10 @@ def test_normalizer_failed_gate_keeps_report_but_not_stats_or_latest(tmp_path):
                 overwrite=True,
             )
         )
-    assert (output_dir / "normalizer_convergence.json").exists()
+    convergence_path = output_dir / "normalizer_convergence.json"
+    assert convergence_path.exists()
+    convergence = json.loads(convergence_path.read_text(encoding="utf-8"))
+    assert convergence["top_channel_diagnostics"]["relative_std_shift"]
     assert not (output_dir / "mean.pt").exists()
     assert not (output_dir / "std.pt").exists()
     assert not (output_dir / "latest_normalizer.json").exists()

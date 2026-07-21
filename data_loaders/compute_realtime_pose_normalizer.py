@@ -23,6 +23,11 @@ from data_loaders.sensor_masking import (
     TRACKER_COUNT,
     get_schema_spec,
 )
+from schemas.realtime_pose_stationary5_v1.contract import (
+    SMPL_JOINT_NAMES,
+    STATIONARY_JOINT_NAMES,
+    TRACKER_NAMES,
+)
 from data_loaders.stationary_label_config import STATIONARY_LABEL_METADATA_FIELDS
 from utils.artifact_paths import normalizer_root, task_root
 from utils.artifact_roots import load_artifact_roots
@@ -32,6 +37,7 @@ from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_
 
 DEFAULT_TASK_SET_NAME = "amass_60hz_tasks"
 DEFAULT_NORMALIZER_NAME = "amass_60hz_train"
+CONVERGENCE_DIAGNOSTIC_TOP_K = 10
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -162,6 +168,8 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         schema_name=schema.name,
         official_windows=windows_per_source,
         comparison_windows=convergence_windows,
+        official_valid_counts=official["feature_valid_counts"],
+        comparison_valid_counts=comparison["feature_valid_counts"],
         official_zero_count_channels=official["zero_count_channels"],
         comparison_zero_count_channels=comparison["zero_count_channels"],
     )
@@ -365,6 +373,8 @@ def build_convergence_report(
     schema_name: str,
     official_windows: int,
     comparison_windows: int,
+    official_valid_counts: np.ndarray | None = None,
+    comparison_valid_counts: np.ndarray | None = None,
     official_zero_count_channels: list[int] | None = None,
     comparison_zero_count_channels: list[int] | None = None,
 ) -> dict[str, object]:
@@ -398,6 +408,17 @@ def build_convergence_report(
     absolute_mean_shift = np.abs(official_mean64 - comparison_mean64)
     absolute_std_shift = np.abs(official_std64 - comparison_std64)
 
+    official_counts64 = _optional_feature_vector(
+        official_valid_counts,
+        feature_dim=schema.feature_dim,
+        name="official_valid_counts",
+    )
+    comparison_counts64 = _optional_feature_vector(
+        comparison_valid_counts,
+        feature_dim=schema.feature_dim,
+        name="comparison_valid_counts",
+    )
+
     def masked_percentile(values: np.ndarray, mask: np.ndarray, percentile: float) -> float:
         selected = values[mask]
         return float(np.percentile(selected, percentile)) if selected.size else 0.0
@@ -422,6 +443,59 @@ def build_convergence_report(
         "low_variance_absolute_mean_std_shift_max": 0.05,
         "stationary_sensor_valid_absolute_mean_shift_max": 0.01,
     }
+    diagnostic_specs = {
+        "normalized_mean_shift": (
+            normalized_mean_shift,
+            scaled_mask,
+            "normalized_mean_shift",
+            thresholds["normalized_mean_std_shift_max"],
+        ),
+        "relative_std_shift": (
+            relative_std_shift,
+            scaled_mask,
+            "relative_std_shift",
+            thresholds["normalized_mean_std_shift_max"],
+        ),
+        "low_variance_absolute_mean_shift": (
+            absolute_mean_shift,
+            low_variance_mask,
+            "absolute_mean_shift",
+            thresholds["low_variance_absolute_mean_std_shift_max"],
+        ),
+        "low_variance_absolute_std_shift": (
+            absolute_std_shift,
+            low_variance_mask,
+            "absolute_std_shift",
+            thresholds["low_variance_absolute_mean_std_shift_max"],
+        ),
+        "stationary_sensor_valid_absolute_mean_shift": (
+            absolute_mean_shift,
+            special_mask,
+            "absolute_mean_shift",
+            thresholds["stationary_sensor_valid_absolute_mean_shift_max"],
+        ),
+    }
+    top_channel_diagnostics: dict[str, object] = {"top_k": CONVERGENCE_DIAGNOSTIC_TOP_K}
+    for key, (values, mask, metric_name, max_threshold) in diagnostic_specs.items():
+        top_channel_diagnostics[key] = _top_channel_shift_records(
+            values=values,
+            mask=mask,
+            metric_name=metric_name,
+            max_threshold=max_threshold,
+            schema_name=schema.name,
+            official_mean=official_mean64,
+            official_std=official_std64,
+            comparison_mean=comparison_mean64,
+            comparison_std=comparison_std64,
+            absolute_mean_shift=absolute_mean_shift,
+            absolute_std_shift=absolute_std_shift,
+            normalized_mean_shift=normalized_mean_shift,
+            relative_std_shift=relative_std_shift,
+            official_valid_counts=official_counts64,
+            comparison_valid_counts=comparison_counts64,
+            special_mask=special_mask,
+            low_variance_mask=low_variance_mask,
+        )
     failed_conditions: list[str] = []
     if not arrays_finite:
         failed_conditions.append("mean/std contains NaN or Inf")
@@ -456,11 +530,149 @@ def build_convergence_report(
         "low_variance_std_threshold": 1e-4,
         "thresholds": thresholds,
         "metrics": metrics,
+        "top_channel_diagnostics": top_channel_diagnostics,
         "zero_count_channels": zero_count_channels,
         "finite": arrays_finite,
         "failed_conditions": failed_conditions,
         "passed": not failed_conditions,
     }
+
+
+def _optional_feature_vector(
+    values: np.ndarray | None,
+    *,
+    feature_dim: int,
+    name: str,
+) -> np.ndarray | None:
+    if values is None:
+        return None
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (feature_dim,):
+        raise ValueError(f"{name} shape 必须为 ({feature_dim},)，当前为 {array.shape}")
+    return array
+
+
+def _top_channel_shift_records(
+    *,
+    values: np.ndarray,
+    mask: np.ndarray,
+    metric_name: str,
+    max_threshold: float,
+    schema_name: str,
+    official_mean: np.ndarray,
+    official_std: np.ndarray,
+    comparison_mean: np.ndarray,
+    comparison_std: np.ndarray,
+    absolute_mean_shift: np.ndarray,
+    absolute_std_shift: np.ndarray,
+    normalized_mean_shift: np.ndarray,
+    relative_std_shift: np.ndarray,
+    official_valid_counts: np.ndarray | None,
+    comparison_valid_counts: np.ndarray | None,
+    special_mask: np.ndarray,
+    low_variance_mask: np.ndarray,
+) -> list[dict[str, object]]:
+    indices = np.flatnonzero(mask)
+    ranked = sorted(
+        (int(index) for index in indices),
+        key=lambda index: (
+            0 if np.isfinite(values[index]) else 1,
+            float(values[index]) if np.isfinite(values[index]) else float("inf"),
+            -index,
+        ),
+        reverse=True,
+    )[:CONVERGENCE_DIAGNOSTIC_TOP_K]
+    official_total = float(official_valid_counts.max(initial=0.0)) if official_valid_counts is not None else 0.0
+    comparison_total = (
+        float(comparison_valid_counts.max(initial=0.0)) if comparison_valid_counts is not None else 0.0
+    )
+    records: list[dict[str, object]] = []
+    for index in ranked:
+        feature_group, channel_name = _describe_feature_channel(schema_name, index)
+        official_count = None if official_valid_counts is None else int(official_valid_counts[index])
+        comparison_count = None if comparison_valid_counts is None else int(comparison_valid_counts[index])
+        records.append(
+            {
+                "channel_index": index,
+                "channel_name": channel_name,
+                "feature_group": feature_group,
+                "ranking_metric": metric_name,
+                "ranking_value": _finite_float_or_none(values[index]),
+                "exceeds_max_threshold": bool(
+                    not np.isfinite(values[index]) or float(values[index]) > float(max_threshold)
+                ),
+                "official_mean": _finite_float_or_none(official_mean[index]),
+                "comparison_mean": _finite_float_or_none(comparison_mean[index]),
+                "official_std": _finite_float_or_none(official_std[index]),
+                "comparison_std": _finite_float_or_none(comparison_std[index]),
+                "absolute_mean_shift": _finite_float_or_none(absolute_mean_shift[index]),
+                "normalized_mean_shift": _finite_float_or_none(normalized_mean_shift[index]),
+                "absolute_std_shift": _finite_float_or_none(absolute_std_shift[index]),
+                "relative_std_shift": _finite_float_or_none(relative_std_shift[index]),
+                "official_valid_count": official_count,
+                "comparison_valid_count": comparison_count,
+                "official_valid_fraction": (
+                    None if official_count is None or official_total <= 0.0 else float(official_count) / official_total
+                ),
+                "comparison_valid_fraction": (
+                    None
+                    if comparison_count is None or comparison_total <= 0.0
+                    else float(comparison_count) / comparison_total
+                ),
+                "gate_class": (
+                    "stationary_sensor_valid"
+                    if bool(special_mask[index])
+                    else "low_variance"
+                    if bool(low_variance_mask[index])
+                    else "scaled"
+                ),
+            }
+        )
+    return records
+
+
+def _finite_float_or_none(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
+
+
+def _describe_feature_channel(schema_name: str, channel_index: int) -> tuple[str, str]:
+    schema = get_schema_spec(schema_name)
+    index = int(channel_index)
+    if not 0 <= index < schema.feature_dim:
+        raise IndexError(f"feature channel 越界：{index}")
+
+    if index in range(schema.body_pose_slice().start, schema.body_pose_slice().stop):
+        offset = index - schema.body_pose_slice().start
+        joint_index, component = divmod(offset, 6)
+        joint_name = SMPL_JOINT_NAMES[joint_index]
+        return schema.body_pose_key, f"{schema.body_pose_key}.{joint_name}.rot6d_{component}"
+    if index in range(schema.root_heading_delta_slice().start, schema.root_heading_delta_slice().stop):
+        component = ("sin", "cos")[index - schema.root_heading_delta_slice().start]
+        return schema.root_heading_delta_key, f"{schema.root_heading_delta_key}.{component}"
+    if schema.supports_root_motion and index in range(schema.root_delta_xz_slice().start, schema.root_delta_xz_slice().stop):
+        component = ("x", "z")[index - schema.root_delta_xz_slice().start]
+        return "root_delta_xz_ref", f"root_delta_xz_ref.{component}"
+    if schema.supports_root_motion and index in range(schema.pelvis_height_slice().start, schema.pelvis_height_slice().stop):
+        return schema.pelvis_height_key, f"{schema.pelvis_height_key}.y"
+    if schema.supports_stationary_prob and index in range(
+        schema.stationary_prob_slice().start,
+        schema.stationary_prob_slice().stop,
+    ):
+        component = STATIONARY_JOINT_NAMES[index - schema.stationary_prob_slice().start]
+        return "stationary_prob_5", f"stationary_prob_5.{component}"
+    if index in range(schema.tracker_pos_slice().start, schema.tracker_pos_slice().stop):
+        offset = index - schema.tracker_pos_slice().start
+        tracker_index, component_index = divmod(offset, 3)
+        component = ("x", "y", "z")[component_index]
+        return "tracker_pos_ref", f"tracker_pos_ref.{TRACKER_NAMES[tracker_index]}.{component}"
+    if index in range(schema.tracker_rot_slice().start, schema.tracker_rot_slice().stop):
+        offset = index - schema.tracker_rot_slice().start
+        tracker_index, component = divmod(offset, 6)
+        return "tracker_rot_ref_6d", f"tracker_rot_ref_6d.{TRACKER_NAMES[tracker_index]}.rot6d_{component}"
+    if index in range(schema.sensor_valid_slice().start, schema.sensor_valid_slice().stop):
+        tracker_index = index - schema.sensor_valid_slice().start
+        return "sensor_valid", f"sensor_valid.{TRACKER_NAMES[tracker_index]}"
+    return "unknown", f"feature_{index}"
 
 
 def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
