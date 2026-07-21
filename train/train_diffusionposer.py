@@ -11,7 +11,12 @@ from data_loaders.get_data import get_dataset_loader
 from data_loaders.sensor_masking import POSE_REPRESENTATION_KEY, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from diffusion import logger
 from train.train_platforms import NoPlatform, TensorboardPlatform
-from train.training_loop import TrainLoop, find_resume_checkpoint
+from train.realtime_rollout import (
+    rollout_curriculum_state_from_args,
+    training_schedule_payload,
+    training_schedule_signature,
+)
+from train.training_loop import TrainLoop, find_resume_checkpoint, parse_resume_step_from_filename
 from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
@@ -44,6 +49,8 @@ def main(argv: list[str] | None = None):
         normalizer_dir_explicit=normalizer_dir_explicit,
     )
     resolve_input_artifact_dirs(args)
+    args.training_schedule = training_schedule_payload(args)
+    args.training_schedule_signature = training_schedule_signature(args)
     prepare_save_dir(args)
     dist_util.setup_dist(args.device if args.cuda else -1)
     logger.configure(dir=args.save_dir)
@@ -53,54 +60,15 @@ def main(argv: list[str] | None = None):
     try:
         train_platform.report_args(args, name="Args")
         save_args(args)
-        enable_rollout_training = (
-            args.rollout_steps > 1
-            and (
-                (
-                    args.short_rollout_loss_weight > 0.0
-                    and args.short_rollout_prob > 0.0
-                )
-                or (
-                    args.long_rollout_loss_weight > 0.0
-                    and args.long_rollout_prob > 0.0
-                )
-            )
-        )
-
         print("creating data loader...")
-        data = get_dataset_loader(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            input_feats=args.input_feats,
-            seq_len=args.seq_len,
-            split=args.data_split,
-            normalizer_dir=args.normalizer_dir,
-            normalize_input=args.normalize_input,
-            preload_data=args.preload_data,
-            source_cache_max_mib=args.source_cache_max_mib,
-            num_workers=args.num_workers,
-            pin_memory=args.cuda,
-            schema_name=args.schema,
-            tracker_pos_noise_std=args.tracker_pos_noise_std,
-            tracker_rot_noise_std=args.tracker_rot_noise_std,
-            non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
-            history_pose_noise_std=args.history_pose_noise_std,
-            history_yaw_noise_std=args.history_yaw_noise_std,
-            root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
-            history_pose_dropout_prob=args.history_pose_dropout_prob,
-            history_pose_replace_prob=args.history_pose_replace_prob,
-            history_yaw_replace_prob=args.history_yaw_replace_prob,
-            history_root_yaw_drift_std=args.history_root_yaw_drift_std,
-            tracker_latency_max_frames=args.tracker_latency_max_frames,
-            tracker_burst_dropout_prob=args.tracker_burst_dropout_prob,
-            tracker_outlier_prob=args.tracker_outlier_prob,
-            enable_rollout=enable_rollout_training,
-            rollout_steps=args.rollout_steps,
-            tracker_mask_policy=args.tracker_mask_policy,
-            tracker_mask_seed=args.tracker_mask_seed,
-            tracker_mask_fill=args.tracker_mask_fill,
-            tracker_mask_categories=args.tracker_mask_categories,
+        data_factory = build_training_data_loader_factory(args)
+        initial_global_step = (
+            parse_resume_step_from_filename(args.resume_checkpoint)
+            if str(args.resume_checkpoint).strip()
+            else 0
         )
+        initial_curriculum = rollout_curriculum_state_from_args(args, initial_global_step)
+        data = data_factory(initial_curriculum.active_rollout_steps)
         eval_data = None
         if args.eval_during_training:
             print("creating eval data loader...")
@@ -144,9 +112,63 @@ def main(argv: list[str] | None = None):
         print(f"Total params: {model.num_parameters() / 1_000_000.0:.2f}M")
 
         print(f"training DiffusionPoser model, task_mode={args.task_mode}...")
-        TrainLoop(args, train_platform, model, diffusion, data, eval_data=eval_data).run_loop()
+        TrainLoop(
+            args,
+            train_platform,
+            model,
+            diffusion,
+            data,
+            eval_data=eval_data,
+            data_factory=data_factory,
+        ).run_loop()
     finally:
         train_platform.close()
+
+
+def build_training_data_loader_factory(args):
+    """返回只改变 active rollout 窗口数的 DataLoader 工厂。"""
+
+    def build(active_rollout_steps: int):
+        active_steps = int(active_rollout_steps)
+        if not 1 <= active_steps <= int(args.rollout_steps):
+            raise ValueError(
+                f"active_rollout_steps={active_steps} 超出任务声明范围 [1,{args.rollout_steps}]"
+            )
+        return get_dataset_loader(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            input_feats=args.input_feats,
+            seq_len=args.seq_len,
+            split=args.data_split,
+            normalizer_dir=args.normalizer_dir,
+            normalize_input=args.normalize_input,
+            preload_data=args.preload_data,
+            source_cache_max_mib=args.source_cache_max_mib,
+            num_workers=args.num_workers,
+            pin_memory=args.cuda,
+            schema_name=args.schema,
+            tracker_pos_noise_std=args.tracker_pos_noise_std,
+            tracker_rot_noise_std=args.tracker_rot_noise_std,
+            non_head_tracker_dropout_prob=args.non_head_tracker_dropout_prob,
+            history_pose_noise_std=args.history_pose_noise_std,
+            history_yaw_noise_std=args.history_yaw_noise_std,
+            root_yaw_ref_noise_std=args.root_yaw_ref_noise_std,
+            history_pose_dropout_prob=args.history_pose_dropout_prob,
+            history_pose_replace_prob=args.history_pose_replace_prob,
+            history_yaw_replace_prob=args.history_yaw_replace_prob,
+            history_root_yaw_drift_std=args.history_root_yaw_drift_std,
+            tracker_latency_max_frames=args.tracker_latency_max_frames,
+            tracker_burst_dropout_prob=args.tracker_burst_dropout_prob,
+            tracker_outlier_prob=args.tracker_outlier_prob,
+            enable_rollout=active_steps > 1,
+            rollout_steps=active_steps,
+            tracker_mask_policy=args.tracker_mask_policy,
+            tracker_mask_seed=args.tracker_mask_seed,
+            tracker_mask_fill=args.tracker_mask_fill,
+            tracker_mask_categories=args.tracker_mask_categories,
+        )
+
+    return build
 
 
 def prepare_save_dir(args):

@@ -23,10 +23,26 @@ from train.training_loop import (
     find_resume_checkpoint,
     validate_resume_checkpoint_contract,
 )
+from train.realtime_rollout import REALTIME_ROLLOUT_DEFAULTS, scheduled_learning_rate
 
 
 CANONICAL_SCHEMA_NAME = "realtime_pose_stationary5_v1"
 LEGACY_SCHEMA_NAME = "realtime_pose_body_fbx_local_root_y0_v1"
+SCHEDULE_SIGNATURE = "schedule-signature"
+
+
+def configure_minimal_data_state(loop: TrainLoop) -> None:
+    loop.args = Namespace(rollout_steps=1)
+    loop.data_factory = None
+    loop.data_num_batches = len(loop.data)
+    loop._data_iterator = None
+    loop._sampling_epoch = 0
+    loop._active_rollout_steps = 1
+    loop._data_initialized_for_training = False
+    loop.rollout_h1_start_step = int(REALTIME_ROLLOUT_DEFAULTS["rollout_h1_start_step"])
+    loop.rollout_h2_start_step = int(REALTIME_ROLLOUT_DEFAULTS["rollout_h2_start_step"])
+    loop.rollout_h4_start_step = int(REALTIME_ROLLOUT_DEFAULTS["rollout_h4_start_step"])
+    loop.rollout_h8_start_step = int(REALTIME_ROLLOUT_DEFAULTS["rollout_h8_start_step"])
 
 
 class DummyModel:
@@ -113,12 +129,17 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
                         "model_arch": "full_feature_dit",
                         "root_y_policy": "fixed_zero",
                         "pelvis_height_mode": "pelvis_local_offset_y",
+                        "training_schedule_signature": SCHEDULE_SIGNATURE,
                     },
                     ensure_ascii=False,
                 ),
                 encoding="utf-8",
             )
-            args = Namespace(schema=REALTIME_POSE_SCHEMA_NAME, model_arch="full_feature_dit")
+            args = Namespace(
+                schema=REALTIME_POSE_SCHEMA_NAME,
+                model_arch="full_feature_dit",
+                training_schedule_signature=SCHEDULE_SIGNATURE,
+            )
 
             validate_resume_checkpoint_contract(checkpoint, args)
 
@@ -218,7 +239,7 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
 
 
 class TrainLoopStepAccountingTest(unittest.TestCase):
-    def test_resume_optimizer_keeps_moments_but_uses_current_cli_lr(self):
+    def test_resume_optimizer_keeps_moments_but_uses_current_schedule_lr(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             checkpoint = Path(tmp_dir) / "model000000025.pt"
             parameter = torch.nn.Parameter(torch.tensor([1.0]))
@@ -233,11 +254,23 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
             loop.resume_step = 25
             loop.device = torch.device("cpu")
             loop.lr = 1e-5
+            loop.num_steps = 100
+            loop.lr_warmup_start = 1e-6
+            loop.lr_warmup_steps = 10
+            loop.lr_min = 1e-6
             loop.opt = torch.optim.AdamW([new_parameter], lr=1e-3)
 
             loop._load_optimizer_state()
 
-            self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], 1e-5)
+            expected_lr = scheduled_learning_rate(
+                global_step=25,
+                num_steps=100,
+                lr=1e-5,
+                lr_warmup_start=1e-6,
+                lr_warmup_steps=10,
+                lr_min=1e-6,
+            )
+            self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], expected_lr)
             self.assertAlmostEqual(loop.opt.param_groups[0]["initial_lr"], 1e-5)
             state = loop.opt.state[new_parameter]
             self.assertIn("exp_avg", state)
@@ -252,9 +285,9 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
         loop.step = 0
         loop.resume_step = 0
         loop.num_steps = 1
-        loop.lr_anneal_steps = 0
         loop.log_interval = 0
         loop.save_interval = 1
+        configure_minimal_data_state(loop)
 
         optimized_steps = []
         logged_steps = []
@@ -281,14 +314,14 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
         loop.step = 0
         loop.resume_step = 10
         loop.num_steps = 10
-        loop.lr_anneal_steps = 0
+        configure_minimal_data_state(loop)
         loop.run_step = lambda batch: self.fail("run_step should not be called after reaching num_steps")
 
         loop.run_loop()
 
         self.assertEqual(loop.step, 0)
 
-    def test_lr_anneal_steps_does_not_stop_training(self):
+    def test_num_steps_stops_training_after_requested_updates(self):
         loop = object.__new__(TrainLoop)
         loop.model = DummyModel()
         loop.data = [{"x": torch.zeros(1)}, {"x": torch.zeros(1)}]
@@ -297,9 +330,9 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
         loop.step = 0
         loop.resume_step = 0
         loop.num_steps = 2
-        loop.lr_anneal_steps = 1
         loop.log_interval = 0
         loop.save_interval = 0
+        configure_minimal_data_state(loop)
 
         optimized_steps = []
         loop.run_step = lambda batch: optimized_steps.append(loop.step + loop.resume_step)
@@ -313,18 +346,21 @@ class TrainLoopStepAccountingTest(unittest.TestCase):
         self.assertEqual(optimized_steps, [0, 1])
         self.assertEqual(loop.step, 2)
 
-    def test_anneal_lr_updates_optimizer_param_groups(self):
+    def test_continuous_lr_updates_optimizer_param_groups(self):
         loop = object.__new__(TrainLoop)
         loop.lr = 0.1
-        loop.lr_anneal_steps = 10
         loop.step = 5
         loop.resume_step = 0
+        loop.num_steps = 10
+        loop.lr_warmup_start = 0.01
+        loop.lr_warmup_steps = 2
+        loop.lr_min = 0.02
         loop.opt = type("DummyOpt", (), {"param_groups": [{"lr": 0.1}, {"lr": 0.1}]})()
 
-        loop._anneal_lr()
+        expected = loop._update_learning_rate()
 
-        self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], 0.05)
-        self.assertAlmostEqual(loop.opt.param_groups[1]["lr"], 0.05)
+        self.assertAlmostEqual(loop.opt.param_groups[0]["lr"], expected)
+        self.assertAlmostEqual(loop.opt.param_groups[1]["lr"], expected)
 
 
 if __name__ == "__main__":

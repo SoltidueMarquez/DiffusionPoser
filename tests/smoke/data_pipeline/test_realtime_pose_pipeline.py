@@ -367,36 +367,26 @@ def test_pipeline_task_defaults_rebuild_final_distribution_with_adjacent_rollout
     assert "--fixed_tracker_patterns" not in task_args
 
 
-def test_pipeline_training_stage_presets_match_sparse_root_plan(tmp_path):
-    expected = {
-        "A": ("20000", "5e-05", "1", "0.0", "dynamic_categories", ["full_six", "standard_three"]),
-        "B": ("20000", "5e-05", "2", "0.5", "dynamic_categories", ["full_six", "standard_three"]),
-        "C": ("20000", "2e-05", "2", "0.5", "dynamic_categories", ["all"]),
-    }
-    for stage, values in expected.items():
-        args = parse_schema_aware_pipeline_args(tmp_path, "--training_stage", stage)
-        train_args = pipeline.build_train_args(args)
-        num_steps, lr, rollout_steps, short_rollout_prob, mask_policy, categories = values
-        assert_arg_value(train_args, "--num_steps", num_steps)
-        assert_arg_value(train_args, "--lr", lr)
-        assert_arg_value(train_args, "--rollout_steps", rollout_steps)
-        assert_arg_value(train_args, "--short_rollout_prob", short_rollout_prob)
-        assert_arg_value(train_args, "--long_rollout_prob", "0.0")
-        assert_arg_value(train_args, "--tracker_mask_policy", mask_policy)
-        category_index = train_args.index("--tracker_mask_categories") + 1
-        assert train_args[category_index : category_index + len(categories)] == categories
-
-
-def test_pipeline_resumed_stage_presets_use_cumulative_global_step_targets(tmp_path):
-    for stage, expected_steps in (("A", "20000"), ("B", "40000"), ("C", "60000")):
-        args = parse_schema_aware_pipeline_args(
-            tmp_path,
-            "--training_stage",
-            stage,
-            "--resume_latest",
-        )
-        train_args = pipeline.build_train_args(args)
-        assert_arg_value(train_args, "--num_steps", expected_steps)
+def test_pipeline_train_command_uses_single_process_curriculum(tmp_path):
+    args = parse_schema_aware_pipeline_args(
+        tmp_path,
+        "--num_steps", "130000",
+        "--rollout_steps", "9",
+        "--tracker_mask_policy", "dynamic_categories",
+        "--tracker_mask_categories", "all",
+        "--resume_latest",
+    )
+    train_args = pipeline.build_train_args(args)
+    assert_arg_value(train_args, "--num_steps", "130000")
+    assert_arg_value(train_args, "--lr", "5e-05")
+    assert_arg_value(train_args, "--rollout_steps", "9")
+    assert_arg_value(train_args, "--rollout_h1_start_step", "30000")
+    assert_arg_value(train_args, "--rollout_h2_start_step", "60000")
+    assert_arg_value(train_args, "--rollout_h4_start_step", "70000")
+    assert_arg_value(train_args, "--rollout_h8_start_step", "90000")
+    assert_arg_value(train_args, "--tracker_mask_policy", "dynamic_categories")
+    assert "--resume_checkpoint" in train_args
+    assert "latest" in train_args
 
 
 def test_pipeline_explicit_save_dir_overrides_experiment_name(tmp_path):

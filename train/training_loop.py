@@ -33,7 +33,13 @@ from sample.runtime_root_resolver import (
     RuntimeRootResolver,
     RuntimeRootResolverState,
 )
-from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS, long_rollout_max_horizon
+from train.realtime_rollout import (
+    REALTIME_LR_DEFAULTS,
+    REALTIME_ROLLOUT_DEFAULTS,
+    rollout_curriculum_state_from_args,
+    sampling_epoch_for_global_step,
+    scheduled_learning_rate,
+)
 from utils import dist_util
 
 
@@ -67,7 +73,13 @@ def validate_root_y0_training_args(args):
     return validate_realtime_pose_training_args(args)
 
 
-def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, schema_name: str | None = None) -> None:
+def validate_resume_checkpoint_contract(
+    resume_checkpoint: str | Path,
+    args,
+    schema_name: str | None = None,
+    *,
+    require_schedule_signature: bool = True,
+) -> None:
     """恢复训练前校验 checkpoint 的 exact schema 契约，防止权重被误加载。"""
 
     checkpoint_path = Path(resume_checkpoint)
@@ -119,6 +131,17 @@ def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, sch
         if key in checkpoint_args and str(checkpoint_args[key]) != expected:
             mismatches.append(f"{key}={checkpoint_args[key]!r}, expected {expected!r}")
 
+    if require_schedule_signature:
+        expected_schedule_signature = str(getattr(args, "training_schedule_signature", ""))
+        checkpoint_schedule_signature = str(checkpoint_args.get("training_schedule_signature", ""))
+        if not expected_schedule_signature:
+            mismatches.append("current training_schedule_signature is missing")
+        elif checkpoint_schedule_signature != expected_schedule_signature:
+            mismatches.append(
+                "training_schedule_signature="
+                f"{checkpoint_schedule_signature!r}, expected {expected_schedule_signature!r}"
+            )
+
     if mismatches:
         joined = "; ".join(mismatches)
         raise ValueError(f"{args_path} 与当前 {schema.name} 训练配置不兼容：{joined}")
@@ -140,12 +163,13 @@ def validate_loaded_state_dict_keys(
 class TrainLoop:
     """realtime_pose 扩散训练循环。"""
 
-    def __init__(self, args, train_platform, model, diffusion, data, eval_data=None):
+    def __init__(self, args, train_platform, model, diffusion, data, eval_data=None, data_factory=None):
         self.args = args
         self.train_platform = train_platform
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.data_factory = data_factory
         self.eval_data = eval_data
 
         self.batch_size = args.batch_size
@@ -156,7 +180,6 @@ class TrainLoop:
         self.resume_checkpoint = args.resume_checkpoint
         self.init_checkpoint = getattr(args, "init_checkpoint", "")
         self.weight_decay = args.weight_decay
-        self.lr_anneal_steps = args.lr_anneal_steps
         self.gradient_clip = args.gradient_clip
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
@@ -164,13 +187,20 @@ class TrainLoop:
         self.schema = validate_realtime_pose_training_args(args)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
         self.rollout_steps = int(getattr(args, "rollout_steps", 1))
-        for name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
+        for name, default in REALTIME_ROLLOUT_DEFAULTS.items():
+            setattr(self, name, type(default)(getattr(args, name, default)))
+        for name, default in REALTIME_LR_DEFAULTS.items():
             setattr(self, name, type(default)(getattr(args, name, default)))
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
         if self.rollout_steps > 9:
             raise ValueError("RPM 风格训练最多支持 base + 8 个相邻窗口，即 rollout_steps<=9。")
-        for name in ("short_rollout_prob", "long_rollout_prob", "long_rollout_transition_prob"):
+        for name in (
+            "short_rollout_prob",
+            "long_rollout_prob",
+            "rollout_max_horizon_prob",
+            "long_rollout_transition_prob",
+        ):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
@@ -178,14 +208,17 @@ class TrainLoop:
             value = float(getattr(self, name))
             if value < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
-        if not 0 <= self.long_rollout_phase1_steps <= self.long_rollout_phase2_steps:
-            raise ValueError("long rollout curriculum steps 必须满足 0 <= phase1 <= phase2")
-        for name in ("long_rollout_phase1_max_horizon", "long_rollout_phase2_max_horizon"):
-            value = int(getattr(self, name))
-            if value < 2 or value > 8:
-                raise ValueError(f"{name} 必须在 [2,8]，实际为 {value}")
         if self.long_rollout_smooth_l1_beta <= 0.0:
             raise ValueError("long_rollout_smooth_l1_beta 必须大于 0")
+        rollout_curriculum_state_from_args(args, 0)
+        scheduled_learning_rate(
+            global_step=0,
+            num_steps=int(args.num_steps),
+            lr=float(args.lr),
+            lr_warmup_start=float(self.lr_warmup_start),
+            lr_warmup_steps=int(self.lr_warmup_steps),
+            lr_min=float(self.lr_min),
+        )
 
         self.save_dir = Path(args.save_dir)
         self.step = 0
@@ -205,16 +238,22 @@ class TrainLoop:
             if len(self.eval_data) <= 0:
                 raise RuntimeError("eval DataLoader 没有可用 batch；请检查 --eval_split 或降低 --batch_size。")
         self.num_epochs = self.num_steps // self.data_num_batches + 1
+        self._data_iterator = None
+        self._sampling_epoch = 0
+        self._active_rollout_steps = int(getattr(getattr(self.data, "dataset", None), "rollout_steps", 1))
+        self._data_initialized_for_training = False
+        self._last_logged_curriculum_phase: str | None = None
         self.device = dist_util.dev()
         self.rollout_diffusion = self._create_rollout_diffusion(args)
 
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
         logger.log(
-            "rollout: "
-            f"steps={self.rollout_steps}, short_prob={self.short_rollout_prob}, "
+            "rollout curriculum: "
+            f"task_steps={self.rollout_steps}, short_prob={self.short_rollout_prob}, "
             f"short_weight={self.short_rollout_loss_weight}, "
             f"long_prob={self.long_rollout_prob}, long_weight={self.long_rollout_loss_weight}, "
+            f"max_horizon_prob={self.rollout_max_horizon_prob}, "
             f"transition_prob={self.long_rollout_transition_prob}, prefix=no_grad"
         )
         if self.task_mode != TASK_MODE_REALTIME_POSE:
@@ -295,7 +334,7 @@ class TrainLoop:
         return feature_w
 
     def _configure_trainable_parameters(self) -> None:
-        """Stage A 起始终训练完整 pose backbone。"""
+        """正式训练从起始 step 起始终训练完整 pose backbone。"""
 
         for param in self.model.parameters():
             param.requires_grad_(True)
@@ -350,7 +389,12 @@ class TrainLoop:
         if not init_checkpoint.exists():
             raise FileNotFoundError(f"--init_checkpoint file does not exist: {init_checkpoint}")
 
-        validate_resume_checkpoint_contract(resume_checkpoint=init_checkpoint, args=self.args, schema_name=self.schema.name)
+        validate_resume_checkpoint_contract(
+            resume_checkpoint=init_checkpoint,
+            args=self.args,
+            schema_name=self.schema.name,
+            require_schedule_signature=False,
+        )
         logger.log(f"warm-start model from checkpoint: {init_checkpoint}")
         state_dict = dist_util.load_state_dict(init_checkpoint, map_location=self.device)
         incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
@@ -371,12 +415,12 @@ class TrainLoop:
         logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
         state_dict = dist_util.load_state_dict(opt_checkpoint, map_location=self.device)
         self.opt.load_state_dict(state_dict)
-        # Stage 间恢复需要保留 Adam moments，但学习率必须服从当前命令行；
-        # 否则 optimizer state 会悄悄把 25k -> 30k 的 1e-5 覆盖回旧值。
+        # 保留 Adam moments，但恢复点学习率只由 global step 的连续曲线决定。
+        current_lr = self.learning_rate_at(self.resume_step)
         for param_group in self.opt.param_groups:
-            param_group["lr"] = self.lr
+            param_group["lr"] = current_lr
             param_group["initial_lr"] = self.lr
-        logger.log(f"resume optimizer lr overridden by current --lr: {self.lr}")
+        logger.log(f"resume optimizer lr restored from schedule at step {self.resume_step}: {current_lr}")
 
     def _create_ema_model(self, args):
         if not args.model_ema:
@@ -413,56 +457,114 @@ class TrainLoop:
             return
 
         last_step_end = time.perf_counter()
-        sampling_epoch_offset = (
-            (int(self.resume_step) + int(self.data_num_batches) - 1) // int(self.data_num_batches)
-            if self.resume_step > 0
-            else 0
-        )
-        for epoch in range(self.num_epochs):
-            dataset = getattr(self.data, "dataset", None)
-            if hasattr(dataset, "set_epoch"):
-                # 阶段恢复位于半个数据 epoch 时直接进入下一个在线采样 epoch，
-                # 避免 source-reference task 再次从 epoch 0 重放同一批窗口。
-                dataset.set_epoch(sampling_epoch_offset + epoch)
-            for batch in self.data:
-                batch_ready_time = time.perf_counter()
-                batch = move_batch_to_device(batch, self.device)
-                train_start_time = time.perf_counter()
-                self.run_step(batch)
-                self.step += 1
-                train_end_time = time.perf_counter()
-                global_step = self.step + self.resume_step
-                print(
-                    f"step[{global_step}] "
-                    f"data={batch_ready_time - last_step_end:.3f}s "
-                    f"train={train_end_time - train_start_time:.3f}s",
-                    flush=True,
-                )
-                last_step_end = train_end_time
+        while not self._should_stop():
+            current_global_step = self.step + self.resume_step
+            self._ensure_training_data_for_step(current_global_step)
+            try:
+                batch = next(self._data_iterator)
+            except StopIteration:
+                self._sampling_epoch += 1
+                self._set_dataset_sampling_epoch(self._sampling_epoch)
+                self._data_iterator = iter(self.data)
+                batch = next(self._data_iterator)
 
-                self.log_step()
-                if self.log_interval > 0 and global_step % self.log_interval == 0:
-                    self.report_metrics()
+            batch_ready_time = time.perf_counter()
+            batch = move_batch_to_device(batch, self.device)
+            train_start_time = time.perf_counter()
+            self.run_step(batch)
+            self.step += 1
+            train_end_time = time.perf_counter()
+            global_step = self.step + self.resume_step
+            print(
+                f"step[{global_step}] "
+                f"data={batch_ready_time - last_step_end:.3f}s "
+                f"train={train_end_time - train_start_time:.3f}s",
+                flush=True,
+            )
+            last_step_end = train_end_time
 
-                if self.save_interval > 0 and global_step % self.save_interval == 0:
-                    self.save()
-                    self.model.eval()
-                    self.evaluate()
-                    self.model.train()
+            self.log_step()
+            if self.log_interval > 0 and global_step % self.log_interval == 0:
+                self.report_metrics()
 
-                    if os.environ.get("DIFFUSION_TRAINING_TEST", ""):
-                        return
+            if self.save_interval > 0 and global_step % self.save_interval == 0:
+                self.save()
+                self.model.eval()
+                self.evaluate()
+                self.model.train()
 
-                if self._should_stop():
-                    break
-
-            if self._should_stop():
-                break
+                if os.environ.get("DIFFUSION_TRAINING_TEST", ""):
+                    self._shutdown_data_iterator()
+                    return
 
         global_step = self.step + self.resume_step
         if self.step > 0 and (self.save_interval <= 0 or global_step % self.save_interval != 0):
             self.save()
             self.evaluate()
+        self._shutdown_data_iterator()
+
+    def _ensure_training_data_for_step(self, global_step: int) -> None:
+        state = rollout_curriculum_state_from_args(self.args, global_step)
+        desired_steps = int(state.active_rollout_steps)
+        needs_rebuild = desired_steps != int(self._active_rollout_steps)
+        if needs_rebuild:
+            if self.data_factory is None:
+                raise RuntimeError(
+                    f"课程进入 {state.phase} 需要 rollout_steps={desired_steps}，但没有提供 DataLoader 工厂。"
+                )
+            self._shutdown_data_iterator()
+            replacement = self.data_factory(desired_steps)
+            replacement_batches = len(replacement)
+            if replacement_batches != self.data_num_batches:
+                raise RuntimeError(
+                    "课程切换前后 DataLoader batch 数必须一致："
+                    f"expected={self.data_num_batches}, actual={replacement_batches}, phase={state.phase}"
+                )
+            self.data = replacement
+            self._active_rollout_steps = desired_steps
+            logger.log(
+                f"rollout DataLoader rebuilt: phase={state.phase}, "
+                f"active_rollout_steps={desired_steps}, batches={replacement_batches}"
+            )
+
+        if needs_rebuild or not self._data_initialized_for_training:
+            self._sampling_epoch = sampling_epoch_for_global_step(
+                global_step=global_step,
+                batches_per_epoch=self.data_num_batches,
+                phase_start_steps=(
+                    self.rollout_h1_start_step,
+                    self.rollout_h2_start_step,
+                    self.rollout_h4_start_step,
+                    self.rollout_h8_start_step,
+                ),
+                resume_mid_epoch=bool(
+                    not self._data_initialized_for_training and self.resume_step > 0
+                ),
+            )
+            self._set_dataset_sampling_epoch(self._sampling_epoch)
+            self._data_iterator = iter(self.data)
+            self._data_initialized_for_training = True
+
+        self.current_curriculum_state = state
+        if state.phase != getattr(self, "_last_logged_curriculum_phase", None):
+            logger.log(
+                "rollout curriculum phase: "
+                f"phase={state.phase}, active_rollout_steps={state.active_rollout_steps}, "
+                f"max_horizon={state.max_horizon}, short_prob={state.short_prob:.6f}, "
+                f"long_prob={state.long_prob:.6f}, max_horizon_prob={state.max_horizon_prob:.6f}"
+            )
+            self._last_logged_curriculum_phase = state.phase
+
+    def _set_dataset_sampling_epoch(self, sampling_epoch: int) -> None:
+        dataset = getattr(self.data, "dataset", None)
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(int(sampling_epoch))
+
+    def _shutdown_data_iterator(self) -> None:
+        iterator = self._data_iterator
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+        self._data_iterator = None
 
     def _should_stop(self) -> bool:
         global_step = self.step + self.resume_step
@@ -519,6 +621,7 @@ class TrainLoop:
             self.model.train()
 
     def run_step(self, batch):
+        self._update_learning_rate()
         self.forward_backward(batch)
 
         self.scaler.unscale_(self.opt)
@@ -534,7 +637,6 @@ class TrainLoop:
             float(self.gradient_clip and grad_norm.detach().float().item() > max_norm),
         )
 
-        self._anneal_lr()
         self.scaler.step(self.opt)
         self.scaler.update()
 
@@ -566,6 +668,15 @@ class TrainLoop:
                 self.scaler.scale(base_loss).backward()
                 total_loss_for_log = base_losses["loss"].detach().float().clone()
 
+                curriculum = rollout_curriculum_state_from_args(
+                    self.args, self.step + self.resume_step
+                )
+                self.current_curriculum_state = curriculum
+                logger.logkv_mean("rollout_phase_max_horizon", float(curriculum.max_horizon))
+                logger.logkv_mean("active_rollout_steps", float(curriculum.active_rollout_steps))
+                logger.logkv_mean("rollout_short_probability", float(curriculum.short_prob))
+                logger.logkv_mean("rollout_long_probability", float(curriculum.long_prob))
+                logger.logkv_mean("rollout_max_horizon_probability", float(curriculum.max_horizon_prob))
                 short_event, long_horizon, event_stats = self.sample_rollout_events(prepared_batch)
                 logger.logkv_mean("short_rollout_event_fraction", float(short_event))
                 logger.logkv_mean("long_rollout_event_fraction", float(long_horizon > 0))
@@ -699,67 +810,81 @@ class TrainLoop:
 
     def sample_rollout_events(self, batch: dict) -> tuple[bool, int, dict[str, float]]:
         stats = {
-            "long_rollout_max_horizon": 0.0,
+            "rollout_active_max_horizon": 0.0,
+            "long_rollout_selected_max_horizon_fraction": 0.0,
             "long_rollout_transition_aware_fraction": 0.0,
             "long_rollout_selected_reconnect_samples": 0.0,
             "long_rollout_selected_dropout_samples": 0.0,
             "short_rollout_reconnect_samples": 0.0,
             "short_rollout_dropout_samples": 0.0,
         }
-        if self.rollout_steps <= 1 or not self.model.training or not torch.is_grad_enabled():
+        for horizon in range(1, 9):
+            stats[f"rollout_h{horizon}_event_fraction"] = 0.0
+        state = rollout_curriculum_state_from_args(self.args, self.step + self.resume_step)
+        self.current_curriculum_state = state
+        active_rollout_steps = int(state.active_rollout_steps)
+        if active_rollout_steps <= 1 or not self.model.training or not torch.is_grad_enabled():
             return False, 0, stats
-        short_enabled = self.short_rollout_prob > 0.0 and self.short_rollout_loss_weight > 0.0
+        short_enabled = state.short_prob > 0.0 and self.short_rollout_loss_weight > 0.0
         long_enabled = (
-            self.rollout_steps > 2
-            and self.long_rollout_prob > 0.0
+            active_rollout_steps > 2
+            and state.long_prob > 0.0
             and self.long_rollout_loss_weight > 0.0
         )
         if not short_enabled and not long_enabled:
             return False, 0, stats
         rollout = batch.get("rollout")
-        if not isinstance(rollout, (list, tuple)) or len(rollout) < self.rollout_steps - 1:
+        if not isinstance(rollout, (list, tuple)) or len(rollout) < active_rollout_steps - 1:
             raise ValueError(
-                f"rollout_steps={self.rollout_steps} 需要 Dataset 返回 rollout 子窗口，"
+                f"active_rollout_steps={active_rollout_steps} 需要 Dataset 返回 rollout 子窗口，"
                 "请先生成 rollout task 并启用 enable_rollout。"
             )
 
         short_event = short_enabled and (
-            torch.rand((), device=self.device).item() < self.short_rollout_prob
+            torch.rand((), device=self.device).item() < state.short_prob
         )
         if short_event:
+            stats["rollout_h1_event_fraction"] = 1.0
             reconnect, dropout = self.rollout_transition_counts(batch=batch, horizon=1)
             stats["short_rollout_reconnect_samples"] = float(reconnect)
             stats["short_rollout_dropout_samples"] = float(dropout)
 
-        max_horizon = long_rollout_max_horizon(
-            global_step=self.step + self.resume_step,
-            rollout_steps=self.rollout_steps,
-            phase1_steps=self.long_rollout_phase1_steps,
-            phase2_steps=self.long_rollout_phase2_steps,
-            phase1_max_horizon=self.long_rollout_phase1_max_horizon,
-            phase2_max_horizon=self.long_rollout_phase2_max_horizon,
-        )
-        stats["long_rollout_max_horizon"] = float(max_horizon)
+        max_horizon = int(state.max_horizon)
+        stats["rollout_active_max_horizon"] = float(max_horizon)
         long_event = long_enabled and max_horizon >= 2 and (
-            torch.rand((), device=self.device).item() < self.long_rollout_prob
+            torch.rand((), device=self.device).item() < state.long_prob
         )
         if not long_event:
             return short_event, 0, stats
 
-        horizon, transition_aware = self.sample_long_rollout_horizon(
+        horizon, transition_aware, selected_max = self.sample_long_rollout_horizon(
             batch=batch,
             max_horizon=max_horizon,
+            max_horizon_prob=float(state.max_horizon_prob),
         )
+        stats[f"rollout_h{horizon}_event_fraction"] = 1.0
+        stats["long_rollout_selected_max_horizon_fraction"] = float(selected_max)
         reconnect, dropout = self.rollout_transition_counts(batch=batch, horizon=horizon)
         stats["long_rollout_transition_aware_fraction"] = float(transition_aware)
         stats["long_rollout_selected_reconnect_samples"] = float(reconnect)
         stats["long_rollout_selected_dropout_samples"] = float(dropout)
         return short_event, horizon, stats
 
-    def sample_long_rollout_horizon(self, batch: dict, max_horizon: int) -> tuple[int, bool]:
-        horizons = torch.arange(2, int(max_horizon) + 1, device=self.device, dtype=torch.long)
+    def sample_long_rollout_horizon(
+        self,
+        batch: dict,
+        max_horizon: int,
+        max_horizon_prob: float,
+    ) -> tuple[int, bool, bool]:
+        max_horizon = int(max_horizon)
+        if max_horizon < 2:
+            return 0, False, False
+        if max_horizon == 2 or torch.rand((), device=self.device).item() < float(max_horizon_prob):
+            return max_horizon, False, True
+
+        horizons = torch.arange(2, max_horizon, device=self.device, dtype=torch.long)
         if horizons.numel() <= 0:
-            return 0, False
+            return max_horizon, False, True
         use_transition = (
             torch.rand((), device=self.device).item() < self.long_rollout_transition_prob
         )
@@ -774,9 +899,9 @@ class TrainLoop:
             score_tensor = torch.tensor(scores, device=self.device, dtype=torch.float32)
             if torch.any(score_tensor > 0.0):
                 selected = int(torch.multinomial(score_tensor, 1).item())
-                return int(horizons[selected].item()), True
+                return int(horizons[selected].item()), True, False
         selected = int(torch.randint(0, horizons.numel(), (), device=self.device).item())
-        return int(horizons[selected].item()), False
+        return int(horizons[selected].item()), False, False
 
     def rollout_transition_counts(self, batch: dict, horizon: int) -> tuple[int, int]:
         rollout_items = batch.get("rollout")
@@ -1237,14 +1362,21 @@ class TrainLoop:
             predicted_history=[pred_target],
         )
 
-    def _anneal_lr(self):
-        if self.lr_anneal_steps <= 0:
-            return
-        global_step = self.step + self.resume_step
-        frac_done = min(float(global_step) / float(self.lr_anneal_steps), 1.0)
-        lr = self.lr * (1.0 - frac_done)
+    def learning_rate_at(self, global_step: int) -> float:
+        return scheduled_learning_rate(
+            global_step=int(global_step),
+            num_steps=int(self.num_steps),
+            lr=float(self.lr),
+            lr_warmup_start=float(self.lr_warmup_start),
+            lr_warmup_steps=int(self.lr_warmup_steps),
+            lr_min=float(self.lr_min),
+        )
+
+    def _update_learning_rate(self) -> float:
+        lr = self.learning_rate_at(self.step + self.resume_step)
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr
+        return lr
 
     def _feature_weights_for_batch(self, batch_size: int, seq_len: int):
         if self.feature_w is None:

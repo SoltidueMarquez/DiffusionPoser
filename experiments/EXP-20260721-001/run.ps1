@@ -5,6 +5,7 @@ param(
     [ValidateRange(0, 1000000)]
     [int]$CanarySteps = 0,
     [switch]$SkipConversion,
+    [switch]$ReusePreparedData,
     [switch]$SkipFinalEvaluationMatrix,
     [int]$Device = -1,
     [int]$BatchSize = 0,
@@ -208,6 +209,7 @@ function Write-RuntimeManifest {
         mode = if ($CanaryMode) { "canary" } else { "full" }
         batch_size = $EffectiveBatchSize
         canary_steps = if ($CanaryMode) { $CanarySteps } else { $null }
+        reuse_prepared_data = [bool]$ReusePreparedData
         status = $Status
         exit_code = $ExitCode
         failure_reason = if ([string]::IsNullOrWhiteSpace($FailureReason)) { $null } else { $FailureReason }
@@ -409,8 +411,8 @@ function Get-CalibratedLossArguments {
 
 function Get-TrainingArguments {
     param(
-        [Parameter(Mandatory = $true)]$Stage,
-        [Parameter(Mandatory = $true)][bool]$ResumeStage,
+        [Parameter(Mandatory = $true)]$Schedule,
+        [Parameter(Mandatory = $true)][bool]$ResumeTraining,
         [object[]]$LossArguments = @(),
         [string]$RunName = ""
     )
@@ -433,22 +435,26 @@ function Get-TrainingArguments {
         "--source_cache_max_mib", (ConvertTo-InvariantString $Config.source_cache_max_mib),
         "--cuda", "true",
         "--device", (ConvertTo-InvariantString $EffectiveDevice),
-        "--lr", (ConvertTo-InvariantString $Stage.lr),
-        "--lr_anneal_steps", (ConvertTo-InvariantString $Config.training.lr_anneal_steps),
+        "--lr", (ConvertTo-InvariantString $Schedule.lr),
+        "--lr_warmup_start", (ConvertTo-InvariantString $Schedule.lr_warmup_start),
+        "--lr_warmup_steps", (ConvertTo-InvariantString $Schedule.lr_warmup_steps),
+        "--lr_min", (ConvertTo-InvariantString $Schedule.lr_min),
         "--weight_decay", (ConvertTo-InvariantString $Config.training.weight_decay),
-        "--num_steps", (ConvertTo-InvariantString $Stage.target_steps),
+        "--num_steps", (ConvertTo-InvariantString $Schedule.num_steps),
         "--log_interval", (ConvertTo-InvariantString $Config.training.log_interval),
         "--save_interval", (ConvertTo-InvariantString $Config.training.save_interval),
         "--checkpoint_max_keep", (ConvertTo-InvariantString $Config.training.checkpoint_max_keep),
-        "--rollout_steps", (ConvertTo-InvariantString $Stage.rollout_steps),
-        "--short_rollout_prob", (ConvertTo-InvariantString $Stage.short_rollout_prob),
-        "--short_rollout_loss_weight", (ConvertTo-InvariantString $Stage.short_rollout_loss_weight),
-        "--long_rollout_prob", (ConvertTo-InvariantString $Stage.long_rollout_prob),
-        "--long_rollout_loss_weight", (ConvertTo-InvariantString $Stage.long_rollout_loss_weight),
-        "--long_rollout_phase1_steps", (ConvertTo-InvariantString $Stage.long_rollout_phase1_steps),
-        "--long_rollout_phase2_steps", (ConvertTo-InvariantString $Stage.long_rollout_phase2_steps),
-        "--long_rollout_phase1_max_horizon", (ConvertTo-InvariantString $Stage.long_rollout_phase1_max_horizon),
-        "--long_rollout_phase2_max_horizon", (ConvertTo-InvariantString $Stage.long_rollout_phase2_max_horizon),
+        "--rollout_steps", (ConvertTo-InvariantString $Schedule.rollout_steps),
+        "--rollout_h1_start_step", (ConvertTo-InvariantString $Schedule.rollout_h1_start_step),
+        "--rollout_h2_start_step", (ConvertTo-InvariantString $Schedule.rollout_h2_start_step),
+        "--rollout_h4_start_step", (ConvertTo-InvariantString $Schedule.rollout_h4_start_step),
+        "--rollout_h8_start_step", (ConvertTo-InvariantString $Schedule.rollout_h8_start_step),
+        "--rollout_prob_ramp_steps", (ConvertTo-InvariantString $Schedule.rollout_prob_ramp_steps),
+        "--rollout_max_horizon_prob", (ConvertTo-InvariantString $Schedule.rollout_max_horizon_prob),
+        "--short_rollout_prob", (ConvertTo-InvariantString $Schedule.short_rollout_prob),
+        "--short_rollout_loss_weight", (ConvertTo-InvariantString $Schedule.short_rollout_loss_weight),
+        "--long_rollout_prob", (ConvertTo-InvariantString $Schedule.long_rollout_prob),
+        "--long_rollout_loss_weight", (ConvertTo-InvariantString $Schedule.long_rollout_loss_weight),
         "--long_rollout_transition_prob", (ConvertTo-InvariantString $Config.training.long_rollout_transition_prob),
         "--long_rollout_smooth_l1_beta", (ConvertTo-InvariantString $Config.training.long_rollout_smooth_l1_beta),
         "--rollout_ddim_steps", (ConvertTo-InvariantString $Config.training.rollout_ddim_steps),
@@ -461,9 +467,9 @@ function Get-TrainingArguments {
         "--gradient_clip"
     )
     $arguments += Get-BaseModelArguments
-    $arguments += Get-ConditioningArguments -TrackerCategories @($Stage.tracker_categories)
+    $arguments += Get-ConditioningArguments -TrackerCategories @($Schedule.tracker_categories)
     $arguments += @($LossArguments)
-    if ($ResumeStage) {
+    if ($ResumeTraining) {
         $arguments += @("--resume_checkpoint", "latest")
     } else {
         $arguments += "--resume_checkpoint="
@@ -652,8 +658,14 @@ $script:StageResults = @()
 $script:EvaluationResults = @()
 $script:CalibratedLossWeights = [ordered]@{}
 
-if (-not $DryRun -and (Test-Path -LiteralPath $RunDir) -and -not $Resume) {
-    throw "实验运行目录已存在：$RunDir。继续已有实验请添加 -Resume。"
+$runStateExists = if ($CanaryMode) {
+    Test-Path -LiteralPath $RunDir
+} else {
+    (Test-Path -LiteralPath $ManifestPath -PathType Leaf) -or
+    (Test-Path -LiteralPath $OfficialTrainingRunRoot)
+}
+if (-not $DryRun -and $runStateExists -and -not $Resume) {
+    throw "实验运行状态已存在：$ManifestPath 或 $TrainingRunRoot。继续已有实验请添加 -Resume。"
 }
 if ($Resume -and (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
     $existingManifest = Get-Content -Raw -LiteralPath $ManifestPath -Encoding UTF8 | ConvertFrom-Json
@@ -680,6 +692,9 @@ Write-Host "Training artifacts:     $TrainingRunRoot"
 Write-Host "Evaluation outputs:     $EvaluationOutputRoot"
 if ($CanaryMode) {
     Write-Host "Mode:                   canary（batch=$EffectiveBatchSize, H8, steps=$CanarySteps）" -ForegroundColor Yellow
+}
+if ($ReusePreparedData) {
+    Write-Host "Prepared data:          严格校验并复用 train task / normalizer" -ForegroundColor Yellow
 }
 $artifactDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($SourceDir))
 $availableGiB = $artifactDrive.AvailableFreeSpace / 1GB
@@ -736,72 +751,111 @@ try {
         throw "使用 -SkipConversion 时 source manifest 必须已经存在：$SourceDir"
     }
 
-    $trainTaskArguments = @(
-        "--artifact_roots_config", $ArtifactRootsConfig,
-        "--schema", [string]$Config.schema_name,
-        "--source_set_name", $ExperimentId,
-        "--task_set_name", "$ExperimentId-train",
-        "--source_dir", $SourceDir,
-        "--output_dir", $TrainTaskRoot,
-        "--output_split_name", [string]$Config.data.train_task_output_name,
-        "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
-        "--splits", "train",
-        "--samples_per_source", (ConvertTo-InvariantString $Config.data.train_samples_per_source),
-        "--rollout_steps", (ConvertTo-InvariantString $Config.data.train_rollout_steps),
-        "--mask_policy", [string]$Config.data.mask_policy,
-        "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
-        "--short_source_policy", "skip",
-        "--seed", (ConvertTo-InvariantString $Seed),
-        "--run_name", "$ExperimentId-train"
-    )
-    if ([bool]$Config.data.direct_task_output) {
-        $trainTaskArguments += "--direct_output"
-    }
-    Invoke-Stage -Name "tasks-train" -Description "生成 train source-reference manifest：每 source 两个在线窗口、支持 H8" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $trainTaskArguments)
-
-    if (-not $CanaryMode) {
-        $evalTaskArguments = @(
+    if ($ReusePreparedData) {
+        $preparedTrainArguments = @(
+            "--source_dir", $SourceDir,
+            "--task_dir", $TrainTaskRoot,
+            "--manifest_split", [string]$Config.data.train_task_output_name,
+            "--expected_data_split", "train",
+            "--schema", [string]$Config.schema_name,
+            "--samples_per_source", (ConvertTo-InvariantString $Config.data.train_samples_per_source),
+            "--rollout_steps", (ConvertTo-InvariantString $Config.data.train_rollout_steps),
+            "--sampling_seed", (ConvertTo-InvariantString $Seed),
+            "--mask_policy", [string]$Config.data.mask_policy,
+            "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
+            "--normalizer_dir", $NormalizerRoot,
+            "--windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_windows_per_source),
+            "--convergence_windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_convergence_windows_per_source),
+            "--tracker_mask_seed", (ConvertTo-InvariantString $Seed)
+        )
+        Invoke-Stage -Name "prepared-data-train" -Description "严格校验并复用 train task、source SHA 与 K4/K8 normalizer" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.validate_realtime_pose_prepared_data" -Arguments $preparedTrainArguments)
+    } else {
+        $trainTaskArguments = @(
             "--artifact_roots_config", $ArtifactRootsConfig,
             "--schema", [string]$Config.schema_name,
             "--source_set_name", $ExperimentId,
-            "--task_set_name", "$ExperimentId-eval",
+            "--task_set_name", "$ExperimentId-train",
             "--source_dir", $SourceDir,
-            "--output_dir", $EvalTaskRoot,
-            "--output_split_name", [string]$Config.data.eval_task_output_name,
+            "--output_dir", $TrainTaskRoot,
+            "--output_split_name", [string]$Config.data.train_task_output_name,
             "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
-            "--splits", "test",
-            "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
-            "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
+            "--splits", "train",
+            "--samples_per_source", (ConvertTo-InvariantString $Config.data.train_samples_per_source),
+            "--rollout_steps", (ConvertTo-InvariantString $Config.data.train_rollout_steps),
             "--mask_policy", [string]$Config.data.mask_policy,
             "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
             "--short_source_policy", "skip",
             "--seed", (ConvertTo-InvariantString $Seed),
-            "--run_name", "$ExperimentId-eval"
+            "--run_name", "$ExperimentId-train"
         )
         if ([bool]$Config.data.direct_task_output) {
-            $evalTaskArguments += "--direct_output"
+            $trainTaskArguments += "--direct_output"
         }
-        Invoke-Stage -Name "tasks-eval" -Description "生成固定 sampling epoch 0 的 test source-reference manifest" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
+        Invoke-Stage -Name "tasks-train" -Description "生成 train source-reference manifest：每 source 两个在线窗口、支持 H8" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $trainTaskArguments)
     }
 
-    $normalizerArguments = @(
-        "--artifact_roots_config", $ArtifactRootsConfig,
-        "--schema", [string]$Config.schema_name,
-        "--task_set_name", "$ExperimentId-train",
-        "--normalizer_name", "$ExperimentId-train",
-        "--task_dir", $TrainTaskRoot,
-        "--output_dir", $NormalizerRoot,
-        "--split", "train",
-        "--windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_windows_per_source),
-        "--convergence_windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_convergence_windows_per_source),
-        "--check_convergence", (ConvertTo-InvariantString $Config.data.normalizer_check_convergence),
-        "--tracker_mask_seed", (ConvertTo-InvariantString $Seed),
-        "--run_name", $ExperimentId
-    )
-    if ([bool]$Config.data.direct_normalizer_output) {
-        $normalizerArguments += "--direct_output"
+    if (-not $CanaryMode) {
+        $evalManifestPath = Join-Path (Join-Path $EvalTaskRoot ([string]$Config.data.eval_task_output_name)) "manifest.jsonl"
+        if ($ReusePreparedData -and (Test-Path -LiteralPath $evalManifestPath -PathType Leaf)) {
+            $preparedEvalArguments = @(
+                "--source_dir", $SourceDir,
+                "--task_dir", $EvalTaskRoot,
+                "--manifest_split", [string]$Config.data.eval_task_output_name,
+                "--expected_data_split", "test",
+                "--schema", [string]$Config.schema_name,
+                "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
+                "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
+                "--sampling_seed", (ConvertTo-InvariantString $Seed),
+                "--mask_policy", [string]$Config.data.mask_policy,
+                "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source)
+            )
+            Invoke-Stage -Name "prepared-data-eval" -Description "严格校验并复用固定 sampling epoch 0 的 test task" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.validate_realtime_pose_prepared_data" -Arguments $preparedEvalArguments)
+        } else {
+            $evalTaskArguments = @(
+                "--artifact_roots_config", $ArtifactRootsConfig,
+                "--schema", [string]$Config.schema_name,
+                "--source_set_name", $ExperimentId,
+                "--task_set_name", "$ExperimentId-eval",
+                "--source_dir", $SourceDir,
+                "--output_dir", $EvalTaskRoot,
+                "--output_split_name", [string]$Config.data.eval_task_output_name,
+                "--split_dir", (Join-Path $RepoRoot "data_loaders\splits"),
+                "--splits", "test",
+                "--samples_per_source", (ConvertTo-InvariantString $Config.data.eval_samples_per_source),
+                "--rollout_steps", (ConvertTo-InvariantString $Config.data.eval_rollout_steps),
+                "--mask_policy", [string]$Config.data.mask_policy,
+                "--patterns_per_source", (ConvertTo-InvariantString $Config.data.patterns_per_source),
+                "--short_source_policy", "skip",
+                "--seed", (ConvertTo-InvariantString $Seed),
+                "--run_name", "$ExperimentId-eval"
+            )
+            if ([bool]$Config.data.direct_task_output) {
+                $evalTaskArguments += "--direct_output"
+            }
+            Invoke-Stage -Name "tasks-eval" -Description "生成固定 sampling epoch 0 的 test source-reference manifest" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.generate_realtime_pose_tasks" -Arguments $evalTaskArguments)
+        }
     }
-    Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K4 正式统计与 K8 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
+
+    if (-not $ReusePreparedData) {
+        $normalizerArguments = @(
+            "--artifact_roots_config", $ArtifactRootsConfig,
+            "--schema", [string]$Config.schema_name,
+            "--task_set_name", "$ExperimentId-train",
+            "--normalizer_name", "$ExperimentId-train",
+            "--task_dir", $TrainTaskRoot,
+            "--output_dir", $NormalizerRoot,
+            "--split", "train",
+            "--windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_windows_per_source),
+            "--convergence_windows_per_source", (ConvertTo-InvariantString $Config.data.normalizer_convergence_windows_per_source),
+            "--check_convergence", (ConvertTo-InvariantString $Config.data.normalizer_check_convergence),
+            "--tracker_mask_seed", (ConvertTo-InvariantString $Seed),
+            "--run_name", $ExperimentId
+        )
+        if ([bool]$Config.data.direct_normalizer_output) {
+            $normalizerArguments += "--direct_output"
+        }
+        Invoke-Stage -Name "normalizer" -Description "按 train source-reference 执行 K4 正式统计与 K8 收敛门禁" -CommandArgs (New-CondaModuleCommand -Module "data_loaders.compute_realtime_pose_normalizer" -Arguments $normalizerArguments)
+    }
 
     if (-not $CanaryMode) {
         $longseqArguments = @(
@@ -825,26 +879,28 @@ try {
     }
 
     if ($CanaryMode) {
-        $configuredStages = @($Config.training.stages)
-        $finalTrainingStage = $configuredStages[$configuredStages.Count - 1]
-        $canaryStage = [pscustomobject][ordered]@{
-            name = $CanaryName
-            target_steps = $CanarySteps
-            lr = [double]$finalTrainingStage.lr
+        $canarySchedule = [pscustomobject][ordered]@{
+            num_steps = $CanarySteps
+            lr = [double]$Config.training.lr
+            lr_warmup_start = [double]$Config.training.lr
+            lr_warmup_steps = 0
+            lr_min = [double]$Config.training.lr
             tracker_categories = @("all")
             rollout_steps = 9
+            rollout_h1_start_step = 0
+            rollout_h2_start_step = 0
+            rollout_h4_start_step = 0
+            rollout_h8_start_step = 0
+            rollout_prob_ramp_steps = 0
+            rollout_max_horizon_prob = 1.0
             short_rollout_prob = 0.0
             short_rollout_loss_weight = 0.0
             long_rollout_prob = 1.0
             long_rollout_loss_weight = [double]$Config.training.long_rollout_loss_weight
-            long_rollout_phase1_steps = 0
-            long_rollout_phase2_steps = 0
-            long_rollout_phase1_max_horizon = 8
-            long_rollout_phase2_max_horizon = 8
         }
         $canaryArguments = Get-TrainingArguments `
-            -Stage $canaryStage `
-            -ResumeStage $false `
+            -Schedule $canarySchedule `
+            -ResumeTraining $false `
             -RunName "$ExperimentId-$CanaryName"
         Invoke-Stage `
             -Name $CanaryName `
@@ -879,7 +935,9 @@ try {
         "--cuda", "true",
         "--device", (ConvertTo-InvariantString $EffectiveDevice),
         "--lr", (ConvertTo-InvariantString $Config.calibration.warmup_lr),
-        "--lr_anneal_steps", "0",
+        "--lr_warmup_start", (ConvertTo-InvariantString $Config.calibration.warmup_lr),
+        "--lr_warmup_steps", "0",
+        "--lr_min", (ConvertTo-InvariantString $Config.calibration.warmup_lr),
         "--weight_decay", "0",
         "--num_steps", (ConvertTo-InvariantString $Config.calibration.warmup_steps),
         "--log_interval", (ConvertTo-InvariantString $Config.training.log_interval),
@@ -930,30 +988,31 @@ try {
     Invoke-Stage -Name "loss-calibration" -Description "标定全部辅助 loss（含 no-Hip Root XZ）" -CommandArgs (New-CondaModuleCommand -Module "train.realtime_loss_calibration" -Arguments $calibrationArguments)
 
     $lossArguments = Get-CalibratedLossArguments
-    $stageIndex = 0
-    foreach ($trainingStage in @($Config.training.stages)) {
-        $resumeStage = $stageIndex -gt 0
-        $targetSteps = [int]$trainingStage.target_steps
-        $description = "训练直接扩散基线至 {0:N0} step" -f $targetSteps
-        $arguments = Get-TrainingArguments -Stage $trainingStage -ResumeStage $resumeStage -LossArguments $lossArguments
-        Invoke-Stage -Name ([string]$trainingStage.name) -Description $description -CommandArgs (New-CondaModuleCommand -Module "train.train_diffusionposer" -Arguments $arguments)
+    $trainingArguments = Get-TrainingArguments `
+        -Schedule $Config.training `
+        -ResumeTraining ([bool]$Resume) `
+        -LossArguments $lossArguments
+    Invoke-Stage `
+        -Name "train-formal-130k" `
+        -Description "单进程训练直接扩散基线至 130,000 step，并按 global step 从 base 扩展到 H8" `
+        -CommandArgs (New-CondaModuleCommand -Module "train.train_diffusionposer" -Arguments $trainingArguments)
 
+    foreach ($targetSteps in @($Config.evaluation.checkpoint_steps)) {
         Invoke-CheckpointEvaluation `
-            -Step $targetSteps `
+            -Step ([int]$targetSteps) `
             -Protocol "dynamic_all" `
             -HistorySource "predicted" `
             -Limit ([int]$Config.evaluation.stage_limit) `
-            -Label "阶段 checkpoint 的 predicted-history 动态 mask 评估"
+            -Label "课程 checkpoint 的 predicted-history 动态 mask 评估"
 
-        if (@($Config.evaluation.reference_history_steps) -contains $targetSteps) {
+        if (@($Config.evaluation.reference_history_steps) -contains [int]$targetSteps) {
             Invoke-CheckpointEvaluation `
-                -Step $targetSteps `
+                -Step ([int]$targetSteps) `
                 -Protocol "dynamic_all" `
                 -HistorySource "reference" `
                 -Limit ([int]$Config.evaluation.reference_history_limit) `
-                -Label "阶段 checkpoint 的 reference-history 诊断评估"
+                -Label "课程 checkpoint 的 reference-history 诊断评估"
         }
-        $stageIndex += 1
     }
 
     if (-not $SkipFinalEvaluationMatrix) {

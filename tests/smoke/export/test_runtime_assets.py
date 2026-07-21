@@ -412,7 +412,7 @@ def test_sentis_export_writes_unity_profile_manifest_after_runtime_assets(tmp_pa
     export_source = build_unity_export_source(
         model_id=model_id,
         source_checkpoint_path=model_path,
-        checkpoint_args={"training_stage": "B", "step": 123},
+        checkpoint_args={"training_schedule_signature": "toy-signature", "step": 123},
         normalizer_dir=tmp_path / "normalizer_source",
         onnx_path=onnx_path,
         model_source="ema",

@@ -38,11 +38,13 @@ def test_canary_mode_uses_isolated_h8_training_run() -> None:
 
     # Canary 从零开始运行强制 long-rollout 压力配置，不复用正式 checkpoint。
     assert "long_rollout_prob = 1.0" in script
-    assert "long_rollout_phase1_steps = 0" in script
-    assert "long_rollout_phase2_steps = 0" in script
-    assert "long_rollout_phase1_max_horizon = 8" in script
-    assert "long_rollout_phase2_max_horizon = 8" in script
-    assert "-ResumeStage $false" in script
+    assert "rollout_h1_start_step = 0" in script
+    assert "rollout_h2_start_step = 0" in script
+    assert "rollout_h4_start_step = 0" in script
+    assert "rollout_h8_start_step = 0" in script
+    assert "rollout_prob_ramp_steps = 0" in script
+    assert "rollout_max_horizon_prob = 1.0" in script
+    assert "-ResumeTraining $false" in script
 
 
 def test_stage_failure_keeps_native_stderr_in_its_log() -> None:

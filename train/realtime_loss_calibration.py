@@ -245,7 +245,7 @@ def _build_category_loader(args, category: str):
 
 
 def main(argv: list[str] | None = None) -> Path:
-    """加载同一 Stage A checkpoint，生成四类 mask × 四段 timestep 的 Loss v3 标定报告。"""
+    """加载统一 warm-up checkpoint，生成四类 mask × 四段 timestep 的 Loss v3 标定报告。"""
 
     from diffusion import logger
     from train.train_diffusionposer import resolve_input_artifact_dirs
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> Path:
     calibration_args, train_argv = calibration_parser.parse_known_args(argv_values)
     args = train_args(train_argv)
     if not str(args.init_checkpoint).strip():
-        raise ValueError("梯度标定必须通过 --init_checkpoint 指定统一的 Stage A checkpoint。")
+        raise ValueError("梯度标定必须通过 --init_checkpoint 指定统一的 warm-up checkpoint。")
     if str(args.resume_checkpoint).strip():
         raise ValueError("梯度标定不能使用 --resume_checkpoint；必须重置 optimizer/global step/EMA。")
 

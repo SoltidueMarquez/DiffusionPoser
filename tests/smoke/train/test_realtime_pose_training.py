@@ -34,7 +34,7 @@ from train.training_loop import (
     log_loss_dict,
     validate_finite_losses,
 )
-from train.realtime_rollout import long_rollout_max_horizon
+from train.realtime_rollout import rollout_curriculum_state
 from utils import dist_util
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, write_toy_source_dataset
 
@@ -290,7 +290,6 @@ def test_single_batch_training_loss_contains_realtime_aux_terms(tmp_path):
         save_interval=0,
         resume_checkpoint="",
         weight_decay=0.0,
-        lr_anneal_steps=0,
         gradient_clip=False,
         snr_gamma=0.0,
         l1_loss=False,
@@ -413,7 +412,6 @@ def test_rollout_training_loss_reinjects_predicted_target_and_backprops(tmp_path
         save_interval=0,
         resume_checkpoint="",
         weight_decay=0.0,
-        lr_anneal_steps=0,
         gradient_clip=False,
         snr_gamma=0.0,
         l1_loss=False,
@@ -534,7 +532,6 @@ def test_rollout_h8_reinjects_every_overlapping_prediction_without_prefix_grad(t
         save_interval=0,
         resume_checkpoint="",
         weight_decay=0.0,
-        lr_anneal_steps=0,
         gradient_clip=False,
         snr_gamma=0.0,
         l1_loss=False,
@@ -600,20 +597,30 @@ def test_rollout_h8_reinjects_every_overlapping_prediction_without_prefix_grad(t
     assert current_batch["previous_state_is_predicted"].all()
 
 
-def test_long_rollout_curriculum_expands_from_h2_to_h8():
-    values = [
-        long_rollout_max_horizon(
+def test_rollout_curriculum_expands_from_base_to_h8():
+    states = [
+        rollout_curriculum_state(
             global_step=step,
             rollout_steps=9,
-            phase1_steps=500,
-            phase2_steps=1500,
-            phase1_max_horizon=2,
-            phase2_max_horizon=4,
+            short_rollout_prob=0.5,
+            long_rollout_prob=0.25,
+            rollout_h1_start_step=300,
+            rollout_h2_start_step=500,
+            rollout_h4_start_step=700,
+            rollout_h8_start_step=900,
+            rollout_prob_ramp_steps=100,
+            rollout_max_horizon_prob=0.5,
         )
-        for step in (0, 499, 500, 1499, 1500, 5000)
+        for step in (0, 300, 400, 500, 700, 900, 1000)
     ]
 
-    assert values == [2, 2, 4, 4, 8, 8]
+    assert [state.max_horizon for state in states] == [0, 1, 1, 2, 4, 8, 8]
+    assert states[1].short_prob == 0.0
+    assert states[2].short_prob == 0.5
+    assert states[3].long_prob == 0.0
+    assert states[4].long_prob == 0.25
+    assert states[5].max_horizon_prob == 0.0
+    assert states[6].max_horizon_prob == 0.5
 
 
 def test_long_rollout_transition_sampling_prefers_reconnect_with_double_weight(monkeypatch):
@@ -623,7 +630,6 @@ def test_long_rollout_transition_sampling_prefers_reconnect_with_double_weight(m
     counts = {
         2: (0, 1),
         3: (1, 0),
-        4: (0, 0),
     }
     loop.rollout_transition_counts = lambda batch, horizon: counts[horizon]
 
@@ -631,18 +637,20 @@ def test_long_rollout_transition_sampling_prefers_reconnect_with_double_weight(m
 
     def choose_reconnect(weights, count):
         assert count == 1
-        assert torch.equal(weights, torch.tensor([1.0, 2.0, 0.0]))
+        assert torch.equal(weights, torch.tensor([1.0, 2.0]))
         return torch.tensor([1])
 
     monkeypatch.setattr(torch, "multinomial", choose_reconnect)
 
-    horizon, transition_aware = loop.sample_long_rollout_horizon(
+    horizon, transition_aware, selected_max = loop.sample_long_rollout_horizon(
         batch={},
         max_horizon=4,
+        max_horizon_prob=0.0,
     )
 
     assert horizon == 3
     assert transition_aware is True
+    assert selected_max is False
 
 
 def test_tracker_relative_position_loss_ignores_common_anchor_translation():
@@ -982,7 +990,6 @@ def test_train_loop_eval_reports_validation_loss(tmp_path):
         save_interval=0,
         resume_checkpoint="",
         weight_decay=0.0,
-        lr_anneal_steps=0,
         gradient_clip=False,
         snr_gamma=0.0,
         l1_loss=False,
@@ -1017,7 +1024,6 @@ def test_train_loop_rejects_empty_train_loader(tmp_path):
         save_interval=0,
         resume_checkpoint="",
         weight_decay=0.0,
-        lr_anneal_steps=0,
         gradient_clip=False,
         snr_gamma=0.0,
         l1_loss=False,

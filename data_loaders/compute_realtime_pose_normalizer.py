@@ -676,7 +676,8 @@ def _describe_feature_channel(schema_name: str, channel_index: int) -> tuple[str
 
 
 def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    # Windows 长路径边界下不要把 `.json.tmp` 叠加到最终文件名。
+    temporary_path = path.with_suffix(".tmp")
     temporary_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",

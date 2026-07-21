@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from diffusion.realtime_pose import REALTIME_POSE_LOSS_DEFAULTS
-from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS
+from train.realtime_rollout import REALTIME_LR_DEFAULTS, REALTIME_ROLLOUT_DEFAULTS
 from data_loaders.sensor_masking import (
     DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
@@ -242,9 +242,8 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--run_name", default="auto", type=str)
     group.add_argument("--overwrite", default=False, action=BooleanOptionalAction)
     group.add_argument("--train_platform_type", default="NoPlatform", choices=["NoPlatform", "TensorboardPlatform"], type=str)
-    group.add_argument("--lr", default=1e-4, type=float)
+    group.add_argument("--lr", default=5e-5, type=float)
     group.add_argument("--weight_decay", default=0.0, type=float)
-    group.add_argument("--lr_anneal_steps", default=0, type=int)
     group.add_argument("--log_interval", default=1_000, type=int)
     group.add_argument("--save_interval", default=5_000, type=int)
     group.add_argument("--checkpoint_max_keep", default=0, type=int)
@@ -258,7 +257,9 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--l1_loss", action="store_true")
     for option_name, default in REALTIME_POSE_LOSS_DEFAULTS.items():
         group.add_argument(f"--{option_name}", default=default, type=float)
-    for option_name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
+    for option_name, default in REALTIME_ROLLOUT_DEFAULTS.items():
+        group.add_argument(f"--{option_name}", default=default, type=type(default))
+    for option_name, default in REALTIME_LR_DEFAULTS.items():
         group.add_argument(f"--{option_name}", default=default, type=type(default))
     group.add_argument("--model_ema", default=True, action=BooleanOptionalAction)
     group.add_argument("--model_ema_steps", type=int, default=10)

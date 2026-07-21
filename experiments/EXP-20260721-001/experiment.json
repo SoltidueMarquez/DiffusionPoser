@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "experiment_id": "EXP-20260721-001",
-  "summary": "训练无小模型的强直接扩散基线，重建多窗口数据并按 H1 到 H8 课程做阶段长序列评估",
+  "summary": "训练无小模型的强直接扩散基线，在单个连续进程中按 global step 从 base 扩展到 H8 自回归课程",
   "experiment_type": "code_change",
   "unity": {
     "participation": "reference_only",
@@ -105,12 +105,23 @@
     "report": "../artifactStore/DiffusionPoser/active/generated/experiments/EXP-20260721-001/runs/calibration/loss-calibration.json"
   },
   "training": {
+    "num_steps": 130000,
+    "lr": 0.00005,
+    "lr_warmup_start": 0.000001,
+    "lr_warmup_steps": 2000,
+    "lr_min": 0.00001,
     "weight_decay": 0.0,
-    "lr_anneal_steps": 0,
     "log_interval": 100,
     "save_interval": 5000,
     "checkpoint_max_keep": 0,
     "gradient_clip": true,
+    "rollout_steps": 9,
+    "rollout_h1_start_step": 30000,
+    "rollout_h2_start_step": 60000,
+    "rollout_h4_start_step": 70000,
+    "rollout_h8_start_step": 90000,
+    "rollout_prob_ramp_steps": 10000,
+    "rollout_max_horizon_prob": 0.5,
     "rollout_ddim_steps": 10,
     "short_rollout_prob": 0.5,
     "short_rollout_loss_weight": 0.5,
@@ -118,152 +129,8 @@
     "long_rollout_loss_weight": 0.5,
     "long_rollout_transition_prob": 0.5,
     "long_rollout_smooth_l1_beta": 1.0,
-    "stages": [
-      {
-        "name": "train-a-base-030k",
-        "target_steps": 30000,
-        "lr": 0.00005,
-        "tracker_categories": [
-          "full_six",
-          "standard_three"
-        ],
-        "expected_max_rollout_horizon": 0,
-        "rollout_steps": 1,
-        "short_rollout_prob": 0.0,
-        "short_rollout_loss_weight": 0.0,
-        "long_rollout_prob": 0.0,
-        "long_rollout_loss_weight": 0.0,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 90000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-b-h1-060k",
-        "target_steps": 60000,
-        "lr": 0.00003,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 1,
-        "rollout_steps": 2,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.0,
-        "long_rollout_loss_weight": 0.0,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 90000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-c1-h2-070k",
-        "target_steps": 70000,
-        "lr": 0.00002,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 2,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 90000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-c2-h4-090k",
-        "target_steps": 90000,
-        "lr": 0.00002,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 4,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 90000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-d1-h4-105k",
-        "target_steps": 105000,
-        "lr": 0.00001,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 4,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 105000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-d2-h8-115k",
-        "target_steps": 115000,
-        "lr": 0.00001,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 8,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 105000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-d3-h8-125k",
-        "target_steps": 125000,
-        "lr": 0.00001,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 8,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 105000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      },
-      {
-        "name": "train-d4-h8-130k",
-        "target_steps": 130000,
-        "lr": 0.00001,
-        "tracker_categories": [
-          "all"
-        ],
-        "expected_max_rollout_horizon": 8,
-        "rollout_steps": 9,
-        "short_rollout_prob": 0.5,
-        "short_rollout_loss_weight": 0.5,
-        "long_rollout_prob": 0.25,
-        "long_rollout_loss_weight": 0.5,
-        "long_rollout_phase1_steps": 70000,
-        "long_rollout_phase2_steps": 105000,
-        "long_rollout_phase1_max_horizon": 2,
-        "long_rollout_phase2_max_horizon": 4
-      }
+    "tracker_categories": [
+      "all"
     ]
   },
   "evaluation": {
@@ -272,6 +139,16 @@
     "history_pose_source": "predicted",
     "warmup_target_source": "first_frame",
     "stage_limit": 4,
+    "checkpoint_steps": [
+      30000,
+      60000,
+      70000,
+      90000,
+      105000,
+      115000,
+      125000,
+      130000
+    ],
     "reference_history_steps": [
       30000,
       90000,

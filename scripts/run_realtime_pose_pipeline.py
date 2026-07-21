@@ -18,7 +18,7 @@ from data_loaders.realtime_pose_dataset import (
     validate_source_reference_entry,
 )
 from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
-from train.realtime_rollout import REALTIME_ROLLOUT_V3_DEFAULTS
+from train.realtime_rollout import REALTIME_LR_DEFAULTS, REALTIME_ROLLOUT_DEFAULTS
 from utils.artifact_paths import export_root, normalizer_root, run_root, source_root, task_root
 from utils.artifact_roots import load_artifact_roots
 from utils.run_dirs import resolve_latest_or_self
@@ -117,7 +117,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--skip_train", action="store_true")
     train.add_argument("--resume_latest", action="store_true")
     train.add_argument("--init_checkpoint", default="", type=str)
-    train.add_argument("--training_stage", default="custom", choices=["custom", "A", "B", "C"], type=str)
     train.add_argument("--model_arch", default="target_dit", choices=["full_feature_dit", "target_dit"])
     train.add_argument("--cuda", default=True, type=str2bool)
     train.add_argument("--device", default=0, type=int)
@@ -128,7 +127,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--save_interval", default=5_000, type=int)
     train.add_argument("--log_interval", default=1_000, type=int)
     train.add_argument("--checkpoint_max_keep", default=3, type=int)
-    train.add_argument("--lr", default=1e-4, type=float)
+    train.add_argument("--lr", default=5e-5, type=float)
+    for option_name, default in REALTIME_LR_DEFAULTS.items():
+        train.add_argument(f"--{option_name}", default=default, type=type(default))
     train.add_argument("--train_platform_type", default="TensorboardPlatform", choices=["NoPlatform", "TensorboardPlatform"])
     train.add_argument("--layers", default=8, type=int)
     train.add_argument("--heads", default=8, type=int)
@@ -146,7 +147,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--tracker_burst_dropout_prob", default=0.0, type=float)
     train.add_argument("--tracker_outlier_prob", default=0.0, type=float)
     train.add_argument("--rollout_steps", default=1, type=int)
-    for option_name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items():
+    for option_name, default in REALTIME_ROLLOUT_DEFAULTS.items():
         train.add_argument(f"--{option_name}", default=default, type=type(default))
     train.add_argument("--tracker_mask_policy", default="task", choices=["task", "fixed_categories", "dynamic_categories"])
     train.add_argument("--tracker_mask_categories", nargs="+", default=["all"])
@@ -523,7 +524,6 @@ def build_export_args(args: argparse.Namespace) -> list[str]:
 
 def build_train_args(args: argparse.Namespace) -> list[str]:
     schema = get_schema_spec(args.schema)
-    stage = resolve_training_stage(args)
     command = [
         "--schema", schema.name,
         "--model_arch", args.model_arch,
@@ -536,11 +536,14 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--batch_size", str(args.train_batch_size),
         "--num_workers", str(args.num_workers),
         "--source_cache_max_mib", str(args.source_cache_max_mib),
-        "--num_steps", str(stage["num_steps"]),
+        "--num_steps", str(args.num_steps),
         "--save_interval", str(args.save_interval),
         "--log_interval", str(args.log_interval),
         "--checkpoint_max_keep", str(args.checkpoint_max_keep),
-        "--lr", str(stage["lr"]),
+        "--lr", str(args.lr),
+        "--lr_warmup_start", str(args.lr_warmup_start),
+        "--lr_warmup_steps", str(args.lr_warmup_steps),
+        "--lr_min", str(args.lr_min),
         "--train_platform_type", args.train_platform_type,
         "--layers", str(args.layers),
         "--heads", str(args.heads),
@@ -554,20 +557,22 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--tracker_latency_max_frames", str(args.tracker_latency_max_frames),
         "--tracker_burst_dropout_prob", str(args.tracker_burst_dropout_prob),
         "--tracker_outlier_prob", str(args.tracker_outlier_prob),
-        "--tracker_mask_policy", str(stage["tracker_mask_policy"]),
-        "--tracker_mask_categories", *[str(value) for value in stage["tracker_mask_categories"]],
-        "--rollout_steps", str(stage["rollout_steps"]),
-        "--short_rollout_prob", str(stage["short_rollout_prob"]),
-        "--short_rollout_loss_weight", str(stage["short_rollout_loss_weight"]),
-        "--long_rollout_prob", str(stage["long_rollout_prob"]),
-        "--long_rollout_loss_weight", str(stage["long_rollout_loss_weight"]),
-        "--long_rollout_phase1_steps", str(stage["long_rollout_phase1_steps"]),
-        "--long_rollout_phase2_steps", str(stage["long_rollout_phase2_steps"]),
-        "--long_rollout_phase1_max_horizon", str(stage["long_rollout_phase1_max_horizon"]),
-        "--long_rollout_phase2_max_horizon", str(stage["long_rollout_phase2_max_horizon"]),
-        "--long_rollout_transition_prob", str(stage["long_rollout_transition_prob"]),
-        "--long_rollout_smooth_l1_beta", str(stage["long_rollout_smooth_l1_beta"]),
-        "--rollout_ddim_steps", str(stage["rollout_ddim_steps"]),
+        "--tracker_mask_policy", str(args.tracker_mask_policy),
+        "--tracker_mask_categories", *[str(value) for value in args.tracker_mask_categories],
+        "--rollout_steps", str(args.rollout_steps),
+        "--short_rollout_prob", str(args.short_rollout_prob),
+        "--short_rollout_loss_weight", str(args.short_rollout_loss_weight),
+        "--long_rollout_prob", str(args.long_rollout_prob),
+        "--long_rollout_loss_weight", str(args.long_rollout_loss_weight),
+        "--rollout_h1_start_step", str(args.rollout_h1_start_step),
+        "--rollout_h2_start_step", str(args.rollout_h2_start_step),
+        "--rollout_h4_start_step", str(args.rollout_h4_start_step),
+        "--rollout_h8_start_step", str(args.rollout_h8_start_step),
+        "--rollout_prob_ramp_steps", str(args.rollout_prob_ramp_steps),
+        "--rollout_max_horizon_prob", str(args.rollout_max_horizon_prob),
+        "--long_rollout_transition_prob", str(args.long_rollout_transition_prob),
+        "--long_rollout_smooth_l1_beta", str(args.long_rollout_smooth_l1_beta),
+        "--rollout_ddim_steps", str(args.rollout_ddim_steps),
         "--eval_num_batches", str(args.eval_num_batches),
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
@@ -584,66 +589,6 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
     if bool(args.resume_latest):
         command.append("latest")
     return command
-
-
-def resolve_training_stage(args: argparse.Namespace) -> dict[str, object]:
-    stage = str(args.training_stage)
-    values: dict[str, object] = {
-        "num_steps": int(args.num_steps),
-        "lr": float(args.lr),
-        "tracker_mask_policy": str(args.tracker_mask_policy),
-        "tracker_mask_categories": list(args.tracker_mask_categories),
-        "rollout_steps": int(args.rollout_steps),
-        **{
-            name: type(default)(getattr(args, name))
-            for name, default in REALTIME_ROLLOUT_V3_DEFAULTS.items()
-        },
-    }
-    if stage == "A":
-        values.update(
-            num_steps=20_000,
-            lr=5e-5,
-            tracker_mask_policy="dynamic_categories",
-            tracker_mask_categories=["full_six", "standard_three"],
-            rollout_steps=1,
-            short_rollout_prob=0.0,
-            short_rollout_loss_weight=0.0,
-            long_rollout_prob=0.0,
-            long_rollout_loss_weight=0.0,
-            rollout_ddim_steps=10,
-        )
-    elif stage == "B":
-        values.update(
-            # TrainLoop interprets num_steps as an absolute global-step target
-            # when resuming, so an A -> B continuation must target 40k.
-            num_steps=40_000 if bool(args.resume_latest) else 20_000,
-            lr=5e-5,
-            tracker_mask_policy="dynamic_categories",
-            tracker_mask_categories=["full_six", "standard_three"],
-            rollout_steps=2,
-            short_rollout_prob=0.5,
-            short_rollout_loss_weight=0.5,
-            long_rollout_prob=0.0,
-            long_rollout_loss_weight=0.0,
-            rollout_ddim_steps=10,
-        )
-    elif stage == "C":
-        values.update(
-            # Likewise, a single resumed A -> B -> C run finishes at 60k.
-            # Starting C from --init_checkpoint creates a fresh optimizer/run
-            # and therefore still performs the requested 20k local steps.
-            num_steps=60_000 if bool(args.resume_latest) else 20_000,
-            lr=2e-5,
-            tracker_mask_policy="dynamic_categories",
-            tracker_mask_categories=["all"],
-            rollout_steps=2,
-            short_rollout_prob=0.5,
-            short_rollout_loss_weight=0.5,
-            long_rollout_prob=0.0,
-            long_rollout_loss_weight=0.0,
-            rollout_ddim_steps=10,
-        )
-    return values
 
 
 def run_pipeline(args: argparse.Namespace) -> None:

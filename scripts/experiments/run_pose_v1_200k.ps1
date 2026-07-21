@@ -42,7 +42,9 @@ $CommonTrainingArgs = @(
     "--seed", [string]$Seed,
     "--batch_size", [string]$BatchSize,
     "--lr", "0.0001",
-    "--lr_anneal_steps", "200000",
+    "--lr_warmup_start", "0.000001",
+    "--lr_warmup_steps", "2000",
+    "--lr_min", "0.00001",
     "--weight_decay", "0",
     "--log_interval", "100",
     "--save_interval", "5000",
@@ -398,40 +400,20 @@ Write-Host "Start step: $currentStep"
 Write-Host "Target:     200000"
 Open-LossMonitorWindow
 
-if ($currentStep -lt 80000) {
-    $resumeValue = if ($currentStep -gt 0) { "latest" } else { "" }
-    Invoke-TrainingStage -StageName "Stage A: base 0-80k" -TargetSteps 80000 -ResumeCheckpoint $resumeValue -RolloutArgs @(
-        "--rollout_steps", "1",
-        "--short_rollout_prob", "0",
-        "--short_rollout_loss_weight", "0",
-        "--long_rollout_prob", "0",
-        "--long_rollout_loss_weight", "0"
-    )
-    $currentStep = 80000
-}
-
-if ($currentStep -lt 140000) {
-    Invoke-TrainingStage -StageName "Stage B: H1 80k-140k" -TargetSteps 140000 -ResumeCheckpoint "latest" -RolloutArgs @(
-        "--rollout_steps", "2",
-        "--short_rollout_prob", "0.5",
-        "--short_rollout_loss_weight", "0.5",
-        "--long_rollout_prob", "0",
-        "--long_rollout_loss_weight", "0"
-    )
-    $currentStep = 140000
-}
-
 if ($currentStep -lt 200000) {
-    Invoke-TrainingStage -StageName "Stage C: H1+H2-8 140k-200k" -TargetSteps 200000 -ResumeCheckpoint "latest" -RolloutArgs @(
+    $resumeValue = if ($currentStep -gt 0) { "latest" } else { "" }
+    Invoke-TrainingStage -StageName "Single-process rollout curriculum 0-200k" -TargetSteps 200000 -ResumeCheckpoint $resumeValue -RolloutArgs @(
         "--rollout_steps", "9",
         "--short_rollout_prob", "0.5",
         "--short_rollout_loss_weight", "0.5",
         "--long_rollout_prob", "0.125",
         "--long_rollout_loss_weight", "0.5",
-        "--long_rollout_phase1_steps", "150000",
-        "--long_rollout_phase2_steps", "170000",
-        "--long_rollout_phase1_max_horizon", "2",
-        "--long_rollout_phase2_max_horizon", "4",
+        "--rollout_h1_start_step", "80000",
+        "--rollout_h2_start_step", "140000",
+        "--rollout_h4_start_step", "150000",
+        "--rollout_h8_start_step", "170000",
+        "--rollout_prob_ramp_steps", "10000",
+        "--rollout_max_horizon_prob", "0.5",
         "--long_rollout_transition_prob", "0.5"
     )
 }
