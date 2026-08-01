@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
-    NON_PELVIS_JOINT_COUNT,
+    HEAD_TRACKER_INDEX,
+    HIP_TRACKER_INDEX,
+    LEFT_FOOT_TRACKER_INDEX,
+    LEFT_HAND_TRACKER_INDEX,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
-    ROOT_YAW_RELATIVE_START,
+    RIGHT_FOOT_TRACKER_INDEX,
+    RIGHT_HAND_TRACKER_INDEX,
+    ROTATION_6D_DIM,
+    SMPL_JOINT_COUNT,
     TRACKER_CONFIGURED_OFFSET,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
@@ -17,6 +26,79 @@ from data_loaders.sensor_masking import (
     TRACKER_MISSING_AGE_OFFSET,
 )
 from model.diffusionposer_dit import SinusoidalTimestepEmbedding
+
+
+REGION_ATTENTION_HEADS = 8
+CONDITION_TOKEN_COUNT = REALTIME_POSE_HISTORY_LENGTH + TRACKER_COUNT * 2
+REGION_SCALE_INITIAL_VALUE = 0.5
+REGION_SCALE_INITIAL_RAW = math.log(math.expm1(REGION_SCALE_INITIAL_VALUE))
+
+TORSO_JOINTS = (
+    "pelvis",
+    "left_hip",
+    "right_hip",
+    "spine1",
+    "spine2",
+    "spine3",
+    "neck",
+    "head",
+    "left_collar",
+    "right_collar",
+)
+LEFT_ARM_JOINTS = ("left_collar", "left_shoulder", "left_elbow", "left_wrist", "left_hand")
+RIGHT_ARM_JOINTS = ("right_collar", "right_shoulder", "right_elbow", "right_wrist", "right_hand")
+LEFT_LEG_JOINTS = ("pelvis", "left_hip", "left_knee", "left_ankle", "left_foot")
+RIGHT_LEG_JOINTS = ("pelvis", "right_hip", "right_knee", "right_ankle", "right_foot")
+
+
+def _joint_indices(names: tuple[str, ...]) -> tuple[int, ...]:
+    return tuple(JOINT_INDEX[name] for name in names)
+
+
+def build_self_region_template() -> torch.Tensor:
+    """构造 `[8,24,24]` 软区域模板；前两个 head 保持全局无偏置。"""
+
+    template = torch.zeros(REGION_ATTENTION_HEADS, SMPL_JOINT_COUNT, SMPL_JOINT_COUNT)
+    head_regions = {
+        2: _joint_indices(TORSO_JOINTS),
+        3: _joint_indices(TORSO_JOINTS),
+        4: _joint_indices(LEFT_ARM_JOINTS),
+        5: _joint_indices(RIGHT_ARM_JOINTS),
+        6: _joint_indices(LEFT_LEG_JOINTS),
+        7: _joint_indices(RIGHT_LEG_JOINTS),
+    }
+    for head_index, joint_indices in head_regions.items():
+        indices = torch.as_tensor(joint_indices, dtype=torch.long)
+        template[head_index][indices[:, None], indices[None, :]] = 1.0
+    return template
+
+
+def build_cross_region_template() -> torch.Tensor:
+    """构造 `[8,24,72]` 区域—Tracker 模板，历史 pose token 不加先验。"""
+
+    template = torch.zeros(REGION_ATTENTION_HEADS, SMPL_JOINT_COUNT, CONDITION_TOKEN_COUNT)
+    head_specs = {
+        2: (_joint_indices(TORSO_JOINTS), (HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX)),
+        3: (_joint_indices(TORSO_JOINTS), (HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX)),
+        4: (_joint_indices(LEFT_ARM_JOINTS), (HEAD_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX)),
+        5: (_joint_indices(RIGHT_ARM_JOINTS), (HEAD_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX)),
+        6: (
+            _joint_indices(LEFT_LEG_JOINTS),
+            (HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX, LEFT_FOOT_TRACKER_INDEX),
+        ),
+        7: (
+            _joint_indices(RIGHT_LEG_JOINTS),
+            (HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX, RIGHT_FOOT_TRACKER_INDEX),
+        ),
+    }
+    for head_index, (joint_indices, tracker_indices) in head_specs.items():
+        for tracker_index in tracker_indices:
+            # 同一 Tracker 同时对应 60 帧 GRU summary 与当前观测 token。
+            summary_index = REALTIME_POSE_HISTORY_LENGTH + tracker_index
+            current_index = REALTIME_POSE_HISTORY_LENGTH + TRACKER_COUNT + tracker_index
+            template[head_index, list(joint_indices), summary_index] = 1.0
+            template[head_index, list(joint_indices), current_index] = 1.0
+    return template
 
 
 class TrackerTokenEncoder(nn.Module):
@@ -89,6 +171,9 @@ class TargetDiTBlock(nn.Module):
 
     def __init__(self, latent_dim: int, num_heads: int, dropout: float):
         super().__init__()
+        if int(num_heads) != REGION_ATTENTION_HEADS:
+            raise ValueError(f"区域注意力固定使用 {REGION_ATTENTION_HEADS} 个 head，实际为 {num_heads}。")
+        self.num_heads = int(num_heads)
         self.self_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.cross_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.mlp_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
@@ -101,10 +186,54 @@ class TargetDiTBlock(nn.Module):
             nn.Linear(latent_dim * 4, latent_dim),
         )
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(latent_dim, latent_dim * 9))
+        self.self_region_scale = nn.Parameter(
+            torch.full((self.num_heads,), REGION_SCALE_INITIAL_RAW)
+        )
+        self.cross_region_scale = nn.Parameter(
+            torch.full((self.num_heads,), REGION_SCALE_INITIAL_RAW)
+        )
+        self.register_buffer("self_region_template", build_self_region_template())
+        self.register_buffer("cross_region_template", build_cross_region_template())
 
     @staticmethod
     def _modulate(value: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return value * (1.0 + scale[:, None]) + shift[:, None]
+
+    def _self_attention_bias(self, batch_size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """返回 MultiheadAttention 需要的 `[B*8,24,24]` additive bias。"""
+
+        scale = F.softplus(self.self_region_scale).to(device=device, dtype=dtype)
+        bias = self.self_region_template.to(device=device, dtype=dtype) * scale[:, None, None]
+        return bias.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(
+            batch_size * self.num_heads,
+            SMPL_JOINT_COUNT,
+            SMPL_JOINT_COUNT,
+        )
+
+    def _cross_attention_bias(
+        self,
+        batch_size: int,
+        condition_padding_mask: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """返回 `[B*8,24,72]` 区域 bias，并在同一 mask 中屏蔽无效历史帧。"""
+
+        scale = F.softplus(self.cross_region_scale).to(device=device, dtype=dtype)
+        base = self.cross_region_template.to(device=device, dtype=dtype) * scale[:, None, None]
+        bias = base.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
+        padding = condition_padding_mask[:, None, None, :].expand(
+            -1,
+            self.num_heads,
+            SMPL_JOINT_COUNT,
+            -1,
+        )
+        bias.masked_fill_(padding, float("-inf"))
+        return bias.reshape(
+            batch_size * self.num_heads,
+            SMPL_JOINT_COUNT,
+            CONDITION_TOKEN_COUNT,
+        )
 
     def forward(
         self,
@@ -112,11 +241,45 @@ class TargetDiTBlock(nn.Module):
         condition: torch.Tensor,
         timestep_embedding: torch.Tensor,
         condition_padding_mask: torch.Tensor | None,
+        self_attention_bias: torch.Tensor,
+        cross_attention_bias: torch.Tensor,
     ) -> torch.Tensor:
+        if condition_padding_mask is None or tuple(condition_padding_mask.shape) != (
+            target.shape[0],
+            CONDITION_TOKEN_COUNT,
+        ):
+            raise ValueError(
+                f"condition_padding_mask 应为 [B,{CONDITION_TOKEN_COUNT}]，"
+                f"实际为 {None if condition_padding_mask is None else tuple(condition_padding_mask.shape)}"
+            )
+        expected_self_shape = (
+            target.shape[0] * self.num_heads,
+            SMPL_JOINT_COUNT,
+            SMPL_JOINT_COUNT,
+        )
+        expected_cross_shape = (
+            target.shape[0] * self.num_heads,
+            SMPL_JOINT_COUNT,
+            CONDITION_TOKEN_COUNT,
+        )
+        if tuple(self_attention_bias.shape) != expected_self_shape:
+            raise ValueError(
+                f"self_attention_bias 应为 {expected_self_shape}，实际为 {tuple(self_attention_bias.shape)}"
+            )
+        if tuple(cross_attention_bias.shape) != expected_cross_shape:
+            raise ValueError(
+                f"cross_attention_bias 应为 {expected_cross_shape}，实际为 {tuple(cross_attention_bias.shape)}"
+            )
         values = self.modulation(timestep_embedding).chunk(9, dim=-1)
         self_shift, self_scale, self_gate, cross_shift, cross_scale, cross_gate, mlp_shift, mlp_scale, mlp_gate = values
         query = self._modulate(self.self_norm(target), self_shift, self_scale)
-        self_value = self.self_attention(query, query, query, need_weights=False)[0]
+        self_value = self.self_attention(
+            query,
+            query,
+            query,
+            attn_mask=self_attention_bias,
+            need_weights=False,
+        )[0]
         target = target + torch.tanh(self_gate)[:, None] * self_value
 
         query = self._modulate(self.cross_norm(target), cross_shift, cross_scale)
@@ -124,7 +287,7 @@ class TargetDiTBlock(nn.Module):
             query,
             condition,
             condition,
-            key_padding_mask=condition_padding_mask,
+            attn_mask=cross_attention_bias,
             need_weights=False,
         )[0]
         target = target + torch.tanh(cross_gate)[:, None] * cross_value
@@ -134,7 +297,7 @@ class TargetDiTBlock(nn.Module):
 
 
 class RealtimePoseTargetDiT(nn.Module):
-    """对 23 个全局旋转 Token 与 1 个 Root 相对 yaw Token 直接去噪。"""
+    """对 24 个 Head-yaw 参考系全局 rotation6D Token 直接去噪。"""
 
     def __init__(
         self,
@@ -152,12 +315,13 @@ class RealtimePoseTargetDiT(nn.Module):
         self.latent_dim = int(latent_dim)
         if self.input_feats != REALTIME_POSE_TARGET_DIM:
             raise ValueError(f"TargetDiT 仅接受 {REALTIME_POSE_TARGET_DIM} 维目标，实际为 {input_feats}。")
+        if int(num_heads) != REGION_ATTENTION_HEADS:
+            raise ValueError(f"区域注意力固定使用 {REGION_ATTENTION_HEADS} 个 head，实际为 {num_heads}。")
         if int(max_seq_len) != 61:
             raise ValueError("TargetDiT 固定使用 60 帧历史和 1 帧当前 Tracker。")
 
         self.joint_input = nn.Linear(6, latent_dim)
-        self.root_input = nn.Linear(2, latent_dim)
-        self.target_identity = nn.Embedding(NON_PELVIS_JOINT_COUNT + 1, latent_dim)
+        self.target_identity = nn.Embedding(SMPL_JOINT_COUNT, latent_dim)
         self.known_state_embed = nn.Embedding(2, latent_dim)
         self.pose_history_proj = nn.Linear(REALTIME_POSE_TARGET_DIM, latent_dim)
         self.pose_temporal_embed = nn.Parameter(torch.zeros(1, REALTIME_POSE_HISTORY_LENGTH, latent_dim))
@@ -168,12 +332,16 @@ class RealtimePoseTargetDiT(nn.Module):
         )
         self.output_norm = nn.LayerNorm(latent_dim)
         self.joint_output = nn.Linear(latent_dim, 6)
-        self.root_output = nn.Linear(latent_dim, 2)
+        self.pelvis_offset_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, 3),
+        )
         if zero_init:
             nn.init.zeros_(self.joint_output.weight)
             nn.init.zeros_(self.joint_output.bias)
-            nn.init.zeros_(self.root_output.weight)
-            nn.init.zeros_(self.root_output.bias)
+            nn.init.zeros_(self.pelvis_offset_head[-1].weight)
+            nn.init.zeros_(self.pelvis_offset_head[-1].bias)
 
     def num_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
@@ -189,8 +357,9 @@ class RealtimePoseTargetDiT(nn.Module):
         valid_frame_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         y: Optional[dict] = None,
+        return_aux_outputs: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         del kwargs
         if hidden_states.ndim != 2 or hidden_states.shape[1] != REALTIME_POSE_TARGET_DIM:
             raise ValueError(
@@ -211,7 +380,7 @@ class RealtimePoseTargetDiT(nn.Module):
         if tuple(tracker_window.shape) != (batch_size, 61, TRACKER_COUNT, TRACKER_FEATURE_DIM):
             raise ValueError(f"tracker_window 形状错误：{tuple(tracker_window.shape)}")
         if tuple(known_mask.shape) != tuple(hidden_states.shape):
-            raise ValueError("known_mask 必须与当前 140 维扩散状态同形。")
+            raise ValueError(f"known_mask 必须与当前 {REALTIME_POSE_TARGET_DIM} 维扩散状态同形。")
         valid_frame_mask = valid_frame_mask if valid_frame_mask is not None else attention_mask
         if valid_frame_mask is None:
             valid_frame_mask = torch.ones(
@@ -224,19 +393,10 @@ class RealtimePoseTargetDiT(nn.Module):
         if tuple(valid_frame_mask.shape) != (batch_size, REALTIME_POSE_HISTORY_LENGTH):
             raise ValueError("valid_frame_mask 必须为 [B,60]。")
 
-        joint_values = hidden_states[:, :ROOT_YAW_RELATIVE_START].reshape(
-            batch_size, NON_PELVIS_JOINT_COUNT, 6
-        )
-        root_value = hidden_states[:, ROOT_YAW_RELATIVE_START:].unsqueeze(1)
-        target = torch.cat([self.joint_input(joint_values), self.root_input(root_value)], dim=1)
-        target_ids = torch.arange(NON_PELVIS_JOINT_COUNT + 1, device=hidden_states.device)
-        atomic_known = torch.cat(
-            [
-                known_mask[:, :ROOT_YAW_RELATIVE_START].reshape(batch_size, NON_PELVIS_JOINT_COUNT, 6).all(-1),
-                known_mask[:, ROOT_YAW_RELATIVE_START:].all(-1, keepdim=True),
-            ],
-            dim=1,
-        )
+        joint_values = hidden_states.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
+        target = self.joint_input(joint_values)
+        target_ids = torch.arange(SMPL_JOINT_COUNT, device=hidden_states.device)
+        atomic_known = known_mask.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM).all(-1)
         target = (
             target
             + self.target_identity(target_ids)[None]
@@ -255,11 +415,28 @@ class RealtimePoseTargetDiT(nn.Module):
         )
         time_embedding = self.time_embed(timestep)
         for block in self.blocks:
-            target = block(target, condition, time_embedding, condition_padding_mask)
+            self_attention_bias = block._self_attention_bias(
+                batch_size,
+                dtype=target.dtype,
+                device=target.device,
+            )
+            cross_attention_bias = block._cross_attention_bias(
+                batch_size,
+                condition_padding_mask=condition_padding_mask,
+                dtype=target.dtype,
+                device=target.device,
+            )
+            target = block(
+                target,
+                condition,
+                time_embedding,
+                condition_padding_mask,
+                self_attention_bias=self_attention_bias,
+                cross_attention_bias=cross_attention_bias,
+            )
 
         target = self.output_norm(target)
-        joint_output = self.joint_output(target[:, :NON_PELVIS_JOINT_COUNT]).reshape(
-            batch_size, ROOT_YAW_RELATIVE_START
-        )
-        root_output = self.root_output(target[:, NON_PELVIS_JOINT_COUNT])
-        return torch.cat([joint_output, root_output], dim=-1)
+        joint_output = self.joint_output(target).reshape(batch_size, REALTIME_POSE_TARGET_DIM)
+        if not return_aux_outputs:
+            return joint_output
+        return joint_output, {"pelvis_head_offset": self.pelvis_offset_head(target[:, JOINT_INDEX["pelvis"]])}

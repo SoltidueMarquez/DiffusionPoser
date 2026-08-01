@@ -15,11 +15,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="按 shard 合并 realtime pose normalizer 统计。")
     parser.add_argument(
         "--task_dir",
-        default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks",
+        default="dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
     )
     parser.add_argument(
         "--output_dir",
-        default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+        default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--eps", default=1e-8, type=float)
@@ -55,7 +55,7 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         tracker_sum, tracker_sumsq, tracker_count, float(args.eps)
     )
     output_root = Path(args.output_dir).resolve()
-    label = "rtp_140d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
+    label = "rtp_144d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
     output_dir = timestamped_child_dir(output_root, label)
     normalizer = RealtimePoseNormalizer(output_dir, eps=float(args.eps), disable=True)
     normalizer_metadata = {

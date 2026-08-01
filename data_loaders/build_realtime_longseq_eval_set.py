@@ -18,8 +18,8 @@ from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
-DEFAULT_TASK_ROOT = "../artifactStore/DiffusionPoser/active/generated/tasks/realpose140_60hz"
-DEFAULT_LONGSEQ_EVAL_ROOT = "../artifactStore/DiffusionPoser/active/generated/longseq_eval/realpose140_60hz"
+DEFAULT_TASK_ROOT = "../artifactStore/DiffusionPoser/active/generated/tasks/realpose144_60hz"
+DEFAULT_LONGSEQ_EVAL_ROOT = "../artifactStore/DiffusionPoser/active/generated/longseq_eval/realpose144_60hz"
 DEFAULT_LONGSEQ_RUN_NAME = "v1_test_stress_long_seed10"
 LONGSEQ_LATEST_KIND = "longseq_eval"
 PRESET_STRESS_LONG = "stress_long"

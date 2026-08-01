@@ -76,11 +76,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("paths")
     paths.add_argument(
         "--source_dir",
-        default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+        default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
     )
     paths.add_argument(
         "--output_dir",
-        default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks",
+        default="dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
     )
     paths.add_argument("--split_dir", default="data_loaders/splits")
 
@@ -141,7 +141,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     if output_root == source_dir or source_dir.is_relative_to(output_root):
         raise ValueError("output_dir 不能等于或包含 source_dir。")
     output_root.mkdir(parents=True, exist_ok=True)
-    label = "rtp_140d" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
+    label = "rtp_144d" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
     output_dir = timestamped_child_dir(output_root, label)
 
     entries = read_source_entries(source_dir)
@@ -403,7 +403,6 @@ def build_task_bundle_row(
         floor_y = float(source["root_pos_world"][current_absolute, 1])
         pose_window = build_pose_target_np(
             joint_rotations_world[frame_slice],
-            source["root_yaw"][frame_slice],
             current_head_yaw,
         )
         tracker_window = build_tracker_window_np(
@@ -416,11 +415,7 @@ def build_task_bundle_row(
             full_state,
             zero_age,
         )
-        full_known_target, _ = build_known_target_np(
-            tracker_window[REALTIME_POSE_TARGET_START],
-            current_head_yaw,
-            source["tracker_rot_world_6d"][current_absolute],
-        )
+        full_known_target, _ = build_known_target_np(tracker_window[REALTIME_POSE_TARGET_START])
         cos_yaw = np.cos(current_head_yaw)
         sin_yaw = np.sin(current_head_yaw)
         yaw_inv = np.asarray(

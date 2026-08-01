@@ -27,7 +27,7 @@ def _stabilize_std(value: torch.Tensor) -> torch.Tensor:
 
 
 class RealtimePoseNormalizer:
-    """140 维姿态与六类 Tracker 连续量的独立 normalizer。"""
+    """144 维姿态与六类 Tracker 连续量的独立 normalizer。"""
 
     def __init__(
         self,
@@ -48,7 +48,7 @@ class RealtimePoseNormalizer:
         self.tracker_mean: torch.Tensor | None = None
         self.tracker_std: torch.Tensor | None = None
         self.metadata: dict[str, Any] = {}
-        # 训练循环仍通过 mean/std 读取姿态统计；这里明确只指 140 维姿态。
+        # 训练循环仍通过 mean/std 读取姿态统计；这里明确只指 144 维姿态。
         self.mean: torch.Tensor | None = None
         self.std: torch.Tensor | None = None
         if not self.disable:
@@ -64,7 +64,7 @@ class RealtimePoseNormalizer:
         missing = [path.name for path in required if not path.exists()]
         if missing:
             raise FileNotFoundError(
-                f"{self.base_dir} 缺少 140 维 normalizer 文件 {missing}；旧 mean.pt/std.pt 不能复用。"
+                f"{self.base_dir} 缺少 144 维 normalizer 文件 {missing}；旧契约的统计不能复用。"
             )
         self.pose_mean = torch.load(self.pose_mean_path, map_location="cpu", weights_only=True).float()
         self.pose_std = _stabilize_std(
@@ -202,7 +202,7 @@ class RealtimePoseNormalizer:
         if tuple(self.pose_mean.shape) != (REALTIME_POSE_TARGET_DIM,) or tuple(self.pose_std.shape) != (
             REALTIME_POSE_TARGET_DIM,
         ):
-            raise ValueError("Pose normalizer 必须为 [140]。")
+            raise ValueError("Pose normalizer 必须为 [144]。")
         expected_tracker = (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM)
         if tuple(self.tracker_mean.shape) != expected_tracker or tuple(self.tracker_std.shape) != expected_tracker:
             raise ValueError("Tracker normalizer 必须为 [6,9]。")

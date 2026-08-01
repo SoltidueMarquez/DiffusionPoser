@@ -115,8 +115,7 @@ def build_online_conditioning(
     current_head_yaw = float(head_yaw_history[-1])
     current_head_position = tracker_pos_world[-1, 0]
     rotations_world = np.stack([state.joint_rotations_world for state in pose_history_world], axis=0)
-    root_yaws = np.asarray([state.root_yaw_world for state in pose_history_world], dtype=np.float32)
-    pose_history_raw = build_pose_target_np(rotations_world, root_yaws, current_head_yaw)
+    pose_history_raw = build_pose_target_np(rotations_world, current_head_yaw)
     tracker_raw = build_tracker_window_np(
         tracker_pos_world,
         tracker_rot_world_6d,
@@ -127,11 +126,7 @@ def build_online_conditioning(
         measured_valid,
         np.minimum(missing_age, MISSING_AGE_CAP).astype(np.float32) / float(MISSING_AGE_CAP),
     )
-    known_target_raw, known_mask = build_known_target_np(
-        tracker_raw[-1],
-        current_head_yaw,
-        tracker_rot_world_6d[-1],
-    )
+    known_target_raw, known_mask = build_known_target_np(tracker_raw[-1])
     if normalizer is None:
         pose_history = pose_history_raw
         tracker_window = tracker_raw
@@ -161,7 +156,7 @@ def sample_online_target(
     device: torch.device,
     normalizer=None,
 ) -> np.ndarray:
-    """执行 DDIM hard inpainting，返回物理空间的 140 维目标。"""
+    """执行 DDIM hard inpainting，返回物理空间的 144 维目标。"""
 
     pose_history = torch.as_tensor(conditioning["pose_history"], device=device, dtype=torch.float32).unsqueeze(0)
     tracker_window = torch.as_tensor(conditioning["tracker_window"], device=device, dtype=torch.float32).unsqueeze(0)
@@ -206,15 +201,13 @@ def decode_and_resolve_pose(
     target = np.asarray(target_raw, dtype=np.float32).reshape(REALTIME_POSE_TARGET_DIM)
     tracker = np.asarray(tracker_current_raw, dtype=np.float32).reshape(TRACKER_COUNT, TRACKER_FEATURE_DIM)
     rest_rot = rotation_6d_to_matrix_np(joint_rest_local_rotations_6d)
-    rotations_head, root_yaw_head = decode_target_head_rotations_np(target, rest_rot)
+    rotations_head, root_yaw_head = decode_target_head_rotations_np(target)
     measured = tracker[:, 10] > 0.5
     root_head, hip_height, joints_head = resolve_root_head_reference_np(
         rotations_head,
         float(root_yaw_head),
         joint_offsets_parent,
         observed_head_height=float(tracker[0, 1]),
-        hip_measured_valid=bool(measured[3]),
-        observed_hip_position_head=tracker[3, :3] if measured[3] else None,
     )
 
     head_yaw_rotation = make_yaw_rotation_np(np.asarray([current_head_yaw_world], dtype=np.float64))[0]
@@ -226,12 +219,16 @@ def decode_and_resolve_pose(
     root_world = origin + head_yaw_rotation @ root_head.astype(np.float64)
     root_world[1] = float(floor_y)
     joints_world = origin[None] + np.einsum("ij,aj->ai", head_yaw_rotation, joints_head)
-    local_delta = global_head_rotations_to_local_delta_6d_np(rotations_head, rest_rot)
+    local_delta = global_head_rotations_to_local_delta_6d_np(
+        rotations_head,
+        root_heading_head=root_yaw_head,
+        rest_local_rotations=rest_rot,
+    )
     root_yaw_world = float(current_head_yaw_world + float(root_yaw_head))
 
     known_error = 0.0
     tracker_rot_head = rotation_6d_to_matrix_np(tracker[:, 3:9])
-    for tracker_index in (0, 1, 2, 4, 5):
+    for tracker_index in range(TRACKER_COUNT):
         if not measured[tracker_index]:
             continue
         joint_index = TRACKER_TO_JOINT[tracker_index]

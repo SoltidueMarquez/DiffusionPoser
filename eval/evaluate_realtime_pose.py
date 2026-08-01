@@ -12,7 +12,9 @@ from data_loaders.sensor_masking import (
     FOOT_TRACKER_INDICES,
     HAND_TRACKER_INDICES,
     JOINT_GLOBAL_ROTATION_DIM,
-    ROOT_YAW_RELATIVE_START,
+    REALTIME_POSE_TARGET_DIM,
+    ROTATION_6D_DIM,
+    SMPL_JOINT_COUNT,
     TRACKER_TO_JOINT,
 )
 
@@ -50,7 +52,7 @@ REQUIRED_RESULT_FIELDS = {
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="评估 140D 动态 Tracker 姿态补全结果。")
+    parser = argparse.ArgumentParser(description="评估 144D 动态 Tracker 姿态补全结果。")
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--output_json", default="")
     return parser
@@ -108,7 +110,7 @@ def _load_result(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         missing = sorted(REQUIRED_RESULT_FIELDS.difference(data.files))
         if missing:
-            raise KeyError(f"{path} 缺少 140D 评估字段：{missing}")
+            raise KeyError(f"{path} 缺少 144D 评估字段：{missing}")
         values = {key: np.asarray(data[key]) for key in REQUIRED_RESULT_FIELDS}
         values["known_rotation_max_error"] = np.asarray(
             data["known_rotation_max_error"] if "known_rotation_max_error" in data.files else 0.0,
@@ -154,8 +156,15 @@ def evaluate_file(path: Path) -> dict[str, object]:
     values = _load_result(path)
     reference = values["reference_target_raw"].astype(np.float64)
     predicted = values["reconstructed_target_raw"].astype(np.float64)
-    if reference.ndim != 3 or reference.shape[-1] != 140 or predicted.shape != reference.shape:
-        raise ValueError(f"{path} target 必须是匹配的 [N,T,140]，实际为 {reference.shape}/{predicted.shape}")
+    if (
+        reference.ndim != 3
+        or reference.shape[-1] != REALTIME_POSE_TARGET_DIM
+        or predicted.shape != reference.shape
+    ):
+        raise ValueError(
+            f"{path} target 必须是匹配的 [N,T,{REALTIME_POSE_TARGET_DIM}]，"
+            f"实际为 {reference.shape}/{predicted.shape}"
+        )
     sequence_count, steps = reference.shape[:2]
     frame_shape = (sequence_count, steps)
     eval_mask = values["eval_frame_mask"].reshape(frame_shape).astype(bool)
@@ -200,15 +209,34 @@ def evaluate_file(path: Path) -> dict[str, object]:
     triple_frame_mask = np.zeros(frame_shape, dtype=bool)
     triple_frame_mask[:, 2:] = triple_mask
 
-    known = values["known_mask"].reshape(sequence_count, steps, 140).astype(bool)
+    known = values["known_mask"].reshape(
+        sequence_count,
+        steps,
+        REALTIME_POSE_TARGET_DIM,
+    ).astype(bool)
     reference_global = rotation_6d_to_matrix_np(
-        reference[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(sequence_count, steps, 23, 6)
+        reference[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(
+            sequence_count,
+            steps,
+            SMPL_JOINT_COUNT,
+            ROTATION_6D_DIM,
+        )
     )
     predicted_global = rotation_6d_to_matrix_np(
-        predicted[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(sequence_count, steps, 23, 6)
+        predicted[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(
+            sequence_count,
+            steps,
+            SMPL_JOINT_COUNT,
+            ROTATION_6D_DIM,
+        )
     )
     rotation_error = _rotation_angle(predicted_global, reference_global)
-    unknown_joint = ~known[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(sequence_count, steps, 23, 6).all(axis=-1)
+    unknown_joint = ~known[..., :JOINT_GLOBAL_ROTATION_DIM].reshape(
+        sequence_count,
+        steps,
+        SMPL_JOINT_COUNT,
+        ROTATION_6D_DIM,
+    ).all(axis=-1)
     unknown_rotation_per_frame = (
         (rotation_error * unknown_joint).sum(axis=-1) / np.maximum(unknown_joint.sum(axis=-1), 1)
     )
@@ -221,7 +249,7 @@ def evaluate_file(path: Path) -> dict[str, object]:
             np.cos(predicted_root_yaw - reference_root_yaw),
         )
     )
-    root_unknown = ~known[..., ROOT_YAW_RELATIVE_START:].all(axis=-1)
+    root_unknown = ~known[..., :ROTATION_6D_DIM].all(axis=-1)
 
     reference_root = values["reference_root_position_world"].reshape(sequence_count, steps, 3).astype(np.float64)
     predicted_root = values["predicted_root_position_world"].reshape(sequence_count, steps, 3).astype(np.float64)
@@ -328,7 +356,7 @@ def evaluate_file(path: Path) -> dict[str, object]:
 
 def summarize(results: list[dict[str, object]]) -> dict[str, object]:
     if not results:
-        raise RuntimeError("没有可评估的 140D reconstruction 文件。")
+        raise RuntimeError("没有可评估的 144D reconstruction 文件。")
     metric_keys = (
         "mpjre_deg",
         "mpjpe_cm",

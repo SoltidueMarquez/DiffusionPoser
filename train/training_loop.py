@@ -371,7 +371,7 @@ class TrainLoop:
                 self.scaler.scale(loss).backward()
 
     def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
-        sample = batch["x"]  # [B,140]
+        sample = batch["x"]  # [B,144]
         if sample.ndim != 2 or sample.shape[1] != REALTIME_POSE_TARGET_DIM:
             raise ValueError(f"训练输入应为 [B,{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(sample.shape)}")
         batch_size = sample.shape[0]
@@ -564,17 +564,14 @@ class TrainLoop:
 
         known_mask = batch.get("known_mask")
         if known_mask is None or known_mask.shape != sample.shape:
-            raise ValueError("batch 必须包含与 [B,140] 同形的 known_mask。")
+            raise ValueError("batch 必须包含与 [B,144] 同形的 known_mask。")
         known_mask = known_mask.bool()
         inpaint_mask = ~known_mask
         if not inpaint_mask.any():
             raise ValueError("当前 batch 没有未知关节。")
-        joint_atomic = known_mask[:, :138].reshape(batch_size, 23, 6)
+        joint_atomic = known_mask.reshape(batch_size, 24, 6)
         if torch.any(joint_atomic.any(dim=-1) != joint_atomic.all(dim=-1)):
             raise ValueError("rotation6D 的六个通道必须使用原子 known mask。")
-        root_atomic = known_mask[:, 138:140]
-        if torch.any(root_atomic.any(dim=-1) != root_atomic.all(dim=-1)):
-            raise ValueError("Root yaw sin/cos 必须使用原子 known mask。")
 
         conditioned_sample = batch.get("known_target")
         if conditioned_sample is None:

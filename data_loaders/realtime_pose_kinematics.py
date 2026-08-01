@@ -423,8 +423,6 @@ def fk_body_fbx_local_torch(
 
     batch_size = body_pose_local_delta_6d.shape[0]
     delta_rot = rotation_6d_to_matrix_torch(body_pose_local_delta_6d.reshape(batch_size, 24, 6))
-    delta_rot = delta_rot.clone()
-    delta_rot[:, 0] = torch.eye(3, dtype=delta_rot.dtype, device=delta_rot.device)
     if rest_local_rotations_6d is None:
         rest_local_rot = torch.eye(3, dtype=delta_rot.dtype, device=delta_rot.device).expand(batch_size, 24, 3, 3)
     else:

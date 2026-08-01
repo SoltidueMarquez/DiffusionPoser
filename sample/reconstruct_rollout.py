@@ -29,7 +29,7 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="执行 140D Head-anchor 显式 rollout。")
+    parser = argparse.ArgumentParser(description="执行 144D Head-anchor 显式 rollout。")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -150,9 +150,13 @@ def rollout_dataset_item(
         rest_rotations = rotation_6d_to_matrix_np(
             batch["joint_rest_local_rotations_6d"][0].cpu().numpy()
         )
-        reference_head_rotations, _ = decode_target_head_rotations_np(ref_raw, rest_rotations)
+        reference_head_rotations, reference_heading_head = decode_target_head_rotations_np(ref_raw)
         reference_local_delta.append(
-            global_head_rotations_to_local_delta_6d_np(reference_head_rotations, rest_rotations)
+            global_head_rotations_to_local_delta_6d_np(
+                reference_head_rotations,
+                root_heading_head=reference_heading_head,
+                rest_local_rotations=rest_rotations,
+            )
         )
         known_masks.append(batch["known_mask"][0].cpu().numpy())
         tracker_positions_world.append(
@@ -232,7 +236,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         for key in payloads[0]
     }
     payload["fps"] = np.float32(60.0)
-    output_dir = Path(args.output_dir or "output/realtime_pose_140d_rollout").resolve()
+    output_dir = Path(args.output_dir or "output/realtime_pose_144d_rollout").resolve()
     output_path = output_dir / "rollout_result.npz"
     save_rollout(output_path, payload)
     print(f"[reconstruct_rollout] weights={source} output={output_path}")

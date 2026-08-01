@@ -31,11 +31,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("paths")
     paths.add_argument("--amass_dir", default="dataset/AMASS", type=str)
     paths.add_argument("--smpl_model_dir", default="dataset/body_models", type=str)
-    paths.add_argument("--source_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-    paths.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-    paths.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
+    paths.add_argument(
+        "--source_dir",
+        default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+        type=str,
+    )
+    paths.add_argument(
+        "--normalizer_dir",
+        default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
+        type=str,
+    )
+    paths.add_argument(
+        "--task_dir",
+        default="dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
+        type=str,
+    )
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
-    paths.add_argument("--save_dir", default="runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit", type=str)
+    paths.add_argument("--save_dir", default="runs/realtime_pose_144d_target_dit", type=str)
 
     pipeline = parser.add_argument_group("pipeline")
     pipeline.add_argument("--start_at", default="convert", choices=PIPELINE_STAGES)

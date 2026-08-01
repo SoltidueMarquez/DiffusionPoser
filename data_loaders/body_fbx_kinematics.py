@@ -121,16 +121,28 @@ def build_synthetic_body_fbx_rest() -> BodyFbxRest:
     )
 
 
-def source_global_rotations_to_body_fbx_local_delta_6d(global_rotations: np.ndarray) -> np.ndarray:
-    """把 AMASS/SMPL global rotations 转成 body.fbx local delta 6D，形状 `[T,144]`。"""
+def source_global_rotations_to_body_fbx_local_delta_6d(
+    global_rotations: np.ndarray,
+    root_heading: np.ndarray,
+) -> np.ndarray:
+    """把 AMASS/SMPL global rotations 转成 body.fbx local delta 6D，形状 `[T,144]`。
+
+    Pelvis 不能再被固定为单位 delta。这里先从源 pelvis 全局旋转中移除
+    actor heading，再把剩余的 pitch/roll/yaw residual 转到 body.fbx 基底；
+    后续 FK 会按 ``heading @ rest @ residual`` 恢复完整 pelvis 朝向。
+    """
 
     global_rot = np.asarray(global_rotations, dtype=np.float64)
     if global_rot.ndim != 4 or global_rot.shape[1:] != (SMPL_JOINT_COUNT, 3, 3):
         raise ValueError(f"global_rotations 应为 [T,24,3,3]，实际为 {global_rot.shape}")
+    headings = np.asarray(root_heading, dtype=np.float64).reshape(-1)
+    if headings.shape != (global_rot.shape[0],):
+        raise ValueError(f"root_heading 应为 [T]，实际为 {headings.shape}")
     source_local = global_to_parent_local_rotations(global_rot)
+    heading_inv = np.swapaxes(make_yaw_rotation_np(headings), -1, -2)
+    source_local[:, 0] = heading_inv @ global_rot[:, 0]
     basis = SOURCE_FK_TO_BODY_FBX_BASIS
     body_delta = basis[None, None] @ source_local @ basis.T[None, None]
-    body_delta[:, 0] = IDENTITY_3X3
     return rotation_6d_forward_up_np(body_delta).reshape(global_rot.shape[0], -1).astype(np.float32)
 
 
@@ -197,7 +209,6 @@ def fk_body_fbx_local_delta(
             raise ValueError(f"local_offsets 应为 [T,{SMPL_JOINT_COUNT},3]，实际为 {offsets.shape}")
 
     delta = rotation_6d_to_matrix_np(pose.reshape(pose.shape[0], SMPL_JOINT_COUNT, 6))
-    delta[:, 0] = IDENTITY_3X3
     local_rot = rest.rest_local_rotations.astype(np.float64)[None] @ delta
     heading_rot = make_yaw_rotation_np(headings)
     positions = np.zeros((pose.shape[0], SMPL_JOINT_COUNT, 3), dtype=np.float64)

@@ -158,8 +158,14 @@ def build_app(service: MotionStudioService) -> FastAPI:
 def config_from_env() -> StudioConfig:
     return StudioConfig.from_paths(
         amass_dir=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"),
-        source_dir=os.environ.get("REALTIME_POSE_EDITOR_SOURCE_DIR", "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz"),
-        data_dir=os.environ.get("REALTIME_POSE_EDITOR_DATA_DIR", "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks"),
+        source_dir=os.environ.get(
+            "REALTIME_POSE_EDITOR_SOURCE_DIR",
+            "dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+        ),
+        data_dir=os.environ.get(
+            "REALTIME_POSE_EDITOR_DATA_DIR",
+            "dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
+        ),
         result_dir=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"),
         output_dir=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"),
         smpl_model_dir=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"),
@@ -174,8 +180,20 @@ app = build_app(MotionStudioService(config_from_env())) if __name__ != "__main__
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local RealtimePose Studio API server.")
     parser.add_argument("--amass_dir", default=os.environ.get("REALTIME_POSE_EDITOR_AMASS_DIR", "dataset/AMASS"))
-    parser.add_argument("--source_dir", default=os.environ.get("REALTIME_POSE_EDITOR_SOURCE_DIR", "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz"))
-    parser.add_argument("--data_dir", default=os.environ.get("REALTIME_POSE_EDITOR_DATA_DIR", "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks"))
+    parser.add_argument(
+        "--source_dir",
+        default=os.environ.get(
+            "REALTIME_POSE_EDITOR_SOURCE_DIR",
+            "dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+        ),
+    )
+    parser.add_argument(
+        "--data_dir",
+        default=os.environ.get(
+            "REALTIME_POSE_EDITOR_DATA_DIR",
+            "dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
+        ),
+    )
     parser.add_argument("--result_dir", default=os.environ.get("REALTIME_POSE_EDITOR_RESULT_DIR", "output"))
     parser.add_argument("--output_dir", default=os.environ.get("REALTIME_POSE_EDITOR_OUTPUT_DIR", "visual_editor/.runtime/exports"))
     parser.add_argument("--smpl_model_dir", default=os.environ.get("REALTIME_POSE_EDITOR_SMPL_MODEL_DIR", "dataset/body_models"))

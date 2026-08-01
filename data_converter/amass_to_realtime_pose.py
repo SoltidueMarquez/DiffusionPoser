@@ -73,7 +73,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert AMASS SMPL motions to realtime_pose files.")
     parser.add_argument("--amass_dir", default="dataset/AMASS", type=Path)
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
-    parser.add_argument("--output_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=Path)
+    parser.add_argument(
+        "--output_dir",
+        default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+        type=Path,
+    )
     parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=1, type=int)
@@ -173,7 +177,10 @@ def build_realtime_pose_features(
     root_yaw = extract_root_heading_from_source_pelvis_up(
         joint_rotations[:, JOINT_INDEX["pelvis"]],
     ).astype(np.float32)
-    body_pose_6d = source_global_rotations_to_body_fbx_local_delta_6d(joint_rotations)
+    body_pose_6d = source_global_rotations_to_body_fbx_local_delta_6d(
+        joint_rotations,
+        root_heading=root_yaw,
+    )
     root_pos_world = actor_root_positions_from_pelvis(
         pelvis_world=pelvis_world,
         root_heading=root_yaw,
@@ -214,7 +221,7 @@ def build_realtime_pose_features(
     features["joint_rest_local_rotations_6d"] = joint_rest_local_rotations_6d
     if body_fbx_rest is not None and body_fbx_rest.source_path is not None:
         features["body_fbx_rest_json"] = np.asarray(str(body_fbx_rest.source_path))
-    # source 是可复用的世界运动缓存，不等同于 140 维扩散 target。Root 轨迹、
+    # source 是可复用的世界运动缓存，不等同于 144 维扩散 target。Root 轨迹、
     # Pelvis 高度和 stationary 标签继续离线保存，但主 task 不会读取这些目标通道。
     features["root_delta_xz_ref"] = encode_root_delta_xz_ref(
         root_pos_world=root_pos_world.astype(np.float32),

@@ -1,4 +1,4 @@
-# RealPose140 Contract
+# RealPose Contract
 
 本文档是当前 Python 本地主链路的数据结构唯一说明。代码和产物不保存 schema 名称、版本或表示方式元数据；结构调整时直接同步修改本文档与实现。
 
@@ -13,7 +13,7 @@
 
 Source 保存从 AMASS 转换得到的完整运动缓存：
 
-- `body_pose_body_fbx_local_delta_6d`: `[T, 144]`，24 个关节的 body.fbx local delta rotation6D。
+- `body_pose_body_fbx_local_delta_6d`: `[T, 144]`，24 个关节的 body.fbx local delta rotation6D；Pelvis 保留移除 Root heading 后的完整 residual rotation。
 - `root_pos_world`: `[T, 3]`，其中 world y 固定为 0。
 - `root_yaw`: `[T]`。
 - `root_heading_delta_sincos`: `[T, 2]`。
@@ -28,12 +28,13 @@ Source 保存从 AMASS 转换得到的完整运动缓存：
 
 Source 的 `metadata` 必须包含与实际数组一致的 `frames` 和 `target_fps`；当前主链路只接受 `target_fps = 60`。
 
-## 140 维姿态
+## 144 维姿态
 
-- `0:138`：Pelvis 之外 23 个关节的 rotation6D，每个关节 6 维。
-- `138:140`：Root yaw 相对当前 Head yaw 的 `[sin, cos]`。
-- 所有关节旋转都表达在当前目标帧的 Head yaw 参考系中。
-- Pelvis 位移、高度、stationary 概率和 Tracker 不进入 140 维姿态。
+- `0:6`：Pelvis 全局 rotation6D。
+- `6:144`：关节 1～23 的全局 rotation6D。
+- 24 个关节的旋转都表达在当前目标帧的 Head-yaw 参考系中。Root heading 从 Pelvis 全局旋转的水平朝向派生。
+- Pelvis 位移、高度、stationary 概率和 Tracker 不进入 144 维姿态。
+- Hip Tracker 有效时硬写入 Pelvis 的完整 rotation6D；无效时 Pelvis 六个通道全部由模型预测。
 
 ## 生成计划
 
@@ -55,10 +56,10 @@ Source 的 `metadata` 必须包含与实际数组一致的 `frames` 和 `target_
 
 一个含 `M` 个窗口、最大四步的 shard 包含：
 
-- `pose_history`: `[M, 60, 140] float32`，只保存 step 0。
-- `current_target`: `[M, 4, 140] float32`。
+- `pose_history`: `[M, 60, 144] float32`，只保存 step 0。
+- `current_target`: `[M, 4, 144] float32`。
 - `tracker_continuous`: `[M, 4, 61, 6, 9] float32`，未应用掉线。
-- `full_known_target`: `[M, 4, 140] float32`，保存六个 Tracker 全有效时的硬条件值。
+- `full_known_target`: `[M, 4, 144] float32`，保存六个 Tracker 全有效时的硬条件值。
 - `configured`: `[M, 5, 64, 6] uint8`。
 - `measured_valid`: `[M, 5, 64, 6] uint8`。
 - `missing_age`: `[M, 5, 64, 6] uint8`。
@@ -74,21 +75,21 @@ Source 的 `metadata` 必须包含与实际数组一致的 `frames` 和 `target_
 
 Dataset 接收 `TaskRequest(task_index, config_index, rollout_steps)`。普通整数索引等价于配置 0、单步请求。每个 worker 最多缓存两个打开的 shard。
 
-Dataset 从所选配置切出 61 帧状态，把连续量与 `configured`、`measured_valid`、归一化 `missing_age` 拼成 `[61, 6, 12]`。无效测量的前 9 维严格置零。当前帧 `measured_valid` 映射为 `[140] known_mask`，`known_target` 的 unknown 位置在归一化后再次置零。`valid_frame_mask` 固定为 `[60]` 全 True。
+Dataset 从所选配置切出 61 帧状态，把连续量与 `configured`、`measured_valid`、归一化 `missing_age` 拼成 `[61, 6, 12]`。无效测量的前 9 维严格置零。当前帧 `measured_valid` 映射为 `[144] known_mask`，`known_target` 的 unknown 位置在归一化后再次置零。`valid_frame_mask` 固定为 `[60]` 全 True。
 
 对外 batch 保持：
 
-- 当前扩散状态：`[B, 140]`。
-- 历史姿态：`[B, 60, 140]`。
+- 当前扩散状态：`[B, 144]`。
+- 历史姿态：`[B, 60, 144]`。
 - Tracker 条件：`[B, 61, 6, 12]`。
-- `known_target`、`known_mask`：`[B, 140]`。
-- 输出：`[B, 140]`。
+- `known_target`、`known_mask`：`[B, 144]`。
+- 输出：`[B, 144]`。
 
 rollout 子项不保存或返回 GT `pose_history`。训练和重建均从 step 0 的历史持续推进，保留所有先前预测。
 
 ## Normalizer
 
-- `pose_mean.pt`、`pose_std.pt`: `[140]`。
+- `pose_mean.pt`、`pose_std.pt`: `[144]`。
 - `tracker_mean.pt`、`tracker_std.pt`: `[6, 9]`。
 - Pose 只统计每个基础窗口的 `pose_history + current_target[:, 0]`。
 - Tracker 只统计未遮挡的 `tracker_continuous[:, 0]`，六个 Tracker 全部计入。

@@ -10,9 +10,8 @@ from data_loaders.realtime_pose_geometry import (
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_torch
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
-    HIP_TRACKER_INDEX,
-    JOINT_GLOBAL_ROTATION_DIM,
-    ROOT_YAW_RELATIVE_START,
+    ROTATION_6D_DIM,
+    SMPL_JOINT_COUNT,
 )
 
 
@@ -44,22 +43,16 @@ def decode_rollout_frame_world_geometry(
     device = pred_raw.device
     dtype = pred_raw.dtype
 
-    rest_rot_6d = batch["joint_rest_local_rotations_6d"].to(device=device, dtype=dtype)
     offsets = batch["joint_offsets_parent"].to(device=device, dtype=dtype)
-    pred_rot_head, pred_root_yaw_head = decode_target_head_rotations_torch(pred_raw, rest_rot_6d)
-    target_rot_head, _ = decode_target_head_rotations_torch(target_raw, rest_rot_6d)
+    pred_rot_head, pred_root_yaw_head = decode_target_head_rotations_torch(pred_raw)
+    target_rot_head, _ = decode_target_head_rotations_torch(target_raw)
 
     tracker_pos_head = batch["current_tracker_pos_head_ref"].to(device=device, dtype=dtype)
-    measured_valid = batch["measured_valid"].to(device=device).bool()
-    if measured_valid.ndim == 3:
-        measured_valid = measured_valid[:, -1]
     _, _, pred_joints_head = resolve_root_head_reference_torch(
         pred_rot_head,
         pred_root_yaw_head,
         offsets,
         observed_head_height=tracker_pos_head[:, HEAD_TRACKER_INDEX, 1],
-        hip_measured_valid=measured_valid[:, HIP_TRACKER_INDEX],
-        observed_hip_position_head=tracker_pos_head[:, HIP_TRACKER_INDEX],
     )
     target_joints_head = batch["target_joints_head_ref"].to(device=device, dtype=dtype)
 
@@ -84,11 +77,9 @@ def decode_rollout_frame_world_geometry(
     target_rot_world = torch.einsum("bij,bajk->baik", head_to_world, target_rot_head)
 
     known_mask = batch["known_mask"].to(device=device).bool()
-    non_pelvis_unknown = ~known_mask[:, :JOINT_GLOBAL_ROTATION_DIM].reshape(
-        pred_xstart.shape[0], -1, 6
+    rotation_unknown = ~known_mask.reshape(
+        pred_xstart.shape[0], SMPL_JOINT_COUNT, ROTATION_6D_DIM
     ).all(dim=-1)
-    root_unknown = ~known_mask[:, ROOT_YAW_RELATIVE_START:].all(dim=-1, keepdim=True)
-    rotation_unknown = torch.cat([root_unknown, non_pelvis_unknown], dim=-1)
     return {
         "pred_joints_world": pred_joints_world,
         "target_joints_world": target_joints_world,

@@ -11,7 +11,7 @@ from eval.evaluate_realtime_pose import evaluate_file, public_result, summarize
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="评估 140D rollout 与 Tracker 重连突变。")
+    parser = argparse.ArgumentParser(description="评估 144D rollout 与 Tracker 重连突变。")
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--output_json", default="")
     return parser

@@ -13,7 +13,7 @@ from data_loaders.sensor_masking import (
 
 
 def build_train_arg_parser() -> ArgumentParser:
-    parser = ArgumentParser(description="Train the 140D realtime pose reconstruction model.")
+    parser = ArgumentParser(description="Train the 144D realtime pose reconstruction model.")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -72,7 +72,11 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--task_mode", default=TASK_MODE_REALTIME_POSE, choices=TASK_MODES, type=str)
     group.add_argument("--data_dir", required=True, type=str, help="realtime_pose materialized task 目录。")
     group.add_argument("--data_split", default="train", type=str)
-    group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    group.add_argument(
+        "--normalizer_dir",
+        default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
+        type=str,
+    )
     group.add_argument("--normalize_input", default=True, type=str2bool)
     group.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     group.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
@@ -146,9 +150,12 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--snr_gamma", default=0.0, type=float)
     group.add_argument("--l1_loss", action="store_true")
     group.add_argument("--aux_loss_weight", default=1.0, type=float)
-    group.add_argument("--yaw_loss_weight", default=10.0, type=float)
     group.add_argument("--rotation_loss_weight", default=1.0, type=float)
     group.add_argument("--fk_loss_weight", default=2.0, type=float)
+    group.add_argument("--local_rot_loss_weight", default=1.0, type=float)
+    group.add_argument("--pelvis_fk_loss_weight", default=2.0, type=float)
+    group.add_argument("--pelvis_offset_loss_weight", default=1.0, type=float)
+    group.add_argument("--pelvis_consistency_loss_weight", default=0.5, type=float)
     group.add_argument("--transition_loss_weight", default=0.5, type=float)
     group.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
     group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)

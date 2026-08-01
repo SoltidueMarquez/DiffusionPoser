@@ -28,7 +28,7 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="采样 140D 动态 Tracker 单帧关节补全任务。")
+    parser = argparse.ArgumentParser(description="采样 144D 动态 Tracker 单帧关节补全任务。")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -39,7 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def build_realtime_inpaint_mask(known_mask: torch.Tensor) -> torch.Tensor:
     if known_mask.ndim != 2 or known_mask.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError("known_mask 必须为 [B,140]。")
+        raise ValueError("known_mask 必须与 144D sample 同形。")
     return ~known_mask.bool()
 
 
@@ -75,10 +75,10 @@ def reconstruct_batch(
 ) -> torch.Tensor:
     del start_timestep
     if init_image is not None:
-        raise ValueError("第一轮 140D 重构已关闭 local-delta IK initializer。")
+        raise ValueError("当前 144D 重构已关闭 local-delta IK initializer。")
     reference = batch["x"].to(device)
     if reference.ndim != 2 or reference.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError(f"sample 应为 [B,140]，实际为 {tuple(reference.shape)}")
+        raise ValueError(f"sample 应为 [B,144]，实际为 {tuple(reference.shape)}")
     model_kwargs = build_sampling_model_kwargs(batch, device)
     sampler = choose_sampler(diffusion, use_ddim=use_ddim)
     with torch.no_grad():
@@ -164,12 +164,15 @@ def save_reconstruction(
         rest_rotations = rotation_6d_to_matrix_np(
             batch["joint_rest_local_rotations_6d"][batch_index].detach().cpu().numpy()
         )
-        reference_head_rotations, _ = decode_target_head_rotations_np(
-            reference_raw[batch_index],
-            rest_rotations,
+        reference_head_rotations, reference_heading_head = decode_target_head_rotations_np(
+            reference_raw[batch_index]
         )
         reference_local_delta.append(
-            global_head_rotations_to_local_delta_6d_np(reference_head_rotations, rest_rotations)
+            global_head_rotations_to_local_delta_6d_np(
+                reference_head_rotations,
+                root_heading_head=reference_heading_head,
+                rest_local_rotations=rest_rotations,
+            )
         )
     scenario = batch.get("scenario", "")
     if isinstance(scenario, str):
@@ -245,7 +248,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         device=device,
         use_ddim=str(args.ts_respace).startswith("ddim"),
     )
-    output_dir = Path(args.output_dir or "output/realtime_pose_140d").resolve()
+    output_dir = Path(args.output_dir or "output/realtime_pose_144d").resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"
     save_reconstruction(
         output_path,

@@ -56,7 +56,7 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="在固定长序列集合上执行 140D 自回归评估。")
+    parser = argparse.ArgumentParser(description="在固定长序列集合上执行 144D 自回归评估。")
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
@@ -67,7 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq.add_argument("--eval_set", default="latest", type=str)
     longseq.add_argument(
         "--normalizer_dir",
-        default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+        default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
         type=str,
     )
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
@@ -215,7 +215,6 @@ def rollout_long_sequence_source(
 
         reference_target = build_pose_target_np(
             joint_rotations_world[absolute_frame : absolute_frame + 1],
-            source["root_yaw"][absolute_frame : absolute_frame + 1],
             current_head_yaw,
         )[0]
         scenario = classify_tracker_window(
@@ -426,7 +425,7 @@ def evaluate_longseq_entries(
         "summary": aggregate,
         "files": [public_result(result) for result in results],
         "metadata": {
-            "kind": "realtime_pose_140d_longseq_rollout",
+            "kind": "realtime_pose_144d_longseq_rollout",
             "eval_set_dir": str(eval_set_dir),
             "output_dir": str(output_dir),
             "model_path": str(model_path),

@@ -6,7 +6,7 @@ from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 def create_model_and_diffusion(args):
     model_arch = getattr(args, "model_arch", "target_dit")
     if model_arch != "target_dit":
-        raise ValueError("140 维动态 Tracker 路径只支持 target_dit；旧 full_feature_dit 不兼容。")
+        raise ValueError("144 维动态 Tracker 路径只支持 target_dit；旧 full_feature_dit 不兼容。")
     model = RealtimePoseTargetDiT(
         input_feats=args.input_feats,
         latent_dim=args.latent_dim,
@@ -20,7 +20,7 @@ def create_model_and_diffusion(args):
 
 
 def create_gaussian_diffusion(args):
-    """创建直接作用于当前 140 维目标的扩散过程。"""
+    """创建直接作用于当前 144 维目标的扩散过程。"""
 
     steps = int(args.diffusion_steps)
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
@@ -33,9 +33,12 @@ def create_gaussian_diffusion(args):
         loss_type=gd.LossType.MSE,
         rescale_timesteps=False,
         aux_loss_weight=getattr(args, "aux_loss_weight", 1.0),
-        yaw_loss_weight=getattr(args, "yaw_loss_weight", 10.0),
         rotation_loss_weight=getattr(args, "rotation_loss_weight", 1.0),
         fk_loss_weight=getattr(args, "fk_loss_weight", 2.0),
+        local_rot_loss_weight=getattr(args, "local_rot_loss_weight", 1.0),
+        pelvis_fk_loss_weight=getattr(args, "pelvis_fk_loss_weight", 2.0),
+        pelvis_offset_loss_weight=getattr(args, "pelvis_offset_loss_weight", 1.0),
+        pelvis_consistency_loss_weight=getattr(args, "pelvis_consistency_loss_weight", 0.5),
         transition_loss_weight=getattr(args, "transition_loss_weight", 0.5),
         tracker_pos_loss_weight=getattr(args, "tracker_pos_loss_weight", 10.0),
         tracker_pos_huber_beta=getattr(args, "tracker_pos_huber_beta", 0.05),
