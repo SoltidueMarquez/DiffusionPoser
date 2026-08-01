@@ -17,34 +17,27 @@ from data_loaders.build_realtime_longseq_eval_set import (
     resolve_manifest_source_path,
     sanitize_path_token,
 )
-from data_loaders.longseq_eval_dropout import (
-    DROPOUT_PRESET_NONE,
-    LongseqDropoutConfig,
-    add_longseq_dropout_options,
-    apply_longseq_dropout_to_source,
-    build_longseq_dropout_config,
+from data_loaders.generate_realtime_pose_tasks import (
+    compute_source_joint_rotations_world,
+    load_realtime_source,
 )
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SEQ_LEN, get_schema_spec
-from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize
-from sample.evaluate_unity_stream_source import (
-    HISTORY_POSE_SOURCE_CHOICES,
-    HISTORY_POSE_SOURCE_REFERENCE,
-    WARMUP_TARGET_SOURCE_CHOICES,
-    WARMUP_TARGET_SOURCE_FIRST_FRAME,
-    build_long_sequence_payload,
-    load_v2_source_with_sensor_valid,
-    repeat_source_sequence,
-    save_long_sequence_result,
-    validate_v2_runtime_args,
+from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_forward_yaw_np
+from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.sensor_masking import (
+    BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
+    REALTIME_POSE_HISTORY_LENGTH,
+    REALTIME_POSE_TARGET_DIM,
+)
+from data_loaders.tracker_timeline import TrackerTimeline, build_tracker_timeline, classify_tracker_window
+from eval.evaluate_realtime_pose import public_result
+from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize_rollouts
+from sample.realtime_pose_runtime import (
+    WorldPoseState,
+    build_online_conditioning,
+    decode_and_resolve_pose,
+    sample_online_target,
 )
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
-from sample.simulate_unity_stream import (
-    DEFAULT_TRACKER_IK_BLEND,
-    DEFAULT_TRACKER_IK_DELTA_LIMIT,
-    DEFAULT_TRACKER_IK_ITERATIONS,
-    DEFAULT_TRACKER_IK_LR,
-    DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
-)
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -60,54 +53,190 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate a checkpoint on a fixed realtime_pose longseq eval set.")
+    parser = argparse.ArgumentParser(description="在固定长序列集合上执行 140D 自回归评估。")
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
     add_sampling_options(parser)
 
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     longseq = parser.add_argument_group("longseq_eval")
     longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
     longseq.add_argument("--eval_set", default="latest", type=str)
-    longseq.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
+    longseq.add_argument(
+        "--normalizer_dir",
+        default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+        type=str,
+    )
     longseq.add_argument("--normalize_input", default=True, type=str2bool)
-    longseq.add_argument("--input_feats", default=schema.feature_dim, type=int)
-    longseq.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
-    longseq.add_argument("--loop_count", default=1, type=int)
+    longseq.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     longseq.add_argument("--limit", default=0, type=int)
-    longseq.add_argument("--initial_root_yaw", default=None, type=float)
-    longseq.add_argument(
-        "--history_pose_source",
-        default=HISTORY_POSE_SOURCE_REFERENCE,
-        choices=HISTORY_POSE_SOURCE_CHOICES,
-        type=str,
-    )
-    longseq.add_argument(
-        "--warmup_target_source",
-        default=WARMUP_TARGET_SOURCE_FIRST_FRAME,
-        choices=WARMUP_TARGET_SOURCE_CHOICES,
-        type=str,
-    )
+    longseq.add_argument("--timeline_seed", default=10, type=int)
 
     render = parser.add_argument_group("render")
-    render.add_argument("--render_mp4", default=True, type=str2bool)
+    render.add_argument("--render_mp4", default=False, action=BooleanOptionalAction)
     render.add_argument("--render_fps", default=30, type=int)
     render.add_argument("--render_stride", default=1, type=int)
     render.add_argument("--render_camera_mode", default="follow", choices=["global", "follow"], type=str)
     render.add_argument("--render_layout", default="overlay", choices=["split", "overlay"], type=str)
     render.add_argument("--render_local_radius", default=1.25, type=float)
-
-    stream = parser.add_argument_group("stream")
-    stream.add_argument("--root_correction", default=True, action=BooleanOptionalAction)
-    stream.add_argument("--tracker_ik", default=True, action=BooleanOptionalAction)
-    stream.add_argument("--tracker_ik_iterations", default=DEFAULT_TRACKER_IK_ITERATIONS, type=int)
-    stream.add_argument("--tracker_ik_lr", default=DEFAULT_TRACKER_IK_LR, type=float)
-    stream.add_argument("--tracker_ik_blend", default=DEFAULT_TRACKER_IK_BLEND, type=float)
-    stream.add_argument("--tracker_ik_target_smoothing", default=DEFAULT_TRACKER_IK_TARGET_SMOOTHING, type=float)
-    stream.add_argument("--tracker_ik_delta_limit", default=DEFAULT_TRACKER_IK_DELTA_LIMIT, type=float)
-    add_longseq_dropout_options(parser)
     return parser
+
+
+def build_initial_pose_history(
+    source: dict[str, np.ndarray],
+    joint_rotations_world: np.ndarray,
+) -> list[WorldPoseState]:
+    """前 60 帧只用于启动自回归，不进入评估结果。"""
+
+    return [
+        WorldPoseState(
+            joint_rotations_world=joint_rotations_world[frame_index].copy(),
+            root_yaw_world=float(source["root_yaw"][frame_index]),
+            hip_height=float(source["pelvis_height"][frame_index, 0]),
+            root_position_world=source["root_pos_world"][frame_index].copy(),
+        )
+        for frame_index in range(REALTIME_POSE_HISTORY_LENGTH)
+    ]
+
+
+def rollout_long_sequence_source(
+    model,
+    diffusion,
+    source: dict[str, np.ndarray],
+    timeline: TrackerTimeline,
+    device: torch.device,
+    normalizer: RealtimePoseNormalizer | None,
+) -> dict[str, np.ndarray]:
+    """对一个完整 source 做逐帧闭环采样，输出形状统一为 `[1,T,...]`。"""
+
+    frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
+    if frame_count <= REALTIME_POSE_HISTORY_LENGTH:
+        raise ValueError(f"长序列至少需要 61 帧，实际为 {frame_count}")
+
+    joint_rotations_world = compute_source_joint_rotations_world(source)
+    head_rotations_world = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"][:, 0])
+    head_yaws = extract_forward_yaw_np(head_rotations_world, initial_yaw=0.0)
+    pose_history = build_initial_pose_history(source, joint_rotations_world)
+
+    reference_targets: list[np.ndarray] = []
+    predicted_targets: list[np.ndarray] = []
+    reference_local_delta: list[np.ndarray] = []
+    predicted_local_delta: list[np.ndarray] = []
+    reference_joints: list[np.ndarray] = []
+    predicted_joints: list[np.ndarray] = []
+    reference_roots: list[np.ndarray] = []
+    predicted_roots: list[np.ndarray] = []
+    reference_root_yaws: list[float] = []
+    predicted_root_yaws: list[float] = []
+    reference_hip_heights: list[float] = []
+    predicted_hip_heights: list[float] = []
+    known_masks: list[np.ndarray] = []
+    tracker_positions: list[np.ndarray] = []
+    configured_values: list[np.ndarray] = []
+    measured_values: list[np.ndarray] = []
+    missing_ages: list[np.ndarray] = []
+    scenarios: list[str] = []
+    known_errors: list[float] = []
+
+    for absolute_frame in range(REALTIME_POSE_HISTORY_LENGTH, frame_count):
+        window_start = absolute_frame - REALTIME_POSE_HISTORY_LENGTH
+        frame_slice = slice(window_start, absolute_frame + 1)
+        timeline_window = timeline.window(window_start)
+        previous_head_yaw = float(head_yaws[window_start - 1]) if window_start > 0 else 0.0
+        floor_y = float(source["root_pos_world"][absolute_frame, 1])
+        conditioning = build_online_conditioning(
+            pose_history_world=pose_history,
+            tracker_pos_world=source["tracker_pos_world"][frame_slice],
+            tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_slice],
+            configured=timeline_window.configured,
+            measured_valid=timeline_window.measured_valid,
+            missing_age=timeline_window.missing_age,
+            floor_y=floor_y,
+            normalizer=normalizer,
+            initial_head_yaw=previous_head_yaw,
+        )
+        predicted_target = sample_online_target(
+            model=model,
+            diffusion=diffusion,
+            conditioning=conditioning,
+            device=device,
+            normalizer=normalizer,
+        )
+        current_head_yaw = float(conditioning["current_head_yaw_world"])
+        current_head_position = np.asarray(conditioning["current_head_position_world"], dtype=np.float32)
+        resolved = decode_and_resolve_pose(
+            target_raw=predicted_target,
+            tracker_current_raw=conditioning["tracker_window_raw"][-1],
+            current_head_yaw_world=current_head_yaw,
+            current_head_position_world=current_head_position,
+            floor_y=floor_y,
+            joint_offsets_parent=source["joint_offsets_parent"],
+            joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
+        )
+        reference_target = build_pose_target_np(
+            joint_rotations_world[absolute_frame : absolute_frame + 1],
+            source["root_yaw"][absolute_frame : absolute_frame + 1],
+            current_head_yaw,
+        )[0]
+        scenario = classify_tracker_window(
+            configured=timeline_window.configured,
+            measured_valid=timeline_window.measured_valid,
+        )
+        if scenario is None:
+            raise ValueError(f"绝对帧 {absolute_frame} 的 Tracker 窗口无法归入五类场景")
+
+        reference_targets.append(reference_target)
+        predicted_targets.append(predicted_target)
+        reference_local_delta.append(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][absolute_frame])
+        predicted_local_delta.append(resolved.body_local_delta_6d)
+        reference_joints.append(source["joints_world"][absolute_frame])
+        predicted_joints.append(resolved.joints_world)
+        reference_roots.append(source["root_pos_world"][absolute_frame])
+        predicted_roots.append(resolved.root_position_world)
+        reference_root_yaws.append(float(source["root_yaw"][absolute_frame]))
+        predicted_root_yaws.append(resolved.root_yaw_world)
+        reference_hip_heights.append(float(source["pelvis_height"][absolute_frame, 0]))
+        predicted_hip_heights.append(resolved.hip_height)
+        known_masks.append(np.asarray(conditioning["known_mask"], dtype=bool))
+        tracker_positions.append(source["tracker_pos_world"][absolute_frame])
+        configured_values.append(timeline.configured[absolute_frame])
+        measured_values.append(timeline.measured_valid[absolute_frame])
+        missing_ages.append(timeline.missing_age[absolute_frame])
+        scenarios.append(scenario)
+        known_errors.append(resolved.known_rotation_max_error)
+
+        # 这里只回灌模型输出；GT pose 在第 60 帧之后不会再次进入历史。
+        pose_history = [*pose_history[1:], resolved.as_world_state()]
+
+    evaluated_frames = frame_count - REALTIME_POSE_HISTORY_LENGTH
+    return {
+        "fps": np.float32(60.0),
+        "absolute_frame_index": np.arange(
+            REALTIME_POSE_HISTORY_LENGTH,
+            frame_count,
+            dtype=np.int64,
+        ),
+        "reference_target_raw": np.asarray(reference_targets, dtype=np.float32)[None],
+        "reconstructed_target_raw": np.asarray(predicted_targets, dtype=np.float32)[None],
+        "reference_body_local_delta_6d": np.asarray(reference_local_delta, dtype=np.float32)[None],
+        "predicted_body_local_delta_6d": np.asarray(predicted_local_delta, dtype=np.float32)[None],
+        "reference_joints_world": np.asarray(reference_joints, dtype=np.float32)[None],
+        "predicted_joints_world": np.asarray(predicted_joints, dtype=np.float32)[None],
+        "reference_root_position_world": np.asarray(reference_roots, dtype=np.float32)[None],
+        "predicted_root_position_world": np.asarray(predicted_roots, dtype=np.float32)[None],
+        "reference_root_yaw_world": np.asarray(reference_root_yaws, dtype=np.float32)[None],
+        "predicted_root_yaw_world": np.asarray(predicted_root_yaws, dtype=np.float32)[None],
+        "reference_hip_height": np.asarray(reference_hip_heights, dtype=np.float32)[None],
+        "predicted_hip_height": np.asarray(predicted_hip_heights, dtype=np.float32)[None],
+        "known_mask": np.asarray(known_masks, dtype=bool)[None],
+        "tracker_pos_world": np.asarray(tracker_positions, dtype=np.float32)[None],
+        "configured": np.asarray(configured_values, dtype=bool)[None],
+        "measured_valid": np.asarray(measured_values, dtype=bool)[None],
+        "missing_age": np.asarray(missing_ages, dtype=np.int64)[None],
+        "scenario": np.asarray(scenarios)[None],
+        "eval_frame_mask": np.ones((1, evaluated_frames), dtype=bool),
+        "known_rotation_max_error": np.asarray(known_errors, dtype=np.float32)[None],
+    }
 
 
 def evaluate_longseq_entries(
@@ -118,31 +247,11 @@ def evaluate_longseq_entries(
     diffusion,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
-    use_ddim: bool,
     model_path: str | Path = "",
     weights: str = "",
-    loop_count: int = 1,
     limit: int = 0,
-    initial_root_yaw: float | None = None,
-    history_pose_source: str = HISTORY_POSE_SOURCE_REFERENCE,
-    warmup_target_source: str = WARMUP_TARGET_SOURCE_FIRST_FRAME,
-    root_correction: bool = True,
-    tracker_ik: bool = True,
-    tracker_ik_iterations: int = DEFAULT_TRACKER_IK_ITERATIONS,
-    tracker_ik_lr: float = DEFAULT_TRACKER_IK_LR,
-    tracker_ik_blend: float = DEFAULT_TRACKER_IK_BLEND,
-    tracker_ik_target_smoothing: float = DEFAULT_TRACKER_IK_TARGET_SMOOTHING,
-    tracker_ik_delta_limit: float = DEFAULT_TRACKER_IK_DELTA_LIMIT,
-    ik_init_mode: str = "random",
-    ik_init_timestep: int = -1,
-    ik_init_iterations: int = 16,
-    ik_init_lr: float = 0.03,
-    ik_init_pos_weight: float = 1.0,
-    ik_init_rot_weight: float = 0.2,
-    ik_init_reg_weight: float = 0.01,
-    ik_init_delta_limit: float = 0.15,
-    dropout_config: LongseqDropoutConfig | None = None,
-    render_mp4: bool = True,
+    timeline_seed: int = 10,
+    render_mp4: bool = False,
     render_fps: int = 30,
     render_stride: int = 1,
     render_camera_mode: str = "follow",
@@ -154,92 +263,55 @@ def evaluate_longseq_entries(
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_entries = entries[: int(limit)] if int(limit) > 0 else entries
     if not selected_entries:
-        raise RuntimeError("No longseq entries to evaluate.")
-    dropout_config = dropout_config or LongseqDropoutConfig()
+        raise RuntimeError("长序列评估集合为空。")
 
     results = []
     for entry in selected_entries:
         sequence_id = str(entry["sequence_id"])
-        sequence_dir = output_dir / build_sequence_output_dir_name(entry)
-        sequence_dir.mkdir(parents=True, exist_ok=True)
-
         source_path = resolve_manifest_source_path(eval_set_dir=eval_set_dir, entry=entry)
-        source = load_v2_source_with_sensor_valid(source_path)
-        source, dropout_metadata = apply_longseq_dropout_to_source(
-            source=source,
-            sequence_id=sequence_id,
-            config=dropout_config,
+        source = load_realtime_source(source_path)
+        frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
+        timeline = build_tracker_timeline(
+            source_id=sequence_id,
+            frame_count=frame_count,
+            global_seed=int(timeline_seed),
         )
-        source = repeat_source_sequence(source, loop_count=int(loop_count))
-        payload = build_long_sequence_payload(
+        print(f"[longseq] {sequence_id}: {frame_count} frames")
+        payload = rollout_long_sequence_source(
             model=model,
             diffusion=diffusion,
             source=source,
+            timeline=timeline,
             device=device,
-            use_ddim=bool(use_ddim),
             normalizer=normalizer,
-            initial_root_yaw=initial_root_yaw,
-            history_pose_source=history_pose_source,
-            warmup_target_source=warmup_target_source,
-            root_correction=bool(root_correction),
-            tracker_ik=bool(tracker_ik),
-            tracker_ik_iterations=int(tracker_ik_iterations),
-            tracker_ik_lr=float(tracker_ik_lr),
-            tracker_ik_blend=float(tracker_ik_blend),
-            tracker_ik_target_smoothing=float(tracker_ik_target_smoothing),
-            tracker_ik_delta_limit=float(tracker_ik_delta_limit),
-            ik_init_mode=ik_init_mode,
-            ik_init_timestep=int(ik_init_timestep),
-            ik_init_iterations=int(ik_init_iterations),
-            ik_init_lr=float(ik_init_lr),
-            ik_init_pos_weight=float(ik_init_pos_weight),
-            ik_init_rot_weight=float(ik_init_rot_weight),
-            ik_init_reg_weight=float(ik_init_reg_weight),
-            ik_init_delta_limit=float(ik_init_delta_limit),
         )
-        metadata = dict(payload["metadata"].item())
-        metadata.update(
-            {
-                "sequence_id": sequence_id,
-                "eval_set_dir": str(eval_set_dir),
-                "eval_set_source_path": str(source_path),
-                "source_relative_path": str(entry.get("source_relative_path", "")),
-                "model_path": str(model_path),
-                "weights": str(weights),
-                "loop_count": int(loop_count),
-                **dropout_metadata,
-            }
-        )
-        payload["metadata"] = np.asarray(metadata, dtype=object)
 
-        result_path = sequence_dir / "unity_stream_long_sequence_result.npz"
-        summary_path = sequence_dir / "unity_stream_eval_summary.json"
-        save_long_sequence_result(result_path, payload)
+        sequence_dir = output_dir / build_sequence_output_dir_name(entry)
+        sequence_dir.mkdir(parents=True, exist_ok=True)
+        result_path = sequence_dir / "rollout_result.npz"
+        np.savez(result_path, **payload)
         result = evaluate_rollout_file(result_path)
         result.update(
             {
                 "sequence_id": sequence_id,
                 "source_relative_path": str(entry.get("source_relative_path", "")),
-                "num_frames": int(entry["num_frames"]),
+                "num_frames": frame_count,
+                "evaluated_frames": frame_count - REALTIME_POSE_HISTORY_LENGTH,
                 "result_path": str(result_path),
-                "summary_path": str(summary_path),
-                "valid_tracker_ratio": float(dropout_metadata["valid_tracker_ratio"]),
-                "min_valid_trackers": int(dropout_metadata["min_valid_trackers"]),
-                "dropout_preset": dropout_config.preset,
-                "tracker_mask_policy": dropout_config.tracker_mask_policy,
             }
         )
-        if bool(render_mp4):
-            mp4_path = sequence_dir / "unity_stream_comparison.mp4"
+
+        if render_mp4:
+            mp4_path = sequence_dir / "comparison.mp4"
             render_realtime_pose_comparison(
                 output_path=mp4_path,
                 reference_joints=payload["reference_joints_world"],
                 predicted_joints=payload["predicted_joints_world"],
                 tracker_pos_world=payload["tracker_pos_world"],
-                sensor_valid=payload["sensor_valid"],
+                sensor_valid=payload["measured_valid"],
                 eval_frame_mask=payload["eval_frame_mask"],
-                root_yaw_reference=payload["root_yaw_reference"],
-                root_yaw_predicted=payload["root_yaw_predicted"],
+                root_yaw_reference=payload["reference_root_yaw_world"],
+                root_yaw_predicted=payload["predicted_root_yaw_world"],
                 fps=int(render_fps),
                 stride=int(render_stride),
                 camera_mode=str(render_camera_mode),
@@ -247,76 +319,60 @@ def evaluate_longseq_entries(
                 local_radius=float(render_local_radius),
             )
             result["mp4_path"] = str(mp4_path)
-        write_sequence_summary(summary_path=summary_path, result=result)
+
+        summary_path = sequence_dir / "rollout_eval_summary.json"
+        with summary_path.open("w", encoding="utf-8") as file:
+            json.dump({"summary": public_result(result)}, file, ensure_ascii=False, indent=2)
+        result["summary_path"] = str(summary_path)
         results.append(result)
 
-    aggregate = summarize(results)
+    aggregate = summarize_rollouts(results)
     summary_payload = {
         "summary": aggregate,
-        "files": results,
+        "files": [public_result(result) for result in results],
         "metadata": {
-            "kind": "longseq_eval_rollout",
+            "kind": "realtime_pose_140d_longseq_rollout",
             "eval_set_dir": str(eval_set_dir),
             "output_dir": str(output_dir),
             "model_path": str(model_path),
             "weights": str(weights),
+            "timeline_seed": int(timeline_seed),
             "sequence_count": len(results),
-            "dropout_config": dropout_config.to_dict(),
         },
     }
     aggregate_path = output_dir / "longseq_eval_summary.json"
-    with aggregate_path.open("w", encoding="utf-8", newline="\n") as file:
-        json.dump(summary_payload, file, indent=2, ensure_ascii=False)
-        file.write("\n")
+    with aggregate_path.open("w", encoding="utf-8") as file:
+        json.dump(summary_payload, file, ensure_ascii=False, indent=2)
     summary_payload["summary_path"] = str(aggregate_path)
     return summary_payload
 
 
-def write_sequence_summary(summary_path: Path, result: dict[str, Any]) -> None:
-    compact = {key: value for key, value in result.items() if key != "path" and not isinstance(value, list)}
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with summary_path.open("w", encoding="utf-8", newline="\n") as file:
-        json.dump({"summary": compact, "files": [result]}, file, indent=2, ensure_ascii=False)
-        file.write("\n")
-
-
-def build_default_output_dir(
-    eval_set_dir: Path,
-    model_path: str | Path,
-    weights: str,
-    dropout_config: LongseqDropoutConfig | None = None,
-) -> Path:
+def build_default_output_dir(eval_set_dir: Path, model_path: str | Path, weights: str) -> Path:
     checkpoint_tag = sanitize_path_token(Path(model_path).stem)
     if weights:
         checkpoint_tag = f"{checkpoint_tag}_{sanitize_path_token(weights)}"
-    if dropout_config is not None and dropout_config.preset != DROPOUT_PRESET_NONE:
-        checkpoint_tag = f"{checkpoint_tag}_{sanitize_path_token(dropout_config.preset)}"
     return Path("output") / "longseq_eval" / eval_set_dir.name / checkpoint_tag
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
-    parser = build_arg_parser()
-    args = parse_and_load_from_model(parser, argv=argv)
-    validate_v2_runtime_args(args)
-
+    args = parse_and_load_from_model(build_arg_parser(), argv=argv)
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     entries = read_longseq_manifest(eval_set_dir)
-    dropout_config = build_longseq_dropout_config(args)
-    normalizer = RealtimePoseNormalizer(args.normalizer_dir, schema_name=REALTIME_POSE_SCHEMA_NAME)
-    if not bool(args.normalize_input):
-        normalizer = None
+    normalizer = (
+        RealtimePoseNormalizer(args.normalizer_dir)
+        if bool(args.normalize_input)
+        else None
+    )
 
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
     model, diffusion = create_model_and_diffusion(args)
     model, weights = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-
-    output_dir = Path(args.output_dir).resolve() if str(args.output_dir).strip() else build_default_output_dir(
-        eval_set_dir=eval_set_dir,
-        model_path=args.model_path,
-        weights=weights,
-        dropout_config=dropout_config,
-    ).resolve()
+    output_dir = (
+        Path(args.output_dir).resolve()
+        if str(args.output_dir).strip()
+        else build_default_output_dir(eval_set_dir, args.model_path, weights).resolve()
+    )
     summary = evaluate_longseq_entries(
         entries=entries,
         eval_set_dir=eval_set_dir,
@@ -325,30 +381,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         diffusion=diffusion,
         device=device,
         normalizer=normalizer,
-        use_ddim=str(args.ts_respace).startswith("ddim"),
         model_path=args.model_path,
         weights=weights,
-        loop_count=int(args.loop_count),
         limit=int(args.limit),
-        initial_root_yaw=args.initial_root_yaw,
-        history_pose_source=str(args.history_pose_source),
-        warmup_target_source=str(args.warmup_target_source),
-        root_correction=bool(args.root_correction),
-        tracker_ik=bool(args.tracker_ik),
-        tracker_ik_iterations=int(args.tracker_ik_iterations),
-        tracker_ik_lr=float(args.tracker_ik_lr),
-        tracker_ik_blend=float(args.tracker_ik_blend),
-        tracker_ik_target_smoothing=float(args.tracker_ik_target_smoothing),
-        tracker_ik_delta_limit=float(args.tracker_ik_delta_limit),
-        ik_init_mode=args.ik_init_mode,
-        ik_init_timestep=int(args.ik_init_timestep),
-        ik_init_iterations=int(args.ik_init_iterations),
-        ik_init_lr=float(args.ik_init_lr),
-        ik_init_pos_weight=float(args.ik_init_pos_weight),
-        ik_init_rot_weight=float(args.ik_init_rot_weight),
-        ik_init_reg_weight=float(args.ik_init_reg_weight),
-        ik_init_delta_limit=float(args.ik_init_delta_limit),
-        dropout_config=dropout_config,
+        timeline_seed=int(args.timeline_seed),
         render_mp4=bool(args.render_mp4),
         render_fps=int(args.render_fps),
         render_stride=int(args.render_stride),
@@ -356,10 +392,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         render_layout=str(args.render_layout),
         render_local_radius=float(args.render_local_radius),
     )
-    print(
-        "[evaluate_longseq_eval_set] "
-        f"sequences={summary['metadata']['sequence_count']} output={output_dir} summary={summary['summary_path']}"
-    )
+    print(f"[evaluate_longseq_eval_set] wrote {summary['summary_path']}")
     return summary
 
 

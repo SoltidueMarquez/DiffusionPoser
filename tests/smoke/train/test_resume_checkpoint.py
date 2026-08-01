@@ -3,23 +3,15 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from argparse import Namespace
 from pathlib import Path
 
 import torch
 
-from data_loaders.sensor_masking import (
-    REALTIME_POSE_INPUT_DIM,
-    REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_SEQ_LEN,
-    TASK_MODE_REALTIME_POSE,
-)
 from train.training_loop import (
     TrainLoop,
     find_latest_model_checkpoint,
     find_latest_run_dir,
     find_resume_checkpoint,
-    validate_resume_checkpoint_contract,
 )
 
 
@@ -90,56 +82,6 @@ class ResumeCheckpointResolutionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self.assertRaises(FileNotFoundError):
                 find_resume_checkpoint(Path(tmp_dir), "latest")
-
-    def test_resume_contract_accepts_current_root_y0_args(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            save_dir = Path(tmp_dir)
-            checkpoint = save_dir / "model000000010.pt"
-            checkpoint.write_bytes(b"")
-            (save_dir / "args.json").write_text(
-                json.dumps(
-                    {
-                        "task_mode": TASK_MODE_REALTIME_POSE,
-                        "schema": REALTIME_POSE_SCHEMA_NAME,
-                        "input_feats": REALTIME_POSE_INPUT_DIM,
-                        "seq_len": REALTIME_POSE_SEQ_LEN,
-                        "max_seq_len": REALTIME_POSE_SEQ_LEN,
-                        "model_arch": "full_feature_dit",
-                        "root_y_policy": "fixed_zero",
-                        "pelvis_height_mode": "pelvis_local_offset_y",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            args = Namespace(schema=REALTIME_POSE_SCHEMA_NAME, model_arch="full_feature_dit")
-
-            validate_resume_checkpoint_contract(checkpoint, args)
-
-    def test_resume_contract_rejects_legacy_schema_even_when_dim_matches(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            save_dir = Path(tmp_dir)
-            checkpoint = save_dir / "model000000010.pt"
-            checkpoint.write_bytes(b"")
-            (save_dir / "args.json").write_text(
-                json.dumps(
-                    {
-                        "task_mode": TASK_MODE_REALTIME_POSE,
-                        "schema": "realtime_pose_v2_contact",
-                        "input_feats": REALTIME_POSE_INPUT_DIM,
-                        "seq_len": REALTIME_POSE_SEQ_LEN,
-                        "max_seq_len": REALTIME_POSE_SEQ_LEN,
-                        "model_arch": "full_feature_dit",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            args = Namespace(schema=REALTIME_POSE_SCHEMA_NAME, model_arch="full_feature_dit")
-
-            with self.assertRaisesRegex(ValueError, "schema"):
-                validate_resume_checkpoint_contract(checkpoint, args)
-
 
 class TrainLoopStepAccountingTest(unittest.TestCase):
     def test_first_saved_checkpoint_uses_completed_step_one(self):

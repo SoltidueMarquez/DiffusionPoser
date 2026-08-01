@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from data_loaders.sensor_masking import (
-    BODY_POSE_DIM,
-    BODY_POSE_START,
-    REALTIME_POSE_SCHEMA_NAME,
-    ROOT_YAW_DELTA_DIM,
-    ROOT_YAW_DELTA_START,
-    get_schema_spec,
+from data_loaders.realtime_pose_geometry import (
+    decode_target_head_rotations_np,
+    pelvis_relative_joint_positions_np,
 )
-from sample.simulate_unity_stream import fk_joints_from_target
+from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_TARGET_DIM,
+    ROOT_YAW_RELATIVE_DIM,
+    ROOT_YAW_RELATIVE_START,
+)
 
 
 def decode_realtime_pose_joints(
@@ -20,47 +21,58 @@ def decode_realtime_pose_joints(
     joint_offsets_parent: np.ndarray,
     joint_rest_local_rotations_6d: np.ndarray | None = None,
 ) -> np.ndarray:
-    """
-    用当前 realtime_pose_body_fbx_local_root_y0_v1 的 root-yaw-relative global 6D pose + root_yaw 做轻量 FK。
-    输入特征为 `[T,C]`，输出 joints 为 `[T,24,3]`，供可视化和 smoke test 使用。
-    """
+    """把 `[T,140]` Head-yaw 参考系姿态还原成 `[T,24,3]` 世界坐标关节。"""
 
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     features = np.asarray(features, dtype=np.float32)
-    if features.ndim != 2 or features.shape[1] != schema.feature_dim:
-        raise ValueError(f"features 应为 [T,{schema.feature_dim}]，实际为 {features.shape}")
+    if features.ndim != 2 or features.shape[1] != REALTIME_POSE_TARGET_DIM:
+        raise ValueError(f"features 应为 [T,{REALTIME_POSE_TARGET_DIM}]，实际为 {features.shape}")
     root_pos = np.asarray(root_pos_world, dtype=np.float32)
     yaw = np.asarray(root_yaw, dtype=np.float32)
+    offsets = np.asarray(joint_offsets_parent, dtype=np.float32)
     if root_pos.shape != (features.shape[0], 3):
         raise ValueError(f"root_pos_world 应为 [T,3]，实际为 {root_pos.shape}")
     if yaw.shape != (features.shape[0],):
         raise ValueError(f"root_yaw 应为 [T]，实际为 {yaw.shape}")
-    joints = [
-        fk_joints_from_target(
-            target_raw=features[frame_index],
-            root_pos_world=root_pos[frame_index],
-            root_yaw=float(yaw[frame_index]),
-            joint_offsets_parent=joint_offsets_parent,
-            schema_name=schema.name,
-            joint_rest_local_rotations_6d=joint_rest_local_rotations_6d,
+    if offsets.shape != (24, 3):
+        raise ValueError(f"joint_offsets_parent 应为 [24,3]，实际为 {offsets.shape}")
+
+    if joint_rest_local_rotations_6d is None:
+        rest_rotations = np.repeat(np.eye(3, dtype=np.float32)[None], 24, axis=0)
+    else:
+        rest_rotations = rotation_6d_to_matrix_np(joint_rest_local_rotations_6d)
+
+    rotations_head, _ = decode_target_head_rotations_np(features, rest_rotations)
+    relative_yaw = np.arctan2(
+        features[:, ROOT_YAW_RELATIVE_START],
+        features[:, ROOT_YAW_RELATIVE_START + 1],
+    )
+    head_to_world = make_yaw_rotation_np(yaw + relative_yaw)
+    rotations_world = np.einsum("tij,tajk->taik", head_to_world, rotations_head)
+    joints_relative = pelvis_relative_joint_positions_np(rotations_world, offsets)
+    pelvis_offset = np.einsum("tij,j->ti", make_yaw_rotation_np(yaw), offsets[0])
+    return (joints_relative + root_pos[:, None] + pelvis_offset[:, None]).astype(np.float32)
+
+
+def decode_root_yaw_from_relative(
+    current_head_yaw: float,
+    root_yaw_relative_sincos: np.ndarray,
+) -> float:
+    relative = np.asarray(root_yaw_relative_sincos, dtype=np.float32)
+    if relative.shape != (ROOT_YAW_RELATIVE_DIM,):
+        raise ValueError(
+            f"root_yaw_relative_sincos 应为 [{ROOT_YAW_RELATIVE_DIM}]，实际为 {relative.shape}"
         )
-        for frame_index in range(features.shape[0])
-    ]
-    return np.stack(joints, axis=0).astype(np.float32)
+    norm = max(float(np.linalg.norm(relative)), 1e-8)
+    sin_relative, cos_relative = relative / norm
+    return float(current_head_yaw - np.arctan2(sin_relative, cos_relative))
 
 
-def decode_root_yaw_from_delta(prev_root_yaw: float, root_yaw_delta_sincos: np.ndarray) -> float:
-    delta = np.asarray(root_yaw_delta_sincos, dtype=np.float32)
-    if delta.shape != (ROOT_YAW_DELTA_DIM,):
-        raise ValueError(f"root_yaw_delta_sincos 应为 [{ROOT_YAW_DELTA_DIM}]，实际为 {delta.shape}")
-    norm = max(float(np.linalg.norm(delta)), 1e-8)
-    sin_delta, cos_delta = delta / norm
-    return float(prev_root_yaw + np.arctan2(sin_delta, cos_delta))
-
-
-def extract_target_yaw_delta(features: np.ndarray) -> np.ndarray:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
+def extract_target_yaw_relative(features: np.ndarray) -> np.ndarray:
     features = np.asarray(features, dtype=np.float32)
-    if features.shape[-1] != schema.feature_dim:
-        raise ValueError(f"features 最后一维应为 {schema.feature_dim}，实际为 {features.shape[-1]}")
-    return features[..., ROOT_YAW_DELTA_START:ROOT_YAW_DELTA_START + ROOT_YAW_DELTA_DIM]
+    if features.shape[-1] != REALTIME_POSE_TARGET_DIM:
+        raise ValueError(
+            f"features 最后一维应为 {REALTIME_POSE_TARGET_DIM}，实际为 {features.shape[-1]}"
+        )
+    return features[
+        ..., ROOT_YAW_RELATIVE_START : ROOT_YAW_RELATIVE_START + ROOT_YAW_RELATIVE_DIM
+    ]

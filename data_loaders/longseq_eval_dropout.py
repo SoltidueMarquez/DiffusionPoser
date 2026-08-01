@@ -7,8 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.realtime_pose_dataset import dropout_non_hip_trackers
 from data_loaders.sensor_masking import (
+    HEAD_TRACKER_INDEX,
     HIP_TRACKER_INDEX,
     TRACKER_COUNT,
     TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
@@ -25,6 +25,20 @@ DROPOUT_PRESET_NONE = "none"
 DROPOUT_PRESET_TRACKER_MASK_TRAIN = "tracker_mask_train"
 DROPOUT_PRESET_TRAIN_DEFAULT = "train_default"
 DROPOUT_PRESETS = (DROPOUT_PRESET_NONE, DROPOUT_PRESET_TRACKER_MASK_TRAIN, DROPOUT_PRESET_TRAIN_DEFAULT)
+
+
+def dropout_non_hip_trackers(
+    sensor_valid: np.ndarray,
+    rng: np.random.Generator,
+    dropout_prob: float,
+) -> np.ndarray:
+    """按帧随机丢弃非 Head、非 Hip Tracker。"""
+
+    valid = np.asarray(sensor_valid, dtype=bool).copy()
+    candidates = [index for index in range(TRACKER_COUNT) if index not in (HEAD_TRACKER_INDEX, HIP_TRACKER_INDEX)]
+    drop = rng.random((valid.shape[0], len(candidates))) < float(dropout_prob)
+    valid[:, candidates] &= ~drop
+    return valid
 
 
 @dataclass(frozen=True)

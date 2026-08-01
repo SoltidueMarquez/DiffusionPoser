@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
-from sample.reconstruct_stream import reconstruct_batch, tensor_bct_to_numpy_btc
+from sample.reconstruct_stream import reconstruct_batch
 from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
@@ -37,8 +37,6 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         seq_len=args.seq_len,
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
-        schema_name=args.schema,
-        tracker_mask_policy="task",
     )
     model, diffusion = create_model_and_diffusion(args)
     model, _source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
@@ -53,14 +51,12 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
             batch=batch,
             device=device,
             use_ddim=str(args.ts_respace).startswith("ddim"),
-            schema_name=args.schema,
         )
-        pred_np = tensor_bct_to_numpy_btc(pred)
+        pred_np = pred.detach().cpu().numpy().astype(np.float32, copy=False)
         task_id = str(dataset.entries[index].get("task_id", index))
         np.savez(
             output_dir / f"{task_id}.npz",
             predicted_features_normalized=pred_np,
-            schema_name=np.asarray(args.schema),
             feature_space=np.asarray("normalized"),
         )
         written += 1

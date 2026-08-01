@@ -5,41 +5,140 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_START, get_schema_spec
-from model.causal_attention import build_target_dit_causal_mask
+from data_loaders.sensor_masking import (
+    NON_PELVIS_JOINT_COUNT,
+    REALTIME_POSE_HISTORY_LENGTH,
+    REALTIME_POSE_TARGET_DIM,
+    ROOT_YAW_RELATIVE_START,
+    TRACKER_CONFIGURED_OFFSET,
+    TRACKER_COUNT,
+    TRACKER_FEATURE_DIM,
+    TRACKER_MEASURED_VALID_OFFSET,
+    TRACKER_MISSING_AGE_OFFSET,
+)
 from model.diffusionposer_dit import SinusoidalTimestepEmbedding
 
 
-class SensorTokenEncoder(nn.Module):
-    """把 6 个 tracker 条件编码成 token，供 target token 通过 attention 读取。"""
+class TrackerTokenEncoder(nn.Module):
+    """显式编码 Tracker 身份、三态、掉线时长以及各自的 60 帧历史。"""
 
-    def __init__(self, input_dim: int, latent_dim: int, tracker_count: int = 6):
+    def __init__(self, latent_dim: int):
         super().__init__()
-        self.tracker_count = int(tracker_count)
-        self.type_embed = nn.Embedding(self.tracker_count, latent_dim)
-        self.value_proj = nn.Linear(input_dim, latent_dim)
+        self.continuous_proj = nn.Linear(9, latent_dim)
+        self.identity_embed = nn.Embedding(TRACKER_COUNT, latent_dim)
+        self.state_embed = nn.Embedding(3, latent_dim)
+        self.age_mlp = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.temporal_embed = nn.Parameter(torch.zeros(1, 61, 1, latent_dim))
+        self.history_gru = nn.GRU(latent_dim, latent_dim, batch_first=True)
 
-    def forward(self, sensor_values: torch.Tensor) -> torch.Tensor:
-        # sensor_values: [B, 6, 10] = pos_ref(3) + rot_ref_6d(6) + valid(1)
-        batch_size, tracker_count, _ = sensor_values.shape
-        if tracker_count != self.tracker_count:
-            raise ValueError(f"tracker token 数量应为 {self.tracker_count}，实际为 {tracker_count}")
-        tracker_ids = torch.arange(tracker_count, device=sensor_values.device)
-        return self.value_proj(sensor_values) + self.type_embed(tracker_ids)[None]
+    @staticmethod
+    def state_index(tracker_window: torch.Tensor) -> torch.Tensor:
+        configured = tracker_window[..., TRACKER_CONFIGURED_OFFSET] > 0.5
+        measured = tracker_window[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
+        if torch.any(measured & ~configured):
+            raise ValueError("measured_valid 必须是 configured 的子集。")
+        # 0=unconfigured, 1=configured_valid, 2=configured_missing
+        return torch.where(configured, torch.where(measured, 1, 2), 0).long()
+
+    def embed_frames(self, tracker_window: torch.Tensor) -> torch.Tensor:
+        batch_size, frames, tracker_count, feature_dim = tracker_window.shape
+        if tracker_count != TRACKER_COUNT or feature_dim != TRACKER_FEATURE_DIM or frames > 61:
+            raise ValueError(
+                f"tracker_window 应为 [B,T,{TRACKER_COUNT},{TRACKER_FEATURE_DIM}] 且 T<=61，"
+                f"实际为 {tuple(tracker_window.shape)}"
+            )
+        tracker_ids = torch.arange(TRACKER_COUNT, device=tracker_window.device)
+        age = tracker_window[..., TRACKER_MISSING_AGE_OFFSET : TRACKER_MISSING_AGE_OFFSET + 1]
+        tokens = (
+            self.continuous_proj(tracker_window[..., :9])
+            + self.identity_embed(tracker_ids)[None, None]
+            + self.state_embed(self.state_index(tracker_window))
+            + self.age_mlp(age)
+            + self.temporal_embed[:, :frames]
+        )
+        return tokens
+
+    def forward(
+        self,
+        tracker_window: torch.Tensor,
+        valid_frame_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tracker_window.shape[1] != 61:
+            raise ValueError(f"tracker_window 固定为 61 帧，实际为 {tracker_window.shape[1]}")
+        embedded = self.embed_frames(tracker_window)
+        history = embedded[:, :REALTIME_POSE_HISTORY_LENGTH]  # [B,60,6,D]
+        batch_size, history_len, tracker_count, latent_dim = history.shape
+        history = history.permute(0, 2, 1, 3).reshape(batch_size * tracker_count, history_len, latent_dim)
+        mask = valid_frame_mask[:, None, :, None].expand(-1, tracker_count, -1, latent_dim)
+        history = history * mask.reshape(batch_size * tracker_count, history_len, latent_dim).to(history.dtype)
+        output, _ = self.history_gru(history)
+        lengths = valid_frame_mask.long().sum(dim=1).clamp_min(1) - 1
+        gather_index = lengths[:, None].expand(-1, tracker_count).reshape(-1)
+        summary = output[torch.arange(batch_size * tracker_count, device=output.device), gather_index]
+        summary = summary.reshape(batch_size, tracker_count, latent_dim)
+        current = embedded[:, REALTIME_POSE_HISTORY_LENGTH]
+        return summary, current
+
+
+class TargetDiTBlock(nn.Module):
+    """目标 self-attention + 条件 cross-attention + timestep AdaLN/gate。"""
+
+    def __init__(self, latent_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
+        self.cross_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
+        self.mlp_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
+        self.self_attention = nn.MultiheadAttention(latent_dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(latent_dim, num_heads, dropout=dropout, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 4, latent_dim),
+        )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(latent_dim, latent_dim * 9))
+
+    @staticmethod
+    def _modulate(value: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return value * (1.0 + scale[:, None]) + shift[:, None]
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        condition: torch.Tensor,
+        timestep_embedding: torch.Tensor,
+        condition_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        values = self.modulation(timestep_embedding).chunk(9, dim=-1)
+        self_shift, self_scale, self_gate, cross_shift, cross_scale, cross_gate, mlp_shift, mlp_scale, mlp_gate = values
+        query = self._modulate(self.self_norm(target), self_shift, self_scale)
+        self_value = self.self_attention(query, query, query, need_weights=False)[0]
+        target = target + torch.tanh(self_gate)[:, None] * self_value
+
+        query = self._modulate(self.cross_norm(target), cross_shift, cross_scale)
+        cross_value = self.cross_attention(
+            query,
+            condition,
+            condition,
+            key_padding_mask=condition_padding_mask,
+            need_weights=False,
+        )[0]
+        target = target + torch.tanh(cross_gate)[:, None] * cross_value
+
+        mlp_value = self.mlp(self._modulate(self.mlp_norm(target), mlp_shift, mlp_scale))
+        return target + torch.tanh(mlp_gate)[:, None] * mlp_value
 
 
 class RealtimePoseTargetDiT(nn.Module):
-    """
-    target-only denoiser。
-
-    外部 API 仍然是 `[B,C,T] -> [B,C,T]`，但模型只学习第 61 帧 target slice。
-    这样不会把 capacity 浪费在 tracker/sensor_valid 这些条件通道上。
-    """
+    """对 23 个全局旋转 Token 与 1 个 Root 相对 yaw Token 直接去噪。"""
 
     def __init__(
         self,
-        input_feats: int,
-        schema_name: str,
+        input_feats: int = REALTIME_POSE_TARGET_DIM,
         latent_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,
@@ -48,102 +147,119 @@ class RealtimePoseTargetDiT(nn.Module):
         max_seq_len: int = 61,
     ):
         super().__init__()
-        self.schema = get_schema_spec(schema_name)
         self.input_feats = int(input_feats)
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
-        self.max_seq_len = int(max_seq_len)
-        if self.input_feats != self.schema.feature_dim:
-            raise ValueError(f"{self.schema.name} 需要 input_feats={self.schema.feature_dim}，实际为 {self.input_feats}")
+        if self.input_feats != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(f"TargetDiT 仅接受 {REALTIME_POSE_TARGET_DIM} 维目标，实际为 {input_feats}。")
+        if int(max_seq_len) != 61:
+            raise ValueError("TargetDiT 固定使用 60 帧历史和 1 帧当前 Tracker。")
 
-        self.frame_proj = nn.Linear(self.input_feats, self.latent_dim)
-        self.target_proj = nn.Linear(self.schema.target_dim, self.latent_dim)
-        self.time_embed = SinusoidalTimestepEmbedding(self.latent_dim)
-        self.frame_pos_embed = nn.Parameter(torch.zeros(1, self.max_seq_len, self.latent_dim))
-        self.sensor_encoder = SensorTokenEncoder(input_dim=10, latent_dim=self.latent_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.latent_dim,
-            nhead=num_heads,
-            dim_feedforward=self.latent_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.joint_input = nn.Linear(6, latent_dim)
+        self.root_input = nn.Linear(2, latent_dim)
+        self.target_identity = nn.Embedding(NON_PELVIS_JOINT_COUNT + 1, latent_dim)
+        self.known_state_embed = nn.Embedding(2, latent_dim)
+        self.pose_history_proj = nn.Linear(REALTIME_POSE_TARGET_DIM, latent_dim)
+        self.pose_temporal_embed = nn.Parameter(torch.zeros(1, REALTIME_POSE_HISTORY_LENGTH, latent_dim))
+        self.tracker_encoder = TrackerTokenEncoder(latent_dim)
+        self.time_embed = SinusoidalTimestepEmbedding(latent_dim)
+        self.blocks = nn.ModuleList(
+            [TargetDiTBlock(latent_dim, num_heads, dropout) for _ in range(int(num_layers))]
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output_proj = nn.Linear(self.latent_dim, self.schema.target_dim)
+        self.output_norm = nn.LayerNorm(latent_dim)
+        self.joint_output = nn.Linear(latent_dim, 6)
+        self.root_output = nn.Linear(latent_dim, 2)
         if zero_init:
-            nn.init.zeros_(self.output_proj.weight)
-            nn.init.zeros_(self.output_proj.bias)
+            nn.init.zeros_(self.joint_output.weight)
+            nn.init.zeros_(self.joint_output.bias)
+            nn.init.zeros_(self.root_output.weight)
+            nn.init.zeros_(self.root_output.bias)
 
     def num_parameters(self) -> int:
-        return sum(param.numel() for param in self.parameters())
+        return sum(parameter.numel() for parameter in self.parameters())
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
+        pose_history: Optional[torch.Tensor] = None,
+        tracker_window: Optional[torch.Tensor] = None,
+        known_mask: Optional[torch.Tensor] = None,
         inpaint_cond: Optional[torch.Tensor] = None,
         valid_frame_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        y: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if hidden_states.dim() != 3:
-            raise ValueError(f"hidden_states 应为 [B,C,T]，实际为 {tuple(hidden_states.shape)}")
-        batch_size, channels, seq_len = hidden_states.shape
-        if channels != self.input_feats:
-            raise ValueError(f"输入特征维应为 {self.input_feats}，实际为 {channels}")
-        if seq_len > self.max_seq_len:
-            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
-        if seq_len <= REALTIME_POSE_TARGET_START:
-            raise ValueError(f"target_dit 固定读取第 {REALTIME_POSE_TARGET_START + 1} 帧，实际 seq_len={seq_len}")
-        if inpaint_cond is None:
-            inpaint_cond = torch.ones_like(hidden_states, dtype=torch.bool)
-        if inpaint_cond.shape != hidden_states.shape:
-            raise ValueError("inpaint_cond 必须与 hidden_states 同形状，均为 [B, C, T]")
+        del kwargs
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(
+                f"hidden_states 应为 [B,{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(hidden_states.shape)}"
+            )
+        y = y or {}
+        pose_history = pose_history if pose_history is not None else y.get("pose_history")
+        tracker_window = tracker_window if tracker_window is not None else y.get("tracker_window")
+        known_mask = known_mask if known_mask is not None else y.get("known_mask")
+        if known_mask is None and inpaint_cond is not None:
+            known_mask = ~inpaint_cond.bool()
+        if pose_history is None or tracker_window is None or known_mask is None:
+            raise ValueError("TargetDiT 需要 pose_history、tracker_window 和 known_mask。")
 
+        batch_size = hidden_states.shape[0]
+        if tuple(pose_history.shape) != (batch_size, REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM):
+            raise ValueError(f"pose_history 形状错误：{tuple(pose_history.shape)}")
+        if tuple(tracker_window.shape) != (batch_size, 61, TRACKER_COUNT, TRACKER_FEATURE_DIM):
+            raise ValueError(f"tracker_window 形状错误：{tuple(tracker_window.shape)}")
+        if tuple(known_mask.shape) != tuple(hidden_states.shape):
+            raise ValueError("known_mask 必须与当前 140 维扩散状态同形。")
+        valid_frame_mask = valid_frame_mask if valid_frame_mask is not None else attention_mask
         if valid_frame_mask is None:
-            valid_frame_mask = attention_mask
-        if valid_frame_mask is None:
-            valid_frame_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=hidden_states.device)
+            valid_frame_mask = torch.ones(
+                batch_size,
+                REALTIME_POSE_HISTORY_LENGTH,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
         valid_frame_mask = valid_frame_mask.bool()
+        if tuple(valid_frame_mask.shape) != (batch_size, REALTIME_POSE_HISTORY_LENGTH):
+            raise ValueError("valid_frame_mask 必须为 [B,60]。")
 
-        frame_tokens = self.frame_proj(hidden_states.transpose(1, 2))
-        frame_tokens = frame_tokens + self.frame_pos_embed[:, :seq_len]
-
-        target_values = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
-        target_token = self.target_proj(target_values) + self.time_embed(timestep)
-        target_token = target_token.unsqueeze(1)
-
-        sensor_values = self._extract_sensor_values(hidden_states)
-        sensor_tokens = self.sensor_encoder(sensor_values)
-        tokens = torch.cat([target_token, sensor_tokens, frame_tokens], dim=1)
-
-        # token 顺序：[target, 6 sensor, T frame]。causal mask 负责时间可见性，padding mask 只表示有效帧。
-        token_mask = torch.zeros(batch_size, 1 + sensor_tokens.shape[1] + seq_len, dtype=torch.bool, device=hidden_states.device)
-        token_mask[:, 1 + sensor_tokens.shape[1]:] = ~valid_frame_mask
-        causal_mask = build_target_dit_causal_mask(
-            seq_len=seq_len,
-            tracker_count=sensor_tokens.shape[1],
-            target_frame=REALTIME_POSE_TARGET_START,
-            device=hidden_states.device,
+        joint_values = hidden_states[:, :ROOT_YAW_RELATIVE_START].reshape(
+            batch_size, NON_PELVIS_JOINT_COUNT, 6
         )
-        hidden = self.transformer(tokens, mask=causal_mask, src_key_padding_mask=token_mask)
-        pred_target = self.output_proj(hidden[:, 0])
-        target_mask = inpaint_cond[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START].to(dtype=hidden_states.dtype)
-        input_target = hidden_states[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START]
-        pred_target = pred_target * target_mask + input_target * (1.0 - target_mask)
+        root_value = hidden_states[:, ROOT_YAW_RELATIVE_START:].unsqueeze(1)
+        target = torch.cat([self.joint_input(joint_values), self.root_input(root_value)], dim=1)
+        target_ids = torch.arange(NON_PELVIS_JOINT_COUNT + 1, device=hidden_states.device)
+        atomic_known = torch.cat(
+            [
+                known_mask[:, :ROOT_YAW_RELATIVE_START].reshape(batch_size, NON_PELVIS_JOINT_COUNT, 6).all(-1),
+                known_mask[:, ROOT_YAW_RELATIVE_START:].all(-1, keepdim=True),
+            ],
+            dim=1,
+        )
+        target = (
+            target
+            + self.target_identity(target_ids)[None]
+            + self.known_state_embed(atomic_known.long())
+        )
 
-        output = hidden_states.clone()
-        output[:, self.schema.target_slice(), REALTIME_POSE_TARGET_START] = pred_target
-        return output
+        pose_tokens = self.pose_history_proj(pose_history) + self.pose_temporal_embed
+        tracker_summary, current_tracker = self.tracker_encoder(tracker_window, valid_frame_mask)
+        condition = torch.cat([pose_tokens, tracker_summary, current_tracker], dim=1)
+        condition_padding_mask = torch.cat(
+            [
+                ~valid_frame_mask,
+                torch.zeros(batch_size, TRACKER_COUNT * 2, dtype=torch.bool, device=hidden_states.device),
+            ],
+            dim=1,
+        )
+        time_embedding = self.time_embed(timestep)
+        for block in self.blocks:
+            target = block(target, condition, time_embedding, condition_padding_mask)
 
-    def _extract_sensor_values(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        values = []
-        frame = REALTIME_POSE_TARGET_START
-        for tracker_index in range(6):
-            pos = hidden_states[:, self.schema.tracker_pos_slice(tracker_index), frame]
-            rot = hidden_states[:, self.schema.tracker_rot_slice(tracker_index), frame]
-            valid = hidden_states[:, self.schema.sensor_valid_start + tracker_index: self.schema.sensor_valid_start + tracker_index + 1, frame]
-            values.append(torch.cat([pos, rot, valid], dim=1))
-        return torch.stack(values, dim=1)
+        target = self.output_norm(target)
+        joint_output = self.joint_output(target[:, :NON_PELVIS_JOINT_COUNT]).reshape(
+            batch_size, ROOT_YAW_RELATIVE_START
+        )
+        root_output = self.root_output(target[:, NON_PELVIS_JOINT_COUNT])
+        return torch.cat([joint_output, root_output], dim=-1)

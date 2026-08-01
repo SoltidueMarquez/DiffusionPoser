@@ -1,0 +1,4 @@
+[generate_realtime_pose_tasks] split=train skipped_short_sources=50 report=D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_v2_base_tasks\20260714_001222_v2_base_seed10\train\skipped_short_sources.jsonl
+[generate_realtime_pose_tasks] split=test skipped_short_sources=10 report=D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_v2_base_tasks\20260714_001222_v2_base_seed10\test\skipped_short_sources.jsonl
+[generate_realtime_pose_tasks] split=train tasks=70216
+[generate_realtime_pose_tasks] split=test tasks=10456

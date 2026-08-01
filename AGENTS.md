@@ -17,13 +17,13 @@ conda run -n diffusionposer5070 <command>
 
 ## 项目结构
 
-- `data_converter/`：AMASS/SMPL-H 到当前 `realtime_pose_body_fbx_local_root_y0_v1` 源数据的转换脚本。
-- `data_loaders/`：`realtime_pose_body_fbx_local_root_y0_v1` task 生成、Dataset、normalizer、tracker pattern 规则。
+- `data_converter/`：AMASS/SMPL-H 到当前 realtime pose 源数据的转换脚本。
+- `data_loaders/`：realtime pose task 生成、Dataset、normalizer、tracker pattern 规则。
 - `model/`：DiffusionPoser/DiT 模型结构。
 - `diffusion/`：Gaussian diffusion、schedule、loss、respace 等扩散核心逻辑。
 - `train/`：训练入口、训练循环、日志平台和 checkpoint 逻辑。
 - `sample/`：实时 61 帧窗口重建、采样辅助、可视化辅助。
-- `eval/`：`realtime_pose_body_fbx_local_root_y0_v1` 评估入口和指标计算。
+- `eval/`：realtime pose 评估入口和指标计算。
 - `export/`：Unity/Sentis 运行时资产导出。
 - `tests/smoke/`：主链路冒烟测试。
 - `dataset/`、`runs/`、`save/`、`output/`：数据和训练/导出产物，默认不要改动或提交。
@@ -59,28 +59,14 @@ conda run -n diffusionposer5070 pytest tests/smoke/visual_editor
 
 如果改动训练、数据生成、在线重建、评估或导出链路，至少运行相关领域的冒烟测试；改动跨模块契约时运行完整 `tests/smoke`。
 
-## realtime_pose_body_fbx_local_root_y0_v1 任务契约
+## RealPose140 数据结构
 
-- 固定为 60 帧历史条件 + 第 61 帧单帧补全。
-- `seq_len = 61`，`target_start = 60`，`target_length = 1`。
-- `feature_dim = 214`，模型输入输出均为 `[B, 214, 61]`。
-- source/task/normalizer/runtime asset 必须包含 `schema_name="realtime_pose_body_fbx_local_root_y0_v1"` 和 `pose_representation="body_fbx_local_delta_6d"`。
-- source/task/normalizer/runtime asset 必须显式包含 `root_y_policy="fixed_zero"` 和 `pelvis_height_mode="pelvis_local_offset_y"`。
-- actor root 的 world y 固定为 0；`root_pos_world[:, 1]` 必须全为 0。
-- `pelvis_height` 表示 pelvis bone 的 local offset y，必须等于 `joints_world[:, 0, 1]`。
-- 通道 `0:144` 是 `body_pose_body_fbx_local_delta_6d`，`144:146` 是 `root_heading_delta_sincos`。
-- 通道 `146:148` 是 `root_delta_xz_ref`，`148:149` 是 `pelvis_height`，`149:154` 是 `stationary_prob_5`。
-- 通道 `154:172` 是 `tracker_pos_ref`，`172:208` 是 `tracker_rot_ref_6d`，`208:214` 是 `sensor_valid`。
-- `inpaint_mask` 只允许覆盖第 61 帧的 `0:154`。
-- hip/waist tracker 必须始终 valid；每帧至少 3 个 tracker valid。
-- 默认 task generator 每个窗口只写 full-tracker task；训练随机遮盖在 `RealtimePoseTaskDataset` 中动态发生。
-- invalid tracker 的 `tracker_pos_ref/tracker_rot_ref_6d` 在归一化后置零，不使用 GT 或上一帧 stale fill。
-- 当前帧 tracker 只能用 `root_yaw_{t-1}` 转到参考局部系，不能使用 GT `root_yaw_t`。
-- 必须保存 `stationary_prob_5`，由转换阶段从 `joints_world` 的 pelvis、左右脚、左右手速度派生。
-- 不兼容且不再保留旧 `realtime_pose_v2_contact` / `root_yaw_global_6d`、上一代 body_fbx local、X277/current277 数据、task、normalizer、checkpoint、Unity schema。
+- 当前 Python 本地主链路的数据结构统一记录在仓库根目录的 `contract.md`。
+- 维度、字段或张量语义变化时只更新该文档与对应实现，不在其他文档重复维护。
 
 ## 变更原则
 
+- 未经用户明确要求，不得给当前算法或实现方案新增版本名称。若稳定数据字段或 Unity runtime 接口确实需要变化，只说明具体变更与影响，先征得用户确认。
 - 先读现有实现，再按当前模块边界做最小必要修改。
 - 不要回滚或覆盖用户已有未提交改动。
 - 只有用户明确要求“添加兼容”时才保留或新增兼容路径；其他需求变更应直接切换到新方案，不要同时维护旧方案。

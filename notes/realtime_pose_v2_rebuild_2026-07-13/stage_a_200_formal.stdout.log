@@ -1,0 +1,1496 @@
+[realtime_pose_pipeline] C:\Users\Administrator\.conda\envs\diffusionposer5070\python.exe -m train.train_diffusionposer --schema realtime_pose_stationary5_v1 --model_arch target_dit --input_feats 214 --data_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_v2_base_tasks --data_split train --normalizer_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\normalizers\realtime_pose_stationary5_v1\amass_60hz_v2_train --save_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\v2_stage_a_smoke_200_20260714 --run_name v2_stage_a_formal_200 --batch_size 16 --num_workers 0 --num_steps 200 --save_interval 100 --log_interval 10 --checkpoint_max_keep 3 --lr 5e-05 --train_platform_type NoPlatform --layers 8 --heads 8 --latent_dim 512 --diffusion_steps 50 --history_pose_noise_std 0.02 --history_yaw_noise_std 0.02 --history_pose_dropout_prob 0.05 --history_pose_replace_prob 0.05 --history_yaw_replace_prob 0.0 --tracker_latency_max_frames 0 --tracker_burst_dropout_prob 0.0 --tracker_outlier_prob 0.0 --tracker_mask_policy dynamic_categories --tracker_mask_categories full_six standard_three --rollout_steps 1 --rollout_prob 0.0 --rollout_loss_weight 0.0 --rollout_ddim_steps 10 --eval_num_batches 4 --cuda true --device 0 --init_checkpoint D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt --model_ema --gradient_clip
+Logging to D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\v2_stage_a_smoke_200_20260714\20260714_012443_v2_stage_a_formal_200
+creating data loader...
+creating model and diffusion...
+Total params: 26.05M
+training DiffusionPoser model, task_mode=realtime_pose_reconstruction...
+training device: cuda:0
+task mode: realtime_pose_reconstruction
+rollout: steps=1, prob=0.0, weight=0.0, detach_history=True
+cuda device name: NVIDIA GeForce RTX 5070
+warm-start model from checkpoint: D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt
+warm-start keeps optimizer/EMA/global step fresh; use --resume_checkpoint for full training resume.
+trainable parameters: 26052762/26052762
+amp dtype: torch.bfloat16, grad scaler enabled: False
+step[1] data=0.168s train=1.083s
+step[2] data=0.071s train=0.042s
+step[3] data=0.086s train=0.034s
+step[4] data=0.092s train=0.036s
+step[5] data=0.082s train=0.034s
+step[6] data=0.084s train=0.045s
+step[7] data=0.086s train=0.036s
+step[8] data=0.090s train=0.038s
+step[9] data=0.098s train=0.043s
+step[10] data=0.092s train=0.040s
+step[10]: loss[0.06375]
+---------------------------------------------
+| aux_loss                       | 0.0549   |
+| aux_loss_q0                    | 0.0606   |
+| aux_loss_q1                    | 0.0585   |
+| aux_loss_q2                    | 0.0522   |
+| aux_loss_q3                    | 0.0476   |
+| fk_loss                        | 0.000245 |
+| fk_loss_q0                     | 0.000143 |
+| fk_loss_q1                     | 0.000213 |
+| fk_loss_q2                     | 0.000389 |
+| fk_loss_q3                     | 0.000263 |
+| foot_lock_loss                 | 0.00418  |
+| foot_lock_loss_q0              | 0.00356  |
+| foot_lock_loss_q1              | 0.00686  |
+| foot_lock_loss_q2              | 0.00271  |
+| foot_lock_loss_q3              | 0.00401  |
+| head_anchor_loss               | 0.0141   |
+| head_anchor_loss_q0            | 0.0129   |
+| head_anchor_loss_q1            | 0.0126   |
+| head_anchor_loss_q2            | 0.0151   |
+| head_anchor_loss_q3            | 0.0156   |
+| hip_root_height_consistency... | 0.00246  |
+| hip_root_position_consisten... | 0.000231 |
+| hip_root_yaw_consistency_lo... | 1.44e-05 |
+| hip_root_yaw_consistency_loss  | 1.25e-05 |
+| joint_vel_loss                 | 0.00701  |
+| joint_vel_loss_q0              | 0.00641  |
+| joint_vel_loss_q1              | 0.0069   |
+| joint_vel_loss_q2              | 0.00701  |
+| joint_vel_loss_q3              | 0.0078   |
+| loss                           | 0.0638   |
+| loss_q0                        | 0.0697   |
+| loss_q1                        | 0.0655   |
+| loss_q2                        | 0.0598   |
+| loss_q3                        | 0.0589   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000366 |
+| root_delta_loss_q0             | 0.000382 |
+| root_delta_loss_q1             | 0.000333 |
+| root_delta_loss_q2             | 0.00032  |
+| root_delta_loss_q3             | 0.000416 |
+| root_height_loss               | 0.0127   |
+| root_height_loss_q0            | 0.0106   |
+| root_height_loss_q1            | 0.0132   |
+| root_height_loss_q2            | 0.0142   |
+| root_height_loss_q3            | 0.0132   |
+| samples                        | 160      |
+| sensor_reprojection_pos_los... | 0.0007   |
+| sensor_reprojection_pos_loss   | 0.00177  |
+| sensor_reprojection_rot_los... | 0.000954 |
+| sensor_reprojection_rot_loss   | 0.000751 |
+| simple_loss                    | 0.00887  |
+| simple_loss_q0                 | 0.00908  |
+| simple_loss_q1                 | 0.00696  |
+| simple_loss_q2                 | 0.00766  |
+| simple_loss_q3                 | 0.0113   |
+| step                           | 10       |
+| yaw_loss                       | 2.44e-05 |
+| yaw_loss_q0                    | 2.48e-05 |
+| yaw_loss_q1                    | 1.18e-05 |
+| yaw_loss_q2                    | 2.5e-05  |
+| yaw_loss_q3                    | 3.39e-05 |
+---------------------------------------------
+step[11] data=0.086s train=0.037s
+step[12] data=0.091s train=0.041s
+step[13] data=0.084s train=0.041s
+step[14] data=0.085s train=0.039s
+step[15] data=0.086s train=0.039s
+step[16] data=0.084s train=0.042s
+step[17] data=0.092s train=0.036s
+step[18] data=0.088s train=0.041s
+step[19] data=0.088s train=0.039s
+step[20] data=0.085s train=0.037s
+step[20]: loss[0.05336]
+---------------------------------------------
+| aux_loss                       | 0.0455   |
+| aux_loss_q0                    | 0.0581   |
+| aux_loss_q1                    | 0.0511   |
+| aux_loss_q2                    | 0.0385   |
+| aux_loss_q3                    | 0.0353   |
+| fk_loss                        | 0.000209 |
+| fk_loss_q0                     | 0.000156 |
+| fk_loss_q1                     | 0.000302 |
+| fk_loss_q2                     | 0.000197 |
+| fk_loss_q3                     | 0.000184 |
+| foot_lock_loss                 | 0.00376  |
+| foot_lock_loss_q0              | 0.00365  |
+| foot_lock_loss_q1              | 0.00434  |
+| foot_lock_loss_q2              | 0.0034   |
+| foot_lock_loss_q3              | 0.00374  |
+| head_anchor_loss               | 0.0123   |
+| head_anchor_loss_q0            | 0.012    |
+| head_anchor_loss_q1            | 0.0122   |
+| head_anchor_loss_q2            | 0.0129   |
+| head_anchor_loss_q3            | 0.0118   |
+| hip_root_height_consistency... | 0.00185  |
+| hip_root_position_consisten... | 0.000532 |
+| hip_root_yaw_consistency_lo... | 1.63e-05 |
+| hip_root_yaw_consistency_loss  | 1.75e-05 |
+| joint_vel_loss                 | 0.00589  |
+| joint_vel_loss_q0              | 0.0058   |
+| joint_vel_loss_q1              | 0.00603  |
+| joint_vel_loss_q2              | 0.00599  |
+| joint_vel_loss_q3              | 0.00572  |
+| loss                           | 0.0534   |
+| loss_q0                        | 0.0646   |
+| loss_q1                        | 0.0574   |
+| loss_q2                        | 0.0483   |
+| loss_q3                        | 0.0433   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.00042  |
+| root_delta_loss_q0             | 0.000423 |
+| root_delta_loss_q1             | 0.000329 |
+| root_delta_loss_q2             | 0.000434 |
+| root_delta_loss_q3             | 0.000494 |
+| root_height_loss               | 0.0103   |
+| root_height_loss_q0            | 0.00906  |
+| root_height_loss_q1            | 0.0124   |
+| root_height_loss_q2            | 0.00978  |
+| root_height_loss_q3            | 0.0103   |
+| samples                        | 320      |
+| sensor_reprojection_pos_los... | 0.000391 |
+| sensor_reprojection_pos_loss   | 0.00139  |
+| sensor_reprojection_rot_los... | 0.000458 |
+| sensor_reprojection_rot_loss   | 0.000233 |
+| simple_loss                    | 0.00781  |
+| simple_loss_q0                 | 0.00655  |
+| simple_loss_q1                 | 0.00635  |
+| simple_loss_q2                 | 0.00981  |
+| simple_loss_q3                 | 0.00807  |
+| step                           | 20       |
+| yaw_loss                       | 2.78e-05 |
+| yaw_loss_q0                    | 1.12e-05 |
+| yaw_loss_q1                    | 1.27e-05 |
+| yaw_loss_q2                    | 4.89e-05 |
+| yaw_loss_q3                    | 3.38e-05 |
+---------------------------------------------
+step[21] data=0.081s train=0.038s
+step[22] data=0.086s train=0.037s
+step[23] data=0.089s train=0.037s
+step[24] data=0.095s train=0.040s
+step[25] data=0.092s train=0.039s
+step[26] data=0.121s train=0.034s
+step[27] data=0.093s train=0.037s
+step[28] data=0.087s train=0.038s
+step[29] data=0.089s train=0.036s
+step[30] data=0.087s train=0.036s
+step[30]: loss[0.04373]
+---------------------------------------------
+| aux_loss                       | 0.036    |
+| aux_loss_q0                    | 0.0447   |
+| aux_loss_q1                    | 0.0307   |
+| aux_loss_q2                    | 0.0287   |
+| aux_loss_q3                    | 0.0405   |
+| fk_loss                        | 0.00012  |
+| fk_loss_q0                     | 9.79e-05 |
+| fk_loss_q1                     | 7.34e-05 |
+| fk_loss_q2                     | 9.01e-05 |
+| fk_loss_q3                     | 0.000222 |
+| foot_lock_loss                 | 0.00333  |
+| foot_lock_loss_q0              | 0.0035   |
+| foot_lock_loss_q1              | 0.00186  |
+| foot_lock_loss_q2              | 0.00409  |
+| foot_lock_loss_q3              | 0.00396  |
+| head_anchor_loss               | 0.00969  |
+| head_anchor_loss_q0            | 0.00893  |
+| head_anchor_loss_q1            | 0.00858  |
+| head_anchor_loss_q2            | 0.00777  |
+| head_anchor_loss_q3            | 0.0136   |
+| hip_root_height_consistency... | 0.00216  |
+| hip_root_position_consisten... | 0.000255 |
+| hip_root_yaw_consistency_lo... | 1.15e-05 |
+| hip_root_yaw_consistency_loss  | 2.02e-05 |
+| joint_vel_loss                 | 0.00522  |
+| joint_vel_loss_q0              | 0.0047   |
+| joint_vel_loss_q1              | 0.00486  |
+| joint_vel_loss_q2              | 0.00487  |
+| joint_vel_loss_q3              | 0.00649  |
+| loss                           | 0.0437   |
+| loss_q0                        | 0.0529   |
+| loss_q1                        | 0.038    |
+| loss_q2                        | 0.036    |
+| loss_q3                        | 0.0486   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000353 |
+| root_delta_loss_q0             | 0.000302 |
+| root_delta_loss_q1             | 0.00039  |
+| root_delta_loss_q2             | 0.000261 |
+| root_delta_loss_q3             | 0.000458 |
+| root_height_loss               | 0.00805  |
+| root_height_loss_q0            | 0.0062   |
+| root_height_loss_q1            | 0.00683  |
+| root_height_loss_q2            | 0.00773  |
+| root_height_loss_q3            | 0.0116   |
+| samples                        | 480      |
+| sensor_reprojection_pos_los... | 0.000638 |
+| sensor_reprojection_pos_loss   | 0.00104  |
+| sensor_reprojection_rot_los... | 0.000114 |
+| sensor_reprojection_rot_loss   | 0.000101 |
+| simple_loss                    | 0.00771  |
+| simple_loss_q0                 | 0.00818  |
+| simple_loss_q1                 | 0.00727  |
+| simple_loss_q2                 | 0.00734  |
+| simple_loss_q3                 | 0.00809  |
+| step                           | 30       |
+| yaw_loss                       | 2.7e-05  |
+| yaw_loss_q0                    | 6.06e-05 |
+| yaw_loss_q1                    | 2.39e-05 |
+| yaw_loss_q2                    | 5.42e-06 |
+| yaw_loss_q3                    | 1.88e-05 |
+---------------------------------------------
+step[31] data=0.082s train=0.043s
+step[32] data=0.084s train=0.039s
+step[33] data=0.087s train=0.048s
+step[34] data=0.088s train=0.042s
+step[35] data=0.096s train=0.054s
+step[36] data=0.090s train=0.035s
+step[37] data=0.085s train=0.038s
+step[38] data=0.091s train=0.039s
+step[39] data=0.090s train=0.042s
+step[40] data=0.111s train=0.040s
+step[40]: loss[0.04019]
+---------------------------------------------
+| aux_loss                       | 0.0314   |
+| aux_loss_q0                    | 0.0464   |
+| aux_loss_q1                    | 0.0323   |
+| aux_loss_q2                    | 0.0256   |
+| aux_loss_q3                    | 0.0201   |
+| fk_loss                        | 5.52e-05 |
+| fk_loss_q0                     | 6.68e-05 |
+| fk_loss_q1                     | 5.19e-05 |
+| fk_loss_q2                     | 6.45e-05 |
+| fk_loss_q3                     | 3.5e-05  |
+| foot_lock_loss                 | 0.00361  |
+| foot_lock_loss_q0              | 0.00299  |
+| foot_lock_loss_q1              | 0.00342  |
+| foot_lock_loss_q2              | 0.00375  |
+| foot_lock_loss_q3              | 0.00437  |
+| head_anchor_loss               | 0.00888  |
+| head_anchor_loss_q0            | 0.0108   |
+| head_anchor_loss_q1            | 0.00905  |
+| head_anchor_loss_q2            | 0.00784  |
+| head_anchor_loss_q3            | 0.00765  |
+| hip_root_height_consistency... | 0.00159  |
+| hip_root_position_consisten... | 0.000246 |
+| hip_root_yaw_consistency_lo... | 5.72e-06 |
+| hip_root_yaw_consistency_loss  | 4.81e-05 |
+| joint_vel_loss                 | 0.00449  |
+| joint_vel_loss_q0              | 0.00526  |
+| joint_vel_loss_q1              | 0.0044   |
+| joint_vel_loss_q2              | 0.00469  |
+| joint_vel_loss_q3              | 0.00349  |
+| loss                           | 0.0402   |
+| loss_q0                        | 0.0549   |
+| loss_q1                        | 0.0463   |
+| loss_q2                        | 0.0334   |
+| loss_q3                        | 0.0248   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000382 |
+| root_delta_loss_q0             | 0.000422 |
+| root_delta_loss_q1             | 0.000329 |
+| root_delta_loss_q2             | 0.000439 |
+| root_delta_loss_q3             | 0.000329 |
+| root_height_loss               | 0.0054   |
+| root_height_loss_q0            | 0.00673  |
+| root_height_loss_q1            | 0.0047   |
+| root_height_loss_q2            | 0.00583  |
+| root_height_loss_q3            | 0.00412  |
+| samples                        | 640      |
+| sensor_reprojection_pos_los... | 0.000149 |
+| sensor_reprojection_pos_loss   | 0.000942 |
+| sensor_reprojection_rot_los... | 0.000276 |
+| sensor_reprojection_rot_loss   | 0.0001   |
+| simple_loss                    | 0.00875  |
+| simple_loss_q0                 | 0.00842  |
+| simple_loss_q1                 | 0.014    |
+| simple_loss_q2                 | 0.00783  |
+| simple_loss_q3                 | 0.00469  |
+| step                           | 40       |
+| yaw_loss                       | 6.08e-05 |
+| yaw_loss_q0                    | 2.15e-05 |
+| yaw_loss_q1                    | 0.000163 |
+| yaw_loss_q2                    | 4.94e-05 |
+| yaw_loss_q3                    | 1.09e-05 |
+---------------------------------------------
+step[41] data=0.089s train=0.047s
+step[42] data=0.084s train=0.038s
+step[43] data=0.083s train=0.042s
+step[44] data=0.094s train=0.038s
+step[45] data=0.088s train=0.043s
+step[46] data=0.082s train=0.037s
+step[47] data=0.090s train=0.039s
+step[48] data=0.114s train=0.037s
+step[49] data=0.083s train=0.039s
+step[50] data=0.091s train=0.042s
+step[50]: loss[0.03566]
+---------------------------------------------
+| aux_loss                       | 0.0273   |
+| aux_loss_q0                    | 0.0385   |
+| aux_loss_q1                    | 0.0254   |
+| aux_loss_q2                    | 0.0201   |
+| aux_loss_q3                    | 0.0227   |
+| fk_loss                        | 4.96e-05 |
+| fk_loss_q0                     | 5.47e-05 |
+| fk_loss_q1                     | 4.45e-05 |
+| fk_loss_q2                     | 4.47e-05 |
+| fk_loss_q3                     | 5.46e-05 |
+| foot_lock_loss                 | 0.00326  |
+| foot_lock_loss_q0              | 0.00231  |
+| foot_lock_loss_q1              | 0.00385  |
+| foot_lock_loss_q2              | 0.00384  |
+| foot_lock_loss_q3              | 0.00317  |
+| head_anchor_loss               | 0.00781  |
+| head_anchor_loss_q0            | 0.00855  |
+| head_anchor_loss_q1            | 0.00713  |
+| head_anchor_loss_q2            | 0.00692  |
+| head_anchor_loss_q3            | 0.00866  |
+| hip_root_height_consistency... | 0.00142  |
+| hip_root_position_consisten... | 0.000207 |
+| hip_root_yaw_consistency_lo... | 5.21e-05 |
+| hip_root_yaw_consistency_loss  | 2.03e-05 |
+| joint_vel_loss                 | 0.00412  |
+| joint_vel_loss_q0              | 0.00431  |
+| joint_vel_loss_q1              | 0.00392  |
+| joint_vel_loss_q2              | 0.00382  |
+| joint_vel_loss_q3              | 0.00447  |
+| loss                           | 0.0357   |
+| loss_q0                        | 0.0452   |
+| loss_q1                        | 0.0327   |
+| loss_q2                        | 0.0295   |
+| loss_q3                        | 0.0333   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000471 |
+| root_delta_loss_q0             | 0.000494 |
+| root_delta_loss_q1             | 0.000415 |
+| root_delta_loss_q2             | 0.000561 |
+| root_delta_loss_q3             | 0.000409 |
+| root_height_loss               | 0.00392  |
+| root_height_loss_q0            | 0.00445  |
+| root_height_loss_q1            | 0.00326  |
+| root_height_loss_q2            | 0.00357  |
+| root_height_loss_q3            | 0.00444  |
+| samples                        | 800      |
+| sensor_reprojection_pos_los... | 0.000229 |
+| sensor_reprojection_pos_loss   | 0.000879 |
+| sensor_reprojection_rot_los... | 0.000366 |
+| sensor_reprojection_rot_loss   | 0.000286 |
+| simple_loss                    | 0.00832  |
+| simple_loss_q0                 | 0.00671  |
+| simple_loss_q1                 | 0.00729  |
+| simple_loss_q2                 | 0.00947  |
+| simple_loss_q3                 | 0.0106   |
+| step                           | 50       |
+| yaw_loss                       | 2.98e-05 |
+| yaw_loss_q0                    | 7.54e-06 |
+| yaw_loss_q1                    | 1.62e-05 |
+| yaw_loss_q2                    | 4.55e-05 |
+| yaw_loss_q3                    | 6.05e-05 |
+---------------------------------------------
+step[51] data=0.087s train=0.047s
+step[52] data=0.086s train=0.038s
+step[53] data=0.084s train=0.035s
+step[54] data=0.091s train=0.041s
+step[55] data=0.092s train=0.037s
+step[56] data=0.086s train=0.037s
+step[57] data=0.091s train=0.038s
+step[58] data=0.086s train=0.037s
+step[59] data=0.086s train=0.048s
+step[60] data=0.090s train=0.041s
+step[60]: loss[0.03612]
+---------------------------------------------
+| aux_loss                       | 0.029    |
+| aux_loss_q0                    | 0.037    |
+| aux_loss_q1                    | 0.034    |
+| aux_loss_q2                    | 0.0242   |
+| aux_loss_q3                    | 0.0203   |
+| fk_loss                        | 6.02e-05 |
+| fk_loss_q0                     | 6.27e-05 |
+| fk_loss_q1                     | 8.27e-05 |
+| fk_loss_q2                     | 5.97e-05 |
+| fk_loss_q3                     | 3.47e-05 |
+| foot_lock_loss                 | 0.00277  |
+| foot_lock_loss_q0              | 0.00264  |
+| foot_lock_loss_q1              | 0.00321  |
+| foot_lock_loss_q2              | 0.00329  |
+| foot_lock_loss_q3              | 0.00174  |
+| head_anchor_loss               | 0.00856  |
+| head_anchor_loss_q0            | 0.00848  |
+| head_anchor_loss_q1            | 0.00938  |
+| head_anchor_loss_q2            | 0.00843  |
+| head_anchor_loss_q3            | 0.00803  |
+| hip_root_height_consistency... | 0.00206  |
+| hip_root_position_consisten... | 0.00027  |
+| hip_root_yaw_consistency_lo... | 2.04e-05 |
+| hip_root_yaw_consistency_loss  | 3.23e-05 |
+| joint_vel_loss                 | 0.00396  |
+| joint_vel_loss_q0              | 0.00379  |
+| joint_vel_loss_q1              | 0.0045   |
+| joint_vel_loss_q2              | 0.00395  |
+| joint_vel_loss_q3              | 0.00364  |
+| loss                           | 0.0361   |
+| loss_q0                        | 0.0439   |
+| loss_q1                        | 0.0397   |
+| loss_q2                        | 0.0315   |
+| loss_q3                        | 0.029    |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000345 |
+| root_delta_loss_q0             | 0.00035  |
+| root_delta_loss_q1             | 0.00037  |
+| root_delta_loss_q2             | 0.00033  |
+| root_delta_loss_q3             | 0.000335 |
+| root_height_loss               | 0.00508  |
+| root_height_loss_q0            | 0.00489  |
+| root_height_loss_q1            | 0.00633  |
+| root_height_loss_q2            | 0.00547  |
+| root_height_loss_q3            | 0.00345  |
+| samples                        | 960      |
+| sensor_reprojection_pos_los... | 0.000148 |
+| sensor_reprojection_pos_loss   | 0.000876 |
+| sensor_reprojection_rot_los... | 0.000773 |
+| sensor_reprojection_rot_loss   | 0.000264 |
+| simple_loss                    | 0.00712  |
+| simple_loss_q0                 | 0.00689  |
+| simple_loss_q1                 | 0.00569  |
+| simple_loss_q2                 | 0.00727  |
+| simple_loss_q3                 | 0.00869  |
+| step                           | 60       |
+| yaw_loss                       | 4.63e-05 |
+| yaw_loss_q0                    | 5.65e-05 |
+| yaw_loss_q1                    | 1.78e-05 |
+| yaw_loss_q2                    | 6.52e-05 |
+| yaw_loss_q3                    | 3.42e-05 |
+---------------------------------------------
+step[61] data=0.088s train=0.048s
+step[62] data=0.085s train=0.037s
+step[63] data=0.090s train=0.039s
+step[64] data=0.098s train=0.040s
+step[65] data=0.100s train=0.045s
+step[66] data=0.103s train=0.040s
+step[67] data=0.092s train=0.037s
+step[68] data=0.087s train=0.036s
+step[69] data=0.084s train=0.040s
+step[70] data=0.087s train=0.042s
+step[70]: loss[0.03099]
+----------------------------------------------
+| aux_loss                       | 0.0246    |
+| aux_loss_q0                    | 0.0338    |
+| aux_loss_q1                    | 0.0214    |
+| aux_loss_q2                    | 0.019     |
+| aux_loss_q3                    | 0.0225    |
+| fk_loss                        | 5.02e-05  |
+| fk_loss_q0                     | 6.78e-05  |
+| fk_loss_q1                     | 3.36e-05  |
+| fk_loss_q2                     | 4.44e-05  |
+| fk_loss_q3                     | 5.43e-05  |
+| foot_lock_loss                 | 0.00266   |
+| foot_lock_loss_q0              | 0.00246   |
+| foot_lock_loss_q1              | 0.00243   |
+| foot_lock_loss_q2              | 0.00301   |
+| foot_lock_loss_q3              | 0.00282   |
+| head_anchor_loss               | 0.00693   |
+| head_anchor_loss_q0            | 0.00747   |
+| head_anchor_loss_q1            | 0.00644   |
+| head_anchor_loss_q2            | 0.00564   |
+| head_anchor_loss_q3            | 0.00803   |
+| hip_root_height_consistency... | 0.00168   |
+| hip_root_position_consisten... | 0.000229  |
+| hip_root_yaw_consistency_lo... | 2.38e-05  |
+| hip_root_yaw_consistency_loss  | 1.51e-05  |
+| joint_vel_loss                 | 0.00404   |
+| joint_vel_loss_q0              | 0.00448   |
+| joint_vel_loss_q1              | 0.00365   |
+| joint_vel_loss_q2              | 0.00387   |
+| joint_vel_loss_q3              | 0.00412   |
+| loss                           | 0.031     |
+| loss_q0                        | 0.0396    |
+| loss_q1                        | 0.0269    |
+| loss_q2                        | 0.0271    |
+| loss_q3                        | 0.0292    |
+| lr                             | 5e-05     |
+| root_delta_loss                | 0.000367  |
+| root_delta_loss_q0             | 0.000354  |
+| root_delta_loss_q1             | 0.000378  |
+| root_delta_loss_q2             | 0.000396  |
+| root_delta_loss_q3             | 0.000345  |
+| root_height_loss               | 0.00518   |
+| root_height_loss_q0            | 0.0054    |
+| root_height_loss_q1            | 0.0045    |
+| root_height_loss_q2            | 0.00441   |
+| root_height_loss_q3            | 0.00642   |
+| samples                        | 1.12e+03  |
+| sensor_reprojection_pos_los... | 0.00019   |
+| sensor_reprojection_pos_loss   | 0.000695  |
+| sensor_reprojection_rot_los... | -1.36e-06 |
+| sensor_reprojection_rot_loss   | -0.000232 |
+| simple_loss                    | 0.00642   |
+| simple_loss_q0                 | 0.00586   |
+| simple_loss_q1                 | 0.00553   |
+| simple_loss_q2                 | 0.00801   |
+| simple_loss_q3                 | 0.00665   |
+| step                           | 70        |
+| yaw_loss                       | 2.79e-05  |
+| yaw_loss_q0                    | 9.86e-06  |
+| yaw_loss_q1                    | 2.57e-05  |
+| yaw_loss_q2                    | 4.76e-05  |
+| yaw_loss_q3                    | 3.38e-05  |
+----------------------------------------------
+step[71] data=0.089s train=0.047s
+step[72] data=0.082s train=0.039s
+step[73] data=0.084s train=0.038s
+step[74] data=0.093s train=0.039s
+step[75] data=0.095s train=0.042s
+step[76] data=0.083s train=0.037s
+step[77] data=0.094s train=0.040s
+step[78] data=0.086s train=0.036s
+step[79] data=0.091s train=0.038s
+step[80] data=0.093s train=0.036s
+step[80]: loss[0.02752]
+----------------------------------------------
+| aux_loss                       | 0.022     |
+| aux_loss_q0                    | 0.0345    |
+| aux_loss_q1                    | 0.019     |
+| aux_loss_q2                    | 0.0178    |
+| aux_loss_q3                    | 0.0147    |
+| fk_loss                        | 3.55e-05  |
+| fk_loss_q0                     | 5.51e-05  |
+| fk_loss_q1                     | 2.84e-05  |
+| fk_loss_q2                     | 2.87e-05  |
+| fk_loss_q3                     | 2.71e-05  |
+| foot_lock_loss                 | 0.00258   |
+| foot_lock_loss_q0              | 0.00196   |
+| foot_lock_loss_q1              | 0.00278   |
+| foot_lock_loss_q2              | 0.00304   |
+| foot_lock_loss_q3              | 0.00265   |
+| head_anchor_loss               | 0.0064    |
+| head_anchor_loss_q0            | 0.00798   |
+| head_anchor_loss_q1            | 0.00587   |
+| head_anchor_loss_q2            | 0.00579   |
+| head_anchor_loss_q3            | 0.00573   |
+| hip_root_height_consistency... | 0.00122   |
+| hip_root_position_consisten... | 0.000183  |
+| hip_root_yaw_consistency_lo... | 3.37e-06  |
+| hip_root_yaw_consistency_loss  | 3.96e-06  |
+| joint_vel_loss                 | 0.00356   |
+| joint_vel_loss_q0              | 0.00431   |
+| joint_vel_loss_q1              | 0.00324   |
+| joint_vel_loss_q2              | 0.00327   |
+| joint_vel_loss_q3              | 0.00333   |
+| loss                           | 0.0275    |
+| loss_q0                        | 0.0413    |
+| loss_q1                        | 0.0231    |
+| loss_q2                        | 0.0225    |
+| loss_q3                        | 0.0211    |
+| lr                             | 5e-05     |
+| root_delta_loss                | 0.000318  |
+| root_delta_loss_q0             | 0.000401  |
+| root_delta_loss_q1             | 0.000242  |
+| root_delta_loss_q2             | 0.00031   |
+| root_delta_loss_q3             | 0.000317  |
+| root_height_loss               | 0.00364   |
+| root_height_loss_q0            | 0.00549   |
+| root_height_loss_q1            | 0.00274   |
+| root_height_loss_q2            | 0.0032    |
+| root_height_loss_q3            | 0.0029    |
+| samples                        | 1.28e+03  |
+| sensor_reprojection_pos_los... | 0.000114  |
+| sensor_reprojection_pos_loss   | 0.000668  |
+| sensor_reprojection_rot_los... | -1.68e-05 |
+| sensor_reprojection_rot_loss   | 4.93e-05  |
+| simple_loss                    | 0.00548   |
+| simple_loss_q0                 | 0.0068    |
+| simple_loss_q1                 | 0.00407   |
+| simple_loss_q2                 | 0.00465   |
+| simple_loss_q3                 | 0.00641   |
+| step                           | 80        |
+| yaw_loss                       | 1.5e-05   |
+| yaw_loss_q0                    | 1.25e-05  |
+| yaw_loss_q1                    | 1.54e-05  |
+| yaw_loss_q2                    | 1.08e-05  |
+| yaw_loss_q3                    | 2.17e-05  |
+----------------------------------------------
+step[81] data=0.092s train=0.038s
+step[82] data=0.080s train=0.038s
+step[83] data=0.081s train=0.036s
+step[84] data=0.093s train=0.045s
+step[85] data=0.091s train=0.035s
+step[86] data=0.093s train=0.038s
+step[87] data=0.094s train=0.049s
+step[88] data=0.085s train=0.039s
+step[89] data=0.092s train=0.044s
+step[90] data=0.080s train=0.036s
+step[90]: loss[0.02450]
+----------------------------------------------
+| aux_loss                       | 0.0199    |
+| aux_loss_q0                    | 0.0194    |
+| aux_loss_q1                    | 0.0217    |
+| aux_loss_q2                    | 0.0237    |
+| aux_loss_q3                    | 0.0144    |
+| fk_loss                        | 3e-05     |
+| fk_loss_q0                     | 1.98e-05  |
+| fk_loss_q1                     | 3.33e-05  |
+| fk_loss_q2                     | 4.55e-05  |
+| fk_loss_q3                     | 1.88e-05  |
+| foot_lock_loss                 | 0.003     |
+| foot_lock_loss_q0              | 0.00304   |
+| foot_lock_loss_q1              | 0.00297   |
+| foot_lock_loss_q2              | 0.00308   |
+| foot_lock_loss_q3              | 0.00289   |
+| head_anchor_loss               | 0.00686   |
+| head_anchor_loss_q0            | 0.00563   |
+| head_anchor_loss_q1            | 0.00693   |
+| head_anchor_loss_q2            | 0.00871   |
+| head_anchor_loss_q3            | 0.00579   |
+| hip_root_height_consistency... | 0.00161   |
+| hip_root_position_consisten... | 0.00022   |
+| hip_root_yaw_consistency_lo... | 2.99e-06  |
+| hip_root_yaw_consistency_loss  | 4.37e-06  |
+| joint_vel_loss                 | 0.00342   |
+| joint_vel_loss_q0              | 0.00293   |
+| joint_vel_loss_q1              | 0.00369   |
+| joint_vel_loss_q2              | 0.00391   |
+| joint_vel_loss_q3              | 0.00307   |
+| loss                           | 0.0245    |
+| loss_q0                        | 0.0227    |
+| loss_q1                        | 0.0267    |
+| loss_q2                        | 0.0288    |
+| loss_q3                        | 0.0192    |
+| lr                             | 5e-05     |
+| root_delta_loss                | 0.000326  |
+| root_delta_loss_q0             | 0.000214  |
+| root_delta_loss_q1             | 0.000374  |
+| root_delta_loss_q2             | 0.000377  |
+| root_delta_loss_q3             | 0.000332  |
+| root_height_loss               | 0.00371   |
+| root_height_loss_q0            | 0.00249   |
+| root_height_loss_q1            | 0.00377   |
+| root_height_loss_q2            | 0.00471   |
+| root_height_loss_q3            | 0.00365   |
+| samples                        | 1.44e+03  |
+| sensor_reprojection_pos_los... | 8.17e-05  |
+| sensor_reprojection_pos_loss   | 0.000402  |
+| sensor_reprojection_rot_los... | -0.000535 |
+| sensor_reprojection_rot_loss   | -4.31e-05 |
+| simple_loss                    | 0.00458   |
+| simple_loss_q0                 | 0.00332   |
+| simple_loss_q1                 | 0.00501   |
+| simple_loss_q2                 | 0.00511   |
+| simple_loss_q3                 | 0.00479   |
+| step                           | 90        |
+| yaw_loss                       | 8.9e-06   |
+| yaw_loss_q0                    | 7.19e-06  |
+| yaw_loss_q1                    | 8.68e-06  |
+| yaw_loss_q2                    | 1.29e-05  |
+| yaw_loss_q3                    | 6.08e-06  |
+----------------------------------------------
+step[91] data=0.085s train=0.037s
+step[92] data=0.088s train=0.046s
+step[93] data=0.093s train=0.037s
+step[94] data=0.092s train=0.040s
+step[95] data=0.097s train=0.044s
+step[96] data=0.086s train=0.046s
+step[97] data=0.089s train=0.038s
+step[98] data=0.086s train=0.035s
+step[99] data=0.087s train=0.034s
+step[100] data=0.089s train=0.040s
+step[100]: loss[0.02807]
+---------------------------------------------
+| aux_loss                       | 0.0232   |
+| aux_loss_q0                    | 0.0248   |
+| aux_loss_q1                    | 0.0283   |
+| aux_loss_q2                    | 0.0196   |
+| aux_loss_q3                    | 0.0191   |
+| fk_loss                        | 4.49e-05 |
+| fk_loss_q0                     | 3.2e-05  |
+| fk_loss_q1                     | 7.33e-05 |
+| fk_loss_q2                     | 4.1e-05  |
+| fk_loss_q3                     | 3.13e-05 |
+| foot_lock_loss                 | 0.00304  |
+| foot_lock_loss_q0              | 0.00339  |
+| foot_lock_loss_q1              | 0.00279  |
+| foot_lock_loss_q2              | 0.00276  |
+| foot_lock_loss_q3              | 0.00323  |
+| head_anchor_loss               | 0.00655  |
+| head_anchor_loss_q0            | 0.006    |
+| head_anchor_loss_q1            | 0.00681  |
+| head_anchor_loss_q2            | 0.00628  |
+| head_anchor_loss_q3            | 0.00742  |
+| hip_root_height_consistency... | 0.00156  |
+| hip_root_position_consisten... | 0.000308 |
+| hip_root_yaw_consistency_lo... | 1.61e-05 |
+| hip_root_yaw_consistency_loss  | 1.08e-05 |
+| joint_vel_loss                 | 0.00374  |
+| joint_vel_loss_q0              | 0.00362  |
+| joint_vel_loss_q1              | 0.00394  |
+| joint_vel_loss_q2              | 0.00375  |
+| joint_vel_loss_q3              | 0.00363  |
+| loss                           | 0.0281   |
+| loss_q0                        | 0.0294   |
+| loss_q1                        | 0.0336   |
+| loss_q2                        | 0.0244   |
+| loss_q3                        | 0.0236   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000367 |
+| root_delta_loss_q0             | 0.000368 |
+| root_delta_loss_q1             | 0.00044  |
+| root_delta_loss_q2             | 0.000333 |
+| root_delta_loss_q3             | 0.000315 |
+| root_height_loss               | 0.00411  |
+| root_height_loss_q0            | 0.00416  |
+| root_height_loss_q1            | 0.00395  |
+| root_height_loss_q2            | 0.00462  |
+| root_height_loss_q3            | 0.00353  |
+| samples                        | 1.6e+03  |
+| sensor_reprojection_pos_los... | 0.00012  |
+| sensor_reprojection_pos_loss   | 0.000666 |
+| sensor_reprojection_rot_los... | 0.000541 |
+| sensor_reprojection_rot_loss   | 5.21e-06 |
+| simple_loss                    | 0.00484  |
+| simple_loss_q0                 | 0.00463  |
+| simple_loss_q1                 | 0.00531  |
+| simple_loss_q2                 | 0.00488  |
+| simple_loss_q3                 | 0.00446  |
+| step                           | 100      |
+| yaw_loss                       | 1.55e-05 |
+| yaw_loss_q0                    | 8.74e-06 |
+| yaw_loss_q1                    | 1.41e-05 |
+| yaw_loss_q2                    | 2.06e-05 |
+| yaw_loss_q3                    | 2.04e-05 |
+---------------------------------------------
+saving checkpoint step 100...
+step[101] data=0.339s train=0.038s
+step[102] data=0.091s train=0.043s
+step[103] data=0.086s train=0.037s
+step[104] data=0.087s train=0.032s
+step[105] data=0.091s train=0.036s
+step[106] data=0.088s train=0.042s
+step[107] data=0.081s train=0.037s
+step[108] data=0.085s train=0.042s
+step[109] data=0.093s train=0.038s
+step[110] data=0.086s train=0.043s
+step[110]: loss[0.03408]
+---------------------------------------------
+| aux_loss                       | 0.0286   |
+| aux_loss_q0                    | 0.0391   |
+| aux_loss_q1                    | 0.0246   |
+| aux_loss_q2                    | 0.0206   |
+| aux_loss_q3                    | 0.0288   |
+| fk_loss                        | 4.54e-05 |
+| fk_loss_q0                     | 5.34e-05 |
+| fk_loss_q1                     | 4.04e-05 |
+| fk_loss_q2                     | 3.12e-05 |
+| fk_loss_q3                     | 5.8e-05  |
+| foot_lock_loss                 | 0.00365  |
+| foot_lock_loss_q0              | 0.00297  |
+| foot_lock_loss_q1              | 0.00422  |
+| foot_lock_loss_q2              | 0.00334  |
+| foot_lock_loss_q3              | 0.00443  |
+| head_anchor_loss               | 0.00833  |
+| head_anchor_loss_q0            | 0.00904  |
+| head_anchor_loss_q1            | 0.00649  |
+| head_anchor_loss_q2            | 0.0071   |
+| head_anchor_loss_q3            | 0.0108   |
+| hip_root_height_consistency... | 0.00256  |
+| hip_root_position_consisten... | 0.000291 |
+| hip_root_yaw_consistency_lo... | 2.68e-06 |
+| hip_root_yaw_consistency_loss  | 1.19e-05 |
+| joint_vel_loss                 | 0.00414  |
+| joint_vel_loss_q0              | 0.00437  |
+| joint_vel_loss_q1              | 0.00395  |
+| joint_vel_loss_q2              | 0.00366  |
+| joint_vel_loss_q3              | 0.00465  |
+| loss                           | 0.0341   |
+| loss_q0                        | 0.0438   |
+| loss_q1                        | 0.0308   |
+| loss_q2                        | 0.0263   |
+| loss_q3                        | 0.0342   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000366 |
+| root_delta_loss_q0             | 0.000359 |
+| root_delta_loss_q1             | 0.00036  |
+| root_delta_loss_q2             | 0.0004   |
+| root_delta_loss_q3             | 0.000339 |
+| root_height_loss               | 0.00483  |
+| root_height_loss_q0            | 0.00542  |
+| root_height_loss_q1            | 0.00369  |
+| root_height_loss_q2            | 0.00384  |
+| root_height_loss_q3            | 0.00646  |
+| samples                        | 1.76e+03 |
+| sensor_reprojection_pos_los... | 0.00028  |
+| sensor_reprojection_pos_loss   | 0.000802 |
+| sensor_reprojection_rot_los... | 0.000407 |
+| sensor_reprojection_rot_loss   | 0.000176 |
+| simple_loss                    | 0.00544  |
+| simple_loss_q0                 | 0.0047   |
+| simple_loss_q1                 | 0.0062   |
+| simple_loss_q2                 | 0.00568  |
+| simple_loss_q3                 | 0.00538  |
+| step                           | 110      |
+| yaw_loss                       | 1.87e-05 |
+| yaw_loss_q0                    | 1.38e-05 |
+| yaw_loss_q1                    | 2.7e-05  |
+| yaw_loss_q2                    | 2.54e-05 |
+| yaw_loss_q3                    | 8.28e-06 |
+---------------------------------------------
+step[111] data=0.085s train=0.043s
+step[112] data=0.090s train=0.040s
+step[113] data=0.086s train=0.040s
+step[114] data=0.090s train=0.044s
+step[115] data=0.092s train=0.046s
+step[116] data=0.092s train=0.035s
+step[117] data=0.084s train=0.044s
+step[118] data=0.093s train=0.049s
+step[119] data=0.092s train=0.038s
+step[120] data=0.086s train=0.043s
+step[120]: loss[0.02905]
+---------------------------------------------
+| aux_loss                       | 0.0238   |
+| aux_loss_q0                    | 0.0274   |
+| aux_loss_q1                    | 0.0208   |
+| aux_loss_q2                    | 0.0257   |
+| aux_loss_q3                    | 0.0205   |
+| fk_loss                        | 3.58e-05 |
+| fk_loss_q0                     | 3.46e-05 |
+| fk_loss_q1                     | 2.38e-05 |
+| fk_loss_q2                     | 4.87e-05 |
+| fk_loss_q3                     | 3.67e-05 |
+| foot_lock_loss                 | 0.00315  |
+| foot_lock_loss_q0              | 0.00323  |
+| foot_lock_loss_q1              | 0.00341  |
+| foot_lock_loss_q2              | 0.00252  |
+| foot_lock_loss_q3              | 0.00333  |
+| head_anchor_loss               | 0.00729  |
+| head_anchor_loss_q0            | 0.0068   |
+| head_anchor_loss_q1            | 0.0063   |
+| head_anchor_loss_q2            | 0.00904  |
+| head_anchor_loss_q3            | 0.00729  |
+| hip_root_height_consistency... | 0.00138  |
+| hip_root_position_consisten... | 0.000152 |
+| hip_root_yaw_consistency_lo... | 2.27e-06 |
+| hip_root_yaw_consistency_loss  | 1.87e-05 |
+| joint_vel_loss                 | 0.00373  |
+| joint_vel_loss_q0              | 0.00367  |
+| joint_vel_loss_q1              | 0.00326  |
+| joint_vel_loss_q2              | 0.00416  |
+| joint_vel_loss_q3              | 0.00383  |
+| loss                           | 0.0291   |
+| loss_q0                        | 0.0323   |
+| loss_q1                        | 0.0249   |
+| loss_q2                        | 0.0336   |
+| loss_q3                        | 0.0248   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.00031  |
+| root_delta_loss_q0             | 0.000315 |
+| root_delta_loss_q1             | 0.000277 |
+| root_delta_loss_q2             | 0.000395 |
+| root_delta_loss_q3             | 0.000261 |
+| root_height_loss               | 0.00436  |
+| root_height_loss_q0            | 0.00351  |
+| root_height_loss_q1            | 0.004    |
+| root_height_loss_q2            | 0.0055   |
+| root_height_loss_q3            | 0.00478  |
+| samples                        | 1.92e+03 |
+| sensor_reprojection_pos_los... | 0.000218 |
+| sensor_reprojection_pos_loss   | 0.000606 |
+| sensor_reprojection_rot_los... | 0.000349 |
+| sensor_reprojection_rot_loss   | 1.37e-05 |
+| simple_loss                    | 0.00522  |
+| simple_loss_q0                 | 0.00492  |
+| simple_loss_q1                 | 0.00406  |
+| simple_loss_q2                 | 0.00798  |
+| simple_loss_q3                 | 0.00429  |
+| step                           | 120      |
+| yaw_loss                       | 2.6e-05  |
+| yaw_loss_q0                    | 7.77e-06 |
+| yaw_loss_q1                    | 2.24e-05 |
+| yaw_loss_q2                    | 7.32e-05 |
+| yaw_loss_q3                    | 1.2e-05  |
+---------------------------------------------
+step[121] data=0.083s train=0.042s
+step[122] data=0.094s train=0.043s
+step[123] data=0.088s train=0.035s
+step[124] data=0.087s train=0.038s
+step[125] data=0.081s train=0.044s
+step[126] data=0.091s train=0.036s
+step[127] data=0.090s train=0.035s
+step[128] data=0.093s train=0.038s
+step[129] data=0.090s train=0.040s
+step[130] data=0.093s train=0.036s
+step[130]: loss[0.02773]
+---------------------------------------------
+| aux_loss                       | 0.0225   |
+| aux_loss_q0                    | 0.0266   |
+| aux_loss_q1                    | 0.0253   |
+| aux_loss_q2                    | 0.0167   |
+| aux_loss_q3                    | 0.0224   |
+| fk_loss                        | 3.46e-05 |
+| fk_loss_q0                     | 3.08e-05 |
+| fk_loss_q1                     | 3.84e-05 |
+| fk_loss_q2                     | 3.03e-05 |
+| fk_loss_q3                     | 3.83e-05 |
+| foot_lock_loss                 | 0.00348  |
+| foot_lock_loss_q0              | 0.00358  |
+| foot_lock_loss_q1              | 0.00407  |
+| foot_lock_loss_q2              | 0.00308  |
+| foot_lock_loss_q3              | 0.00319  |
+| head_anchor_loss               | 0.00677  |
+| head_anchor_loss_q0            | 0.00651  |
+| head_anchor_loss_q1            | 0.00654  |
+| head_anchor_loss_q2            | 0.00548  |
+| head_anchor_loss_q3            | 0.00874  |
+| hip_root_height_consistency... | 0.00222  |
+| hip_root_position_consisten... | 0.000262 |
+| hip_root_yaw_consistency_lo... | 1.28e-05 |
+| hip_root_yaw_consistency_loss  | 9.37e-06 |
+| joint_vel_loss                 | 0.00363  |
+| joint_vel_loss_q0              | 0.00356  |
+| joint_vel_loss_q1              | 0.00363  |
+| joint_vel_loss_q2              | 0.00357  |
+| joint_vel_loss_q3              | 0.00376  |
+| loss                           | 0.0277   |
+| loss_q0                        | 0.0319   |
+| loss_q1                        | 0.0312   |
+| loss_q2                        | 0.0214   |
+| loss_q3                        | 0.0277   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000288 |
+| root_delta_loss_q0             | 0.000249 |
+| root_delta_loss_q1             | 0.0003   |
+| root_delta_loss_q2             | 0.000308 |
+| root_delta_loss_q3             | 0.000285 |
+| root_height_loss               | 0.0038   |
+| root_height_loss_q0            | 0.00317  |
+| root_height_loss_q1            | 0.004    |
+| root_height_loss_q2            | 0.00372  |
+| root_height_loss_q3            | 0.00417  |
+| samples                        | 2.08e+03 |
+| sensor_reprojection_pos_los... | 0.000177 |
+| sensor_reprojection_pos_loss   | 0.000539 |
+| sensor_reprojection_rot_los... | 0.000609 |
+| sensor_reprojection_rot_loss   | 0.000159 |
+| simple_loss                    | 0.00528  |
+| simple_loss_q0                 | 0.00526  |
+| simple_loss_q1                 | 0.00589  |
+| simple_loss_q2                 | 0.00469  |
+| simple_loss_q3                 | 0.00528  |
+| step                           | 130      |
+| yaw_loss                       | 1.65e-05 |
+| yaw_loss_q0                    | 7.8e-06  |
+| yaw_loss_q1                    | 2.19e-05 |
+| yaw_loss_q2                    | 1.49e-05 |
+| yaw_loss_q3                    | 1.92e-05 |
+---------------------------------------------
+step[131] data=0.091s train=0.037s
+step[132] data=0.089s train=0.036s
+step[133] data=0.086s train=0.044s
+step[134] data=0.093s train=0.041s
+step[135] data=0.084s train=0.037s
+step[136] data=0.090s train=0.037s
+step[137] data=0.090s train=0.036s
+step[138] data=0.087s train=0.038s
+step[139] data=0.087s train=0.035s
+step[140] data=0.086s train=0.036s
+step[140]: loss[0.02766]
+----------------------------------------------
+| aux_loss                       | 0.0226    |
+| aux_loss_q0                    | 0.034     |
+| aux_loss_q1                    | 0.0225    |
+| aux_loss_q2                    | 0.0178    |
+| aux_loss_q3                    | 0.0168    |
+| fk_loss                        | 3.96e-05  |
+| fk_loss_q0                     | 7.02e-05  |
+| fk_loss_q1                     | 3.37e-05  |
+| fk_loss_q2                     | 2.88e-05  |
+| fk_loss_q3                     | 3.04e-05  |
+| foot_lock_loss                 | 0.00328   |
+| foot_lock_loss_q0              | 0.00423   |
+| foot_lock_loss_q1              | 0.00296   |
+| foot_lock_loss_q2              | 0.00282   |
+| foot_lock_loss_q3              | 0.00331   |
+| head_anchor_loss               | 0.00685   |
+| head_anchor_loss_q0            | 0.00792   |
+| head_anchor_loss_q1            | 0.00703   |
+| head_anchor_loss_q2            | 0.00598   |
+| head_anchor_loss_q3            | 0.00645   |
+| hip_root_height_consistency... | 0.00171   |
+| hip_root_position_consisten... | 0.000225  |
+| hip_root_yaw_consistency_lo... | 2.37e-05  |
+| hip_root_yaw_consistency_loss  | 1.13e-05  |
+| joint_vel_loss                 | 0.00354   |
+| joint_vel_loss_q0              | 0.00395   |
+| joint_vel_loss_q1              | 0.0035    |
+| joint_vel_loss_q2              | 0.00328   |
+| joint_vel_loss_q3              | 0.00349   |
+| loss                           | 0.0277    |
+| loss_q0                        | 0.0382    |
+| loss_q1                        | 0.0275    |
+| loss_q2                        | 0.0239    |
+| loss_q3                        | 0.0217    |
+| lr                             | 5e-05     |
+| root_delta_loss                | 0.000314  |
+| root_delta_loss_q0             | 0.000323  |
+| root_delta_loss_q1             | 0.000292  |
+| root_delta_loss_q2             | 0.000357  |
+| root_delta_loss_q3             | 0.000294  |
+| root_height_loss               | 0.00373   |
+| root_height_loss_q0            | 0.00522   |
+| root_height_loss_q1            | 0.00322   |
+| root_height_loss_q2            | 0.00302   |
+| root_height_loss_q3            | 0.00382   |
+| samples                        | 2.24e+03  |
+| sensor_reprojection_pos_los... | 0.000143  |
+| sensor_reprojection_pos_loss   | 0.0006    |
+| sensor_reprojection_rot_los... | -0.000425 |
+| sensor_reprojection_rot_loss   | 0.00022   |
+| simple_loss                    | 0.00506   |
+| simple_loss_q0                 | 0.00425   |
+| simple_loss_q1                 | 0.00503   |
+| simple_loss_q2                 | 0.00608   |
+| simple_loss_q3                 | 0.00487   |
+| step                           | 140       |
+| yaw_loss                       | 1.72e-05  |
+| yaw_loss_q0                    | 6.27e-06  |
+| yaw_loss_q1                    | 1.45e-05  |
+| yaw_loss_q2                    | 2.3e-05   |
+| yaw_loss_q3                    | 2.58e-05  |
+----------------------------------------------
+step[141] data=0.082s train=0.038s
+step[142] data=0.094s train=0.036s
+step[143] data=0.089s train=0.038s
+step[144] data=0.091s train=0.040s
+step[145] data=0.083s train=0.038s
+step[146] data=0.094s train=0.041s
+step[147] data=0.117s train=0.041s
+step[148] data=0.081s train=0.038s
+step[149] data=0.091s train=0.056s
+step[150] data=0.091s train=0.036s
+step[150]: loss[0.02707]
+---------------------------------------------
+| aux_loss                       | 0.0211   |
+| aux_loss_q0                    | 0.0215   |
+| aux_loss_q1                    | 0.0202   |
+| aux_loss_q2                    | 0.0222   |
+| aux_loss_q3                    | 0.0204   |
+| fk_loss                        | 3.43e-05 |
+| fk_loss_q0                     | 2.62e-05 |
+| fk_loss_q1                     | 3.16e-05 |
+| fk_loss_q2                     | 3.29e-05 |
+| fk_loss_q3                     | 5.02e-05 |
+| foot_lock_loss                 | 0.00298  |
+| foot_lock_loss_q0              | 0.00251  |
+| foot_lock_loss_q1              | 0.00335  |
+| foot_lock_loss_q2              | 0.00271  |
+| foot_lock_loss_q3              | 0.00343  |
+| head_anchor_loss               | 0.00641  |
+| head_anchor_loss_q0            | 0.00558  |
+| head_anchor_loss_q1            | 0.00596  |
+| head_anchor_loss_q2            | 0.00722  |
+| head_anchor_loss_q3            | 0.00713  |
+| hip_root_height_consistency... | 0.00112  |
+| hip_root_position_consisten... | 0.00017  |
+| hip_root_yaw_consistency_lo... | 1.68e-06 |
+| hip_root_yaw_consistency_loss  | 1.49e-05 |
+| joint_vel_loss                 | 0.00348  |
+| joint_vel_loss_q0              | 0.00303  |
+| joint_vel_loss_q1              | 0.00334  |
+| joint_vel_loss_q2              | 0.00371  |
+| joint_vel_loss_q3              | 0.004    |
+| loss                           | 0.0271   |
+| loss_q0                        | 0.0251   |
+| loss_q1                        | 0.0253   |
+| loss_q2                        | 0.0305   |
+| loss_q3                        | 0.0279   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000383 |
+| root_delta_loss_q0             | 0.000358 |
+| root_delta_loss_q1             | 0.000341 |
+| root_delta_loss_q2             | 0.000419 |
+| root_delta_loss_q3             | 0.000429 |
+| root_height_loss               | 0.0034   |
+| root_height_loss_q0            | 0.00285  |
+| root_height_loss_q1            | 0.00308  |
+| root_height_loss_q2            | 0.00355  |
+| root_height_loss_q3            | 0.00435  |
+| samples                        | 2.4e+03  |
+| sensor_reprojection_pos_los... | 0.000193 |
+| sensor_reprojection_pos_loss   | 0.000515 |
+| sensor_reprojection_rot_los... | 0.000671 |
+| sensor_reprojection_rot_loss   | 0.000312 |
+| simple_loss                    | 0.00598  |
+| simple_loss_q0                 | 0.00364  |
+| simple_loss_q1                 | 0.0051   |
+| simple_loss_q2                 | 0.00829  |
+| simple_loss_q3                 | 0.00752  |
+| step                           | 150      |
+| yaw_loss                       | 2.37e-05 |
+| yaw_loss_q0                    | 6.27e-06 |
+| yaw_loss_q1                    | 1.82e-05 |
+| yaw_loss_q2                    | 6.05e-05 |
+| yaw_loss_q3                    | 1.14e-05 |
+---------------------------------------------
+step[151] data=0.092s train=0.038s
+step[152] data=0.085s train=0.037s
+step[153] data=0.088s train=0.043s
+step[154] data=0.090s train=0.034s
+step[155] data=0.093s train=0.037s
+step[156] data=0.087s train=0.041s
+step[157] data=0.090s train=0.038s
+step[158] data=0.086s train=0.040s
+step[159] data=0.093s train=0.048s
+step[160] data=0.088s train=0.043s
+step[160]: loss[0.02985]
+----------------------------------------------
+| aux_loss                       | 0.0244    |
+| aux_loss_q0                    | 0.0328    |
+| aux_loss_q1                    | 0.0254    |
+| aux_loss_q2                    | 0.0237    |
+| aux_loss_q3                    | 0.0156    |
+| fk_loss                        | 3.85e-05  |
+| fk_loss_q0                     | 4.37e-05  |
+| fk_loss_q1                     | 4.38e-05  |
+| fk_loss_q2                     | 3.84e-05  |
+| fk_loss_q3                     | 2.58e-05  |
+| foot_lock_loss                 | 0.00308   |
+| foot_lock_loss_q0              | 0.00387   |
+| foot_lock_loss_q1              | 0.00312   |
+| foot_lock_loss_q2              | 0.00247   |
+| foot_lock_loss_q3              | 0.00318   |
+| head_anchor_loss               | 0.00737   |
+| head_anchor_loss_q0            | 0.00728   |
+| head_anchor_loss_q1            | 0.00794   |
+| head_anchor_loss_q2            | 0.00756   |
+| head_anchor_loss_q3            | 0.00633   |
+| hip_root_height_consistency... | 0.00136   |
+| hip_root_position_consisten... | 0.000145  |
+| hip_root_yaw_consistency_lo... | 1.73e-05  |
+| hip_root_yaw_consistency_loss  | 1.17e-05  |
+| joint_vel_loss                 | 0.00376   |
+| joint_vel_loss_q0              | 0.00406   |
+| joint_vel_loss_q1              | 0.00373   |
+| joint_vel_loss_q2              | 0.00385   |
+| joint_vel_loss_q3              | 0.00335   |
+| loss                           | 0.0299    |
+| loss_q0                        | 0.0382    |
+| loss_q1                        | 0.0296    |
+| loss_q2                        | 0.0307    |
+| loss_q3                        | 0.0205    |
+| lr                             | 5e-05     |
+| root_delta_loss                | 0.000382  |
+| root_delta_loss_q0             | 0.000398  |
+| root_delta_loss_q1             | 0.000335  |
+| root_delta_loss_q2             | 0.000504  |
+| root_delta_loss_q3             | 0.000249  |
+| root_height_loss               | 0.00394   |
+| root_height_loss_q0            | 0.00416   |
+| root_height_loss_q1            | 0.00357   |
+| root_height_loss_q2            | 0.00455   |
+| root_height_loss_q3            | 0.00334   |
+| samples                        | 2.56e+03  |
+| sensor_reprojection_pos_los... | 0.00012   |
+| sensor_reprojection_pos_loss   | 0.000652  |
+| sensor_reprojection_rot_los... | -0.000319 |
+| sensor_reprojection_rot_loss   | 0.000111  |
+| simple_loss                    | 0.00546   |
+| simple_loss_q0                 | 0.00542   |
+| simple_loss_q1                 | 0.00424   |
+| simple_loss_q2                 | 0.00703   |
+| simple_loss_q3                 | 0.00486   |
+| step                           | 160       |
+| yaw_loss                       | 1.87e-05  |
+| yaw_loss_q0                    | 1.52e-05  |
+| yaw_loss_q1                    | 1.36e-05  |
+| yaw_loss_q2                    | 1.89e-05  |
+| yaw_loss_q3                    | 2.93e-05  |
+----------------------------------------------
+step[161] data=0.364s train=0.045s
+step[162] data=0.087s train=0.043s
+step[163] data=0.093s train=0.036s
+step[164] data=0.083s train=0.036s
+step[165] data=0.084s train=0.040s
+step[166] data=0.087s train=0.047s
+step[167] data=0.087s train=0.037s
+step[168] data=0.087s train=0.040s
+step[169] data=0.084s train=0.033s
+step[170] data=0.091s train=0.035s
+step[170]: loss[0.02666]
+---------------------------------------------
+| aux_loss                       | 0.0219   |
+| aux_loss_q0                    | 0.0288   |
+| aux_loss_q1                    | 0.0195   |
+| aux_loss_q2                    | 0.0218   |
+| aux_loss_q3                    | 0.0196   |
+| fk_loss                        | 3.73e-05 |
+| fk_loss_q0                     | 4.79e-05 |
+| fk_loss_q1                     | 2.88e-05 |
+| fk_loss_q2                     | 3.53e-05 |
+| fk_loss_q3                     | 3.91e-05 |
+| foot_lock_loss                 | 0.00294  |
+| foot_lock_loss_q0              | 0.00291  |
+| foot_lock_loss_q1              | 0.00246  |
+| foot_lock_loss_q2              | 0.00392  |
+| foot_lock_loss_q3              | 0.00265  |
+| head_anchor_loss               | 0.00672  |
+| head_anchor_loss_q0            | 0.00773  |
+| head_anchor_loss_q1            | 0.00556  |
+| head_anchor_loss_q2            | 0.00718  |
+| head_anchor_loss_q3            | 0.00673  |
+| hip_root_height_consistency... | 0.00202  |
+| hip_root_position_consisten... | 0.000232 |
+| hip_root_yaw_consistency_lo... | 5.81e-06 |
+| hip_root_yaw_consistency_loss  | 3.95e-06 |
+| joint_vel_loss                 | 0.00371  |
+| joint_vel_loss_q0              | 0.00384  |
+| joint_vel_loss_q1              | 0.00343  |
+| joint_vel_loss_q2              | 0.00375  |
+| joint_vel_loss_q3              | 0.00383  |
+| loss                           | 0.0267   |
+| loss_q0                        | 0.0337   |
+| loss_q1                        | 0.0232   |
+| loss_q2                        | 0.0268   |
+| loss_q3                        | 0.0249   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.00035  |
+| root_delta_loss_q0             | 0.000363 |
+| root_delta_loss_q1             | 0.000332 |
+| root_delta_loss_q2             | 0.000309 |
+| root_delta_loss_q3             | 0.000386 |
+| root_height_loss               | 0.00446  |
+| root_height_loss_q0            | 0.00496  |
+| root_height_loss_q1            | 0.00384  |
+| root_height_loss_q2            | 0.00451  |
+| root_height_loss_q3            | 0.00461  |
+| samples                        | 2.72e+03 |
+| sensor_reprojection_pos_los... | 0.000152 |
+| sensor_reprojection_pos_loss   | 0.000466 |
+| sensor_reprojection_rot_los... | 0.000297 |
+| sensor_reprojection_rot_loss   | 0.000108 |
+| simple_loss                    | 0.00477  |
+| simple_loss_q0                 | 0.00497  |
+| simple_loss_q1                 | 0.00374  |
+| simple_loss_q2                 | 0.00502  |
+| simple_loss_q3                 | 0.00533  |
+| step                           | 170      |
+| yaw_loss                       | 9.72e-06 |
+| yaw_loss_q0                    | 6.74e-06 |
+| yaw_loss_q1                    | 6.52e-06 |
+| yaw_loss_q2                    | 1.05e-05 |
+| yaw_loss_q3                    | 1.38e-05 |
+---------------------------------------------
+step[171] data=0.091s train=0.042s
+step[172] data=0.087s train=0.040s
+step[173] data=0.094s train=0.038s
+step[174] data=0.091s train=0.039s
+step[175] data=0.088s train=0.040s
+step[176] data=0.087s train=0.036s
+step[177] data=0.094s train=0.038s
+step[178] data=0.087s train=0.039s
+step[179] data=0.088s train=0.037s
+step[180] data=0.086s train=0.046s
+step[180]: loss[0.02842]
+---------------------------------------------
+| aux_loss                       | 0.0227   |
+| aux_loss_q0                    | 0.0212   |
+| aux_loss_q1                    | 0.022    |
+| aux_loss_q2                    | 0.0286   |
+| aux_loss_q3                    | 0.0174   |
+| fk_loss                        | 4.91e-05 |
+| fk_loss_q0                     | 2.62e-05 |
+| fk_loss_q1                     | 3.25e-05 |
+| fk_loss_q2                     | 9.36e-05 |
+| fk_loss_q3                     | 3.07e-05 |
+| foot_lock_loss                 | 0.00307  |
+| foot_lock_loss_q0              | 0.00407  |
+| foot_lock_loss_q1              | 0.00244  |
+| foot_lock_loss_q2              | 0.00383  |
+| foot_lock_loss_q3              | 0.00191  |
+| head_anchor_loss               | 0.00713  |
+| head_anchor_loss_q0            | 0.00516  |
+| head_anchor_loss_q1            | 0.00576  |
+| head_anchor_loss_q2            | 0.00937  |
+| head_anchor_loss_q3            | 0.0075   |
+| hip_root_height_consistency... | 0.00136  |
+| hip_root_position_consisten... | 0.00022  |
+| hip_root_yaw_consistency_lo... | 6.06e-06 |
+| hip_root_yaw_consistency_loss  | 5.49e-06 |
+| joint_vel_loss                 | 0.00377  |
+| joint_vel_loss_q0              | 0.00326  |
+| joint_vel_loss_q1              | 0.00352  |
+| joint_vel_loss_q2              | 0.00451  |
+| joint_vel_loss_q3              | 0.00354  |
+| loss                           | 0.0284   |
+| loss_q0                        | 0.0258   |
+| loss_q1                        | 0.0274   |
+| loss_q2                        | 0.0348   |
+| loss_q3                        | 0.0238   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000413 |
+| root_delta_loss_q0             | 0.00043  |
+| root_delta_loss_q1             | 0.000338 |
+| root_delta_loss_q2             | 0.000419 |
+| root_delta_loss_q3             | 0.000472 |
+| root_height_loss               | 0.00412  |
+| root_height_loss_q0            | 0.00321  |
+| root_height_loss_q1            | 0.00363  |
+| root_height_loss_q2            | 0.00607  |
+| root_height_loss_q3            | 0.00296  |
+| samples                        | 2.88e+03 |
+| sensor_reprojection_pos_los... | 0.000144 |
+| sensor_reprojection_pos_loss   | 0.000498 |
+| sensor_reprojection_rot_los... | 0.000219 |
+| sensor_reprojection_rot_loss   | 0.000275 |
+| simple_loss                    | 0.0057   |
+| simple_loss_q0                 | 0.00456  |
+| simple_loss_q1                 | 0.00537  |
+| simple_loss_q2                 | 0.00622  |
+| simple_loss_q3                 | 0.00637  |
+| step                           | 180      |
+| yaw_loss                       | 1.81e-05 |
+| yaw_loss_q0                    | 1.09e-05 |
+| yaw_loss_q1                    | 2.13e-05 |
+| yaw_loss_q2                    | 1.5e-05  |
+| yaw_loss_q3                    | 2.48e-05 |
+---------------------------------------------
+step[181] data=0.098s train=0.047s
+step[182] data=0.095s train=0.056s
+step[183] data=0.112s train=0.044s
+step[184] data=0.090s train=0.044s
+step[185] data=0.106s train=0.046s
+step[186] data=0.094s train=0.045s
+step[187] data=0.099s train=0.041s
+step[188] data=0.091s train=0.036s
+step[189] data=0.088s train=0.036s
+step[190] data=0.089s train=0.040s
+step[190]: loss[0.02756]
+---------------------------------------------
+| aux_loss                       | 0.0228   |
+| aux_loss_q0                    | 0.021    |
+| aux_loss_q1                    | 0.032    |
+| aux_loss_q2                    | 0.0199   |
+| aux_loss_q3                    | 0.0162   |
+| fk_loss                        | 4.06e-05 |
+| fk_loss_q0                     | 1.91e-05 |
+| fk_loss_q1                     | 6.87e-05 |
+| fk_loss_q2                     | 3.3e-05  |
+| fk_loss_q3                     | 3.38e-05 |
+| foot_lock_loss                 | 0.00305  |
+| foot_lock_loss_q0              | 0.00286  |
+| foot_lock_loss_q1              | 0.00262  |
+| foot_lock_loss_q2              | 0.00368  |
+| foot_lock_loss_q3              | 0.00316  |
+| head_anchor_loss               | 0.00716  |
+| head_anchor_loss_q0            | 0.0059   |
+| head_anchor_loss_q1            | 0.00927  |
+| head_anchor_loss_q2            | 0.00681  |
+| head_anchor_loss_q3            | 0.00617  |
+| hip_root_height_consistency... | 0.00203  |
+| hip_root_position_consisten... | 0.000312 |
+| hip_root_yaw_consistency_lo... | 1e-05    |
+| hip_root_yaw_consistency_loss  | 5.91e-06 |
+| joint_vel_loss                 | 0.00364  |
+| joint_vel_loss_q0              | 0.00301  |
+| joint_vel_loss_q1              | 0.00431  |
+| joint_vel_loss_q2              | 0.00357  |
+| joint_vel_loss_q3              | 0.00351  |
+| loss                           | 0.0276   |
+| loss_q0                        | 0.0239   |
+| loss_q1                        | 0.0371   |
+| loss_q2                        | 0.0265   |
+| loss_q3                        | 0.0208   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000377 |
+| root_delta_loss_q0             | 0.000296 |
+| root_delta_loss_q1             | 0.000393 |
+| root_delta_loss_q2             | 0.000429 |
+| root_delta_loss_q3             | 0.000386 |
+| root_height_loss               | 0.00427  |
+| root_height_loss_q0            | 0.0035   |
+| root_height_loss_q1            | 0.00572  |
+| root_height_loss_q2            | 0.00361  |
+| root_height_loss_q3            | 0.00386  |
+| samples                        | 3.04e+03 |
+| sensor_reprojection_pos_los... | 0.000142 |
+| sensor_reprojection_pos_loss   | 0.000558 |
+| sensor_reprojection_rot_los... | -0.00075 |
+| sensor_reprojection_rot_loss   | 9.35e-06 |
+| simple_loss                    | 0.00479  |
+| simple_loss_q0                 | 0.00291  |
+| simple_loss_q1                 | 0.00501  |
+| simple_loss_q2                 | 0.00662  |
+| simple_loss_q3                 | 0.00458  |
+| step                           | 190      |
+| yaw_loss                       | 1.41e-05 |
+| yaw_loss_q0                    | 7.65e-06 |
+| yaw_loss_q1                    | 1.58e-05 |
+| yaw_loss_q2                    | 1.77e-05 |
+| yaw_loss_q3                    | 1.46e-05 |
+---------------------------------------------
+step[191] data=0.086s train=0.044s
+step[192] data=0.093s train=0.038s
+step[193] data=0.089s train=0.036s
+step[194] data=0.085s train=0.041s
+step[195] data=0.087s train=0.042s
+step[196] data=0.098s train=0.040s
+step[197] data=0.082s train=0.045s
+step[198] data=0.084s train=0.048s
+step[199] data=0.087s train=0.036s
+step[200] data=0.094s train=0.047s
+step[200]: loss[0.02579]
+---------------------------------------------
+| aux_loss                       | 0.0206   |
+| aux_loss_q0                    | 0.0291   |
+| aux_loss_q1                    | 0.0194   |
+| aux_loss_q2                    | 0.0168   |
+| aux_loss_q3                    | 0.0185   |
+| fk_loss                        | 2.82e-05 |
+| fk_loss_q0                     | 3.78e-05 |
+| fk_loss_q1                     | 2.76e-05 |
+| fk_loss_q2                     | 2.32e-05 |
+| fk_loss_q3                     | 2.58e-05 |
+| foot_lock_loss                 | 0.00271  |
+| foot_lock_loss_q0              | 0.00255  |
+| foot_lock_loss_q1              | 0.00258  |
+| foot_lock_loss_q2              | 0.0031   |
+| foot_lock_loss_q3              | 0.00256  |
+| head_anchor_loss               | 0.00674  |
+| head_anchor_loss_q0            | 0.00785  |
+| head_anchor_loss_q1            | 0.00608  |
+| head_anchor_loss_q2            | 0.00593  |
+| head_anchor_loss_q3            | 0.00763  |
+| hip_root_height_consistency... | 0.00177  |
+| hip_root_position_consisten... | 0.000478 |
+| hip_root_yaw_consistency_lo... | 2.17e-05 |
+| hip_root_yaw_consistency_loss  | 8.2e-06  |
+| joint_vel_loss                 | 0.00333  |
+| joint_vel_loss_q0              | 0.0036   |
+| joint_vel_loss_q1              | 0.0032   |
+| joint_vel_loss_q2              | 0.0032   |
+| joint_vel_loss_q3              | 0.00341  |
+| loss                           | 0.0258   |
+| loss_q0                        | 0.0325   |
+| loss_q1                        | 0.0256   |
+| loss_q2                        | 0.022    |
+| loss_q3                        | 0.024    |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000456 |
+| root_delta_loss_q0             | 0.000415 |
+| root_delta_loss_q1             | 0.000473 |
+| root_delta_loss_q2             | 0.000414 |
+| root_delta_loss_q3             | 0.000527 |
+| root_height_loss               | 0.00333  |
+| root_height_loss_q0            | 0.00381  |
+| root_height_loss_q1            | 0.00304  |
+| root_height_loss_q2            | 0.00305  |
+| root_height_loss_q3            | 0.00365  |
+| samples                        | 3.2e+03  |
+| sensor_reprojection_pos_los... | 0.00011  |
+| sensor_reprojection_pos_loss   | 0.000472 |
+| sensor_reprojection_rot_los... | -9.3e-05 |
+| sensor_reprojection_rot_loss   | 4.23e-05 |
+| simple_loss                    | 0.00523  |
+| simple_loss_q0                 | 0.00343  |
+| simple_loss_q1                 | 0.00624  |
+| simple_loss_q2                 | 0.00523  |
+| simple_loss_q3                 | 0.00556  |
+| step                           | 200      |
+| yaw_loss                       | 2.57e-05 |
+| yaw_loss_q0                    | 5.89e-06 |
+| yaw_loss_q1                    | 3.14e-05 |
+| yaw_loss_q2                    | 2.17e-05 |
+| yaw_loss_q3                    | 4.25e-05 |
+---------------------------------------------
+saving checkpoint step 200...

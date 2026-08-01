@@ -10,7 +10,7 @@
 ## 实验目的
 
 - 对 loss 相关改动做第一轮 ablation，记录每次改动的动机、配置和结果。
-- 历史实验记录中的 `realtime_pose_v2_contact` 已废弃；新实验应使用当前 `realtime_pose_body_fbx_local_root_y0_v1` stationary5 契约。
+- 新实验的数据字段与维度以仓库根目录的 `contract.md` 为准。
 
 ## 产物约定
 

@@ -9,7 +9,7 @@ from data_loaders.build_realtime_longseq_eval_set import (
     resolve_manifest_source_path,
 )
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY
 from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
 from utils.run_dirs import read_latest_pointer
 
@@ -28,7 +28,6 @@ def test_longseq_eval_builder_selects_test_non_mirror_long_sources(tmp_path):
             split="test",
             min_frames=60,
             include_mirror=False,
-            schema=REALTIME_POSE_SCHEMA_NAME,
             overwrite=True,
         )
     )
@@ -42,16 +41,11 @@ def test_longseq_eval_builder_selects_test_non_mirror_long_sources(tmp_path):
     assert {entry["is_mirrored"] for entry in entries} == {False}
     assert all(entry["split"] == "test" for entry in entries)
 
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     for entry in entries:
         copied_path = resolve_manifest_source_path(output_dir, entry)
         assert copied_path.exists()
-        source = load_realtime_source(copied_path, schema_name=schema.name)
-        assert source[schema.body_pose_key].shape[0] == entry["num_frames"]
-        assert entry["schema_name"] == schema.name
-        assert entry["pose_representation"] == schema.pose_representation
-        assert entry["root_y_policy"] == schema.root_y_policy
-        assert entry["pelvis_height_mode"] == schema.pelvis_height_mode
+        source = load_realtime_source(copied_path)
+        assert source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0] == entry["num_frames"]
 
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["sequence_count"] == 2

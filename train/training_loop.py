@@ -10,98 +10,17 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
+from data_loaders.realtime_pose_geometry import reexpress_pose_target_between_head_yaws_torch
+
 from data_loaders.sensor_masking import (
-    POSE_REPRESENTATION_KEY,
-    REALTIME_POSE_SCHEMA_NAME,
+    REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_START,
+    REALTIME_POSE_TARGET_DIM,
     TASK_MODE_REALTIME_POSE,
-    get_schema_spec,
 )
 from diffusion import logger
+from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 from utils import dist_util
-
-
-CHECKPOINT_CONTRACT_KEYS = ("task_mode", "schema", "input_feats", "seq_len", "max_seq_len", "model_arch")
-CHECKPOINT_INT_CONTRACT_KEYS = {"input_feats", "seq_len", "max_seq_len"}
-
-
-def validate_root_y0_training_args(args):
-    """训练入口只接受当前 root-y0 schema，避免旧 211 维 schema 静默混入。"""
-
-    schema = get_schema_spec(getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
-    if schema.name != REALTIME_POSE_SCHEMA_NAME:
-        raise ValueError(f"当前训练脚本只支持 {REALTIME_POSE_SCHEMA_NAME}，实际为 {schema.name}。")
-
-    input_feats = int(getattr(args, "input_feats", schema.feature_dim))
-    if input_feats != schema.feature_dim:
-        raise ValueError(f"{schema.name} 训练输入维度必须为 {schema.feature_dim}，实际为 {input_feats}。")
-
-    seq_len = int(getattr(args, "seq_len", REALTIME_POSE_SEQ_LEN))
-    if seq_len != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{schema.name} 固定使用 seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {seq_len}。")
-
-    max_seq_len = int(getattr(args, "max_seq_len", REALTIME_POSE_SEQ_LEN))
-    if max_seq_len != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{schema.name} 固定使用 max_seq_len={REALTIME_POSE_SEQ_LEN}，实际为 {max_seq_len}。")
-
-    return schema
-
-
-def validate_resume_checkpoint_contract(resume_checkpoint: str | Path, args, schema_name: str | None = None) -> None:
-    """恢复训练前校验 checkpoint 的 schema 契约，防止旧 contact/root-y schema 权重被误加载。"""
-
-    checkpoint_path = Path(resume_checkpoint)
-    args_path = checkpoint_path.with_name("args.json")
-    if not args_path.exists():
-        raise FileNotFoundError(f"恢复训练需要 checkpoint 同目录存在 args.json，用于校验 schema 契约：{args_path}")
-
-    with args_path.open("r", encoding="utf-8") as file:
-        checkpoint_args = json.load(file)
-    if not isinstance(checkpoint_args, dict):
-        raise ValueError(f"{args_path} 必须是 JSON object。")
-
-    schema = get_schema_spec(schema_name or getattr(args, "schema", REALTIME_POSE_SCHEMA_NAME))
-    expected_contract = {
-        "task_mode": TASK_MODE_REALTIME_POSE,
-        "schema": schema.name,
-        "input_feats": schema.feature_dim,
-        "seq_len": REALTIME_POSE_SEQ_LEN,
-        "max_seq_len": REALTIME_POSE_SEQ_LEN,
-        "model_arch": str(getattr(args, "model_arch", "full_feature_dit")),
-    }
-
-    missing = [key for key in CHECKPOINT_CONTRACT_KEYS if key not in checkpoint_args]
-    if missing:
-        raise ValueError(f"{args_path} 缺少 checkpoint 训练契约字段：{missing}。旧 checkpoint 不能直接恢复到 root-y0 训练。")
-
-    mismatches: list[str] = []
-    for key, expected in expected_contract.items():
-        actual = checkpoint_args[key]
-        if key in CHECKPOINT_INT_CONTRACT_KEYS:
-            try:
-                actual = int(actual)
-            except (TypeError, ValueError):
-                mismatches.append(f"{key}={checkpoint_args[key]!r}, expected {expected!r}")
-                continue
-        else:
-            actual = str(actual)
-        if actual != expected:
-            mismatches.append(f"{key}={actual!r}, expected {expected!r}")
-
-    optional_schema_metadata = {
-        "schema_name": schema.name,
-        POSE_REPRESENTATION_KEY: schema.pose_representation,
-        "root_y_policy": schema.root_y_policy,
-        "pelvis_height_mode": schema.pelvis_height_mode,
-    }
-    for key, expected in optional_schema_metadata.items():
-        if key in checkpoint_args and str(checkpoint_args[key]) != expected:
-            mismatches.append(f"{key}={checkpoint_args[key]!r}, expected {expected!r}")
-
-    if mismatches:
-        joined = "; ".join(mismatches)
-        raise ValueError(f"{args_path} 与当前 root-y0 训练配置不兼容：{joined}")
 
 
 class TrainLoop:
@@ -127,18 +46,27 @@ class TrainLoop:
         self.snr_gamma = args.snr_gamma
         self.use_l1 = args.l1_loss
         self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
-        self.schema = validate_root_y0_training_args(args)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
         self.rollout_steps = int(getattr(args, "rollout_steps", 1))
         self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
         self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
         self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
+        self.rollout_joint_vel_loss_weight = float(
+            getattr(args, "rollout_joint_vel_loss_weight", 0.05)
+        )
+        self.rollout_rot_vel_loss_weight = float(
+            getattr(args, "rollout_rot_vel_loss_weight", 0.02)
+        )
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
-        if self.rollout_steps > 2:
-            raise ValueError("第一版训练只支持 rollout_steps<=2，避免提前引入长 rollout 变量。")
+        if self.rollout_steps > 4:
+            raise ValueError("当前快速迭代版本只支持 rollout_steps<=4。")
         if self.rollout_loss_weight < 0.0:
             raise ValueError(f"rollout_loss_weight must be >= 0, got {self.rollout_loss_weight}")
+        if self.rollout_joint_vel_loss_weight < 0.0:
+            raise ValueError("rollout_joint_vel_loss_weight 必须大于等于 0。")
+        if self.rollout_rot_vel_loss_weight < 0.0:
+            raise ValueError("rollout_rot_vel_loss_weight 必须大于等于 0。")
         if not 0.0 <= self.rollout_prob <= 1.0:
             raise ValueError(f"rollout_prob must be in [0, 1], got {self.rollout_prob}")
 
@@ -166,7 +94,9 @@ class TrainLoop:
         logger.log(f"task mode: {self.task_mode}")
         logger.log(
             f"rollout: steps={self.rollout_steps}, prob={self.rollout_prob}, "
-            f"weight={self.rollout_loss_weight}, detach_history={self.detach_rollout_history}"
+            f"weight={self.rollout_loss_weight}, detach_history={self.detach_rollout_history}, "
+            f"joint_vel_weight={self.rollout_joint_vel_loss_weight}, "
+            f"rot_vel_weight={self.rollout_rot_vel_loss_weight}"
         )
         if self.task_mode != TASK_MODE_REALTIME_POSE:
             raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
@@ -213,8 +143,8 @@ class TrainLoop:
             raise FileNotFoundError(f"开启 --weighted_loss 后找不到特征权重文件：{feature_w_path}")
 
         feature_w = torch.load(feature_w_path, map_location="cpu", weights_only=True).float().flatten()
-        if feature_w.numel() != self.schema.feature_dim:
-            raise ValueError(f"feature_w 应为 {self.schema.feature_dim} 维，实际为 {feature_w.numel()} 维")
+        if feature_w.numel() != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(f"feature_w 应为 {REALTIME_POSE_TARGET_DIM} 维，实际为 {feature_w.numel()} 维")
         feature_w.requires_grad_(False)
         return feature_w
 
@@ -240,7 +170,6 @@ class TrainLoop:
 
         self.resume_checkpoint = resume_checkpoint
         self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
-        validate_resume_checkpoint_contract(resume_checkpoint=resume_checkpoint, args=self.args, schema_name=self.schema.name)
         logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
         state_dict = dist_util.load_state_dict(resume_checkpoint, map_location=self.device)
         incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
@@ -432,12 +361,11 @@ class TrainLoop:
                 self.scaler.scale(loss).backward()
 
     def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
-        sample = batch["x"]  # [B, C, 61]
-        batch_size, channels, seq_len = sample.shape
-        if channels != self.schema.feature_dim:
-            raise ValueError(f"训练输入应为 [B, {self.schema.feature_dim}, T]，实际为 {tuple(sample.shape)}")
-
-        feature_w = self._feature_weights_for_batch(batch_size, seq_len)
+        sample = batch["x"]  # [B,140]
+        if sample.ndim != 2 or sample.shape[1] != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(f"训练输入应为 [B,{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(sample.shape)}")
+        batch_size = sample.shape[0]
+        feature_w = self._feature_weights_for_batch(batch_size)
         do_rollout = self.should_compute_rollout_loss(batch)
         model_kwargs = self.mask_manager(batch, sample)
         losses = self.diffusion.training_losses(
@@ -454,26 +382,42 @@ class TrainLoop:
         if not do_rollout:
             return losses
 
-        rollout_losses = self.compute_one_step_rollout_losses(
+        rollout_losses = self.compute_rollout_losses(
             batch=batch,
             pred_xstart=pred_xstart,
             timesteps=timesteps,
         )
         base_loss = losses["loss"]
-        rollout_loss = rollout_losses["loss"]
-        rollout_loss_weighted = rollout_loss * self.rollout_loss_weight
+        rollout_frame_loss = rollout_losses.pop("loss")
+        joint_vel_loss = rollout_losses.pop("joint_vel_loss")
+        rotation_vel_loss = rollout_losses.pop("rotation_vel_loss")
+        rollout_loss_weighted = rollout_frame_loss * self.rollout_loss_weight
+        joint_vel_loss_weighted = joint_vel_loss * self.rollout_joint_vel_loss_weight
+        rotation_vel_loss_weighted = rotation_vel_loss * self.rollout_rot_vel_loss_weight
         losses["base_loss"] = base_loss
-        losses["rollout_loss"] = rollout_loss
+        losses["rollout_loss"] = rollout_frame_loss
         losses["rollout_loss_weighted"] = rollout_loss_weighted
-        losses["loss"] = base_loss + rollout_loss_weighted
+        losses["rollout_joint_vel_loss"] = joint_vel_loss
+        losses["rollout_joint_vel_loss_weighted"] = joint_vel_loss_weighted
+        losses["rollout_rotation_vel_loss"] = rotation_vel_loss
+        losses["rollout_rotation_vel_loss_weighted"] = rotation_vel_loss_weighted
+        losses["loss"] = (
+            base_loss
+            + rollout_loss_weighted
+            + joint_vel_loss_weighted
+            + rotation_vel_loss_weighted
+        )
         for key, value in rollout_losses.items():
-            if key == "loss":
-                continue
             losses[f"rollout_{key}"] = value
         return losses
 
     def should_compute_rollout_loss(self, batch: dict) -> bool:
-        if self.rollout_steps <= 1 or self.rollout_loss_weight <= 0.0 or self.rollout_prob <= 0.0:
+        rollout_weight_enabled = (
+            self.rollout_loss_weight > 0.0
+            or self.rollout_joint_vel_loss_weight > 0.0
+            or self.rollout_rot_vel_loss_weight > 0.0
+        )
+        if self.rollout_steps <= 1 or not rollout_weight_enabled or self.rollout_prob <= 0.0:
             return False
         if not self.model.training or not torch.is_grad_enabled():
             return False
@@ -485,47 +429,166 @@ class TrainLoop:
             )
         return bool(torch.rand((), device=self.device).item() < self.rollout_prob)
 
-    def compute_one_step_rollout_losses(
+    def compute_rollout_losses(
         self,
         batch: dict,
         pred_xstart: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> dict:
         if pred_xstart is None:
-            raise ValueError("rollout loss 需要第一步 diffusion.training_losses 返回 pred_xstart。")
-        rollout_batch = batch["rollout"][0]
-        next_sample = rollout_batch["x"]  # [B, C, 61]
-        if next_sample.shape != batch["x"].shape:
-            raise ValueError(f"rollout[0]['x'] 应为 {tuple(batch['x'].shape)}，实际为 {tuple(next_sample.shape)}")
+            raise ValueError("rollout loss 需要第一步 training_losses 返回 pred_xstart。")
 
-        next_batch = dict(rollout_batch)
-        next_conditioned = self.build_one_step_rollout_conditioned_x(
-            rollout_batch=rollout_batch,
-            pred_xstart=pred_xstart,
+        predictions = [pred_xstart]
+        step_batches = [batch]
+        rollout_terms: list[dict] = []
+        pose_history = batch["pose_history"]
+        current_batch = batch
+
+        for rollout_index, materialized_batch in enumerate(
+            batch["rollout"][: self.rollout_steps - 1],
+            start=1,
+        ):
+            next_batch = dict(materialized_batch)
+            next_sample = next_batch["x"]
+            if next_sample.shape != batch["x"].shape:
+                raise ValueError(
+                    f"rollout[{rollout_index - 1}]['x'] 应为 {tuple(batch['x'].shape)}，"
+                    f"实际为 {tuple(next_sample.shape)}"
+                )
+
+            # 持续滚动同一份历史，防止第三步以后较早的模型预测被离线 GT 历史重新覆盖。
+            pose_history = self.build_next_rollout_pose_history(
+                pose_history=pose_history,
+                source_head_yaw_world=current_batch["current_head_yaw_world"],
+                destination_head_yaw_world=next_batch["current_head_yaw_world"],
+                pred_xstart=predictions[-1],
+            )
+            next_batch["pose_history"] = pose_history
+
+            feature_w = self._feature_weights_for_batch(next_sample.shape[0])
+            next_terms = self.diffusion.training_losses(
+                self.model,
+                next_sample,
+                timesteps,
+                model_kwargs=self.mask_manager(next_batch, next_sample),
+                feature_w=feature_w,
+                snr_gamma=self.snr_gamma,
+                use_l1=self.use_l1,
+                return_pred_xstart=True,
+            )
+            next_prediction = next_terms.pop("pred_xstart", None)
+            if next_prediction is None:
+                raise ValueError(f"rollout step {rollout_index} 没有返回 pred_xstart。")
+            predictions.append(next_prediction)
+            step_batches.append(next_batch)
+            rollout_terms.append(next_terms)
+            current_batch = next_batch
+
+        if not rollout_terms:
+            raise ValueError("rollout_steps>1 时至少应产生一个后续预测。")
+
+        result: dict[str, torch.Tensor] = {
+            "loss": torch.stack([terms["loss"] for terms in rollout_terms], dim=0).mean(dim=0),
+        }
+        for step_index, terms in enumerate(rollout_terms, start=1):
+            result[f"step_{step_index}_loss"] = terms["loss"]
+
+        common_keys = set.intersection(*(set(terms.keys()) for terms in rollout_terms))
+        for key in sorted(common_keys - {"loss"}):
+            values = [terms[key] for terms in rollout_terms]
+            if all(torch.is_tensor(value) and value.shape == values[0].shape for value in values):
+                result[key] = torch.stack(values, dim=0).mean(dim=0)
+
+        result.update(
+            compute_rollout_temporal_losses(
+                predictions=predictions,
+                step_batches=step_batches,
+                normalizer_mean=self.normalizer_mean,
+                normalizer_std=self.normalizer_std,
+            )
         )
-        next_batch["conditioned_x"] = next_conditioned
+        return result
 
-        batch_size, _, seq_len = next_sample.shape
-        feature_w = self._feature_weights_for_batch(batch_size, seq_len)
-        model_kwargs = self.mask_manager(next_batch, next_sample)
-        return self.diffusion.training_losses(
-            self.model,
-            next_sample,
-            timesteps,
-            model_kwargs=model_kwargs,
-            feature_w=feature_w,
-            snr_gamma=self.snr_gamma,
-            use_l1=self.use_l1,
+    def build_next_rollout_pose_history(
+        self,
+        pose_history: torch.Tensor,
+        source_head_yaw_world: torch.Tensor,
+        destination_head_yaw_world: torch.Tensor,
+        pred_xstart: torch.Tensor,
+    ) -> torch.Tensor:
+        """把当前历史整体换到下一帧参考系，并追加当前模型预测。"""
+
+        if pose_history.ndim != 3 or tuple(pose_history.shape[1:]) != (
+            REALTIME_POSE_HISTORY_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ):
+            raise ValueError(
+                f"pose_history 应为 [B,{REALTIME_POSE_HISTORY_LENGTH},{REALTIME_POSE_TARGET_DIM}]，"
+                f"实际为 {tuple(pose_history.shape)}"
+            )
+        if pred_xstart.shape != pose_history[:, -1].shape:
+            raise ValueError("pred_xstart 必须与单帧 pose history 同形。")
+
+        pred_for_history = pred_xstart.detach() if self.detach_rollout_history else pred_xstart
+        if self.normalizer_mean is not None and self.normalizer_std is not None:
+            mean = self.normalizer_mean.to(device=pose_history.device, dtype=pose_history.dtype)
+            std = self.normalizer_std.to(device=pose_history.device, dtype=pose_history.dtype)
+            history_raw = pose_history * std + mean
+            pred_raw = pred_for_history * std + mean
+        else:
+            mean = std = None
+            history_raw = pose_history
+            pred_raw = pred_for_history
+
+        batch_size, history_length, target_dim = history_raw.shape
+        source_yaw = source_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
+        destination_yaw = destination_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
+        history_reexpressed = reexpress_pose_target_between_head_yaws_torch(
+            history_raw.reshape(batch_size * history_length, target_dim),
+            source_yaw[:, None].expand(-1, history_length).reshape(-1),
+            destination_yaw[:, None].expand(-1, history_length).reshape(-1),
+        ).reshape(batch_size, history_length, target_dim)
+        pred_reexpressed = reexpress_pose_target_between_head_yaws_torch(
+            pred_raw,
+            source_yaw,
+            destination_yaw,
         )
+        next_history_raw = torch.cat(
+            [history_reexpressed[:, 1:], pred_reexpressed[:, None]],
+            dim=1,
+        )
+        if mean is None or std is None:
+            return next_history_raw
+        return (next_history_raw - mean) / std
 
-    def build_one_step_rollout_conditioned_x(self, rollout_batch: dict, pred_xstart: torch.Tensor) -> torch.Tensor:
-        next_conditioned = rollout_batch["conditioned_x"].clone()
-        pred_target_t = pred_xstart[:, : self.schema.target_dim, REALTIME_POSE_TARGET_START]
+    def build_one_step_rollout_pose_history(
+        self,
+        current_batch: dict,
+        rollout_batch: dict,
+        pred_xstart: torch.Tensor,
+    ) -> torch.Tensor:
+        """把 frame t 预测重表达到 frame t+1 的 Head 参考系后回灌。"""
+
+        next_history = rollout_batch["pose_history"].clone()
+        pred_target_t = pred_xstart
         if self.detach_rollout_history:
             pred_target_t = pred_target_t.detach()
-        # 下一窗口的 frame 59 对应上一窗口刚预测的 frame t；frame 60 仍然保持 target 置零。
-        next_conditioned[:, : self.schema.target_dim, REALTIME_POSE_TARGET_START - 1] = pred_target_t
-        return next_conditioned
+        if self.normalizer_mean is not None and self.normalizer_std is not None:
+            mean = self.normalizer_mean.to(device=pred_target_t.device, dtype=pred_target_t.dtype)
+            std = self.normalizer_std.to(device=pred_target_t.device, dtype=pred_target_t.dtype)
+            pred_raw = pred_target_t * std + mean
+        else:
+            mean = std = None
+            pred_raw = pred_target_t
+        reexpressed = reexpress_pose_target_between_head_yaws_torch(
+            pred_raw,
+            current_batch["current_head_yaw_world"],
+            rollout_batch["current_head_yaw_world"],
+        )
+        if mean is not None and std is not None:
+            reexpressed = (reexpressed - mean) / std
+        next_history[:, -1] = reexpressed
+        return next_history
 
     def _anneal_lr(self):
         if self.lr_anneal_steps <= 0:
@@ -536,73 +599,66 @@ class TrainLoop:
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr
 
-    def _feature_weights_for_batch(self, batch_size: int, seq_len: int):
+    def _feature_weights_for_batch(self, batch_size: int):
         if self.feature_w is None:
             return None
-        return self.feature_w.to(self.device)[None, :, None].repeat(batch_size, 1, seq_len)
+        return self.feature_w.to(self.device)[None].repeat(batch_size, 1)
 
     def mask_manager(self, batch, sample):
-        """
-        `inpaint_mask=True` 表示该位置需要加噪、预测并参与 denoise loss。
-        tracker 条件和 sensor_valid 永远作为观测条件，不参与 diffusion loss。
-        """
+        """统一使用 known=True / unknown=False 的关节级硬 inpainting 契约。"""
 
-        batch_size, channels, seq_len = sample.shape
+        batch_size = sample.shape[0]
         valid_frame_mask = batch.get("valid_frame_mask", batch.get("attention_mask"))
         if valid_frame_mask is None:
-            valid_frame_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=sample.device)
+            valid_frame_mask = torch.ones(batch_size, 60, dtype=torch.bool, device=sample.device)
         valid_frame_mask = valid_frame_mask.bool()
-        if valid_frame_mask.shape != (batch_size, seq_len):
-            raise ValueError(f"valid_frame_mask 应为 [B, T]，实际为 {tuple(valid_frame_mask.shape)}")
+        if valid_frame_mask.shape != (batch_size, 60):
+            raise ValueError(f"valid_frame_mask 应为 [B,60]，实际为 {tuple(valid_frame_mask.shape)}")
 
-        inpaint_mask = batch.get("inpaint_mask")
-        if inpaint_mask is None:
-            raise ValueError("训练 batch 缺少 inpaint_mask，请先生成 realtime_pose task。")
-        inpaint_mask = inpaint_mask.bool()
-        if inpaint_mask.shape != sample.shape:
-            raise ValueError(f"inpaint_mask 应为 {tuple(sample.shape)}，实际为 {tuple(inpaint_mask.shape)}")
-
-        inpaint_mask = inpaint_mask & valid_frame_mask.unsqueeze(1)
-        inpaint_mask[:, self.schema.target_dim:self.schema.feature_dim, :] = False
-        sensor_slice = self.schema.sensor_valid_slice()
-        if inpaint_mask[:, sensor_slice, :].any():
-            raise ValueError("sensor_valid 不能参与 diffusion loss，请检查 task 的 inpaint_mask。")
+        known_mask = batch.get("known_mask")
+        if known_mask is None or known_mask.shape != sample.shape:
+            raise ValueError("batch 必须包含与 [B,140] 同形的 known_mask。")
+        known_mask = known_mask.bool()
+        inpaint_mask = ~known_mask
         if not inpaint_mask.any():
-            raise ValueError("当前 batch 的 inpaint_mask 没有待补全部分，请检查离线任务生成结果。")
+            raise ValueError("当前 batch 没有未知关节。")
+        joint_atomic = known_mask[:, :138].reshape(batch_size, 23, 6)
+        if torch.any(joint_atomic.any(dim=-1) != joint_atomic.all(dim=-1)):
+            raise ValueError("rotation6D 的六个通道必须使用原子 known mask。")
+        root_atomic = known_mask[:, 138:140]
+        if torch.any(root_atomic.any(dim=-1) != root_atomic.all(dim=-1)):
+            raise ValueError("Root yaw sin/cos 必须使用原子 known mask。")
 
-        conditioned_sample = batch.get("conditioned_x", sample)
+        conditioned_sample = batch.get("known_target")
+        if conditioned_sample is None:
+            raise ValueError("batch 缺少 known_target。")
         if conditioned_sample.shape != sample.shape:
-            raise ValueError(f"conditioned_x 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}")
+            raise ValueError(f"known_target 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}")
 
         y = {
             "mask": inpaint_mask,
             "inpainted_motion": conditioned_sample,
-            "schema_name": self.schema.name,
-            "target_joints_world": batch["target_joints_world"],
-            "prev_joints_world": batch["prev_joints_world"],
-            "target_root_pos_world": batch["target_root_pos_world"],
-            "prev_root_yaw": batch["prev_root_yaw"],
-            "target_root_yaw": batch["target_root_yaw"],
-            "target_tracker_pos_ref": batch["target_tracker_pos_ref"],
-            "target_tracker_rot_ref_6d": batch["target_tracker_rot_ref_6d"],
-            "target_sensor_valid": batch["target_sensor_valid"],
+            "known_mask": known_mask,
+            "pose_history": batch["pose_history"],
+            "tracker_window": batch["tracker_window"],
+            "target_joints_head_ref": batch["target_joints_head_ref"],
+            "prev_joints_head_ref": batch["prev_joints_head_ref"],
+            "current_tracker_pos_head_ref": batch["current_tracker_pos_head_ref"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
-            "sensor_valid": batch["sensor_valid"],
+            "joint_rest_local_rotations_6d": batch["joint_rest_local_rotations_6d"],
+            "configured": batch["configured"],
+            "measured_valid": batch["measured_valid"],
+            "missing_age": batch["missing_age"],
         }
-        if "joint_rest_local_rotations_6d" in batch:
-            y["joint_rest_local_rotations_6d"] = batch["joint_rest_local_rotations_6d"]
-        if self.schema.supports_root_motion:
-            y["prev_root_pos_world"] = batch["prev_root_pos_world"]
-            y["target_root_delta_xz_ref"] = batch["target_root_delta_xz_ref"]
-            y["target_root_height"] = batch["target_root_height"]
-        if self.schema.supports_stationary_prob:
-            y["target_stationary_prob_5"] = batch["target_stationary_prob_5"]
         if self.normalizer_mean is not None and self.normalizer_std is not None:
             y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
             y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)
 
         return {
             "inpaint_cond": inpaint_mask,
+            "known_mask": known_mask,
+            "pose_history": batch["pose_history"],
+            "tracker_window": batch["tracker_window"],
             "valid_frame_mask": valid_frame_mask,
             "attention_mask": valid_frame_mask,
             "y": y,

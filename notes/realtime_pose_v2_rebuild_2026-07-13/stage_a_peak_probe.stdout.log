@@ -1,0 +1,135 @@
+[realtime_pose_pipeline] C:\Users\Administrator\.conda\envs\diffusionposer5070\python.exe -m train.train_diffusionposer --schema realtime_pose_stationary5_v1 --model_arch target_dit --input_feats 214 --data_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_v2_base_tasks --data_split train --normalizer_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\normalizers\realtime_pose_stationary5_v1\amass_60hz_v2_train --save_dir D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\v2_stage_a_peak_probe_20260714 --run_name v2_stage_a_peak_probe --batch_size 16 --num_workers 0 --num_steps 2 --save_interval 2 --log_interval 1 --checkpoint_max_keep 1 --lr 5e-05 --train_platform_type NoPlatform --layers 8 --heads 8 --latent_dim 512 --diffusion_steps 50 --history_pose_noise_std 0.02 --history_yaw_noise_std 0.02 --history_pose_dropout_prob 0.05 --history_pose_replace_prob 0.05 --history_yaw_replace_prob 0.0 --tracker_latency_max_frames 0 --tracker_burst_dropout_prob 0.0 --tracker_outlier_prob 0.0 --tracker_mask_policy dynamic_categories --tracker_mask_categories full_six standard_three --rollout_steps 1 --rollout_prob 0.0 --rollout_loss_weight 0.0 --rollout_ddim_steps 10 --eval_num_batches 4 --cuda true --device 0 --init_checkpoint D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt --model_ema --gradient_clip
+Logging to D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\v2_stage_a_peak_probe_20260714\20260714_012712_v2_stage_a_peak_probe
+creating data loader...
+creating model and diffusion...
+Total params: 26.05M
+training DiffusionPoser model, task_mode=realtime_pose_reconstruction...
+training device: cuda:0
+task mode: realtime_pose_reconstruction
+rollout: steps=1, prob=0.0, weight=0.0, detach_history=True
+cuda device name: NVIDIA GeForce RTX 5070
+warm-start model from checkpoint: D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt
+warm-start keeps optimizer/EMA/global step fresh; use --resume_checkpoint for full training resume.
+trainable parameters: 26052762/26052762
+amp dtype: torch.bfloat16, grad scaler enabled: False
+step[1] data=0.117s train=0.366s
+step[1]: loss[0.05122]
+---------------------------------------------
+| aux_loss                       | 0.042    |
+| aux_loss_q0                    | 0.0317   |
+| aux_loss_q1                    | 0.0483   |
+| aux_loss_q3                    | 0.0534   |
+| fk_loss                        | 0.0001   |
+| fk_loss_q0                     | 4.12e-05 |
+| fk_loss_q1                     | 0.000138 |
+| fk_loss_q3                     | 0.000161 |
+| foot_lock_loss                 | 0.00371  |
+| foot_lock_loss_q0              | 0.00269  |
+| foot_lock_loss_q1              | 0.00396  |
+| foot_lock_loss_q3              | 0.00558  |
+| head_anchor_loss               | 0.0116   |
+| head_anchor_loss_q0            | 0.00954  |
+| head_anchor_loss_q1            | 0.0103   |
+| head_anchor_loss_q3            | 0.0189   |
+| hip_root_height_consistency... | 0        |
+| hip_root_position_consisten... | 0        |
+| hip_root_yaw_consistency_lo... | 0        |
+| hip_root_yaw_consistency_loss  | 9.32e-06 |
+| joint_vel_loss                 | 0.00598  |
+| joint_vel_loss_q0              | 0.00429  |
+| joint_vel_loss_q1              | 0.0065   |
+| joint_vel_loss_q3              | 0.00887  |
+| loss                           | 0.0512   |
+| loss_q0                        | 0.0361   |
+| loss_q1                        | 0.0559   |
+| loss_q3                        | 0.0772   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.00036  |
+| root_delta_loss_q0             | 0.000299 |
+| root_delta_loss_q1             | 0.000279 |
+| root_delta_loss_q3             | 0.000664 |
+| root_height_loss               | 0.00889  |
+| root_height_loss_q0            | 0.00668  |
+| root_height_loss_q1            | 0.0116   |
+| root_height_loss_q3            | 0.00857  |
+| samples                        | 16       |
+| sensor_reprojection_pos_los... | 0.000861 |
+| sensor_reprojection_pos_loss   | 0.00125  |
+| sensor_reprojection_rot_los... | 0.0043   |
+| sensor_reprojection_rot_loss   | 0.00145  |
+| simple_loss                    | 0.00921  |
+| simple_loss_q0                 | 0.0044   |
+| simple_loss_q1                 | 0.00754  |
+| simple_loss_q3                 | 0.0238   |
+| step                           | 1        |
+| yaw_loss                       | 1.94e-05 |
+| yaw_loss_q0                    | 1.62e-05 |
+| yaw_loss_q1                    | 7.99e-06 |
+| yaw_loss_q3                    | 4.94e-05 |
+---------------------------------------------
+step[2] data=0.073s train=0.036s
+step[2]: loss[0.09586]
+---------------------------------------------
+| aux_loss                       | 0.0851   |
+| aux_loss_q0                    | 0.0225   |
+| aux_loss_q1                    | 0.0621   |
+| aux_loss_q2                    | 0.177    |
+| aux_loss_q3                    | 0.0459   |
+| fk_loss                        | 0.000753 |
+| fk_loss_q0                     | 1.5e-05  |
+| fk_loss_q1                     | 0.000159 |
+| fk_loss_q2                     | 0.00209  |
+| fk_loss_q3                     | 0.000303 |
+| foot_lock_loss                 | 0.00391  |
+| foot_lock_loss_q0              | 0.00261  |
+| foot_lock_loss_q1              | 0.00958  |
+| foot_lock_loss_q2              | 0.00104  |
+| foot_lock_loss_q3              | 0.00286  |
+| head_anchor_loss               | 0.0225   |
+| head_anchor_loss_q0            | 0.00618  |
+| head_anchor_loss_q1            | 0.0167   |
+| head_anchor_loss_q2            | 0.047    |
+| head_anchor_loss_q3            | 0.0114   |
+| hip_root_height_consistency... | 0.0022   |
+| hip_root_position_consisten... | 0.000114 |
+| hip_root_yaw_consistency_lo... | 4.07e-06 |
+| hip_root_yaw_consistency_loss  | 1.11e-05 |
+| joint_vel_loss                 | 0.00935  |
+| joint_vel_loss_q0              | 0.00279  |
+| joint_vel_loss_q1              | 0.00755  |
+| joint_vel_loss_q2              | 0.0175   |
+| joint_vel_loss_q3              | 0.00694  |
+| loss                           | 0.0959   |
+| loss_q0                        | 0.0261   |
+| loss_q1                        | 0.0662   |
+| loss_q2                        | 0.2      |
+| loss_q3                        | 0.0556   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000296 |
+| root_delta_loss_q0             | 0.000192 |
+| root_delta_loss_q1             | 0.000166 |
+| root_delta_loss_q2             | 0.000576 |
+| root_delta_loss_q3             | 0.000141 |
+| root_height_loss               | 0.0204   |
+| root_height_loss_q0            | 0.00303  |
+| root_height_loss_q1            | 0.0181   |
+| root_height_loss_q2            | 0.045    |
+| root_height_loss_q3            | 0.00568  |
+| samples                        | 32       |
+| sensor_reprojection_pos_los... | 0.00163  |
+| sensor_reprojection_pos_loss   | 0.00291  |
+| sensor_reprojection_rot_los... | 0.00203  |
+| sensor_reprojection_rot_loss   | 0.000614 |
+| simple_loss                    | 0.0108   |
+| simple_loss_q0                 | 0.00356  |
+| simple_loss_q1                 | 0.00404  |
+| simple_loss_q2                 | 0.0226   |
+| simple_loss_q3                 | 0.0097   |
+| step                           | 2        |
+| yaw_loss                       | 4.64e-05 |
+| yaw_loss_q0                    | 2.7e-05  |
+| yaw_loss_q1                    | 4.92e-07 |
+| yaw_loss_q2                    | 9.48e-05 |
+| yaw_loss_q3                    | 5.25e-05 |
+---------------------------------------------
+saving checkpoint step 2...

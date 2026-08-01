@@ -1,0 +1,136 @@
+[realtime_pose_pipeline] C:\Users\Administrator\.conda\envs\diffusionposer5070\python.exe -m train.train_diffusionposer --schema realtime_pose_stationary5_v1 --model_arch target_dit --input_feats 214 --data_dir dataset\generated\tasks\realtime_pose_stationary5_v1\amass_60hz_v2_base_smoke_tasks --data_split train --normalizer_dir dataset\generated\normalizers\realtime_pose_stationary5_v1\amass_60hz_v2_base_smoke_train --save_dir runs\realtime_pose_stationary5_v1\v2_base_smoke_20260714 --run_name v2_base_smoke_2step --batch_size 16 --num_workers 0 --num_steps 2 --save_interval 1 --log_interval 1 --checkpoint_max_keep 3 --lr 5e-05 --train_platform_type NoPlatform --layers 8 --heads 8 --latent_dim 512 --diffusion_steps 50 --history_pose_noise_std 0.02 --history_yaw_noise_std 0.02 --history_pose_dropout_prob 0.05 --history_pose_replace_prob 0.05 --history_yaw_replace_prob 0.0 --tracker_latency_max_frames 0 --tracker_burst_dropout_prob 0.0 --tracker_outlier_prob 0.0 --tracker_mask_policy dynamic_categories --tracker_mask_categories full_six standard_three --rollout_steps 1 --rollout_prob 0.0 --rollout_loss_weight 0.0 --rollout_ddim_steps 10 --eval_num_batches 4 --cuda true --device 0 --init_checkpoint runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt --model_ema --gradient_clip
+Logging to D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\runs\realtime_pose_stationary5_v1\v2_base_smoke_20260714\20260714_001026_v2_base_smoke_2step
+creating data loader...
+creating model and diffusion...
+Total params: 26.05M
+training DiffusionPoser model, task_mode=realtime_pose_reconstruction...
+training device: cuda:0
+task mode: realtime_pose_reconstruction
+rollout: steps=1, prob=0.0, weight=0.0, detach_history=True
+cuda device name: NVIDIA GeForce RTX 5070
+warm-start model from checkpoint: runs\realtime_pose_stationary5_v1\stationary5_target_dit\20260626_192142_s5_tdit_seed10\model000100000.pt
+warm-start keeps optimizer/EMA/global step fresh; use --resume_checkpoint for full training resume.
+trainable parameters: 26052762/26052762
+amp dtype: torch.bfloat16, grad scaler enabled: False
+step[1] data=0.157s train=1.034s
+step[1]: loss[0.24831]
+---------------------------------------------
+| aux_loss                       | 0.223    |
+| aux_loss_q0                    | 0.358    |
+| aux_loss_q1                    | 0.128    |
+| aux_loss_q3                    | 0.101    |
+| fk_loss                        | 0.000658 |
+| fk_loss_q0                     | 0.000874 |
+| fk_loss_q1                     | 0.0003   |
+| fk_loss_q3                     | 0.000871 |
+| foot_lock_loss                 | 0.00943  |
+| foot_lock_loss_q0              | 0.0136   |
+| foot_lock_loss_q1              | 0.00505  |
+| foot_lock_loss_q3              | 0.00853  |
+| head_anchor_loss               | 0.0273   |
+| head_anchor_loss_q0            | 0.0373   |
+| head_anchor_loss_q1            | 0.0184   |
+| head_anchor_loss_q3            | 0.0215   |
+| hip_root_height_consistency... | 0.0105   |
+| hip_root_position_consisten... | 0.000723 |
+| hip_root_yaw_consistency_lo... | 5.84e-05 |
+| hip_root_yaw_consistency_loss  | 7.96e-05 |
+| joint_vel_loss                 | 0.0142   |
+| joint_vel_loss_q0              | 0.0174   |
+| joint_vel_loss_q1              | 0.0106   |
+| joint_vel_loss_q3              | 0.0142   |
+| loss                           | 0.248    |
+| loss_q0                        | 0.387    |
+| loss_q1                        | 0.145    |
+| loss_q3                        | 0.132    |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.00103  |
+| root_delta_loss_q0             | 0.00102  |
+| root_delta_loss_q1             | 0.00114  |
+| root_delta_loss_q3             | 0.000826 |
+| root_height_loss               | 0.016    |
+| root_height_loss_q0            | 0.0262   |
+| root_height_loss_q1            | 0.00717  |
+| root_height_loss_q3            | 0.0101   |
+| samples                        | 16       |
+| sensor_reprojection_pos_los... | 0.0024   |
+| sensor_reprojection_pos_loss   | 0.0142   |
+| sensor_reprojection_rot_los... | 0.00969  |
+| sensor_reprojection_rot_loss   | 0.00942  |
+| simple_loss                    | 0.0249   |
+| simple_loss_q0                 | 0.0292   |
+| simple_loss_q1                 | 0.0169   |
+| simple_loss_q3                 | 0.031    |
+| step                           | 1        |
+| yaw_loss                       | 8.18e-05 |
+| yaw_loss_q0                    | 6.48e-05 |
+| yaw_loss_q1                    | 0.000112 |
+| yaw_loss_q3                    | 6.17e-05 |
+---------------------------------------------
+saving checkpoint step 1...
+step[2] data=0.348s train=0.043s
+step[2]: loss[0.19495]
+---------------------------------------------
+| aux_loss                       | 0.172    |
+| aux_loss_q0                    | 0.407    |
+| aux_loss_q1                    | 0.154    |
+| aux_loss_q2                    | 0.0749   |
+| aux_loss_q3                    | 0.0431   |
+| fk_loss                        | 0.000443 |
+| fk_loss_q0                     | 0.00105  |
+| fk_loss_q1                     | 0.000378 |
+| fk_loss_q2                     | 0.000207 |
+| fk_loss_q3                     | 0.000116 |
+| foot_lock_loss                 | 0.00388  |
+| foot_lock_loss_q0              | 0.00473  |
+| foot_lock_loss_q1              | 0.00347  |
+| foot_lock_loss_q2              | 0.00585  |
+| foot_lock_loss_q3              | 0        |
+| head_anchor_loss               | 0.021    |
+| head_anchor_loss_q0            | 0.0319   |
+| head_anchor_loss_q1            | 0.0202   |
+| head_anchor_loss_q2            | 0.0179   |
+| head_anchor_loss_q3            | 0.0129   |
+| hip_root_height_consistency... | 0.00496  |
+| hip_root_position_consisten... | 0.00151  |
+| hip_root_yaw_consistency_lo... | 9.71e-05 |
+| hip_root_yaw_consistency_loss  | 4.64e-05 |
+| joint_vel_loss                 | 0.0119   |
+| joint_vel_loss_q0              | 0.0184   |
+| joint_vel_loss_q1              | 0.012    |
+| joint_vel_loss_q2              | 0.00905  |
+| joint_vel_loss_q3              | 0.00776  |
+| loss                           | 0.195    |
+| loss_q0                        | 0.463    |
+| loss_q1                        | 0.17     |
+| loss_q2                        | 0.0815   |
+| loss_q3                        | 0.0603   |
+| lr                             | 5e-05    |
+| root_delta_loss                | 0.000919 |
+| root_delta_loss_q0             | 0.00124  |
+| root_delta_loss_q1             | 0.00058  |
+| root_delta_loss_q2             | 0.000782 |
+| root_delta_loss_q3             | 0.00117  |
+| root_height_loss               | 0.0165   |
+| root_height_loss_q0            | 0.028    |
+| root_height_loss_q1            | 0.0183   |
+| root_height_loss_q2            | 0.0108   |
+| root_height_loss_q3            | 0.00836  |
+| samples                        | 32       |
+| sensor_reprojection_pos_los... | 0.000535 |
+| sensor_reprojection_pos_loss   | 0.0104   |
+| sensor_reprojection_rot_los... | 0.00182  |
+| sensor_reprojection_rot_loss   | 0.00754  |
+| simple_loss                    | 0.0233   |
+| simple_loss_q0                 | 0.0559   |
+| simple_loss_q1                 | 0.0163   |
+| simple_loss_q2                 | 0.00653  |
+| simple_loss_q3                 | 0.0172   |
+| step                           | 2        |
+| yaw_loss                       | 7.81e-05 |
+| yaw_loss_q0                    | 7.11e-05 |
+| yaw_loss_q1                    | 0.000148 |
+| yaw_loss_q2                    | 1.5e-05  |
+| yaw_loss_q3                    | 9.94e-05 |
+---------------------------------------------
+saving checkpoint step 2...

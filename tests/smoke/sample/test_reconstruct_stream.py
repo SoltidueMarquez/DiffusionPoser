@@ -1,169 +1,103 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
-from data_loaders.sensor_masking import (
-    HIP_TRACKER_INDEX,
-    REALTIME_POSE_INPUT_DIM,
-    REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_START,
-    SMPL_JOINT_COUNT,
-    get_schema_spec,
+from data_loaders.generate_realtime_pose_tasks import build_task_arrays, compute_source_joint_rotations_world
+from data_loaders.realtime_pose_geometry import extract_forward_yaw_np
+from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.tracker_timeline import build_tracker_timeline, classify_tracker_window
+from diffusion.gaussian_diffusion import (
+    GaussianDiffusion,
+    LossType,
+    ModelMeanType,
+    ModelVarType,
+    get_named_beta_schedule,
 )
-from sample.ik_initializer import build_tracker_pose_init_image
+from model.realtime_pose_target_dit import RealtimePoseTargetDiT
+from eval.evaluate_realtime_pose import evaluate_file
 from sample.reconstruct_stream import reconstruct_batch, save_reconstruction
-from sample.simulate_unity_stream import IDENTITY_6D
+from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
+from tests.smoke.train.test_realtime_pose_140d_training import _make_batch
 
 
-class RecordingDiffusion:
-    def __init__(self):
-        self.noise = "unset"
-
-    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs):
-        del model, clip_denoised, model_kwargs
-        self.noise = noise
-        return torch.ones(shape)
-
-
-class RecordingWarmStartDiffusion:
-    def __init__(self):
-        self.num_timesteps = 10
-        self.init_image = None
-        self.skip_timesteps = None
-
-    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs, init_image=None, skip_timesteps=0):
-        del model, noise, clip_denoised, model_kwargs
-        self.init_image = init_image
-        self.skip_timesteps = skip_timesteps
-        return torch.ones(shape)
-
-
-def test_reconstruct_batch_starts_from_sampler_noise_and_keeps_conditions():
-    conditioned = torch.full((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), 2.0)
+def test_reconstruct_batch_preserves_every_known_channel():
+    target, known_target, known, kwargs = _make_batch(batch_size=1)
+    y = kwargs["y"]
     batch = {
-        "conditioned_x": conditioned,
-        "valid_frame_mask": torch.ones(1, REALTIME_POSE_SEQ_LEN, dtype=torch.bool),
+        "x": target,
+        "known_target": known_target,
+        "known_mask": known,
+        "pose_history": kwargs["pose_history"],
+        "tracker_window": kwargs["tracker_window"],
+        "valid_frame_mask": kwargs["valid_frame_mask"],
     }
-    diffusion = RecordingDiffusion()
-
-    reconstructed = reconstruct_batch(
-        model=object(),
-        diffusion=diffusion,
-        batch=batch,
-        device=torch.device("cpu"),
-        use_ddim=False,
+    model = RealtimePoseTargetDiT(input_feats=140, latent_dim=32, num_layers=1, num_heads=4)
+    diffusion = GaussianDiffusion(
+        betas=get_named_beta_schedule("cosine", 6),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
     )
-
-    assert diffusion.noise is None
-    assert torch.all(reconstructed[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] == 1.0)
-    condition_mask = torch.ones_like(conditioned, dtype=torch.bool)
-    condition_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = False
-    assert torch.all(reconstructed[condition_mask] == conditioned[condition_mask])
+    reconstructed = reconstruct_batch(model, diffusion, batch, torch.device("cpu"), use_ddim=True)
+    assert reconstructed.shape == (1, 140)
+    torch.testing.assert_close(reconstructed[known], known_target[known], atol=1e-6, rtol=0.0)
 
 
-def test_reconstruct_batch_passes_ik_init_image_and_start_timestep():
-    conditioned = torch.zeros((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
-    init_image = torch.full_like(conditioned, 0.5)
+def test_save_reconstruction_writes_unified_evaluation_fields(tmp_path):
+    source = build_toy_realtime_source(frame_count=70)
+    rotations_world = compute_source_joint_rotations_world(source)
+    head_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"][:, 0])
+    head_yaws = extract_forward_yaw_np(head_rotations, initial_yaw=0.0)
+    timeline_window = build_tracker_timeline("toy", 70, global_seed=10).window(0)
+    scenario = classify_tracker_window(timeline_window.configured, timeline_window.measured_valid)
+    task = build_task_arrays(
+        source=source,
+        source_path=Path("toy.npz"),
+        source_frames=70,
+        joint_rotations_world=rotations_world,
+        head_yaws=head_yaws,
+        timeline_window=timeline_window,
+        start_frame=0,
+        scenario=str(scenario),
+    )
+    tracker = task["tracker_window"]
     batch = {
-        "conditioned_x": conditioned,
-        "valid_frame_mask": torch.ones(1, REALTIME_POSE_SEQ_LEN, dtype=torch.bool),
+        "current_tracker_pos_head_ref": torch.from_numpy(tracker[-1:, :, :3]),
+        "current_tracker_rot_head_ref_6d": torch.from_numpy(tracker[-1:, :, 3:9]),
+        "configured": torch.from_numpy(task["configured"][None]),
+        "measured_valid": torch.from_numpy(task["measured_valid"][None]),
+        "missing_age": torch.from_numpy(task["missing_age"][None]),
+        "missing_age_norm": torch.from_numpy(tracker[None, :, :, 11]),
+        "current_head_yaw_world": torch.from_numpy(np.asarray(task["current_head_yaw_world"]).reshape(1)),
+        "current_head_position_world": torch.from_numpy(task["current_head_position_world"][None]),
+        "floor_y": torch.from_numpy(np.asarray(task["floor_y"]).reshape(1)),
+        "joint_offsets_parent": torch.from_numpy(task["joint_offsets_parent"][None]),
+        "joint_rest_local_rotations_6d": torch.from_numpy(task["joint_rest_local_rotations_6d"][None]),
+        "target_joints_head_ref": torch.from_numpy(task["target_joints_head_ref"][None]),
+        "target_root_position_head_ref": torch.from_numpy(task["target_root_position_head_ref"][None]),
+        "target_root_yaw_world": torch.from_numpy(np.asarray(task["target_root_yaw_world"]).reshape(1)),
+        "target_hip_height": torch.from_numpy(np.asarray(task["target_hip_height"]).reshape(1)),
+        "scenario": str(scenario),
     }
-    diffusion = RecordingWarmStartDiffusion()
-
-    reconstruct_batch(
-        model=object(),
-        diffusion=diffusion,
+    reference = torch.from_numpy(task["current_target"][None])
+    known_mask = torch.from_numpy(task["known_mask"][None])
+    result_path = tmp_path / "reconstruction.npz"
+    save_reconstruction(
+        path=result_path,
+        reference=reference,
+        reconstructed=reference.clone(),
+        known_mask=known_mask,
         batch=batch,
-        device=torch.device("cpu"),
-        use_ddim=False,
-        init_image=init_image,
-        start_timestep=3,
-    )
-
-    assert diffusion.init_image is not None
-    assert diffusion.skip_timesteps == 6
-    torch.testing.assert_close(diffusion.init_image, init_image)
-
-
-def test_tracker_pose_init_image_only_changes_target_frame_target_channels():
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    conditioned = torch.zeros((1, schema.feature_dim, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
-    conditioned[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START - 1] = torch.from_numpy(
-        np.tile(IDENTITY_6D, SMPL_JOINT_COUNT)
-    )
-    conditioned[:, schema.root_yaw_delta_slice(), REALTIME_POSE_TARGET_START - 1] = torch.tensor([0.0, 1.0])
-    conditioned[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START - 1] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
-    conditioned[:, schema.tracker_pos_slice(HIP_TRACKER_INDEX), REALTIME_POSE_TARGET_START] = torch.tensor([0.0, 0.9, 0.0])
-    conditioned[:, schema.tracker_rot_slice(HIP_TRACKER_INDEX), REALTIME_POSE_TARGET_START] = torch.from_numpy(IDENTITY_6D)
-    conditioned[:, schema.sensor_valid_slice(), REALTIME_POSE_TARGET_START] = 1.0
-    before = conditioned.clone()
-
-    init_image = build_tracker_pose_init_image(
-        conditioned_x=conditioned,
-        schema_name=schema.name,
-        joint_offsets_parent=torch.zeros(1, SMPL_JOINT_COUNT, 3),
-        iterations=0,
-    )
-
-    changed_mask = init_image != before
-    allowed_mask = torch.zeros_like(conditioned, dtype=torch.bool)
-    allowed_mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
-    assert not changed_mask[~allowed_mask].any()
-    assert torch.allclose(
-        init_image[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START],
-        conditioned[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START - 1],
-    )
-    assert torch.allclose(init_image[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START], torch.tensor([[0.9]]))
-
-
-def test_save_reconstruction_writes_raw_and_normalized_features(tmp_path):
-    class OffsetNormalizer:
-        def inverse(self, features):
-            return features + 10.0
-
-    reference = torch.zeros((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
-    reconstructed = reference.clone()
-    reconstructed[:, 0, REALTIME_POSE_TARGET_START] = 1.0
-    inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
-    inpaint_mask[:, :REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START] = True
-    path = tmp_path / "result.npz"
-
-    save_reconstruction(
-        path=path,
-        reference=reference,
-        conditioned=reference,
-        reconstructed=reconstructed,
-        inpaint_mask=inpaint_mask,
-        normalizer=OffsetNormalizer(),
-    )
-
-    with np.load(path, allow_pickle=False) as data:
-        assert "reference_features_raw" in data.files
-        assert "reference_features_normalized" in data.files
-        assert data["input_feature_space"].item() == "normalized"
-        np.testing.assert_allclose(data["reference_features_normalized"], 0.0)
-        np.testing.assert_allclose(data["reference_features_raw"], 10.0)
-        np.testing.assert_allclose(data["reference_features"], data["reference_features_raw"])
-
-
-def test_save_reconstruction_without_normalizer_does_not_write_normalized_fields(tmp_path):
-    reference = torch.zeros((1, REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SEQ_LEN), dtype=torch.float32)
-    inpaint_mask = torch.zeros_like(reference, dtype=torch.bool)
-    path = tmp_path / "raw_result.npz"
-
-    save_reconstruction(
-        path=path,
-        reference=reference,
-        conditioned=reference,
-        reconstructed=reference,
-        inpaint_mask=inpaint_mask,
         normalizer=None,
     )
 
-    with np.load(path, allow_pickle=False) as data:
-        assert data["input_feature_space"].item() == "raw"
-        assert "reference_features_raw" in data.files
-        assert "reference_features_normalized" not in data.files
+    with np.load(result_path, allow_pickle=False) as data:
+        assert data["reference_target_raw"].shape == (1, 1, 140)
+        assert data["reference_body_local_delta_6d"].shape == (1, 1, 144)
+        assert data["predicted_joints_world"].shape == (1, 1, 24, 3)
+    metrics = evaluate_file(result_path)
+    assert metrics["mpjre_deg"] < 1e-4
+    assert metrics["mpjpe_cm"] < 1e-3

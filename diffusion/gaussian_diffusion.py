@@ -17,19 +17,19 @@ from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
 from data_loaders.realtime_pose_kinematics import (
-    JOINT_INDEX,
-    TRACKER_JOINT_INDICES,
-    fk_body_fbx_local_torch,
-    fk_root_global_torch,
-    make_yaw_rotation_torch,
-    rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
 )
+from data_loaders.realtime_pose_geometry import (
+    decode_target_head_rotations_torch,
+    resolve_root_head_reference_torch,
+)
 from data_loaders.sensor_masking import (
+    FOOT_TRACKER_INDICES,
+    HAND_TRACKER_INDICES,
     HIP_TRACKER_INDEX,
-    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
-    REALTIME_POSE_TARGET_START,
-    get_schema_spec,
+    JOINT_GLOBAL_ROTATION_DIM,
+    ROOT_YAW_RELATIVE_START,
+    TRACKER_TO_JOINT,
 )
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
@@ -139,17 +139,11 @@ class GaussianDiffusion:
         rescale_timesteps=False,
         aux_loss_weight=1.0,
         yaw_loss_weight=10.0,
+        rotation_loss_weight=1.0,
         fk_loss_weight=2.0,
-        joint_vel_loss_weight=0.5,
-        foot_lock_loss_weight=0.5,
-        root_delta_loss_weight=1.0,
-        root_height_loss_weight=1.0,
-        contact_loss_weight=0.5,
+        transition_loss_weight=0.5,
         tracker_pos_loss_weight=5.0,
         tracker_pos_huber_beta=0.05,
-        tracker_pos_timestep_min_weight=0.1,
-        tracker_pos_timestep_gamma=2.0,
-        tracker_rot_loss_weight=2.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -157,23 +151,13 @@ class GaussianDiffusion:
         self.rescale_timesteps = rescale_timesteps
         self.aux_loss_weight = float(aux_loss_weight)
         self.yaw_loss_weight = float(yaw_loss_weight)
+        self.rotation_loss_weight = float(rotation_loss_weight)
         self.fk_loss_weight = float(fk_loss_weight)
-        self.joint_vel_loss_weight = float(joint_vel_loss_weight)
-        self.foot_lock_loss_weight = float(foot_lock_loss_weight)
-        self.root_delta_loss_weight = float(root_delta_loss_weight)
-        self.root_height_loss_weight = float(root_height_loss_weight)
-        self.contact_loss_weight = float(contact_loss_weight)
+        self.transition_loss_weight = float(transition_loss_weight)
         self.tracker_pos_loss_weight = float(tracker_pos_loss_weight)
         self.tracker_pos_huber_beta = float(tracker_pos_huber_beta)
-        self.tracker_pos_timestep_min_weight = float(tracker_pos_timestep_min_weight)
-        self.tracker_pos_timestep_gamma = float(tracker_pos_timestep_gamma)
-        self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
         if self.tracker_pos_huber_beta <= 0.0:
             raise ValueError("tracker_pos_huber_beta 必须大于 0")
-        if not 0.0 <= self.tracker_pos_timestep_min_weight <= 1.0:
-            raise ValueError("tracker_pos_timestep_min_weight 必须在 [0, 1] 范围内")
-        if self.tracker_pos_timestep_gamma < 0.0:
-            raise ValueError("tracker_pos_timestep_gamma 必须大于等于 0")
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1368,222 +1352,142 @@ class GaussianDiffusion:
         x_t = x_start * negnoise_level_mask + x_t * (1 - negnoise_level_mask)
         return x_t
 
-    def _realtime_pose_slice_to_raw(self, values, y, start, end):
-        """把归一化后的 realtime 特征切片还原到物理尺度。"""
-
-        mean = y.get("normalizer_mean")
-        std = y.get("normalizer_std")
-        if mean is None or std is None:
-            return values
-        return values * std[start:end].view(1, -1) + mean[start:end].view(1, -1)
-
-    def _tracker_pos_timestep_weight(self, timesteps, batch_size, device, dtype):
-        """低噪声阶段的 pred_xstart 更可信，因此给 tracker 位置重投影更高权重。"""
-
-        if timesteps is None:
-            return torch.ones(batch_size, device=device, dtype=dtype)
-        timesteps = timesteps.to(device=device, dtype=dtype).view(-1)
-        if timesteps.shape[0] != batch_size:
-            raise ValueError(f"tracker timestep batch 不匹配：t={tuple(timesteps.shape)} batch_size={batch_size}")
-        if self.num_timesteps <= 1:
-            progress = torch.ones_like(timesteps)
-        else:
-            progress = 1.0 - timesteps / float(self.num_timesteps - 1)
-        progress = progress.clamp(0.0, 1.0)
-        return self.tracker_pos_timestep_min_weight + (
-            1.0 - self.tracker_pos_timestep_min_weight
-        ) * progress.pow(self.tracker_pos_timestep_gamma)
-
     def _realtime_pose_aux_losses(self, pred_xstart, x_start, model_kwargs, timesteps=None):
-        """计算 realtime_pose 第 61 帧的 yaw/FK/root/contact/sensor 辅助损失。"""
+        """140D 路径的旋转、FK、Tracker 位置与切换连续性损失。"""
 
+        del timesteps
         y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
-        if "schema_name" not in y:
-            return {}
-        schema = get_schema_spec(y.get("schema_name"))
-
         required = (
-            "target_joints_world",
-            "prev_joints_world",
-            "target_root_pos_world",
-            "prev_root_yaw",
+            "known_mask",
+            "pose_history",
+            "target_joints_head_ref",
+            "prev_joints_head_ref",
             "joint_offsets_parent",
+            "joint_rest_local_rotations_6d",
+            "current_tracker_pos_head_ref",
+            "measured_valid",
+            "configured",
+            "missing_age",
         )
-        if schema.supports_stationary_prob:
-            required = (*required, "target_stationary_prob_5")
         missing = [name for name in required if name not in y]
         if missing:
-            raise KeyError(f"{schema.name} auxiliary loss 缺少 batch 字段：{missing}")
+            raise KeyError(f"140D auxiliary loss 缺少 batch 字段：{missing}")
+        if pred_xstart.ndim != 2 or pred_xstart.shape[1] != ROOT_YAW_RELATIVE_START + 2:
+            raise ValueError(f"140D auxiliary loss 收到错误形状：{tuple(pred_xstart.shape)}")
 
-        frame = REALTIME_POSE_TARGET_START
-        pose_slice = schema.body_pose_slice()
-        yaw_slice = schema.root_yaw_delta_slice()
+        device = pred_xstart.device
+        dtype = pred_xstart.dtype
+        mean = y.get("normalizer_mean")
+        std = y.get("normalizer_std")
 
-        pred_pose = pred_xstart[:, pose_slice, frame]
-        pred_yaw_delta = pred_xstart[:, yaw_slice, frame]
-        gt_yaw_delta = x_start[:, yaw_slice, frame]
-        pred_pose = self._realtime_pose_slice_to_raw(pred_pose, y, pose_slice.start, pose_slice.stop)
-        pred_yaw_delta = self._realtime_pose_slice_to_raw(pred_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
-        gt_yaw_delta = self._realtime_pose_slice_to_raw(gt_yaw_delta, y, yaw_slice.start, yaw_slice.stop)
+        def to_raw(value):
+            if mean is None or std is None:
+                return value
+            return value * std.to(device=device, dtype=dtype) + mean.to(device=device, dtype=dtype)
 
-        pred_yaw_delta = torch.nn.functional.normalize(pred_yaw_delta, dim=-1, eps=1e-8)
-        gt_yaw_delta = torch.nn.functional.normalize(gt_yaw_delta, dim=-1, eps=1e-8)
-        yaw_loss = 1.0 - (pred_yaw_delta * gt_yaw_delta).sum(dim=-1)
+        pred_raw = to_raw(pred_xstart)
+        target_raw = to_raw(x_start)
+        known_mask = y["known_mask"].to(device=device).bool()
+        joint_unknown = ~known_mask[:, :JOINT_GLOBAL_ROTATION_DIM].reshape(-1, 23, 6).all(dim=-1)
+        root_unknown = ~known_mask[:, ROOT_YAW_RELATIVE_START:].all(dim=-1)
 
-        prev_root_yaw = y["prev_root_yaw"].to(device=pred_xstart.device, dtype=pred_xstart.dtype).view(-1)
-        yaw_delta_angle = torch.atan2(pred_yaw_delta[:, 0], pred_yaw_delta[:, 1])
-        pred_root_yaw = prev_root_yaw + yaw_delta_angle
+        pred_joint_rot = rotation_6d_to_matrix_torch(
+            pred_raw[:, :JOINT_GLOBAL_ROTATION_DIM].reshape(-1, 23, 6)
+        )
+        target_joint_rot = rotation_6d_to_matrix_torch(
+            target_raw[:, :JOINT_GLOBAL_ROTATION_DIM].reshape(-1, 23, 6)
+        )
 
-        target_root_pos = y["target_root_pos_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        target_joints = y["target_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        prev_joints = y["prev_joints_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        offsets = y["joint_offsets_parent"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-        rest_local_rotations_6d = y.get("joint_rest_local_rotations_6d")
-        if rest_local_rotations_6d is not None:
-            rest_local_rotations_6d = rest_local_rotations_6d.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+        def rotation_angle(first, second):
+            relative = first.transpose(-1, -2) @ second
+            cosine = ((relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            return torch.acos(cosine)
 
-        root_delta_loss = None
-        root_height_loss = None
-        if schema.supports_root_motion:
-            root_delta_slice = schema.root_delta_xz_slice()
-            root_height_slice = schema.root_height_slice()
-            pred_root_delta = pred_xstart[:, root_delta_slice, frame]
-            gt_root_delta = x_start[:, root_delta_slice, frame]
-            pred_root_height = pred_xstart[:, root_height_slice, frame]
-            gt_root_height = x_start[:, root_height_slice, frame]
-            pred_root_delta = self._realtime_pose_slice_to_raw(
-                pred_root_delta,
-                y,
-                root_delta_slice.start,
-                root_delta_slice.stop,
-            )
-            gt_root_delta = self._realtime_pose_slice_to_raw(gt_root_delta, y, root_delta_slice.start, root_delta_slice.stop)
-            pred_root_height = self._realtime_pose_slice_to_raw(
-                pred_root_height,
-                y,
-                root_height_slice.start,
-                root_height_slice.stop,
-            )
-            gt_root_height = self._realtime_pose_slice_to_raw(gt_root_height, y, root_height_slice.start, root_height_slice.stop)
-            root_delta_loss = torch.abs(pred_root_delta - gt_root_delta).mean(dim=1)
-            root_height_loss = torch.abs(pred_root_height - gt_root_height).mean(dim=1)
+        rotation_error = rotation_angle(pred_joint_rot, target_joint_rot)
+        joint_denom = joint_unknown.float().sum(dim=1).clamp_min(1.0)
+        rotation_loss = (rotation_error * joint_unknown.float()).sum(dim=1) / joint_denom
 
-            prev_root_pos = y["prev_root_pos_world"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            delta_3d = torch.zeros_like(prev_root_pos)
-            delta_3d[:, 0] = pred_root_delta[:, 0]
-            delta_3d[:, 2] = pred_root_delta[:, 1]
-            yaw_rot = make_yaw_rotation_torch(prev_root_yaw)
-            target_root_pos = prev_root_pos + torch.einsum("bij,bj->bi", yaw_rot, delta_3d)
-            target_root_pos = target_root_pos.clone()
-            # root-y0 schema 中 actor root y 永远为 0，高度通道只驱动 pelvis/root bone 的 local offset y。
-            target_root_pos[:, 1] = 0.0
-            offsets = offsets.clone()
-            offsets[:, 0, 1] = pred_root_height.view(-1)
+        pred_yaw = torch.nn.functional.normalize(
+            pred_raw[:, ROOT_YAW_RELATIVE_START:], dim=-1, eps=1e-8
+        )
+        target_yaw = torch.nn.functional.normalize(
+            target_raw[:, ROOT_YAW_RELATIVE_START:], dim=-1, eps=1e-8
+        )
+        yaw_loss = (1.0 - (pred_yaw * target_yaw).sum(dim=-1)) * root_unknown.float()
 
-        if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-            pred_joints, pred_global_rot = fk_body_fbx_local_torch(
-                body_pose_local_delta_6d=pred_pose,
-                actor_root_pos_world=target_root_pos,
-                root_heading=pred_root_yaw,
-                rest_local_positions=offsets,
-                rest_local_rotations_6d=rest_local_rotations_6d,
-                return_global_rot=True,
-            )
-        else:
-            pred_joints, pred_global_rot = fk_root_global_torch(
-                body_pose_root_global_6d=pred_pose,
-                root_pos_world=target_root_pos,
-                root_yaw=pred_root_yaw,
-                parent_offsets=offsets,
-                return_global_rot=True,
-            )
+        rest_rot = y["joint_rest_local_rotations_6d"].to(device=device, dtype=dtype)
+        offsets = y["joint_offsets_parent"].to(device=device, dtype=dtype)
+        pred_global_rot, root_yaw_head = decode_target_head_rotations_torch(pred_raw, rest_rot)
+        tracker_pos = y["current_tracker_pos_head_ref"].to(device=device, dtype=dtype)
+        measured = y["measured_valid"].to(device=device).bool()
+        current_measured = measured[:, -1] if measured.ndim == 3 else measured
+        root_translation, derived_hip_height, pred_joints = resolve_root_head_reference_torch(
+            pred_global_rot,
+            root_yaw_head,
+            offsets,
+            observed_head_height=tracker_pos[:, 0, 1],
+            hip_measured_valid=current_measured[:, HIP_TRACKER_INDEX],
+            observed_hip_position_head=tracker_pos[:, HIP_TRACKER_INDEX],
+        )
+        del root_translation, derived_hip_height
+        target_joints = y["target_joints_head_ref"].to(device=device, dtype=dtype)
+        fk_loss = torch.square(pred_joints - target_joints).flatten(1).mean(dim=1)
 
-        fk_loss = ((pred_joints - target_joints) ** 2).flatten(1).mean(dim=1)
-        pred_joint_vel = pred_joints - prev_joints
-        gt_joint_vel = target_joints - prev_joints
-        joint_vel_loss = torch.abs(pred_joint_vel - gt_joint_vel).flatten(1).mean(dim=1)
-
-        foot_indices = torch.tensor(
-            [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
-            device=pred_xstart.device,
+        tracker_indices = torch.as_tensor(
+            [*HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES],
+            device=device,
             dtype=torch.long,
         )
-        if schema.supports_stationary_prob:
-            stationary_prob = y["target_stationary_prob_5"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            if tuple(stationary_prob.shape) != (pred_xstart.shape[0], 5):
-                raise ValueError(f"target_stationary_prob_5 应为 [B, 5]，实际为 {tuple(stationary_prob.shape)}")
-            foot_lock_weight = stationary_prob[:, 1:3].clamp(0.0, 1.0)
-        else:
-            foot_lock_weight = torch.zeros((pred_xstart.shape[0], 2), device=pred_xstart.device, dtype=pred_xstart.dtype)
-        pred_foot_delta_xz = pred_joints[:, foot_indices][:, :, [0, 2]] - prev_joints[:, foot_indices][:, :, [0, 2]]
-        foot_lock_raw = torch.linalg.norm(pred_foot_delta_xz, dim=-1) * foot_lock_weight
-        foot_lock_count = foot_lock_weight.sum(dim=1).clamp_min(1.0)
-        foot_lock_loss = foot_lock_raw.sum(dim=1) / foot_lock_count
+        joint_indices = torch.as_tensor(
+            [TRACKER_TO_JOINT[index] for index in [*HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES]],
+            device=device,
+            dtype=torch.long,
+        )
+        tracker_distance = torch.linalg.norm(
+            pred_joints[:, joint_indices] - tracker_pos[:, tracker_indices],
+            dim=-1,
+        )
+        beta = torch.as_tensor(self.tracker_pos_huber_beta, device=device, dtype=dtype)
+        tracker_huber = torch.where(
+            tracker_distance < beta,
+            0.5 * tracker_distance.square() / beta,
+            tracker_distance - 0.5 * beta,
+        )
+        tracker_valid = current_measured[:, tracker_indices].float()
+        tracker_pos_loss = (tracker_huber * tracker_valid).sum(dim=1) / tracker_valid.sum(dim=1).clamp_min(1.0)
 
-        result = {
+        pose_history = y["pose_history"].to(device=device, dtype=dtype)
+        previous_raw = to_raw(pose_history[:, -1])
+        previous_global_rot, previous_root_yaw_head = decode_target_head_rotations_torch(previous_raw, rest_rot)
+        continuity_rotation = rotation_angle(pred_global_rot[:, 1:], previous_global_rot[:, 1:])
+        continuity_rotation = (continuity_rotation * joint_unknown.float()).sum(dim=1) / joint_denom
+        yaw_delta = torch.atan2(
+            torch.sin(root_yaw_head - previous_root_yaw_head),
+            torch.cos(root_yaw_head - previous_root_yaw_head),
+        ).abs() * root_unknown.float()
+
+        configured = y["configured"].to(device=device).bool()
+        missing_age = y["missing_age"].to(device=device)
+        if configured.ndim == 3:
+            state_changed = (
+                (configured[:, -1] != configured[:, -2])
+                | (measured[:, -1] != measured[:, -2])
+            ).any(dim=1)
+            current_age = missing_age[:, -1]
+        else:
+            state_changed = torch.zeros(pred_xstart.shape[0], device=device, dtype=torch.bool)
+            current_age = missing_age
+        early_dropout = ((current_age > 0) & (current_age <= 5)).any(dim=1)
+        transition_weight = (state_changed | early_dropout).float()
+        transition_loss = (continuity_rotation + yaw_delta) * transition_weight
+
+        return {
+            "rotation_loss": rotation_loss,
             "yaw_loss": yaw_loss,
             "fk_loss": fk_loss,
-            "joint_vel_loss": joint_vel_loss,
-            "foot_lock_loss": foot_lock_loss,
+            "sensor_reprojection_pos_loss": tracker_pos_loss,
+            "transition_loss": transition_loss,
         }
-        if root_delta_loss is not None and root_height_loss is not None:
-            result["root_delta_loss"] = root_delta_loss
-            result["root_height_loss"] = root_height_loss
-        target_tracker_pos_ref = y.get("target_tracker_pos_ref")
-        target_tracker_rot_ref = y.get("target_tracker_rot_ref_6d")
-        target_sensor_valid = y.get("target_sensor_valid")
-        if target_tracker_pos_ref is not None and target_sensor_valid is not None:
-            target_tracker_pos_ref = target_tracker_pos_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
-            tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
-            pred_tracker = pred_joints[:, tracker_indices]
-            # tracker_pos_ref 的定义是 `(tracker_world - current_root_world) @ R(prev_yaw)`。
-            # hip/waist tracker 已经用于 root correction，这里只让 head/hands/feet 约束姿态，
-            # 避免 pelvis pose 和 root 位移在同一个观测上抢解释权。
-            pred_tracker_ref = torch.einsum(
-                "btj,bjk->btk",
-                pred_tracker - target_root_pos[:, None],
-                make_yaw_rotation_torch(prev_root_yaw),
-            )
-            valid_nonhip = valid_target.clone()
-            valid_nonhip[:, HIP_TRACKER_INDEX] = False
-            tracker_distance = torch.linalg.norm(pred_tracker_ref - target_tracker_pos_ref, dim=-1)
-            beta = torch.as_tensor(self.tracker_pos_huber_beta, device=pred_xstart.device, dtype=pred_xstart.dtype)
-            reproj = torch.where(
-                tracker_distance < beta,
-                0.5 * tracker_distance.square() / beta,
-                tracker_distance - 0.5 * beta,
-            )
-            valid_weight = valid_nonhip.float()
-            denom = valid_weight.sum(dim=1).clamp_min(1.0)
-            tracker_loss = (reproj * valid_weight).sum(dim=1) / denom
-            timestep_weight = self._tracker_pos_timestep_weight(
-                timesteps,
-                batch_size=pred_xstart.shape[0],
-                device=pred_xstart.device,
-                dtype=pred_xstart.dtype,
-            )
-            result["sensor_reprojection_pos_loss"] = timestep_weight * tracker_loss
-        if target_tracker_rot_ref is not None and target_sensor_valid is not None:
-            target_tracker_rot_ref = target_tracker_rot_ref.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            valid_target = target_sensor_valid.to(device=pred_xstart.device).bool()
-            tracker_indices = torch.as_tensor(TRACKER_JOINT_INDICES, device=pred_xstart.device, dtype=torch.long)
-            pred_tracker_rot_world = pred_global_rot[:, tracker_indices]
-            # tracker_rot_ref_6d 的定义是 `R(prev_yaw)^T @ tracker_rot_world`。
-            # 这里把 FK 得到的关节全局旋转投到同一参考系，只对 valid tracker 做旋转对齐。
-            ref_inv = make_yaw_rotation_torch(prev_root_yaw).transpose(-1, -2)
-            pred_tracker_rot_ref = torch.einsum("bij,btjk->btik", ref_inv, pred_tracker_rot_world)
-            target_tracker_rot_ref = rotation_6d_to_matrix_torch(target_tracker_rot_ref)
-            pred_tracker_rot_ref_6d = rotation_6d_forward_up_torch(pred_tracker_rot_ref)
-            target_tracker_rot_ref_6d = rotation_6d_forward_up_torch(target_tracker_rot_ref)
-            rot_cos = (
-                pred_tracker_rot_ref_6d.reshape(pred_tracker_rot_ref_6d.shape[0], pred_tracker_rot_ref_6d.shape[1], 2, 3)
-                * target_tracker_rot_ref_6d.reshape(target_tracker_rot_ref_6d.shape[0], target_tracker_rot_ref_6d.shape[1], 2, 3)
-            ).sum(dim=-1)
-            rot_reproj = 1.0 - rot_cos.mean(dim=-1)
-            denom = valid_target.float().sum(dim=1).clamp_min(1.0)
-            result["sensor_reprojection_rot_loss"] = (rot_reproj * valid_target.float()).sum(dim=1) / denom
-        return result
 
     def training_losses(
         self,
@@ -1684,6 +1588,9 @@ class GaussianDiffusion:
                 pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
             else:
                 pred_xstart = None
+            if pred_xstart is not None:
+                # 辅助损失与 rollout 也必须看到硬写回后的已知关节。
+                pred_xstart = torch.where(inpaint_cond, pred_xstart, conditioning_motion)
 
             terms["simple_loss"] = self.masked_l2(target, model_output, mask, feature_w, use_l1) 
 
@@ -1706,22 +1613,12 @@ class GaussianDiffusion:
                     terms.update(aux_terms)
                     aux_loss = (
                         self.yaw_loss_weight * terms["yaw_loss"]
+                        + self.rotation_loss_weight * terms["rotation_loss"]
                         + self.fk_loss_weight * terms["fk_loss"]
-                        + self.joint_vel_loss_weight * terms["joint_vel_loss"]
-                        + self.foot_lock_loss_weight * terms["foot_lock_loss"]
+                        + self.transition_loss_weight * terms["transition_loss"]
                     )
-                    if "root_delta_loss" in terms:
-                        aux_loss = (
-                            aux_loss
-                            + self.root_delta_loss_weight * terms["root_delta_loss"]
-                            + self.root_height_loss_weight * terms["root_height_loss"]
-                        )
-                    if "contact_loss" in terms:
-                        aux_loss = aux_loss + self.contact_loss_weight * terms["contact_loss"]
                     if "sensor_reprojection_pos_loss" in terms:
                         aux_loss = aux_loss + self.tracker_pos_loss_weight * terms["sensor_reprojection_pos_loss"]
-                    if "sensor_reprojection_rot_loss" in terms:
-                        aux_loss = aux_loss + self.tracker_rot_loss_weight * terms["sensor_reprojection_rot_loss"]
                     terms["aux_loss"] = self.aux_loss_weight * aux_loss
                     terms["loss"] = terms["loss"] + terms["aux_loss"]
 

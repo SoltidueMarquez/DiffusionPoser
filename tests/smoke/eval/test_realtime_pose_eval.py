@@ -1,78 +1,41 @@
-from __future__ import annotations
-
-import numpy as np
-import pytest
-import torch
-
-from data_loaders.realtime_pose_dataset import encode_realtime_pose_features
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_START
-from eval.evaluate_realtime_pose import evaluate_file, summarize
-from sample.reconstruct_stream import build_realtime_inpaint_mask, save_reconstruction
-from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
+from eval.evaluate_realtime_pose import summarize
 
 
-def test_realtime_pose_eval_reads_result_npz(tmp_path):
-    source = build_toy_realtime_source(frame_count=61)
-    source["sensor_valid"] = np.ones((61, 6), dtype=bool)
-    features = encode_realtime_pose_features(source)
-    reconstructed = features.copy()
-    reconstructed[REALTIME_POSE_TARGET_START, 0] += 0.1
-    mask = np.zeros((61, REALTIME_POSE_INPUT_DIM), dtype=bool)
-    mask[REALTIME_POSE_TARGET_START, :REALTIME_POSE_TARGET_DIM] = True
-    path = tmp_path / "result.npz"
-    np.savez(path, reference_features=features, reconstructed_features=reconstructed, inpaint_mask=mask)
-    metrics = evaluate_file(path)
-    assert metrics["target_frames"] == 1
-    assert metrics["pose_mse"] > 0.0
+METRIC_KEYS = (
+    "mpjre_deg",
+    "mpjpe_cm",
+    "mpjve_cm_s",
+    "unknown_rotation_deg",
+    "root_yaw_error_deg",
+    "root_xz_error_m",
+    "hip_height_error_m",
+    "tracker_position_error_m",
+)
 
 
-def test_realtime_pose_eval_reads_batched_reconstruction_npz(tmp_path):
-    source = build_toy_realtime_source(frame_count=61)
-    source["sensor_valid"] = np.ones((61, 6), dtype=bool)
-    features = encode_realtime_pose_features(source)
-    reference = torch.from_numpy(features.T).unsqueeze(0).float()
-    reconstructed = reference.clone()
-    reconstructed[:, 0, REALTIME_POSE_TARGET_START] += 0.1
-    inpaint_mask = build_realtime_inpaint_mask(1, torch.device("cpu"))
-    path = tmp_path / "batched_result.npz"
-    save_reconstruction(path, reference, reference, reconstructed, inpaint_mask)
-
-    metrics = evaluate_file(path)
-    assert metrics["batch_size"] == 1
-    assert metrics["target_frames"] == 1
-    assert metrics["feature_space"] == "raw"
-    assert metrics["pose_mse"] > 0.0
+def _result(samples: int, mpjpe_sum: float, mpjpe_count: int, known_max: float) -> dict:
+    stats = {key: {"sum": 0.0, "count": samples} for key in METRIC_KEYS}
+    stats["mpjpe_cm"] = {"sum": mpjpe_sum, "count": mpjpe_count}
+    stats["mpjve_cm_s"] = {"sum": 0.0, "count": 0}
+    return {
+        "sequences": 1,
+        "samples": samples,
+        "velocity_pairs": 0,
+        "known_tracker_rotation_max_error_deg": known_max,
+        "by_scenario": {},
+        "by_missing_age": {},
+        "_metric_stats": stats,
+    }
 
 
-def test_realtime_pose_eval_prefers_raw_features_when_available(tmp_path):
-    source = build_toy_realtime_source(frame_count=61)
-    source["sensor_valid"] = np.ones((61, 6), dtype=bool)
-    features = encode_realtime_pose_features(source)[None]
-    raw_reconstructed = features.copy()
-    raw_reconstructed[:, REALTIME_POSE_TARGET_START, 0] += 0.2
-    normalized_reconstructed = features.copy()
-    mask = np.zeros((1, 61, REALTIME_POSE_INPUT_DIM), dtype=bool)
-    mask[:, REALTIME_POSE_TARGET_START, :REALTIME_POSE_TARGET_DIM] = True
-    path = tmp_path / "raw_priority.npz"
-    np.savez(
-        path,
-        reference_features_raw=features,
-        reconstructed_features_raw=raw_reconstructed,
-        reference_features_normalized=features,
-        reconstructed_features_normalized=normalized_reconstructed,
-        inpaint_mask=mask,
+def test_eval_summary_uses_weighted_metric_counts_and_global_max():
+    summary = summarize(
+        [
+            _result(samples=1, mpjpe_sum=1.0, mpjpe_count=1, known_max=0.1),
+            _result(samples=3, mpjpe_sum=9.0, mpjpe_count=3, known_max=0.3),
+        ]
     )
-
-    metrics = evaluate_file(path)
-    assert metrics["feature_space"] == "raw"
-    assert metrics["pose_mse"] > 0.0
-
-
-def test_realtime_pose_eval_rejects_mixed_feature_spaces():
-    with pytest.raises(ValueError, match="feature_space"):
-        summarize(
-            [
-                {"feature_space": "raw", "pose_mse": 1.0, "yaw_cos_loss": 0.1, "target_mae": 0.5},
-                {"feature_space": "normalized", "pose_mse": 2.0, "yaw_cos_loss": 0.2, "target_mae": 0.6},
-            ]
-        )
+    assert summary["samples"] == 4
+    assert summary["mpjpe_cm"] == 2.5
+    assert summary["mpjve_cm_s"] is None
+    assert summary["known_tracker_rotation_max_error_deg"] == 0.3

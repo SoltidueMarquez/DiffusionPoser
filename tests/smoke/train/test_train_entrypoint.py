@@ -8,34 +8,22 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from unittest.mock import patch
 
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
 from utils.parser_util import add_data_options, add_training_options
 
 
 class TrainEntrypointTest(unittest.TestCase):
-    def test_data_options_default_to_previous_history_and_tracker_augmentation(self):
+    def test_data_options_only_expose_materialized_task_controls(self):
         parser = ArgumentParser()
         add_data_options(parser)
 
         args = parser.parse_args(["--data_dir", "dataset/tasks"])
 
-        self.assertEqual(args.schema, REALTIME_POSE_SCHEMA_NAME)
-        self.assertEqual(args.history_pose_noise_std, 0.02)
-        self.assertEqual(args.history_yaw_noise_std, 0.02)
-        self.assertEqual(args.history_pose_dropout_prob, 0.05)
-        self.assertEqual(args.history_pose_replace_prob, 0.05)
-        self.assertEqual(args.tracker_latency_max_frames, 2)
-        self.assertEqual(args.tracker_burst_dropout_prob, 0.05)
-        self.assertEqual(args.tracker_outlier_prob, 0.01)
-
-    def test_data_options_reject_legacy_training_schema(self):
-        parser = ArgumentParser()
-        add_data_options(parser)
-
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["--data_dir", "dataset/tasks", "--schema", "realtime_pose_v2_contact"])
+        self.assertEqual(args.rollout_steps, 1)
+        self.assertNotIn("--history_pose_noise_std", parser._option_string_actions)
+        self.assertNotIn("--tracker_latency_max_frames", parser._option_string_actions)
+        self.assertNotIn("--tracker_mask_policy", parser._option_string_actions)
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -49,8 +37,6 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertTrue(args.model_ema)
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
-        self.assertEqual(args.tracker_pos_timestep_min_weight, 0.1)
-        self.assertEqual(args.tracker_pos_timestep_gamma, 2.0)
 
     def test_training_options_can_disable_default_model_ema(self):
         parser = ArgumentParser()
@@ -103,7 +89,6 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="debug run",
-                schema=REALTIME_POSE_SCHEMA_NAME,
                 model_arch="target_dit",
                 seed=123,
             )
@@ -125,7 +110,6 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="same",
-                schema=REALTIME_POSE_SCHEMA_NAME,
                 model_arch="target_dit",
                 seed=123,
             )

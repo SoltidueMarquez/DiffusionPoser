@@ -8,7 +8,7 @@ from argparse import BooleanOptionalAction
 from dataclasses import dataclass
 from pathlib import Path
 
-from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_SCHEMA_NAMES, get_schema_spec
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
 from utils.run_dirs import resolve_latest_or_self
 
 
@@ -38,7 +38,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     paths.add_argument("--save_dir", default="runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit", type=str)
 
     pipeline = parser.add_argument_group("pipeline")
-    pipeline.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES)
     pipeline.add_argument("--start_at", default="convert", choices=PIPELINE_STAGES)
     pipeline.add_argument("--stop_after", default="train", choices=PIPELINE_STAGES)
     pipeline.add_argument("--dry_run", action="store_true")
@@ -79,14 +78,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tasks.add_argument("--skip_tasks", action="store_true")
     tasks.add_argument("--splits", nargs="+", default=["train", "test"])
     tasks.add_argument("--samples_per_file", default=4, type=int)
-    tasks.add_argument("--mask_policy", default="full", choices=["full", "fixed_patterns"])
-    tasks.add_argument("--fixed_tracker_patterns", nargs="+", default=["all"])
+    tasks.add_argument("--rollout_steps", default=1, type=int)
     tasks.add_argument("--short_source_policy", default="skip", choices=["skip", "error"])
 
     train = parser.add_argument_group("train")
     train.add_argument("--skip_train", action="store_true")
     train.add_argument("--resume_latest", action="store_true")
-    train.add_argument("--model_arch", default="target_dit", choices=["full_feature_dit", "target_dit"])
+    train.add_argument("--model_arch", default="target_dit", choices=["target_dit"])
     train.add_argument("--cuda", default=True, type=str2bool)
     train.add_argument("--device", default=0, type=int)
     train.add_argument("--train_batch_size", default=64, type=int)
@@ -104,16 +102,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--ts_respace", default="", type=str)
     train.add_argument("--model_ema", action=BooleanOptionalAction, default=True)
     train.add_argument("--gradient_clip", action=BooleanOptionalAction, default=True)
-    train.add_argument("--history_pose_noise_std", default=0.02, type=float)
-    train.add_argument("--history_yaw_noise_std", default=0.02, type=float)
-    train.add_argument("--history_pose_dropout_prob", default=0.05, type=float)
-    train.add_argument("--history_pose_replace_prob", default=0.05, type=float)
-    train.add_argument("--history_yaw_replace_prob", default=0.0, type=float)
-    train.add_argument("--tracker_latency_max_frames", default=2, type=int)
-    train.add_argument("--tracker_burst_dropout_prob", default=0.05, type=float)
-    train.add_argument("--tracker_outlier_prob", default=0.01, type=float)
-    train.add_argument("--predicted_history_cache_dir", default="", type=str)
-    train.add_argument("--predicted_history_prob", default=0.0, type=float)
+    train.add_argument("--rollout_loss_weight", default=0.0, type=float)
+    train.add_argument("--rollout_prob", default=0.0, type=float)
+    train.add_argument("--detach_rollout_history", default=True, type=str2bool)
+    train.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
+    train.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)
     return parser
 
 
@@ -143,6 +136,12 @@ def add_flag(args: list[str], enabled: bool, flag: str) -> None:
 
 def add_bool_value(args: list[str], name: str, value: bool) -> None:
     args.extend([name, "true" if value else "false"])
+
+
+def add_boolean_optional_flag(args: list[str], name: str, value: bool) -> None:
+    """向使用 BooleanOptionalAction 的下游 parser 显式传递 true/false。"""
+
+    args.append(name if value else f"--no-{name.removeprefix('--')}")
 
 
 def run_python_module(module: str, args: list[str], dry_run: bool) -> None:
@@ -196,7 +195,7 @@ def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[b
         return False, ""
     if stage == "convert" and not bool(getattr(args, "rebuild_source", False)):
         source_dir = Path(args.source_dir)
-        if has_usable_source_manifest(source_dir=source_dir, schema_name=str(args.schema)):
+        if has_usable_source_manifest(source_dir=source_dir):
             return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
     if stage == "tasks":
         task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
@@ -204,7 +203,7 @@ def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[b
             return True, f"复用已有 task 产物: {task_dir}"
     if stage == "normalizer":
         normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
-        if has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
+        if has_normalizer_artifact(normalizer_dir=normalizer_dir):
             return True, f"复用已有 normalizer 产物: {normalizer_dir}"
     return False, ""
 
@@ -213,7 +212,7 @@ def dependency_block_message(stage: str, failed_stages: set[str], args: argparse
     """阶段失败后只在依赖产物仍可用时继续，避免误用旧的 latest 产物。"""
 
     if stage == "tasks" and "convert" in failed_stages:
-        if has_usable_source_manifest(source_dir=Path(args.source_dir), schema_name=str(args.schema)):
+        if has_usable_source_manifest(source_dir=Path(args.source_dir)):
             return ""
         return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
     if stage == "normalizer" and "tasks" in failed_stages:
@@ -228,12 +227,12 @@ def dependency_block_message(stage: str, failed_stages: set[str], args: argparse
                 return "tasks 失败且找不到 train task manifest，跳过 train。"
         if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
             normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
-            if not has_normalizer_artifact(normalizer_dir=normalizer_dir, schema_name=str(args.schema)):
+            if not has_normalizer_artifact(normalizer_dir=normalizer_dir):
                 return "normalizer 失败且找不到可用 normalizer 产物，跳过 train。"
     return ""
 
 
-def has_usable_source_manifest(source_dir: Path, schema_name: str) -> bool:
+def has_usable_source_manifest(source_dir: Path) -> bool:
     manifest_path = source_dir / "manifest.jsonl"
     if not manifest_path.exists():
         return False
@@ -244,8 +243,6 @@ def has_usable_source_manifest(source_dir: Path, schema_name: str) -> bool:
                     continue
                 entry = json.loads(line)
                 if entry.get("status") not in SOURCE_USABLE_STATUSES:
-                    continue
-                if str(entry.get("schema_name", schema_name)) != schema_name:
                     continue
                 return True
     except (OSError, json.JSONDecodeError):
@@ -263,17 +260,14 @@ def has_task_manifests(task_dir: Path, splits: list[str]) -> bool:
     return True
 
 
-def has_normalizer_artifact(normalizer_dir: Path, schema_name: str) -> bool:
-    mean_path = normalizer_dir / "mean.pt"
-    std_path = normalizer_dir / "std.pt"
-    meta_path = normalizer_dir / "normalizer_meta.json"
-    if not (mean_path.exists() and std_path.exists() and meta_path.exists()):
-        return False
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return str(meta.get("schema_name", schema_name)) == schema_name
+def has_normalizer_artifact(normalizer_dir: Path) -> bool:
+    required = (
+        "pose_mean.pt",
+        "pose_std.pt",
+        "tracker_mean.pt",
+        "tracker_std.pt",
+    )
+    return all((normalizer_dir / name).exists() for name in required)
 
 
 def format_pipeline_failures(failures: list[StageResult]) -> str:
@@ -286,7 +280,6 @@ def format_pipeline_failures(failures: list[StageResult]) -> str:
 
 def build_convert_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
         "--amass_dir", normalize_path(args.amass_dir),
         "--smpl_model_dir", normalize_path(args.smpl_model_dir),
         "--output_dir", normalize_path(args.source_dir),
@@ -313,7 +306,6 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
 
 def build_normalizer_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
         "--task_dir", normalize_path(args.task_dir),
         "--output_dir", normalize_path(args.normalizer_dir),
         "--split", args.normalizer_split,
@@ -325,27 +317,22 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
 
 def build_task_args(args: argparse.Namespace) -> list[str]:
     command = [
-        "--schema", args.schema,
         "--source_dir", normalize_path(args.source_dir),
         "--output_dir", normalize_path(args.task_dir),
         "--split_dir", normalize_path(args.split_dir),
         "--splits", *[str(split) for split in args.splits],
         "--samples_per_file", str(args.samples_per_file),
-        "--mask_policy", args.mask_policy,
-        "--fixed_tracker_patterns", *[str(pattern) for pattern in args.fixed_tracker_patterns],
+        "--rollout_steps", str(args.rollout_steps),
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
     ]
-    add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
 
 def build_train_args(args: argparse.Namespace) -> list[str]:
-    schema = get_schema_spec(args.schema)
     command = [
-        "--schema", schema.name,
         "--model_arch", args.model_arch,
-        "--input_feats", str(schema.feature_dim),
+        "--input_feats", str(REALTIME_POSE_TARGET_DIM),
         "--data_dir", normalize_path(args.task_dir),
         "--data_split", "train",
         "--normalizer_dir", normalize_path(args.normalizer_dir),
@@ -363,25 +350,18 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--heads", str(args.heads),
         "--latent_dim", str(args.latent_dim),
         "--diffusion_steps", str(args.diffusion_steps),
-        "--history_pose_noise_std", str(args.history_pose_noise_std),
-        "--history_yaw_noise_std", str(args.history_yaw_noise_std),
-        "--history_pose_dropout_prob", str(args.history_pose_dropout_prob),
-        "--history_pose_replace_prob", str(args.history_pose_replace_prob),
-        "--history_yaw_replace_prob", str(args.history_yaw_replace_prob),
-        "--tracker_latency_max_frames", str(args.tracker_latency_max_frames),
-        "--tracker_burst_dropout_prob", str(args.tracker_burst_dropout_prob),
-        "--tracker_outlier_prob", str(args.tracker_outlier_prob),
-        "--tracker_mask_policy", "dynamic_categories",
-        "--tracker_mask_categories", "all",
+        "--rollout_steps", str(args.rollout_steps),
+        "--rollout_loss_weight", str(args.rollout_loss_weight),
+        "--rollout_prob", str(args.rollout_prob),
+        "--detach_rollout_history", "true" if args.detach_rollout_history else "false",
+        "--rollout_joint_vel_loss_weight", str(args.rollout_joint_vel_loss_weight),
+        "--rollout_rot_vel_loss_weight", str(args.rollout_rot_vel_loss_weight),
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
     command.extend(["--device", str(args.device)])
     if args.ts_respace:
         command.extend(["--ts_respace", args.ts_respace])
-    if args.predicted_history_cache_dir:
-        command.extend(["--predicted_history_cache_dir", normalize_path(args.predicted_history_cache_dir)])
-        command.extend(["--predicted_history_prob", str(args.predicted_history_prob)])
-    add_flag(command, bool(args.model_ema), "--model_ema")
+    add_boolean_optional_flag(command, "--model_ema", bool(args.model_ema))
     add_flag(command, bool(args.gradient_clip), "--gradient_clip")
     add_flag(command, bool(args.overwrite), "--overwrite")
     add_flag(command, bool(args.resume_latest), "--resume_checkpoint")

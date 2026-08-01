@@ -1,130 +1,88 @@
 from __future__ import annotations
 
-import argparse
-
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 
-from data_loaders.build_realtime_longseq_eval_set import build_realtime_longseq_eval_set, read_longseq_manifest
-from data_loaders.longseq_eval_dropout import LongseqDropoutConfig
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, REALTIME_POSE_TARGET_START, get_schema_spec
-from sample.evaluate_longseq_eval_set import evaluate_longseq_entries
-from sample.simulate_unity_stream import IDENTITY_6D
-from tests.smoke.longseq_eval_fixtures import write_toy_longseq_task_run
-
-
-class FixedLongseqDiffusion:
-    def __init__(self):
-        self.calls = 0
-
-    def p_sample_loop(self, model, shape, noise, clip_denoised, model_kwargs):
-        del model, shape, noise, clip_denoised
-        self.calls += 1
-        sample = model_kwargs["y"]["inpainted_motion"].clone()
-        schema = get_schema_spec(model_kwargs["y"]["schema_name"])
-        sample[:, schema.body_pose_slice(), REALTIME_POSE_TARGET_START] = torch.from_numpy(
-            np.tile(IDENTITY_6D, 24)
-        ).to(sample.device)
-        sample[:, schema.root_yaw_delta_slice(), REALTIME_POSE_TARGET_START] = torch.tensor(
-            [0.0, 1.0],
-            dtype=sample.dtype,
-            device=sample.device,
-        )
-        sample[:, schema.root_delta_xz_slice(), REALTIME_POSE_TARGET_START] = 0.0
-        sample[:, schema.root_height_slice(), REALTIME_POSE_TARGET_START] = 0.0
-        sample[:, schema.stationary_prob_slice(), REALTIME_POSE_TARGET_START] = 0.0
-        return sample
+import sample.evaluate_longseq_eval_set as longseq
+from data_loaders.generate_realtime_pose_tasks import compute_source_joint_rotations_world
+from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_forward_yaw_np
+from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_np, rotation_6d_to_matrix_np
+from data_loaders.tracker_timeline import TrackerTimeline, compute_missing_age
+from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file
+from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
 
-def test_evaluate_longseq_entries_writes_per_sequence_and_aggregate_summary(tmp_path):
-    task_root, _task_run = write_toy_longseq_task_run(tmp_path)
-    eval_set_dir = build_realtime_longseq_eval_set(
-        argparse.Namespace(
-            task_dir=str(task_root),
-            task_run="latest",
-            output_root=str(tmp_path / "longseq_eval"),
-            run_name="stress",
-            preset="stress_long",
-            split="test",
-            min_frames=60,
-            include_mirror=False,
-            schema=REALTIME_POSE_SCHEMA_NAME,
-            overwrite=True,
-        )
+def test_longseq_140d_rollout_reinjects_prediction_and_keeps_missing_age(monkeypatch, tmp_path):
+    source = build_toy_realtime_source(frame_count=63)
+    rotations_world = compute_source_joint_rotations_world(source)
+    head_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"][:, 0])
+    head_yaws = extract_forward_yaw_np(head_rotations, initial_yaw=0.0)
+    targets = [
+        build_pose_target_np(
+            rotations_world[frame_index : frame_index + 1],
+            source["root_yaw"][frame_index : frame_index + 1],
+            float(head_yaws[frame_index]),
+        )[0]
+        for frame_index in range(60, 63)
+    ]
+    # 第一个未知关节故意偏离 GT，用于确认下一帧读到的是预测历史。
+    targets[0] = targets[0].copy()
+    targets[0][:6] = rotation_6d_forward_up_np(
+        Rotation.from_rotvec([0.35, 0.0, 0.0]).as_matrix()
     )
-    entries = read_longseq_manifest(eval_set_dir)
-    output_dir = tmp_path / "output"
 
-    summary = evaluate_longseq_entries(
-        entries=entries,
-        eval_set_dir=eval_set_dir,
-        output_dir=output_dir,
-        model=object(),
-        diffusion=FixedLongseqDiffusion(),
+    configured = np.ones((63, 6), dtype=bool)
+    measured = configured.copy()
+    measured[61:, 3] = False
+    missing_age = compute_missing_age(configured, measured)
+    timeline = TrackerTimeline(
+        configured=configured,
+        measured_valid=measured,
+        missing_age=missing_age,
+        missing_age_norm=missing_age.astype(np.float32) / 60.0,
+    )
+
+    captured_histories = []
+    original_build_conditioning = longseq.build_online_conditioning
+
+    def capture_conditioning(*args, **kwargs):
+        captured_histories.append(list(kwargs["pose_history_world"]))
+        return original_build_conditioning(*args, **kwargs)
+
+    sample_index = 0
+
+    def fake_sample_online_target(**_kwargs):
+        nonlocal sample_index
+        result = targets[sample_index]
+        sample_index += 1
+        return result
+
+    monkeypatch.setattr(longseq, "build_online_conditioning", capture_conditioning)
+    monkeypatch.setattr(longseq, "sample_online_target", fake_sample_online_target)
+    payload = longseq.rollout_long_sequence_source(
+        model=None,
+        diffusion=None,
+        source=source,
+        timeline=timeline,
         device=torch.device("cpu"),
         normalizer=None,
-        use_ddim=False,
-        model_path="model000000000.pt",
-        weights="model",
-        limit=1,
-        root_correction=False,
-        tracker_ik=False,
-        render_mp4=False,
     )
 
-    assert summary["summary"]["file_count"] == 1
-    assert summary["metadata"]["sequence_count"] == 1
-    assert (output_dir / "longseq_eval_summary.json").exists()
-    sequence_dir = output_dir / entries[0]["sequence_id"]
-    assert (sequence_dir / "unity_stream_long_sequence_result.npz").exists()
-    assert (sequence_dir / "unity_stream_eval_summary.json").exists()
-
-
-def test_evaluate_longseq_entries_applies_dropout_to_sensor_valid(tmp_path):
-    task_root, _task_run = write_toy_longseq_task_run(tmp_path)
-    eval_set_dir = build_realtime_longseq_eval_set(
-        argparse.Namespace(
-            task_dir=str(task_root),
-            task_run="latest",
-            output_root=str(tmp_path / "longseq_eval"),
-            run_name="stress",
-            preset="stress_long",
-            split="test",
-            min_frames=60,
-            include_mirror=False,
-            schema=REALTIME_POSE_SCHEMA_NAME,
-            overwrite=True,
-        )
+    assert payload["reconstructed_target_raw"].shape == (1, 3, 140)
+    assert payload["predicted_joints_world"].shape == (1, 3, 24, 3)
+    assert payload["missing_age"][0, :, 3].tolist() == [0, 1, 2]
+    assert payload["scenario"].tolist() == [["fixed_six", "dropout", "dropout"]]
+    assert len(captured_histories) == 3
+    assert not np.allclose(
+        captured_histories[1][-1].joint_rotations_world[1],
+        rotations_world[60, 1],
     )
-    entries = read_longseq_manifest(eval_set_dir)
-    output_dir = tmp_path / "output_dropout"
+    assert np.isfinite(payload["predicted_joints_world"]).all()
+    assert float(payload["known_rotation_max_error"].max()) < 1e-5
 
-    summary = evaluate_longseq_entries(
-        entries=entries,
-        eval_set_dir=eval_set_dir,
-        output_dir=output_dir,
-        model=object(),
-        diffusion=FixedLongseqDiffusion(),
-        device=torch.device("cpu"),
-        normalizer=None,
-        use_ddim=False,
-        model_path="model000000000.pt",
-        weights="model",
-        limit=1,
-        root_correction=False,
-        tracker_ik=False,
-        render_mp4=False,
-        dropout_config=LongseqDropoutConfig(
-            preset="tracker_mask_train",
-            tracker_mask_policy="fixed_categories",
-            tracker_mask_categories=("upper-body",),
-        ),
-    )
-
-    result_path = output_dir / entries[0]["sequence_id"] / "unity_stream_long_sequence_result.npz"
-    with np.load(result_path, allow_pickle=True) as data:
-        sensor_valid = np.asarray(data["sensor_valid"], dtype=bool)[0]
-    assert not sensor_valid.all()
-    assert sensor_valid[:, 3].all()
-    assert sensor_valid.sum(axis=1).min() >= 3
-    assert summary["files"][0]["valid_tracker_ratio"] < 1.0
+    result_path = tmp_path / "rollout_result.npz"
+    np.savez(result_path, **payload)
+    result = evaluate_rollout_file(result_path)
+    assert result["samples"] == 3
+    assert result["velocity_pairs"] == 2

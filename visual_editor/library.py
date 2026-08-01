@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
-from data_loaders.sensor_masking import REALTIME_POSE_INPUT_DIM, REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY, REALTIME_POSE_INPUT_DIM
 from utils.run_dirs import resolve_latest_or_self
 from visual_editor.models import ComparePreset, MotionAsset, MotionTrack, StudioConfig
 from visual_editor.realtime_pose import iter_jsonl, load_task_npz, stable_id
@@ -29,7 +29,6 @@ class MotionLibrary:
         assets.update(self.scan_results())
         self.assets = assets
         self.index_meta = {
-            "schema_name": "realtime_pose_studio_library_v2",
             "source_dir": str(self.config.source_dir),
             "data_dir": str(self.config.data_dir),
             "result_dir": str(self.config.result_dir),
@@ -42,7 +41,6 @@ class MotionLibrary:
         source_dir = self.config.source_dir
         if not source_dir.exists():
             return assets
-        schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
         for path in sorted(source_dir.rglob("*.npz")):
             if "tasks" in path.parts:
                 continue
@@ -51,7 +49,7 @@ class MotionLibrary:
             except Exception:
                 continue
             relative = path.relative_to(source_dir).as_posix()
-            frame_count = int(source[schema.body_pose_key].shape[0])
+            frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
             asset_id = stable_id("source", str(path.resolve()))
             track = MotionTrack(
                 track_id="realtime_source",
@@ -61,7 +59,7 @@ class MotionLibrary:
                 fps=float(self.config.realtime_pose_fps),
                 source_path=path,
                 compatible_realtime_pose=True,
-                meta={"source_relative_path": relative, "schema_name": REALTIME_POSE_SCHEMA_NAME},
+                meta={"source_relative_path": relative},
             )
             assets[asset_id] = MotionAsset(
                 asset_id=asset_id,
@@ -72,7 +70,7 @@ class MotionLibrary:
                 frame_count=frame_count,
                 fps=float(self.config.realtime_pose_fps),
                 group=relative.split("/")[0] if "/" in relative else "Realtime Source",
-                meta={"schema_name": REALTIME_POSE_SCHEMA_NAME, "source_relative_path": relative},
+                meta={"source_relative_path": relative},
             )
         return assets
 
@@ -85,17 +83,14 @@ class MotionLibrary:
         root_manifest = data_dir / "manifest.jsonl"
         if root_manifest.exists():
             manifest_paths.append(root_manifest)
-        schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
         for manifest_path in manifest_paths:
             for entry in iter_jsonl(manifest_path):
-                if entry.get("schema_name") != REALTIME_POSE_SCHEMA_NAME:
-                    continue
                 task_path = manifest_path.parent / str(entry["task_path"])
                 try:
                     task = load_task_npz(task_path)
                 except Exception:
                     continue
-                frame_count = int(task[schema.body_pose_key].shape[0])
+                frame_count = int(task[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
                 asset_id = stable_id("task", str(task_path.resolve()))
                 track = MotionTrack(
                     track_id="task_reference",
@@ -158,7 +153,7 @@ class MotionLibrary:
                     fps=float(self.config.realtime_pose_fps),
                     source_path=path,
                     compatible_realtime_pose=False,
-                    meta={"schema_name": REALTIME_POSE_SCHEMA_NAME},
+                    meta={},
                 )
             assets[asset_id] = MotionAsset(
                 asset_id=asset_id,
@@ -169,13 +164,12 @@ class MotionLibrary:
                 frame_count=frame_count,
                 fps=float(self.config.realtime_pose_fps),
                 group="Reconstruction Result",
-                meta={"schema_name": REALTIME_POSE_SCHEMA_NAME},
+                meta={},
             )
         return assets
 
     def payload(self) -> dict[str, Any]:
         return {
-            "schema_name": "realtime_pose_studio_library_v2",
             "index": self.index_meta,
             "assets": [asset.to_dict() for asset in self.assets.values()],
             "stats": {

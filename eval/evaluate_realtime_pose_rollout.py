@@ -6,121 +6,79 @@ from pathlib import Path
 
 import numpy as np
 
+from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from eval.evaluate_realtime_pose import evaluate_file, public_result, summarize
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate realtime_pose rollout result npz files.")
-    parser.add_argument("--input_dir", required=True, type=str)
-    parser.add_argument("--output_json", default="", type=str)
+    parser = argparse.ArgumentParser(description="评估 140D rollout 与 Tracker 重连突变。")
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--output_json", default="")
     return parser
 
 
-def evaluate_rollout_file(path: Path) -> dict[str, float | int | str | list[float]]:
-    with np.load(path, allow_pickle=True) as data:
-        reference_features = np.asarray(data["reference_features_raw"], dtype=np.float32)
-        predicted_features = np.asarray(data["predicted_features_raw"], dtype=np.float32)
-        reference_joints = np.asarray(data["reference_joints_world"], dtype=np.float32)
-        predicted_joints = np.asarray(data["predicted_joints_world"], dtype=np.float32)
-        root_yaw_reference = np.asarray(data["root_yaw_reference"], dtype=np.float32)
-        root_yaw_predicted = np.asarray(data["root_yaw_predicted"], dtype=np.float32)
-        eval_frame_mask = read_eval_frame_mask(data, reference_features.shape[:2])
-        warmup_frames = int(np.asarray(data["warmup_frames"]).item()) if "warmup_frames" in data.files else 0
+def evaluate_rollout_file(path: Path) -> dict[str, object]:
+    result = evaluate_file(path)
+    with np.load(path, allow_pickle=False) as data:
+        joints = np.asarray(data["predicted_joints_world"], dtype=np.float64)
+        local_delta = np.asarray(data["predicted_body_local_delta_6d"], dtype=np.float64)
+        measured = np.asarray(data["measured_valid"], dtype=bool)
+        eval_mask = np.asarray(data["eval_frame_mask"], dtype=bool)
 
-    if reference_features.shape != predicted_features.shape:
-        raise ValueError(f"{path} feature shape 不匹配：{reference_features.shape} vs {predicted_features.shape}")
-    if reference_joints.shape != predicted_joints.shape:
-        raise ValueError(f"{path} joints shape 不匹配：{reference_joints.shape} vs {predicted_joints.shape}")
-    if not eval_frame_mask.any():
-        raise ValueError(f"{path} eval_frame_mask 没有可评估帧。")
+    sequence_count, steps = joints.shape[:2]
+    if steps < 2:
+        reconnect = np.zeros((sequence_count, 0), dtype=bool)
+        velocity = np.zeros((sequence_count, 0), dtype=np.float64)
+        angular = np.zeros((sequence_count, 0), dtype=np.float64)
+    else:
+        reconnect = (measured[:, 1:] & ~measured[:, :-1])[:, :, 1:].any(axis=-1)
+        reconnect &= eval_mask[:, 1:] & eval_mask[:, :-1]
+        velocity = np.linalg.norm(joints[:, 1:, :22] - joints[:, :-1, :22], axis=-1).mean(axis=-1)
+        rotations = rotation_6d_to_matrix_np(local_delta.reshape(sequence_count, steps, 24, 6))
+        relative = np.swapaxes(rotations[:, :-1, 1:22], -1, -2) @ rotations[:, 1:, 1:22]
+        cosine = np.clip((np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5, -1.0, 1.0)
+        angular = np.arccos(cosine).mean(axis=-1)
 
-    joint_error = np.linalg.norm(predicted_joints - reference_joints, axis=-1)
-    mpjpe_by_time = masked_time_mean(joint_error, eval_frame_mask)
-    yaw_error = np.abs(wrap_radians(root_yaw_predicted - root_yaw_reference))
-    yaw_by_time = masked_time_mean(yaw_error[..., None], eval_frame_mask)
-    temporal_jitter = np.diff(predicted_features, n=2, axis=1)
-    jitter_mask = eval_frame_mask[:, 2:] & eval_frame_mask[:, 1:-1] & eval_frame_mask[:, :-2]
-    temporal_jitter_value = float(np.mean(np.abs(temporal_jitter[jitter_mask]))) if jitter_mask.any() else 0.0
-    return {
-        "path": str(path),
-        "batch_size": int(reference_features.shape[0]),
-        "frames": int(reference_features.shape[1]),
-        "evaluated_frames": int(eval_frame_mask.sum()),
-        "warmup_frames": int(warmup_frames),
-        "mpjpe_mean": float(np.mean(joint_error[eval_frame_mask])),
-        "mpjpe_final": float(mpjpe_by_time[-1]),
-        "mpjpe_by_time": [float(value) for value in mpjpe_by_time.tolist()],
-        "yaw_error_mean": float(np.mean(yaw_error[eval_frame_mask])),
-        "yaw_error_final": float(yaw_by_time[-1]),
-        "yaw_drift_by_time": [float(value) for value in yaw_by_time.tolist()],
-        "foot_skating_left": 0.0,
-        "foot_skating_right": 0.0,
-        "ground_penetration_ratio": 0.0,
-        "tracker_reprojection_pos_error": 0.0,
-        "temporal_jitter": temporal_jitter_value,
+    reconnect_count = int(reconnect.sum())
+    velocity_sum = float(velocity[reconnect].sum()) if reconnect_count else 0.0
+    angular_sum_deg = float(np.degrees(angular[reconnect]).sum()) if reconnect_count else 0.0
+    result["reconnect_frames"] = reconnect_count
+    result["reconnect_velocity_jump_m"] = velocity_sum / reconnect_count if reconnect_count else 0.0
+    result["reconnect_angular_jump_deg"] = angular_sum_deg / reconnect_count if reconnect_count else 0.0
+    result["_reconnect_stats"] = {
+        "count": reconnect_count,
+        "velocity_sum": velocity_sum,
+        "angular_sum_deg": angular_sum_deg,
     }
+    return result
 
 
-def read_eval_frame_mask(data: np.lib.npyio.NpzFile, shape: tuple[int, int]) -> np.ndarray:
-    if "eval_frame_mask" not in data.files:
-        return np.ones(shape, dtype=bool)
-    mask = np.asarray(data["eval_frame_mask"], dtype=bool)
-    if mask.shape == (shape[1],):
-        mask = np.repeat(mask[None], shape[0], axis=0)
-    if mask.shape != shape:
-        raise ValueError(f"eval_frame_mask 应为 {shape} 或 [{shape[1]}]，实际为 {mask.shape}")
-    return mask
-
-
-def masked_time_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    mask = np.asarray(mask, dtype=bool)
-    result = []
-    for frame_index in range(values.shape[1]):
-        frame_mask = mask[:, frame_index]
-        if not frame_mask.any():
-            continue
-        result.append(float(np.mean(values[:, frame_index][frame_mask])))
-    return np.asarray(result, dtype=np.float32)
-
-
-def wrap_radians(angle: np.ndarray) -> np.ndarray:
-    return (angle + np.pi) % (2.0 * np.pi) - np.pi
-
-
-def summarize(results: list[dict[str, float | int | str | list[float]]]) -> dict[str, float | int]:
-    if not results:
-        raise RuntimeError("没有可评估的 rollout npz 文件。")
-    metric_names = (
-        "mpjpe_mean",
-        "mpjpe_final",
-        "yaw_error_mean",
-        "yaw_error_final",
-        "foot_skating_left",
-        "foot_skating_right",
-        "ground_penetration_ratio",
-        "tracker_reprojection_pos_error",
-        "temporal_jitter",
-    )
-    summary: dict[str, float | int] = {
-        "file_count": len(results),
-        "frames": int(sum(int(item["frames"]) for item in results)),
-        "evaluated_frames": int(sum(int(item.get("evaluated_frames", item["frames"])) for item in results)),
-        "warmup_frames": int(sum(int(item.get("warmup_frames", 0)) for item in results)),
-    }
-    for name in metric_names:
-        summary[name] = float(np.mean([float(item[name]) for item in results]))
+def summarize_rollouts(results: list[dict[str, object]]) -> dict[str, object]:
+    summary = summarize(results)
+    reconnect_count = sum(int(result["_reconnect_stats"]["count"]) for result in results)
+    velocity_sum = sum(float(result["_reconnect_stats"]["velocity_sum"]) for result in results)
+    angular_sum = sum(float(result["_reconnect_stats"]["angular_sum_deg"]) for result in results)
+    summary["reconnect_frames"] = reconnect_count
+    summary["reconnect_velocity_jump_m"] = velocity_sum / reconnect_count if reconnect_count else 0.0
+    summary["reconnect_angular_jump_deg"] = angular_sum / reconnect_count if reconnect_count else 0.0
     return summary
 
 
-def main(argv: list[str] | None = None) -> dict[str, float | int]:
+def main(argv: list[str] | None = None) -> dict[str, object]:
     args = build_arg_parser().parse_args(argv)
     input_dir = Path(args.input_dir).resolve()
-    results = [evaluate_rollout_file(path) for path in sorted(input_dir.rglob("rollout_result*.npz"))]
-    if not results:
-        results = [evaluate_rollout_file(path) for path in sorted(input_dir.rglob("*.npz"))]
-    summary = summarize(results)
+    paths = sorted(input_dir.rglob("rollout_result*.npz")) or sorted(input_dir.rglob("*.npz"))
+    results = [evaluate_rollout_file(path) for path in paths]
+    summary = summarize_rollouts(results)
     output_json = Path(args.output_json).resolve() if args.output_json else input_dir / "rollout_eval_summary.json"
+    output_json.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w", encoding="utf-8") as file:
-        json.dump({"summary": summary, "files": results}, file, indent=2, ensure_ascii=False)
+        json.dump(
+            {"summary": summary, "files": [public_result(result) for result in results]},
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
     print(f"[evaluate_realtime_pose_rollout] wrote {output_json}")
     return summary
 

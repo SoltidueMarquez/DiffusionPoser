@@ -33,6 +33,10 @@ AMASS_TO_UNITY = np.array(
 )
 
 
+class ShortMotionError(ValueError):
+    """动作帧数不足以完成稳定重采样或 source 转换。"""
+
+
 @dataclass(frozen=True)
 class MotionSource:
     """AMASS motion 在转换流程中的最小输入表示。"""
@@ -97,7 +101,7 @@ def load_motion_source(path: Path, amass_dir: Path, target_fps: float) -> Motion
         if trans.shape != (poses.shape[0], 3):
             raise ValueError(f"trans 应为 [T,3] 且与 poses 同帧数，实际为 {trans.shape}")
         if poses.shape[0] < 3:
-            raise ValueError("原始帧数少于 3，无法转换。")
+            raise ShortMotionError("原始帧数少于 3，跳过该动作。")
         betas = np.asarray(data["betas"], dtype=np.float64) if "betas" in data.files else np.zeros(10)
         gender = normalize_gender(data["gender"] if "gender" in data.files else "neutral")
 
@@ -108,7 +112,7 @@ def load_motion_source(path: Path, amass_dir: Path, target_fps: float) -> Motion
         target_fps=target_fps,
     )
     if poses_resampled.shape[0] < 3:
-        raise ValueError(f"重采样到 {target_fps:g}Hz 后少于 3 帧，无法转换。")
+        raise ShortMotionError(f"重采样到 {target_fps:g}Hz 后少于 3 帧，跳过该动作。")
     relative_path = path.relative_to(amass_dir)
     return MotionSource(
         path=path,

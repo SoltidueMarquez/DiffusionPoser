@@ -7,30 +7,28 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
-from data_loaders.sensor_masking import (
-    REALTIME_POSE_SCHEMA_NAME,
-    REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_START,
-    TRACKER_MASK_POLICY_AUTO,
-    TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES,
-    TRACKER_MASK_POLICY_TASK,
-    get_schema_spec,
+from data_loaders.realtime_pose_geometry import (
+    decode_target_head_rotations_np,
+    global_head_rotations_to_local_delta_6d_np,
 )
-from sample.ik_initializer import (
-    IK_INIT_MODE_TRACKER_POSE,
-    build_tracker_pose_init_image,
-    resolve_ik_init_timestep,
-    skip_timesteps_from_start,
-    validate_ik_init_mode,
-)
+from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from sample.realtime_pose_runtime import decode_and_resolve_pose
 from sample.utils import choose_sampler, load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
-from utils.parser_util import add_base_options, add_data_options, add_diffusion_options, add_model_options, add_sampling_options, parse_and_load_from_model
+from utils.parser_util import (
+    add_base_options,
+    add_data_options,
+    add_diffusion_options,
+    add_model_options,
+    add_sampling_options,
+    parse_and_load_from_model,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample realtime_pose_body_fbx_local_root_y0_v1 stationary5 single-frame reconstruction tasks.")
+    parser = argparse.ArgumentParser(description="采样 140D 动态 Tracker 单帧关节补全任务。")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -39,15 +37,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_realtime_inpaint_mask(
-    batch_size: int,
-    device: torch.device,
-    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
-) -> torch.Tensor:
-    schema = get_schema_spec(schema_name)
-    mask = torch.zeros(batch_size, schema.feature_dim, REALTIME_POSE_SEQ_LEN, dtype=torch.bool, device=device)
-    mask[:, schema.target_slice(), REALTIME_POSE_TARGET_START] = True
-    return mask
+def build_realtime_inpaint_mask(known_mask: torch.Tensor) -> torch.Tensor:
+    if known_mask.ndim != 2 or known_mask.shape[1] != REALTIME_POSE_TARGET_DIM:
+        raise ValueError("known_mask 必须为 [B,140]。")
+    return ~known_mask.bool()
+
+
+def build_sampling_model_kwargs(batch: dict, device: torch.device) -> dict:
+    known_mask = batch["known_mask"].to(device).bool()
+    known_target = batch["known_target"].to(device)
+    pose_history = batch["pose_history"].to(device)
+    tracker_window = batch["tracker_window"].to(device)
+    valid_frame_mask = batch["valid_frame_mask"].to(device).bool()
+    unknown_mask = build_realtime_inpaint_mask(known_mask)
+    return {
+        "inpaint_cond": unknown_mask,
+        "known_mask": known_mask,
+        "pose_history": pose_history,
+        "tracker_window": tracker_window,
+        "valid_frame_mask": valid_frame_mask,
+        "attention_mask": valid_frame_mask,
+        "y": {
+            "mask": unknown_mask,
+            "inpainted_motion": known_target,
+        },
+    }
 
 
 def reconstruct_batch(
@@ -56,147 +70,159 @@ def reconstruct_batch(
     batch: dict,
     device: torch.device,
     use_ddim: bool = True,
-    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     init_image: torch.Tensor | None = None,
     start_timestep: int | None = None,
 ) -> torch.Tensor:
-    schema = get_schema_spec(schema_name)
-    sample = batch["conditioned_x"].to(device)
-    batch_size = sample.shape[0]
-    if tuple(sample.shape[1:]) != (schema.feature_dim, REALTIME_POSE_SEQ_LEN):
-        raise ValueError(f"{schema.name} sample 应为 [B,{schema.feature_dim},61]，实际为 {tuple(sample.shape)}")
-    inpaint_mask = build_realtime_inpaint_mask(batch_size, device, schema_name=schema.name)
-    valid_frame_mask = batch["valid_frame_mask"].to(device)
-    model_kwargs = {
-        "inpaint_cond": inpaint_mask,
-        "valid_frame_mask": valid_frame_mask,
-        "attention_mask": valid_frame_mask,
-        "y": {
-            "mask": inpaint_mask,
-            "inpainted_motion": sample,
-            "schema_name": schema.name,
-        },
-    }
-    if "joint_offsets_parent" in batch:
-        model_kwargs["y"]["joint_offsets_parent"] = batch["joint_offsets_parent"].to(device)
-    if "joint_rest_local_rotations_6d" in batch:
-        model_kwargs["y"]["joint_rest_local_rotations_6d"] = batch["joint_rest_local_rotations_6d"].to(device)
-    sampler = choose_sampler(diffusion, use_ddim=use_ddim)
-    sampler_kwargs = {}
+    del start_timestep
     if init_image is not None:
-        init_image = init_image.to(device=device, dtype=sample.dtype)
-        if init_image.shape != sample.shape:
-            raise ValueError(f"init_image 应与 sample 同形状，实际 {tuple(init_image.shape)} vs {tuple(sample.shape)}")
-        if start_timestep is None:
-            raise ValueError("传入 init_image 时必须同时传入 start_timestep。")
-        sampler_kwargs["init_image"] = init_image
-        sampler_kwargs["skip_timesteps"] = skip_timesteps_from_start(diffusion, int(start_timestep))
+        raise ValueError("第一轮 140D 重构已关闭 local-delta IK initializer。")
+    reference = batch["x"].to(device)
+    if reference.ndim != 2 or reference.shape[1] != REALTIME_POSE_TARGET_DIM:
+        raise ValueError(f"sample 应为 [B,140]，实际为 {tuple(reference.shape)}")
+    model_kwargs = build_sampling_model_kwargs(batch, device)
+    sampler = choose_sampler(diffusion, use_ddim=use_ddim)
     with torch.no_grad():
         reconstructed = sampler(
             model,
-            shape=sample.shape,
+            shape=tuple(reference.shape),
             noise=None,
             clip_denoised=False,
             model_kwargs=model_kwargs,
-            **sampler_kwargs,
         )
-    return torch.where(inpaint_mask, reconstructed, sample)
+    known_mask = model_kwargs["known_mask"]
+    return torch.where(known_mask, model_kwargs["y"]["inpainted_motion"], reconstructed)
 
 
-def build_ik_init_image_for_batch(
-    batch: dict,
-    *,
-    device: torch.device,
-    schema_name: str,
-    normalizer=None,
-    ik_init_mode: str = "random",
-    ik_init_iterations: int = 16,
-    ik_init_lr: float = 0.03,
-    ik_init_pos_weight: float = 1.0,
-    ik_init_rot_weight: float = 0.2,
-    ik_init_reg_weight: float = 0.01,
-    ik_init_delta_limit: float = 0.15,
-) -> torch.Tensor | None:
-    mode = validate_ik_init_mode(ik_init_mode)
-    if mode != IK_INIT_MODE_TRACKER_POSE:
-        return None
-    return build_tracker_pose_init_image(
-        conditioned_x=batch["conditioned_x"].to(device),
-        schema_name=schema_name,
-        normalizer=normalizer,
-        joint_offsets_parent=batch.get("joint_offsets_parent"),
-        joint_rest_local_rotations_6d=batch.get("joint_rest_local_rotations_6d"),
-        iterations=ik_init_iterations,
-        lr=ik_init_lr,
-        pos_weight=ik_init_pos_weight,
-        rot_weight=ik_init_rot_weight,
-        reg_weight=ik_init_reg_weight,
-        delta_limit=ik_init_delta_limit,
-    )
-
-
-def tensor_bct_to_numpy_btc(tensor: torch.Tensor) -> np.ndarray:
-    """把模型内部 `[B, C, T]` 特征转成文件里使用的 `[B, T, C]`。"""
-
-    return tensor.detach().cpu().numpy().transpose(0, 2, 1).astype(np.float32, copy=False)
-
-
-def inverse_normalized_features(features: np.ndarray, normalizer) -> np.ndarray:
-    if normalizer is None:
-        return features
-    return np.asarray(normalizer.inverse(features), dtype=np.float32)
+def inverse_normalized_target(target: torch.Tensor, normalizer) -> np.ndarray:
+    value = target.detach().cpu()
+    if normalizer is not None:
+        value = normalizer.inverse_pose(value)
+    return np.asarray(value, dtype=np.float32)
 
 
 def save_reconstruction(
     path: Path,
     reference: torch.Tensor,
-    conditioned: torch.Tensor,
     reconstructed: torch.Tensor,
-    inpaint_mask: torch.Tensor,
+    known_mask: torch.Tensor,
+    batch: dict,
     normalizer=None,
-    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    has_normalizer = normalizer is not None
-    reference_input = tensor_bct_to_numpy_btc(reference)
-    conditioned_input = tensor_bct_to_numpy_btc(conditioned)
-    reconstructed_input = tensor_bct_to_numpy_btc(reconstructed)
-    reference_raw = inverse_normalized_features(reference_input, normalizer=normalizer)
-    conditioned_raw = inverse_normalized_features(conditioned_input, normalizer=normalizer)
-    reconstructed_raw = inverse_normalized_features(reconstructed_input, normalizer=normalizer)
-    payload = {
-        "schema_name": np.asarray(schema_name),
-        "feature_space": np.asarray("raw"),
-        "input_feature_space": np.asarray("normalized" if has_normalizer else "raw"),
-        # 兼容已有评估读取字段，但现在明确写 raw，避免评估默认落在归一化空间。
-        "reference_features": reference_raw,
-        "conditioned_features": conditioned_raw,
-        "reconstructed_features": reconstructed_raw,
-        "reference_features_raw": reference_raw,
-        "conditioned_features_raw": conditioned_raw,
-        "reconstructed_features_raw": reconstructed_raw,
-        "inpaint_mask": inpaint_mask.detach().cpu().numpy().transpose(0, 2, 1),
-    }
-    if has_normalizer:
-        payload.update(
-            reference_features_normalized=reference_input,
-            conditioned_features_normalized=conditioned_input,
-            reconstructed_features_normalized=reconstructed_input,
+    reference_raw = inverse_normalized_target(reference, normalizer)
+    reconstructed_raw = inverse_normalized_target(reconstructed, normalizer)
+    resolved = []
+    reference_local_delta = []
+    reference_joints_world = []
+    reference_root_world = []
+    tracker_positions_world = []
+    for batch_index in range(reconstructed_raw.shape[0]):
+        value = decode_and_resolve_pose(
+            reconstructed_raw[batch_index],
+            np.concatenate(
+                [
+                    batch["current_tracker_pos_head_ref"][batch_index].detach().cpu().numpy(),
+                    batch["current_tracker_rot_head_ref_6d"][batch_index].detach().cpu().numpy(),
+                    batch["configured"][batch_index, -1, :, None].detach().cpu().numpy(),
+                    batch["measured_valid"][batch_index, -1, :, None].detach().cpu().numpy(),
+                    batch["missing_age_norm"][batch_index, -1, :, None].detach().cpu().numpy(),
+                ],
+                axis=-1,
+            ),
+            float(batch["current_head_yaw_world"][batch_index].item()),
+            batch["current_head_position_world"][batch_index].detach().cpu().numpy(),
+            float(batch["floor_y"][batch_index].item()),
+            batch["joint_offsets_parent"][batch_index].detach().cpu().numpy(),
+            batch["joint_rest_local_rotations_6d"][batch_index].detach().cpu().numpy(),
         )
-    np.savez(path, **payload)
+        resolved.append(value)
+        head_yaw = float(batch["current_head_yaw_world"][batch_index].item())
+        head_position = batch["current_head_position_world"][batch_index].detach().cpu().numpy()
+        floor_y = float(batch["floor_y"][batch_index].item())
+        origin = np.asarray([head_position[0], floor_y, head_position[2]], dtype=np.float32)
+        yaw_rotation = make_yaw_rotation_np(np.asarray([head_yaw], dtype=np.float32))[0]
+        reference_joints_world.append(
+            origin[None]
+            + np.einsum(
+                "ij,aj->ai",
+                yaw_rotation,
+                batch["target_joints_head_ref"][batch_index].detach().cpu().numpy(),
+            )
+        )
+        reference_root_world.append(
+            origin
+            + yaw_rotation @ batch["target_root_position_head_ref"][batch_index].detach().cpu().numpy()
+        )
+        tracker_positions_world.append(
+            origin[None]
+            + np.einsum(
+                "ij,aj->ai",
+                yaw_rotation,
+                batch["current_tracker_pos_head_ref"][batch_index].detach().cpu().numpy(),
+            )
+        )
+        rest_rotations = rotation_6d_to_matrix_np(
+            batch["joint_rest_local_rotations_6d"][batch_index].detach().cpu().numpy()
+        )
+        reference_head_rotations, _ = decode_target_head_rotations_np(
+            reference_raw[batch_index],
+            rest_rotations,
+        )
+        reference_local_delta.append(
+            global_head_rotations_to_local_delta_6d_np(reference_head_rotations, rest_rotations)
+        )
+    scenario = batch.get("scenario", "")
+    if isinstance(scenario, str):
+        scenario_values = np.asarray([scenario] * reconstructed_raw.shape[0])
+    else:
+        scenario_values = np.asarray(scenario)
+    add_time = lambda value: np.asarray(value)[:, None]
+    np.savez(
+        path,
+        fps=np.float32(60.0),
+        reference_target_raw=add_time(reference_raw.astype(np.float32)),
+        reconstructed_target_raw=add_time(reconstructed_raw.astype(np.float32)),
+        known_mask=add_time(known_mask.detach().cpu().numpy()),
+        reference_body_local_delta_6d=add_time(np.asarray(reference_local_delta, dtype=np.float32)),
+        predicted_body_local_delta_6d=add_time(
+            np.stack([value.body_local_delta_6d for value in resolved]).astype(np.float32)
+        ),
+        reference_joints_world=add_time(np.asarray(reference_joints_world, dtype=np.float32)),
+        predicted_joints_world=add_time(
+            np.stack([value.joints_world for value in resolved]).astype(np.float32)
+        ),
+        reference_root_position_world=add_time(np.asarray(reference_root_world, dtype=np.float32)),
+        predicted_root_position_world=add_time(
+            np.stack([value.root_position_world for value in resolved]).astype(np.float32)
+        ),
+        reference_root_yaw_world=add_time(
+            batch["target_root_yaw_world"].detach().cpu().numpy().astype(np.float32)
+        ),
+        predicted_root_yaw_world=add_time(
+            np.asarray([value.root_yaw_world for value in resolved], dtype=np.float32)
+        ),
+        reference_hip_height=add_time(
+            batch["target_hip_height"].detach().cpu().numpy().astype(np.float32)
+        ),
+        predicted_hip_height=add_time(
+            np.asarray([value.hip_height for value in resolved], dtype=np.float32)
+        ),
+        tracker_pos_world=add_time(np.asarray(tracker_positions_world, dtype=np.float32)),
+        configured=add_time(batch["configured"][:, -1].detach().cpu().numpy()),
+        measured_valid=add_time(batch["measured_valid"][:, -1].detach().cpu().numpy()),
+        missing_age=add_time(batch["missing_age"][:, -1].detach().cpu().numpy()),
+        scenario=add_time(scenario_values),
+        eval_frame_mask=np.ones((reconstructed_raw.shape[0], 1), dtype=bool),
+        known_rotation_max_error=add_time(np.asarray(
+            [value.known_rotation_max_error for value in resolved], dtype=np.float32
+        )),
+    )
 
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
-    parser = build_arg_parser()
-    args = parse_and_load_from_model(parser, argv=argv)
+    args = parse_and_load_from_model(build_arg_parser(), argv=argv)
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
-
-    sample_mask_policy = (
-        TRACKER_MASK_POLICY_TASK
-        if args.tracker_mask_policy in {TRACKER_MASK_POLICY_AUTO, TRACKER_MASK_POLICY_DYNAMIC_CATEGORIES}
-        else args.tracker_mask_policy
-    )
     dataset = RealtimePoseTaskDataset(
         data_dir=args.data_dir,
         split=args.data_split,
@@ -204,56 +230,30 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
         folder_path=getattr(args, "folder_path", "") or None,
-        schema_name=args.schema,
-        tracker_mask_policy=sample_mask_policy,
-        tracker_mask_seed=args.tracker_mask_seed,
-        tracker_mask_fill=args.tracker_mask_fill,
-        tracker_mask_categories=args.tracker_mask_categories,
     )
-    batch = dataset[0]
-    batch = {key: value.unsqueeze(0).to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
-
+    item = dataset[0]
+    batch = {
+        key: value.unsqueeze(0).to(device) if torch.is_tensor(value) else value
+        for key, value in item.items()
+    }
     model, diffusion = create_model_and_diffusion(args)
     model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-    ik_init_image = build_ik_init_image_for_batch(
-        batch,
-        device=device,
-        schema_name=args.schema,
-        normalizer=getattr(dataset, "normalizer", None),
-        ik_init_mode=args.ik_init_mode,
-        ik_init_iterations=args.ik_init_iterations,
-        ik_init_lr=args.ik_init_lr,
-        ik_init_pos_weight=args.ik_init_pos_weight,
-        ik_init_rot_weight=args.ik_init_rot_weight,
-        ik_init_reg_weight=args.ik_init_reg_weight,
-        ik_init_delta_limit=args.ik_init_delta_limit,
-    )
-    ik_start_timestep = (
-        resolve_ik_init_timestep(diffusion, args.ik_init_timestep)
-        if ik_init_image is not None
-        else None
-    )
     reconstructed = reconstruct_batch(
         model,
         diffusion,
         batch,
         device=device,
         use_ddim=str(args.ts_respace).startswith("ddim"),
-        schema_name=args.schema,
-        init_image=ik_init_image,
-        start_timestep=ik_start_timestep,
     )
-    inpaint_mask = build_realtime_inpaint_mask(1, device, schema_name=args.schema)
-    output_dir = Path(args.output_dir or Path(args.model_path).with_suffix("").name).resolve()
+    output_dir = Path(args.output_dir or "output/realtime_pose_140d").resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"
     save_reconstruction(
         output_path,
         batch["x"],
-        batch["conditioned_x"],
         reconstructed,
-        inpaint_mask,
-        normalizer=getattr(dataset, "normalizer", None),
-        schema_name=args.schema,
+        batch["known_mask"],
+        batch,
+        normalizer=dataset.normalizer,
     )
     print(f"[reconstruct_stream] weights={source} output={output_path}")
     return {"output_path": output_path}

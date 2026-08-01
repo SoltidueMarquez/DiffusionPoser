@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from scripts import run_realtime_pose_pipeline as pipeline
 from utils.run_dirs import write_latest_pointer
 
@@ -33,20 +32,15 @@ def parse_pipeline_args(tmp_path: Path, *extra: str):
             "",
             "--splits",
             "train",
-            "--schema",
-            REALTIME_POSE_SCHEMA_NAME,
             *extra,
         ]
     )
 
 
 def write_usable_source_manifest(source_dir: Path) -> None:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source_dir.mkdir(parents=True, exist_ok=True)
     entry = {
         "status": "converted",
-        "schema_name": schema.name,
-        "pose_representation": schema.pose_representation,
         "source_relative_path": "toy.npz",
         "output_path": "toy.npz",
     }
@@ -62,26 +56,23 @@ def write_latest_task_artifact(task_root: Path, split: str = "train") -> Path:
         root_dir=task_root,
         kind="tasks",
         output_dir=task_dir,
-        metadata={"schema_name": REALTIME_POSE_SCHEMA_NAME, "splits": [split]},
+        metadata={"splits": [split]},
     )
     return task_dir
 
 
 def write_latest_normalizer_artifact(normalizer_root: Path) -> Path:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     normalizer_dir = normalizer_root / "20260101_000000_normalizer"
     normalizer_dir.mkdir(parents=True, exist_ok=True)
-    (normalizer_dir / "mean.pt").write_bytes(b"mean")
-    (normalizer_dir / "std.pt").write_bytes(b"std")
-    (normalizer_dir / "normalizer_meta.json").write_text(
-        json.dumps({"schema_name": schema.name}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    (normalizer_dir / "pose_mean.pt").write_bytes(b"mean")
+    (normalizer_dir / "pose_std.pt").write_bytes(b"std")
+    (normalizer_dir / "tracker_mean.pt").write_bytes(b"mean")
+    (normalizer_dir / "tracker_std.pt").write_bytes(b"std")
     write_latest_pointer(
         root_dir=normalizer_root,
         kind="normalizer",
         output_dir=normalizer_dir,
-        metadata={"schema_name": schema.name},
+        metadata={},
     )
     return normalizer_dir
 

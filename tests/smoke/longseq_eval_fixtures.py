@@ -5,13 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
-from data_loaders.sensor_masking import REALTIME_POSE_SCHEMA_NAME, get_schema_spec
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 from utils.run_dirs import write_latest_pointer
 
 
 def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     source_root = tmp_path / "sources"
     task_root = tmp_path / "tasks"
     task_run = task_root / "manual_run"
@@ -37,11 +35,12 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
                 "source_relative_path": relative_path,
                 "stablemotion_split_key": str(Path(relative_path).with_suffix(".npy")).replace("\\", "/"),
                 "source_frames": frame_count,
-                "schema_name": schema.name,
-                "pose_representation": schema.pose_representation,
-                "root_y_policy": schema.root_y_policy,
-                "pelvis_height_mode": schema.pelvis_height_mode,
+                "target_fps": 60.0,
                 "is_mirrored": is_mirrored,
+                "start_frame": 0,
+                "seq_len": 61,
+                "max_rollout_steps": 1,
+                "rollout_task_paths": [],
             }
             file.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -49,7 +48,7 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
         root_dir=task_root,
         kind="tasks",
         output_dir=task_run,
-        metadata={"schema_name": schema.name, "splits": ["test"], "counts": {"test": len(records)}},
+        metadata={"splits": ["test"], "counts": {"test": len(records)}},
     )
     return task_root, task_run
 

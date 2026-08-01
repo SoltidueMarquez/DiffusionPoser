@@ -1,0 +1,4 @@
+[compute_realtime_pose_normalizer] 统计完成。
+- 匹配 task 数：70216
+- 累计有效帧数：42831760
+- 输出目录：D:\Projects\SchoolWorkProjects\firstPaperRalated\01_当前主线项目\DiffusionPoser\dataset\generated\normalizers\realtime_pose_stationary5_v1\amass_60hz_v2_train\20260714_003252_v2_base_online_seed10

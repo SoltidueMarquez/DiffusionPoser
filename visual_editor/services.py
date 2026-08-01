@@ -5,7 +5,7 @@ from typing import Any
 
 from visual_editor.decoder import MotionDecoder
 from visual_editor.library import MotionLibrary
-from visual_editor.models import ComparePane, EDIT_PROJECT_SCHEMA, StudioConfig
+from visual_editor.models import ComparePane, StudioConfig
 from visual_editor.realtime_pose import (
     KEYFRAME_TARGETS,
     load_json,
@@ -56,7 +56,6 @@ class CompareService:
                 warnings.append(f"{label}: {type(exc).__name__}: {exc}")
             payload_panes.append({"pane_index": index, "label": label, "asset": asset.to_dict(), "track": track.to_dict(), **frame_payload})
         return {
-            "schema_name": "realtime_pose_studio_compare_frames_v2",
             "start": int(start),
             "count": int(count),
             "fps": fps,
@@ -84,7 +83,6 @@ class EditService:
             raise ValueError(f"track is not exportable: {track_id}")
         project_id = stable_id("edit", f"{asset_id}|{track_id}|{utc_now()}")
         project = {
-            "schema_name": EDIT_PROJECT_SCHEMA,
             "project_id": project_id,
             "name": name or f"{asset.label} / {track.label} realtime export",
             "asset_id": asset_id,
@@ -102,8 +100,6 @@ class EditService:
         if not path.exists():
             raise FileNotFoundError(f"edit project not found: {path}")
         project = load_json(path)
-        if project.get("schema_name") != EDIT_PROJECT_SCHEMA:
-            raise ValueError(f"{path} is not a realtime pose edit project")
         return project
 
     def save_project(self, project: dict[str, Any]) -> dict[str, Any]:

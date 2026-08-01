@@ -34,7 +34,6 @@ export interface ComparePreset {
 }
 
 export interface LibraryPayload {
-  schema_name: string;
   index: Record<string, unknown>;
   assets: MotionAsset[];
   stats: Record<string, number>;
@@ -76,7 +75,6 @@ export interface PaneFrames {
 }
 
 export interface CompareFramesPayload {
-  schema_name: string;
   start: number;
   count: number;
   fps: number;
@@ -85,7 +83,6 @@ export interface CompareFramesPayload {
 }
 
 export interface EditProject {
-  schema_name: string;
   project_id: string;
   name: string;
   asset_id: string;
@@ -96,7 +93,6 @@ export interface EditProject {
 }
 
 export interface ExportResult {
-  schema_name: string;
   created_at: string;
   export_dir: string;
   split: string;

@@ -9,14 +9,10 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.generate_realtime_pose_tasks import clip_source, load_realtime_source, normalize_slashes, save_task_npz
-from data_loaders.realtime_pose_contract import validate_realtime_task_contract, validate_root_y0_invariants
+from data_loaders.generate_realtime_pose_tasks import load_realtime_source, normalize_slashes, save_task_npz
 from data_loaders.sensor_masking import (
-    LEGACY_BODY_POSE_PARENT_KEY,
-    POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
-    POSE_REPRESENTATION_KEY,
+    BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_INPUT_DIM,
-    REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
@@ -26,10 +22,8 @@ from data_loaders.sensor_masking import (
     TASK_MASK_POLICY_FIXED_PATTERNS,
     TASK_MASK_POLICY_FULL,
     create_realtime_inpaint_mask,
-    get_schema_spec,
     make_tracker_pattern,
     repeat_pattern_sensor_valid,
-    validate_pose_representation,
     validate_sensor_valid,
 )
 
@@ -92,11 +86,8 @@ def file_stat_payload(path: Path) -> dict[str, Any]:
 
 
 def load_task_npz(path: Path) -> dict[str, np.ndarray]:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     with np.load(path, allow_pickle=False) as data:
         task = {key: data[key].copy() for key in data.files}
-    validate_realtime_task_contract(task, schema=schema, source=str(path))
-    validate_sensor_valid(task["sensor_valid"])
     return task
 
 
@@ -106,38 +97,41 @@ def load_stream_npz(path: Path) -> dict[str, np.ndarray]:
     return payload
 
 
+def clip_source(source: dict[str, np.ndarray], start_frame: int, seq_len: int) -> dict[str, np.ndarray]:
+    """裁出一个窗口；静态 rest 数组保持原样。"""
+
+    frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
+    end_frame = int(start_frame) + int(seq_len)
+    return {
+        key: value[start_frame:end_frame].copy()
+        if value.ndim > 0 and value.shape[0] == frame_count
+        else value.copy()
+        for key, value in source.items()
+    }
+
+
 def validate_realtime_motion_arrays(payload: dict[str, np.ndarray], path: Path | None = None) -> None:
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
     label = f"{path} " if path else ""
-    if LEGACY_BODY_POSE_PARENT_KEY in payload:
-        raise ValueError(f"{label}contains legacy {LEGACY_BODY_POSE_PARENT_KEY}; regenerate realtime_pose data.")
-    if POSE_REPRESENTATION_KEY not in payload:
-        raise KeyError(f"{label}missing `{POSE_REPRESENTATION_KEY}`")
-    validate_pose_representation(payload[POSE_REPRESENTATION_KEY], schema_name=schema.name, source=str(path or "payload"))
-    frame_count = int(np.asarray(payload[schema.body_pose_key]).shape[0])
+    frame_count = int(np.asarray(payload[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY]).shape[0])
     expected = {
-        schema.body_pose_key: (frame_count, 144),
+        BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY: (frame_count, 144),
         "root_pos_world": (frame_count, 3),
         "root_yaw": (frame_count,),
-        schema.root_heading_delta_key: (frame_count, 2),
+        "root_heading_delta_sincos": (frame_count, 2),
+        "root_delta_xz_ref": (frame_count, 2),
+        "pelvis_height": (frame_count, 1),
+        "stationary_prob_5": (frame_count, 5),
         "tracker_pos_world": (frame_count, 6, 3),
         "tracker_rot_world_6d": (frame_count, 6, 6),
         "joints_world": (frame_count, 24, 3),
         "joint_offsets_parent": (24, 3),
+        "joint_rest_local_rotations_6d": (24, 6),
     }
-    if schema.supports_root_motion:
-        expected["root_delta_xz_ref"] = (frame_count, 2)
-        expected[schema.pelvis_height_key] = (frame_count, 1)
-    if schema.supports_stationary_prob:
-        expected["stationary_prob_5"] = (frame_count, 5)
-    if schema.pose_representation == POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D:
-        expected["joint_rest_local_rotations_6d"] = (24, 6)
     for key, shape in expected.items():
         if key not in payload:
             raise KeyError(f"{label}missing `{key}`")
         if tuple(np.asarray(payload[key]).shape) != shape:
             raise ValueError(f"{label}{key} must be {shape}, got {np.asarray(payload[key]).shape}")
-    validate_root_y0_invariants(payload, schema=schema, source=str(path or "payload"))
 
 
 def array_to_list(array: np.ndarray) -> list:
@@ -156,7 +150,7 @@ def build_realtime_pose_frames(
     frame_offset: int = 0,
 ) -> dict[str, Any]:
     validate_realtime_motion_arrays(motion)
-    frame_count = int(motion[get_schema_spec(REALTIME_POSE_SCHEMA_NAME).body_pose_key].shape[0])
+    frame_count = int(motion[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
     start_index = max(0, int(start) + int(frame_offset))
     count_value = max(1, min(int(count), DEFAULT_API_FRAME_LIMIT))
     end_index = min(frame_count, start_index + count_value)
@@ -184,7 +178,6 @@ def build_realtime_pose_frames(
             }
         )
     return {
-        "schema_name": "realtime_pose_studio_frames_v2",
         "asset_id": asset_id,
         "track_id": track_id,
         "start": int(start),
@@ -207,8 +200,7 @@ def write_realtime_task_dataset(
     request: dict[str, Any],
 ) -> dict[str, Any]:
     validate_realtime_motion_arrays(source)
-    schema = get_schema_spec(REALTIME_POSE_SCHEMA_NAME)
-    frame_count = int(source[schema.body_pose_key].shape[0])
+    frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
     target_frames = resolve_target_frames(request=request, frame_count=frame_count)
     split = safe_token(str(request.get("split") or "train"), fallback="train")
     export_name = request.get("export_name") or f"{safe_token(project_id)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -230,15 +222,6 @@ def write_realtime_task_dataset(
             start_frame = int(target_frame) - REALTIME_POSE_TARGET_START
             clip = clip_source(source, start_frame=start_frame, seq_len=REALTIME_POSE_SEQ_LEN)
             task_arrays = dict(clip)
-            task_arrays.update(
-                {
-                    "schema_name": np.asarray(schema.name),
-                    "task_format": np.asarray(schema.task_format),
-                    POSE_REPRESENTATION_KEY: np.asarray(schema.pose_representation),
-                    "root_y_policy": np.asarray(schema.root_y_policy),
-                    "pelvis_height_mode": np.asarray(schema.pelvis_height_mode),
-                }
-            )
             for pattern_index, category in enumerate(pattern_categories):
                 pattern = make_tracker_pattern(category, rng)
                 sensor_valid = repeat_pattern_sensor_valid(pattern, seq_len=REALTIME_POSE_SEQ_LEN)
@@ -251,7 +234,7 @@ def write_realtime_task_dataset(
                     compress=False,
                     **task_arrays,
                     sensor_valid=sensor_valid,
-                    inpaint_mask=create_realtime_inpaint_mask(schema_name=schema.name),
+                    inpaint_mask=create_realtime_inpaint_mask(),
                     start_frame=np.int64(start_frame),
                     target_start=np.int64(REALTIME_POSE_TARGET_START),
                     target_length=np.int64(REALTIME_POSE_TARGET_LENGTH),
@@ -270,12 +253,7 @@ def write_realtime_task_dataset(
                     "valid_length": REALTIME_POSE_SEQ_LEN,
                     "source_frames": frame_count,
                     "seq_len": REALTIME_POSE_SEQ_LEN,
-                    "feature_dim": schema.feature_dim,
-                    "task_format": schema.task_format,
-                    "schema_name": schema.name,
-                    POSE_REPRESENTATION_KEY: schema.pose_representation,
-                    "root_y_policy": schema.root_y_policy,
-                    "pelvis_height_mode": schema.pelvis_height_mode,
+                    "feature_dim": REALTIME_POSE_INPUT_DIM,
                     "task_mode": TASK_MODE_REALTIME_POSE,
                     "target_start": REALTIME_POSE_TARGET_START,
                     "target_length": REALTIME_POSE_TARGET_LENGTH,
@@ -288,8 +266,6 @@ def write_realtime_task_dataset(
                 tasks.append({"task_id": task_id, "target_frame": int(target_frame), "task_path": str(task_path)})
 
     dataset_index = {
-        "schema_name": "realtime_pose_studio_export_v2",
-        "pose_representation": schema.pose_representation,
         "created_at": utc_now(),
         "export_dir": str(export_dir),
         "split": split,
@@ -300,7 +276,6 @@ def write_realtime_task_dataset(
             "label": source_label,
             "source_path": str(source_path),
             "source_relative_path": source_relative_path,
-            "pose_representation": schema.pose_representation,
         },
         "project_id": project_id,
         "mask_policy": mask_policy,

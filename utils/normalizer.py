@@ -8,10 +8,11 @@ import numpy as np
 import torch
 
 from data_loaders.sensor_masking import (
-    POSE_REPRESENTATION_KEY,
-    REALTIME_POSE_SCHEMA_NAME,
-    get_schema_spec,
-    validate_pose_representation,
+    REALTIME_POSE_TARGET_DIM,
+    TRACKER_CONTINUOUS_DIM,
+    TRACKER_COUNT,
+    TRACKER_FEATURE_DIM,
+    TRACKER_MEASURED_VALID_OFFSET,
 )
 from utils.run_dirs import resolve_latest_or_self
 
@@ -19,151 +20,196 @@ from utils.run_dirs import resolve_latest_or_self
 REALTIME_POSE_MIN_NORMALIZER_STD = 1e-4
 
 
-def enforce_realtime_pose_normalizer_contract(
-    mean: torch.Tensor,
-    std: torch.Tensor,
-    schema_name: str = REALTIME_POSE_SCHEMA_NAME,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """固定二值条件和近常量通道的尺度，避免标准化把微小数值噪声放大到 fp16 溢出。"""
-
-    schema = get_schema_spec(schema_name)
-    mean = mean.float().flatten().clone()
-    std = std.float().flatten().clone()
-    if mean.numel() == schema.feature_dim and std.numel() == schema.feature_dim:
-        # AMASS 转换里会出现理论恒定的旋转/位置通道，统计 std 可能接近 1e-8。
-        # 这些通道按原始物理尺度训练更稳定，否则会把 1e-4 级噪声放大成上万。
-        std[std < REALTIME_POSE_MIN_NORMALIZER_STD] = 1.0
-        sensor_slice = schema.sensor_valid_slice()
-        mean[sensor_slice] = 0.0
-        std[sensor_slice] = 1.0
-        if schema.supports_stationary_prob:
-            stationary_slice = schema.stationary_prob_slice()
-            mean[stationary_slice] = 0.0
-            std[stationary_slice] = 1.0
-    return mean, std
+def _stabilize_std(value: torch.Tensor) -> torch.Tensor:
+    value = value.float().clone()
+    value[value < REALTIME_POSE_MIN_NORMALIZER_STD] = 1.0
+    return value
 
 
 class RealtimePoseNormalizer:
-    """realtime_pose schema-specific mean/std 标准化工具。"""
+    """140 维姿态与六类 Tracker 连续量的独立 normalizer。"""
 
     def __init__(
         self,
         base_dir: str | Path,
         eps: float = 1e-8,
         disable: bool = False,
-        schema_name: str = REALTIME_POSE_SCHEMA_NAME,
     ):
         self.eps = float(eps)
         self.disable = bool(disable)
-        self.base_dir = Path(base_dir) if self.disable else resolve_latest_or_self(base_dir, kind="normalizer")
-        self.mean_path = self.base_dir / "mean.pt"
-        self.std_path = self.base_dir / "std.pt"
+        self.base_dir = Path(base_dir) if disable else resolve_latest_or_self(base_dir, kind="normalizer")
+        self.pose_mean_path = self.base_dir / "pose_mean.pt"
+        self.pose_std_path = self.base_dir / "pose_std.pt"
+        self.tracker_mean_path = self.base_dir / "tracker_mean.pt"
+        self.tracker_std_path = self.base_dir / "tracker_std.pt"
         self.meta_path = self.base_dir / "normalizer_meta.json"
-        self.schema = get_schema_spec(schema_name)
+        self.pose_mean: torch.Tensor | None = None
+        self.pose_std: torch.Tensor | None = None
+        self.tracker_mean: torch.Tensor | None = None
+        self.tracker_std: torch.Tensor | None = None
+        # 训练循环仍通过 mean/std 读取姿态统计；这里明确只指 140 维姿态。
         self.mean: torch.Tensor | None = None
         self.std: torch.Tensor | None = None
         if not self.disable:
             self.load()
 
     def load(self) -> None:
-        if not self.mean_path.exists() or not self.std_path.exists():
-            raise FileNotFoundError(
-                "找不到 realtime_pose normalizer 文件，请先运行 "
-                "`python -m data_loaders.compute_realtime_pose_normalizer ...`。"
-            )
-        self._validate_meta()
-        mean = torch.load(self.mean_path, map_location="cpu", weights_only=True).float().flatten()
-        std = torch.load(self.std_path, map_location="cpu", weights_only=True).float().flatten()
-        mean, std = enforce_realtime_pose_normalizer_contract(mean, std, schema_name=self.schema.name)
-        self._validate_stats(mean=mean, std=std)
-        self.mean = mean
-        self.std = torch.clamp(std, min=self.eps)
-
-    def save(self, mean: Any, std: Any) -> None:
-        mean_tensor = torch.as_tensor(mean, dtype=torch.float32).flatten()
-        std_tensor = torch.as_tensor(std, dtype=torch.float32).flatten()
-        mean_tensor, std_tensor = enforce_realtime_pose_normalizer_contract(
-            mean_tensor,
-            std_tensor,
-            schema_name=self.schema.name,
+        required = (
+            self.pose_mean_path,
+            self.pose_std_path,
+            self.tracker_mean_path,
+            self.tracker_std_path,
         )
-        self._validate_stats(mean=mean_tensor, std=std_tensor)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(mean_tensor, self.mean_path)
-        torch.save(torch.clamp(std_tensor, min=self.eps), self.std_path)
-        self._write_meta()
-        self.mean = mean_tensor
-        self.std = torch.clamp(std_tensor, min=self.eps)
-
-    def normalize(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
-        if self.disable:
-            return x
-        mean, std = self._stats_for_value(x)
-        return (x - mean) / (std + self.eps)
-
-    def inverse(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
-        if self.disable:
-            return x
-        mean, std = self._stats_for_value(x)
-        return x * (std + self.eps) + mean
-
-    def _validate_meta(self) -> None:
-        if not self.meta_path.exists():
+        missing = [path.name for path in required if not path.exists()]
+        if missing:
             raise FileNotFoundError(
-                f"{self.base_dir} 缺少 normalizer_meta.json；旧 parent-local normalizer 不能用于当前 root-global schema。"
+                f"{self.base_dir} 缺少 140 维 normalizer 文件 {missing}；旧 mean.pt/std.pt 不能复用。"
             )
-        with self.meta_path.open("r", encoding="utf-8") as file:
-            meta = json.load(file)
-        if str(meta.get("schema_name", "")) != self.schema.name:
-            raise ValueError(f"normalizer schema_name={meta.get('schema_name')!r}, expected {self.schema.name!r}.")
-        validate_pose_representation(meta.get(POSE_REPRESENTATION_KEY), schema_name=self.schema.name, source=str(self.meta_path))
-        feature_dim = int(meta.get("feature_dim", -1))
-        if feature_dim != self.schema.feature_dim:
-            raise ValueError(f"normalizer feature_dim={feature_dim}, expected {self.schema.feature_dim}.")
-        if "root_y_policy" not in meta:
-            raise ValueError(f"normalizer metadata 缺少 root_y_policy: {self.meta_path}")
-        if str(meta["root_y_policy"]) != self.schema.root_y_policy:
-            raise ValueError(f"normalizer root_y_policy={meta.get('root_y_policy')!r}, expected {self.schema.root_y_policy!r}.")
-        if "pelvis_height_mode" not in meta:
-            raise ValueError(f"normalizer metadata 缺少 pelvis_height_mode: {self.meta_path}")
-        if str(meta["pelvis_height_mode"]) != self.schema.pelvis_height_mode:
-            raise ValueError(
-                f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {self.schema.pelvis_height_mode!r}."
-            )
+        self.pose_mean = torch.load(self.pose_mean_path, map_location="cpu", weights_only=True).float()
+        self.pose_std = _stabilize_std(
+            torch.load(self.pose_std_path, map_location="cpu", weights_only=True).float()
+        )
+        self.tracker_mean = torch.load(self.tracker_mean_path, map_location="cpu", weights_only=True).float()
+        self.tracker_std = _stabilize_std(
+            torch.load(self.tracker_std_path, map_location="cpu", weights_only=True).float()
+        )
+        self._validate_stats()
+        self.mean = self.pose_mean
+        self.std = self.pose_std
 
-    def _write_meta(self) -> None:
+    def save(
+        self,
+        pose_mean: Any,
+        pose_std: Any,
+        tracker_mean: Any,
+        tracker_std: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.pose_mean = torch.as_tensor(pose_mean, dtype=torch.float32).reshape(-1)
+        self.pose_std = _stabilize_std(torch.as_tensor(pose_std, dtype=torch.float32).reshape(-1))
+        self.tracker_mean = torch.as_tensor(tracker_mean, dtype=torch.float32).reshape(
+            TRACKER_COUNT, TRACKER_CONTINUOUS_DIM
+        )
+        self.tracker_std = _stabilize_std(
+            torch.as_tensor(tracker_std, dtype=torch.float32).reshape(
+                TRACKER_COUNT, TRACKER_CONTINUOUS_DIM
+            )
+        )
+        self._validate_stats()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.pose_mean, self.pose_mean_path)
+        torch.save(self.pose_std, self.pose_std_path)
+        torch.save(self.tracker_mean, self.tracker_mean_path)
+        torch.save(self.tracker_std, self.tracker_std_path)
+        self._write_meta(metadata or {})
+        self.mean = self.pose_mean
+        self.std = self.pose_std
+
+    def normalize_pose(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        if self.disable:
+            return value
+        mean, std = self._pose_stats_for(value)
+        return (value - mean) / (std + self.eps)
+
+    def inverse_pose(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        if self.disable:
+            return value
+        mean, std = self._pose_stats_for(value)
+        return value * (std + self.eps) + mean
+
+    # 兼容仓库内只针对姿态张量的简写；不再接受 214 维混合特征。
+    normalize = normalize_pose
+    inverse = inverse_pose
+
+    def normalize_tracker(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """归一化前 9 维，并在归一化后严格清零 invalid Tracker 连续量。"""
+
+        if value.shape[-2:] != (TRACKER_COUNT, TRACKER_FEATURE_DIM):
+            raise ValueError(
+                f"tracker_window 尾部必须为 [{TRACKER_COUNT},{TRACKER_FEATURE_DIM}]，实际为 {tuple(value.shape)}"
+            )
+        if self.disable:
+            return value.clone() if isinstance(value, torch.Tensor) else value.copy()
+        mean, std = self._tracker_stats_for(value)
+        result = value.clone() if isinstance(value, torch.Tensor) else value.copy()
+        continuous = (result[..., :TRACKER_CONTINUOUS_DIM] - mean) / (std + self.eps)
+        measured = result[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
+        if isinstance(result, torch.Tensor):
+            continuous = torch.where(measured[..., None], continuous, torch.zeros_like(continuous))
+        else:
+            continuous = np.where(measured[..., None], continuous, np.zeros_like(continuous))
+        result[..., :TRACKER_CONTINUOUS_DIM] = continuous
+        return result
+
+    def inverse_tracker_continuous(
+        self,
+        value: np.ndarray | torch.Tensor,
+    ) -> np.ndarray | torch.Tensor:
+        if value.shape[-2:] != (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM):
+            raise ValueError(
+                f"Tracker 连续量尾部必须为 [{TRACKER_COUNT},{TRACKER_CONTINUOUS_DIM}]，实际为 {tuple(value.shape)}"
+            )
+        if self.disable:
+            return value
+        mean, std = self._tracker_stats_for(value)
+        return value * (std + self.eps) + mean
+
+    def _pose_stats_for(
+        self, value: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
+        if value.shape[-1] != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(
+                f"姿态最后一维必须为 {REALTIME_POSE_TARGET_DIM}，实际为 {value.shape[-1]}；旧 154/214 维数据不可用。"
+            )
+        if self.pose_mean is None or self.pose_std is None:
+            self.load()
+        assert self.pose_mean is not None and self.pose_std is not None
+        if isinstance(value, np.ndarray):
+            return (
+                self.pose_mean.numpy().astype(value.dtype, copy=False),
+                self.pose_std.numpy().astype(value.dtype, copy=False),
+            )
+        return (
+            self.pose_mean.to(device=value.device, dtype=value.dtype),
+            self.pose_std.to(device=value.device, dtype=value.dtype),
+        )
+
+    def _tracker_stats_for(
+        self, value: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
+        if self.tracker_mean is None or self.tracker_std is None:
+            self.load()
+        assert self.tracker_mean is not None and self.tracker_std is not None
+        if isinstance(value, np.ndarray):
+            return (
+                self.tracker_mean.numpy().astype(value.dtype, copy=False),
+                self.tracker_std.numpy().astype(value.dtype, copy=False),
+            )
+        return (
+            self.tracker_mean.to(device=value.device, dtype=value.dtype),
+            self.tracker_std.to(device=value.device, dtype=value.dtype),
+        )
+
+    def _validate_stats(self) -> None:
+        assert self.pose_mean is not None and self.pose_std is not None
+        assert self.tracker_mean is not None and self.tracker_std is not None
+        if tuple(self.pose_mean.shape) != (REALTIME_POSE_TARGET_DIM,) or tuple(self.pose_std.shape) != (
+            REALTIME_POSE_TARGET_DIM,
+        ):
+            raise ValueError("Pose normalizer 必须为 [140]。")
+        expected_tracker = (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM)
+        if tuple(self.tracker_mean.shape) != expected_tracker or tuple(self.tracker_std.shape) != expected_tracker:
+            raise ValueError("Tracker normalizer 必须为 [6,9]。")
+        tensors = (self.pose_mean, self.pose_std, self.tracker_mean, self.tracker_std)
+        if not all(torch.isfinite(tensor).all() for tensor in tensors):
+            raise ValueError("normalizer 统计包含 NaN 或 Inf。")
+        if torch.any(self.pose_std <= 0) or torch.any(self.tracker_std <= 0):
+            raise ValueError("normalizer std 必须全大于零。")
+
+    def _write_meta(self, extra: dict[str, Any]) -> None:
         meta = {
-            "schema_name": self.schema.name,
-            POSE_REPRESENTATION_KEY: self.schema.pose_representation,
-            "root_y_policy": self.schema.root_y_policy,
-            "pelvis_height_mode": self.schema.pelvis_height_mode,
-            "feature_dim": self.schema.feature_dim,
             "eps": self.eps,
+            **extra,
         }
         with self.meta_path.open("w", encoding="utf-8") as file:
-            json.dump(meta, file, indent=2, ensure_ascii=False, sort_keys=True)
-
-    def _validate_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        expected_dim = self.schema.feature_dim
-        if mean.numel() != expected_dim or std.numel() != expected_dim:
-            raise ValueError(
-                f"realtime_pose normalizer 需要 {expected_dim} 维，"
-                f"实际 mean={mean.numel()}, std={std.numel()}"
-            )
-        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
-            raise ValueError("realtime_pose normalizer mean/std 包含 NaN 或 Inf。")
-        if torch.any(std <= 0):
-            raise ValueError("realtime_pose normalizer std 必须全部大于 0。")
-
-    def _stats_for_value(self, x: np.ndarray | torch.Tensor) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
-        if self.mean is None or self.std is None:
-            self.load()
-        if x.shape[-1] != self.schema.feature_dim:
-            raise ValueError(f"输入最后一维应为 {self.schema.feature_dim}，实际为 {x.shape[-1]}")
-
-        assert self.mean is not None and self.std is not None
-        if isinstance(x, np.ndarray):
-            mean = self.mean.numpy().astype(x.dtype, copy=False)
-            std = self.std.numpy().astype(x.dtype, copy=False)
-            return mean, std
-        return self.mean.to(device=x.device, dtype=x.dtype), self.std.to(device=x.device, dtype=x.dtype)
+            json.dump(meta, file, ensure_ascii=False, indent=2, sort_keys=True)

@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
-from data_loaders.sensor_masking import DEFAULT_REALTIME_POSE_SCHEMA_NAME, get_schema_spec
+from data_loaders.realtime_pose_validation import validate_realtime_task_manifest_entry
+from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
@@ -39,7 +40,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     selection.add_argument("--split", default="test", type=str)
     selection.add_argument("--min_frames", default=2000, type=int)
     selection.add_argument("--include_mirror", default=False, action=BooleanOptionalAction)
-    selection.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, type=str)
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--overwrite", default=False, action=BooleanOptionalAction)
@@ -110,19 +110,19 @@ def build_sequence_output_dir_name(entry: dict[str, Any]) -> str:
 
 
 def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
-    schema = get_schema_spec(str(args.schema))
     task_run_dir = resolve_task_run_dir(task_dir=args.task_dir, task_run=args.task_run)
     manifest_path = task_run_dir / str(args.split) / "manifest.jsonl"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Task manifest not found: {manifest_path}")
 
     entries = read_jsonl(manifest_path)
+    for index, entry in enumerate(entries, start=1):
+        validate_realtime_task_manifest_entry(entry, label=f"{manifest_path}:{index}")
     selected = select_longseq_entries(
         entries=entries,
         split=str(args.split),
         min_frames=int(args.min_frames),
         include_mirror=bool(args.include_mirror),
-        schema_name=schema.name,
     )
     if not selected:
         raise RuntimeError(
@@ -143,14 +143,12 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
         task_run_dir=task_run_dir,
         task_manifest_path=manifest_path,
         preset=str(args.preset),
-        schema_name=schema.name,
     )
 
     config = build_config(
         args=args,
         task_run_dir=task_run_dir,
         task_manifest_path=manifest_path,
-        schema_name=schema.name,
     )
     summary = build_summary(
         manifest_entries=manifest_entries,
@@ -167,10 +165,6 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
             "preset": str(args.preset),
             "split": str(args.split),
             "sequence_count": len(manifest_entries),
-            "schema_name": schema.name,
-            "root_y_policy": schema.root_y_policy,
-            "pelvis_height_mode": schema.pelvis_height_mode,
-            "pose_representation": schema.pose_representation,
         },
     )
     return output_dir
@@ -181,13 +175,10 @@ def select_longseq_entries(
     split: str,
     min_frames: int,
     include_mirror: bool,
-    schema_name: str,
 ) -> list[dict[str, Any]]:
     deduped: dict[str, dict[str, Any]] = {}
     for entry in entries:
         if str(entry.get("split", split)) != split:
-            continue
-        if str(entry.get("schema_name", schema_name)) != schema_name:
             continue
         source_relative_path = normalize_slashes(str(entry.get("source_relative_path", "")))
         if not source_relative_path:
@@ -197,14 +188,18 @@ def select_longseq_entries(
 
     selected = []
     for source_relative_path, entry in deduped.items():
-        frames = int(entry.get("source_frames") or entry.get("frames") or 0)
+        if "source_frames" not in entry:
+            raise KeyError(f"task manifest 缺少 source_frames: {entry.get('task_id', source_relative_path)}")
+        frames = int(entry["source_frames"])
+        if frames <= 0:
+            raise ValueError(f"task manifest source_frames 必须大于 0: {entry.get('task_id', source_relative_path)}")
         if frames < int(min_frames):
             continue
         is_mirrored = bool(entry.get("is_mirrored", False)) or source_relative_path.startswith("M/")
         if is_mirrored and not include_mirror:
             continue
         selected.append(entry)
-    selected.sort(key=lambda item: (-int(item.get("source_frames") or item.get("frames") or 0), normalize_slashes(item["source_relative_path"])))
+    selected.sort(key=lambda item: (-int(item["source_frames"]), normalize_slashes(item["source_relative_path"])))
     return selected
 
 
@@ -215,16 +210,14 @@ def copy_selected_sources(
     task_run_dir: Path,
     task_manifest_path: Path,
     preset: str,
-    schema_name: str,
 ) -> list[dict[str, Any]]:
-    schema = get_schema_spec(schema_name)
     manifest_entries = []
     used_sequence_ids: set[str] = set()
     for index, task_entry in enumerate(selected):
         original_source_path = resolve_task_source_path(task_entry=task_entry, task_manifest_path=task_manifest_path)
-        source = load_realtime_source(original_source_path, schema_name=schema.name)
-        frame_count = int(source[schema.body_pose_key].shape[0])
-        declared_frames = int(task_entry.get("source_frames") or task_entry.get("frames") or frame_count)
+        source = load_realtime_source(original_source_path)
+        frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
+        declared_frames = int(task_entry["source_frames"])
         if frame_count != declared_frames:
             raise ValueError(f"{original_source_path} frame count {frame_count} != manifest source_frames {declared_frames}")
 
@@ -243,11 +236,7 @@ def copy_selected_sources(
                 "stablemotion_split_key": normalize_slashes(str(task_entry.get("stablemotion_split_key", ""))),
                 "split": str(task_entry.get("split", "test")),
                 "num_frames": frame_count,
-                "fps": 60.0,
-                "schema_name": schema.name,
-                "pose_representation": schema.pose_representation,
-                "root_y_policy": schema.root_y_policy,
-                "pelvis_height_mode": schema.pelvis_height_mode,
+                "fps": float(task_entry["target_fps"]),
                 "preset": preset,
                 "is_mirrored": bool(task_entry.get("is_mirrored", False)) or source_relative_path.startswith("M/"),
                 "rank": index,
@@ -293,19 +282,13 @@ def build_config(
     args: argparse.Namespace,
     task_run_dir: Path,
     task_manifest_path: Path,
-    schema_name: str,
 ) -> dict[str, Any]:
-    schema = get_schema_spec(schema_name)
     return {
         "kind": LONGSEQ_LATEST_KIND,
         "preset": str(args.preset),
         "split": str(args.split),
         "min_frames": int(args.min_frames),
         "include_mirror": bool(args.include_mirror),
-        "schema_name": schema.name,
-        "pose_representation": schema.pose_representation,
-        "root_y_policy": schema.root_y_policy,
-        "pelvis_height_mode": schema.pelvis_height_mode,
         "task_run_dir": str(task_run_dir),
         "task_manifest_path": str(task_manifest_path),
         "storage_mode": "copied_npz",

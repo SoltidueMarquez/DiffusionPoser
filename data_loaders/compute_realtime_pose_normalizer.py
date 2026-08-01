@@ -1,170 +1,110 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 from tqdm.auto import tqdm
 
 from data_loaders.realtime_pose_dataset import (
-    encode_realtime_pose_features,
     find_manifest_path,
     load_materialized_task_npz,
-    load_realtime_task_arrays,
     read_task_manifest,
 )
 from data_loaders.sensor_masking import (
-    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    POSE_REPRESENTATION_KEY,
-    REALTIME_POSE_SCHEMA_NAMES,
-    REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_DIM,
+    TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
-    get_schema_spec,
-    validate_pose_representation,
+    TRACKER_MEASURED_VALID_OFFSET,
 )
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute realtime_pose mean/std normalizer from materialized tasks.")
-    group = parser.add_argument_group("paths")
-    group.add_argument("--task_dir", default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks", type=str)
-    group.add_argument("--output_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
-
-    group = parser.add_argument_group("statistics")
-    group.add_argument("--schema", default=DEFAULT_REALTIME_POSE_SCHEMA_NAME, choices=REALTIME_POSE_SCHEMA_NAMES, type=str)
-    group.add_argument("--split", default="train", type=str)
-    group.add_argument("--eps", default=1e-8, type=float)
-    group.add_argument("--run_name", default="auto", type=str)
-    group.add_argument("--overwrite", action="store_true")
+    parser = argparse.ArgumentParser(description="统计 140D pose 与 [6,9] Tracker normalizer。")
+    parser.add_argument(
+        "--task_dir",
+        default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz",
+    )
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--eps", default=1e-8, type=float)
+    parser.add_argument("--run_name", default="auto")
+    # 保留 CLI 参数名，实际输出始终使用新时间戳目录，不覆盖旧统计。
+    parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
 def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, object]:
-    task_dir = resolve_latest_or_self(Path(args.task_dir), kind="tasks")
-    output_root = Path(args.output_dir).resolve()
-    output_dir = timestamped_child_dir(output_root, resolve_normalizer_run_label(args))
-    args.output_dir = str(output_dir)
-    schema = get_schema_spec(getattr(args, "schema", DEFAULT_REALTIME_POSE_SCHEMA_NAME))
-    if not task_dir.exists():
-        raise FileNotFoundError(f"{schema.name} task 目录不存在：{task_dir}")
-    ensure_output_dir(output_dir=output_dir, overwrite=bool(args.overwrite))
-
+    task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
     manifest_path = find_manifest_path(task_dir, args.split)
-    task_entries = read_task_manifest(manifest_path)
-    if not task_entries:
-        raise RuntimeError(f"split={args.split} 没有匹配到 {schema.name} task。")
+    entries = read_task_manifest(manifest_path)
+    if not entries:
+        raise RuntimeError(f"{manifest_path} 没有 task。")
 
-    running_sum: np.ndarray | None = None
-    running_sumsq: np.ndarray | None = None
-    running_count: np.ndarray | None = None
-    total_frames = 0
-    tracker_valid_observation_counts = np.zeros(TRACKER_COUNT, dtype=np.int64)
+    pose_sum = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float64)
+    pose_sumsq = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float64)
+    pose_count = 0
+    tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
+    tracker_sumsq = np.zeros_like(tracker_sum)
+    tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
 
-    for entry in tqdm(task_entries, desc=f"统计 split={args.split} realtime normalizer", unit="task"):
-        entry_schema = str(entry.get("schema_name", schema.name))
-        if entry_schema != schema.name:
-            raise ValueError(f"task {entry.get('task_id', '<unknown>')} schema_name={entry_schema}，期望 {schema.name}")
-        validate_pose_representation(
-            entry.get(POSE_REPRESENTATION_KEY),
-            schema_name=schema.name,
-            source=f"{manifest_path}:{entry.get('task_id', '<unknown>')}",
-        )
-        task = load_materialized_task_npz(manifest_dir=manifest_path.parent, task_path=entry["task_path"], schema_name=schema.name)
-        arrays = load_realtime_task_arrays(task=task, seq_len=REALTIME_POSE_SEQ_LEN, schema_name=schema.name)
-        features = encode_realtime_pose_features(arrays, schema_name=schema.name)
-        seq_sum, seq_sumsq, seq_count = masked_task_feature_stats(features=features, sensor_valid=arrays["sensor_valid"], schema_name=schema.name)
-        running_sum = seq_sum if running_sum is None else running_sum + seq_sum
-        running_sumsq = seq_sumsq if running_sumsq is None else running_sumsq + seq_sumsq
-        running_count = seq_count if running_count is None else running_count + seq_count
-        total_frames += int(features.shape[0])
-        tracker_valid_observation_counts += arrays["sensor_valid"].sum(axis=0).astype(np.int64)
+    for entry in tqdm(entries, desc="统计 140D normalizer", unit="task"):
+        task = load_materialized_task_npz(manifest_path.parent, entry["task_path"])
+        pose = np.concatenate(
+            [task["pose_history"], task["current_target"][None]],
+            axis=0,
+        ).astype(np.float64)
+        pose_sum += pose.sum(axis=0)
+        pose_sumsq += np.square(pose).sum(axis=0)
+        pose_count += pose.shape[0]
 
-    if running_sum is None or running_sumsq is None or running_count is None or total_frames <= 0:
-        raise RuntimeError("没有成功统计到有效帧，无法生成 realtime_pose normalizer。")
+        tracker = task["tracker_window"].astype(np.float64)
+        valid = tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
+        continuous = tracker[..., :TRACKER_CONTINUOUS_DIM]
+        tracker_sum += (continuous * valid[..., None]).sum(axis=0)
+        tracker_sumsq += (np.square(continuous) * valid[..., None]).sum(axis=0)
+        tracker_count += valid.sum(axis=0)[:, None]
 
-    mean, std = finalize_mean_std(running_sum, running_sumsq, running_count, eps=float(args.eps))
-    normalizer = RealtimePoseNormalizer(base_dir=output_dir, eps=float(args.eps), disable=True, schema_name=schema.name)
-    normalizer.save(mean=mean, std=std)
+    pose_mean, pose_std = finalize_mean_std(pose_sum, pose_sumsq, pose_count, float(args.eps))
+    tracker_mean, tracker_std = finalize_mean_std(
+        tracker_sum,
+        tracker_sumsq,
+        tracker_count,
+        float(args.eps),
+    )
 
-    meta = {
-        "schema_name": schema.name,
-        "pose_representation": schema.pose_representation,
-        "root_y_policy": schema.root_y_policy,
-        "pelvis_height_mode": schema.pelvis_height_mode,
-        "task_dir": str(task_dir),
-        "normalizer_root": str(output_root),
-        "output_dir": str(output_dir),
-        "split": args.split,
-        "matched_tasks": len(task_entries),
-        "total_frames": total_frames,
-        "tracker_valid_observation_counts": tracker_valid_observation_counts.astype(int).tolist(),
-        "feature_dim": schema.feature_dim,
-        "eps": float(args.eps),
-        "std_definition": "population",
-    }
-    save_meta(output_dir=output_dir, meta=meta)
-    write_latest_pointer(
-        root_dir=output_root,
-        kind="normalizer",
-        output_dir=output_dir,
+    output_root = Path(args.output_dir).resolve()
+    label = "rtp_140d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
+    output_dir = timestamped_child_dir(output_root, label)
+    normalizer = RealtimePoseNormalizer(output_dir, eps=float(args.eps), disable=True)
+    normalizer.save(
+        pose_mean,
+        pose_std,
+        tracker_mean,
+        tracker_std,
         metadata={
-            "normalizer_dir": str(output_dir),
-            "normalizer_root": str(output_root),
             "task_dir": str(task_dir),
-            "schema_name": schema.name,
-            "pose_representation": schema.pose_representation,
-            "root_y_policy": schema.root_y_policy,
-            "pelvis_height_mode": schema.pelvis_height_mode,
-            "split": args.split,
-            "matched_tasks": len(task_entries),
+            "split": str(args.split),
+            "matched_tasks": len(entries),
+            "pose_observation_count": int(pose_count),
+            "tracker_valid_observation_counts": tracker_count[:, 0].astype(int).tolist(),
+            "std_definition": "population",
         },
     )
+    meta = {
+        "output_dir": str(output_dir),
+        "task_dir": str(task_dir),
+        "matched_tasks": len(entries),
+        "pose_observation_count": int(pose_count),
+        "tracker_valid_observation_counts": tracker_count[:, 0].astype(int).tolist(),
+    }
+    write_latest_pointer(output_root, "normalizer", output_dir, meta)
     return meta
-
-
-def resolve_normalizer_run_label(args: argparse.Namespace) -> str:
-    run_name = str(getattr(args, "run_name", "auto") or "auto").strip()
-    if run_name.lower() in {"", "auto"}:
-        return f"{getattr(args, 'schema', DEFAULT_REALTIME_POSE_SCHEMA_NAME)}_normalizer_{getattr(args, 'split', 'train')}"
-    return run_name
-
-
-def ensure_output_dir(output_dir: Path, overwrite: bool) -> None:
-    mean_path = output_dir / "mean.pt"
-    std_path = output_dir / "std.pt"
-    meta_path = output_dir / "normalizer_meta.json"
-    existing = [path for path in (mean_path, std_path, meta_path) if path.exists()]
-    if existing and not overwrite:
-        existing_text = ", ".join(str(path) for path in existing)
-        raise FileExistsError(f"normalizer 输出已存在：{existing_text}。如需重算，请添加 --overwrite。")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-
-def masked_task_feature_stats(
-    features: np.ndarray,
-    sensor_valid: np.ndarray,
-    schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """统计单个 task window；invalid tracker 的零填充值不进入 tracker pos/rot 的均值方差。"""
-
-    schema = get_schema_spec(schema_name)
-    mask = np.ones_like(features, dtype=bool)
-    valid = np.asarray(sensor_valid, dtype=bool)
-    for tracker_index in range(TRACKER_COUNT):
-        missing = ~valid[:, tracker_index]
-        if not missing.any():
-            continue
-        mask[missing, schema.tracker_pos_slice(tracker_index)] = False
-        mask[missing, schema.tracker_rot_slice(tracker_index)] = False
-    masked = features.astype(np.float64, copy=False) * mask.astype(np.float64)
-    return (
-        masked.sum(axis=0, dtype=np.float64),
-        np.square(masked).sum(axis=0, dtype=np.float64),
-        mask.sum(axis=0, dtype=np.float64),
-    )
 
 
 def finalize_mean_std(
@@ -176,10 +116,8 @@ def finalize_mean_std(
     count = np.asarray(running_count, dtype=np.float64)
     safe_count = np.maximum(count, 1.0)
     mean = running_sum / safe_count
-    second_moment = running_sumsq / safe_count
-    variance = np.maximum(second_moment - np.square(mean), 0.0)
-    std = np.sqrt(variance)
-    std = np.clip(std, a_min=eps, a_max=None)
+    variance = np.maximum(running_sumsq / safe_count - np.square(mean), 0.0)
+    std = np.maximum(np.sqrt(variance), float(eps))
     if count.shape:
         empty = count <= 0
         mean = np.where(empty, 0.0, mean)
@@ -187,21 +125,11 @@ def finalize_mean_std(
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-def save_meta(output_dir: Path, meta: dict[str, object]) -> None:
-    meta_path = output_dir / "normalizer_meta.json"
-    with meta_path.open("w", encoding="utf-8") as file:
-        json.dump(meta, file, indent=2, ensure_ascii=False, sort_keys=True)
-
-
 def main(argv: list[str] | None = None) -> dict[str, object]:
-    parser = build_argument_parser()
-    args = parser.parse_args(argv)
-    meta = compute_realtime_pose_normalizer(args)
-    print("[compute_realtime_pose_normalizer] 统计完成。")
-    print(f"- 匹配 task 数：{meta['matched_tasks']}")
-    print(f"- 累计有效帧数：{meta['total_frames']}")
-    print(f"- 输出目录：{meta['output_dir']}")
-    return meta
+    args = build_argument_parser().parse_args(argv)
+    result = compute_realtime_pose_normalizer(args)
+    print(f"[normalizer] 完成：{result['output_dir']}")
+    return result
 
 
 if __name__ == "__main__":
