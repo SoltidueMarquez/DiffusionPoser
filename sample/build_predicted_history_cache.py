@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
             use_ddim=str(args.ts_respace).startswith("ddim"),
         )
         pred_np = pred.detach().cpu().numpy().astype(np.float32, copy=False)
-        task_id = str(dataset.entries[index].get("task_id", index))
+        task_id = dataset.task_id_at(index)
         np.savez(
             output_dir / f"{task_id}.npz",
             predicted_features_normalized=pred_np,

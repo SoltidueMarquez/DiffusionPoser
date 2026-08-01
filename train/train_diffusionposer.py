@@ -57,11 +57,13 @@ def main():
             split=args.data_split,
             normalizer_dir=args.normalizer_dir,
             normalize_input=args.normalize_input,
-            preload_data=args.preload_data,
             num_workers=args.num_workers,
             pin_memory=args.cuda,
             enable_rollout=enable_rollout_training,
             rollout_steps=args.rollout_steps,
+            rollout_prob=args.rollout_prob,
+            scenario_weights=args.scenario_weights,
+            seed=args.seed,
         )
         eval_data = None
         if args.eval_during_training:
@@ -74,11 +76,13 @@ def main():
                 split=args.eval_split,
                 normalizer_dir=args.normalizer_dir,
                 normalize_input=args.normalize_input,
-                preload_data=args.preload_data,
                 num_workers=args.num_workers,
                 pin_memory=args.cuda,
                 enable_rollout=False,
                 rollout_steps=1,
+                rollout_prob=0.0,
+                scenario_weights=args.scenario_weights,
+                seed=args.seed,
             )
 
         print("creating model and diffusion...")

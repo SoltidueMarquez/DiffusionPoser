@@ -4,25 +4,15 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-from tqdm.auto import tqdm
 
-from data_loaders.realtime_pose_dataset import (
-    find_manifest_path,
-    load_materialized_task_npz,
-    read_task_manifest,
-)
-from data_loaders.sensor_masking import (
-    REALTIME_POSE_TARGET_DIM,
-    TRACKER_CONTINUOUS_DIM,
-    TRACKER_COUNT,
-    TRACKER_MEASURED_VALID_OFFSET,
-)
+from data_loaders.realtime_pose_task_store import load_shard_stats, read_store_metadata
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, TRACKER_CONTINUOUS_DIM, TRACKER_COUNT
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="统计 140D pose 与 [6,9] Tracker normalizer。")
+    parser = argparse.ArgumentParser(description="按 shard 合并 realtime pose normalizer 统计。")
     parser.add_argument(
         "--task_dir",
         default="dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks",
@@ -34,77 +24,53 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="train")
     parser.add_argument("--eps", default=1e-8, type=float)
     parser.add_argument("--run_name", default="auto")
-    # 保留 CLI 参数名，实际输出始终使用新时间戳目录，不覆盖旧统计。
-    parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
 def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, object]:
     task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-    manifest_path = find_manifest_path(task_dir, args.split)
-    entries = read_task_manifest(manifest_path)
-    if not entries:
-        raise RuntimeError(f"{manifest_path} 没有 task。")
+    split_dir = task_dir / str(args.split)
+    metadata = read_store_metadata(split_dir)
+    shards = sorted(metadata["shards"], key=lambda value: int(value["index"]))
+    if not shards:
+        raise RuntimeError(f"{split_dir} 没有 shard。")
 
     pose_sum = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float64)
-    pose_sumsq = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float64)
+    pose_sumsq = np.zeros_like(pose_sum)
     pose_count = 0
     tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
     tracker_sumsq = np.zeros_like(tracker_sum)
     tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
-
-    for entry in tqdm(entries, desc="统计 140D normalizer", unit="task"):
-        task = load_materialized_task_npz(manifest_path.parent, entry["task_path"])
-        pose = np.concatenate(
-            [task["pose_history"], task["current_target"][None]],
-            axis=0,
-        ).astype(np.float64)
-        pose_sum += pose.sum(axis=0)
-        pose_sumsq += np.square(pose).sum(axis=0)
-        pose_count += pose.shape[0]
-
-        tracker = task["tracker_window"].astype(np.float64)
-        valid = tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
-        continuous = tracker[..., :TRACKER_CONTINUOUS_DIM]
-        tracker_sum += (continuous * valid[..., None]).sum(axis=0)
-        tracker_sumsq += (np.square(continuous) * valid[..., None]).sum(axis=0)
-        tracker_count += valid.sum(axis=0)[:, None]
+    for shard in shards:
+        stats = load_shard_stats(split_dir, shard)
+        pose_sum += stats["pose_sum"]
+        pose_sumsq += stats["pose_sumsq"]
+        pose_count += int(stats["pose_count"])
+        tracker_sum += stats["tracker_sum"]
+        tracker_sumsq += stats["tracker_sumsq"]
+        tracker_count += stats["tracker_count"]
 
     pose_mean, pose_std = finalize_mean_std(pose_sum, pose_sumsq, pose_count, float(args.eps))
     tracker_mean, tracker_std = finalize_mean_std(
-        tracker_sum,
-        tracker_sumsq,
-        tracker_count,
-        float(args.eps),
+        tracker_sum, tracker_sumsq, tracker_count, float(args.eps)
     )
-
     output_root = Path(args.output_dir).resolve()
     label = "rtp_140d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
     output_dir = timestamped_child_dir(output_root, label)
     normalizer = RealtimePoseNormalizer(output_dir, eps=float(args.eps), disable=True)
-    normalizer.save(
-        pose_mean,
-        pose_std,
-        tracker_mean,
-        tracker_std,
-        metadata={
-            "task_dir": str(task_dir),
-            "split": str(args.split),
-            "matched_tasks": len(entries),
-            "pose_observation_count": int(pose_count),
-            "tracker_valid_observation_counts": tracker_count[:, 0].astype(int).tolist(),
-            "std_definition": "population",
-        },
-    )
-    meta = {
-        "output_dir": str(output_dir),
+    normalizer_metadata = {
+        "generation_plan_hash": str(metadata["generation_plan_hash"]),
         "task_dir": str(task_dir),
-        "matched_tasks": len(entries),
+        "split": str(args.split),
+        "sample_count": int(metadata["sample_count"]),
         "pose_observation_count": int(pose_count),
-        "tracker_valid_observation_counts": tracker_count[:, 0].astype(int).tolist(),
+        "tracker_observation_counts": tracker_count[:, 0].astype(int).tolist(),
+        "std_definition": "population",
     }
-    write_latest_pointer(output_root, "normalizer", output_dir, meta)
-    return meta
+    normalizer.save(pose_mean, pose_std, tracker_mean, tracker_std, metadata=normalizer_metadata)
+    result = {"output_dir": str(output_dir), **normalizer_metadata}
+    write_latest_pointer(output_root, "normalizer", output_dir, result)
+    return result
 
 
 def finalize_mean_std(

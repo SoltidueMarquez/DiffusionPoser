@@ -20,13 +20,15 @@ conda run -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_ta
   --output_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks `
   --split_dir data_loaders/splits `
   --splits train test `
-  --samples_per_file 4
+  --base_windows_per_source 20 `
+  --max_rollout_steps 4 `
+  --shard_size 4096 `
+  --seed 10
 
 conda run -n diffusionposer5070 python -m data_loaders.compute_realtime_pose_normalizer `
   --task_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks `
   --output_dir dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz `
-  --split train `
-  --overwrite
+  --split train
 ```
 
 ## 训练
@@ -38,7 +40,12 @@ conda run -n diffusionposer5070 python -m train.train_diffusionposer `
   --data_split train `
   --normalizer_dir dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz `
   --save_dir runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit `
+  --rollout_steps 4 `
+  --rollout_prob 0.25 `
+  --scenario_weights 1 1 1 1 1 `
   --overwrite
 ```
+
+Task 生成后由未压缩 `.npy` shard 直接 mmap 读取。每个基础动作窗口保存固定五套 Tracker 配置，训练期只选择配置与是否读取后续 rollout step；这些训练参数不会改变 normalizer。
 
 Unity 与导出链路暂未同步到这次 Python 本地改动。

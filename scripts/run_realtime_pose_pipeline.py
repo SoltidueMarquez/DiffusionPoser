@@ -77,8 +77,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tasks = parser.add_argument_group("tasks")
     tasks.add_argument("--skip_tasks", action="store_true")
     tasks.add_argument("--splits", nargs="+", default=["train", "test"])
-    tasks.add_argument("--samples_per_file", default=4, type=int)
-    tasks.add_argument("--rollout_steps", default=1, type=int)
+    tasks.add_argument("--base_windows_per_source", default=20, type=int)
+    tasks.add_argument("--max_rollout_steps", default=4, type=int)
+    tasks.add_argument("--shard_size", default=4096, type=int)
     tasks.add_argument("--short_source_policy", default="skip", choices=["skip", "error"])
 
     train = parser.add_argument_group("train")
@@ -103,7 +104,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--model_ema", action=BooleanOptionalAction, default=True)
     train.add_argument("--gradient_clip", action=BooleanOptionalAction, default=True)
     train.add_argument("--rollout_loss_weight", default=0.0, type=float)
+    train.add_argument("--rollout_steps", default=1, type=int)
     train.add_argument("--rollout_prob", default=0.0, type=float)
+    train.add_argument("--scenario_weights", nargs=5, default=[1.0] * 5, type=float)
     train.add_argument("--detach_rollout_history", default=True, type=str2bool)
     train.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
     train.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)
@@ -199,7 +202,7 @@ def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[b
             return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
     if stage == "tasks":
         task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-        if has_task_manifests(task_dir=task_dir, splits=list(args.splits)):
+        if has_task_stores(task_dir=task_dir, splits=list(args.splits)):
             return True, f"复用已有 task 产物: {task_dir}"
     if stage == "normalizer":
         normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
@@ -217,14 +220,14 @@ def dependency_block_message(stage: str, failed_stages: set[str], args: argparse
         return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
     if stage == "normalizer" and "tasks" in failed_stages:
         task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-        if has_task_manifests(task_dir=task_dir, splits=[str(args.normalizer_split)]):
+        if has_task_stores(task_dir=task_dir, splits=[str(args.normalizer_split)]):
             return ""
-        return "tasks 失败且找不到可用于 normalizer_split 的 task manifest，跳过 normalizer。"
+        return "tasks 失败且找不到可用于 normalizer_split 的 task store，跳过 normalizer。"
     if stage == "train":
         if "tasks" in failed_stages:
             task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-            if not has_task_manifests(task_dir=task_dir, splits=["train"]):
-                return "tasks 失败且找不到 train task manifest，跳过 train。"
+            if not has_task_stores(task_dir=task_dir, splits=["train"]):
+                return "tasks 失败且找不到 train task store，跳过 train。"
         if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
             normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
             if not has_normalizer_artifact(normalizer_dir=normalizer_dir):
@@ -250,12 +253,12 @@ def has_usable_source_manifest(source_dir: Path) -> bool:
     return False
 
 
-def has_task_manifests(task_dir: Path, splits: list[str]) -> bool:
+def has_task_stores(task_dir: Path, splits: list[str]) -> bool:
     if not task_dir.exists():
         return False
     for split in splits:
-        manifest_path = task_dir / str(split) / "manifest.jsonl"
-        if not manifest_path.exists():
+        metadata_path = task_dir / str(split) / "task_store.json"
+        if not metadata_path.exists():
             return False
     return True
 
@@ -311,7 +314,6 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
         "--split", args.normalizer_split,
         "--run_name", args.run_name,
     ]
-    add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
 
@@ -321,8 +323,9 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--output_dir", normalize_path(args.task_dir),
         "--split_dir", normalize_path(args.split_dir),
         "--splits", *[str(split) for split in args.splits],
-        "--samples_per_file", str(args.samples_per_file),
-        "--rollout_steps", str(args.rollout_steps),
+        "--base_windows_per_source", str(args.base_windows_per_source),
+        "--max_rollout_steps", str(args.max_rollout_steps),
+        "--shard_size", str(args.shard_size),
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
     ]
@@ -353,6 +356,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--rollout_steps", str(args.rollout_steps),
         "--rollout_loss_weight", str(args.rollout_loss_weight),
         "--rollout_prob", str(args.rollout_prob),
+        "--scenario_weights", *[str(value) for value in args.scenario_weights],
         "--detach_rollout_history", "true" if args.detach_rollout_history else "false",
         "--rollout_joint_vel_loss_weight", str(args.rollout_joint_vel_loss_weight),
         "--rollout_rot_vel_loss_weight", str(args.rollout_rot_vel_loss_weight),

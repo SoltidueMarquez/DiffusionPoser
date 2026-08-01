@@ -47,6 +47,7 @@ class RealtimePoseNormalizer:
         self.pose_std: torch.Tensor | None = None
         self.tracker_mean: torch.Tensor | None = None
         self.tracker_std: torch.Tensor | None = None
+        self.metadata: dict[str, Any] = {}
         # 训练循环仍通过 mean/std 读取姿态统计；这里明确只指 140 维姿态。
         self.mean: torch.Tensor | None = None
         self.std: torch.Tensor | None = None
@@ -74,6 +75,10 @@ class RealtimePoseNormalizer:
             torch.load(self.tracker_std_path, map_location="cpu", weights_only=True).float()
         )
         self._validate_stats()
+        if self.meta_path.exists():
+            value = json.loads(self.meta_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                self.metadata = value
         self.mean = self.pose_mean
         self.std = self.pose_std
 
@@ -102,6 +107,7 @@ class RealtimePoseNormalizer:
         torch.save(self.tracker_mean, self.tracker_mean_path)
         torch.save(self.tracker_std, self.tracker_std_path)
         self._write_meta(metadata or {})
+        self.metadata = {"eps": self.eps, **(metadata or {})}
         self.mean = self.pose_mean
         self.std = self.pose_std
 

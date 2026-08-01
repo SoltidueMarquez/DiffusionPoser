@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from data_loaders.generate_realtime_pose_tasks import load_realtime_source, normalize_slashes, save_task_npz
+from data_loaders.generate_realtime_pose_tasks import load_realtime_source, normalize_slashes
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_INPUT_DIM,
@@ -31,6 +31,19 @@ from data_loaders.sensor_masking import (
 SENSOR_NAMES = tuple(TRACKER_NAMES)
 KEYFRAME_TARGETS = ("root",) + SENSOR_NAMES
 DEFAULT_API_FRAME_LIMIT = 240
+
+
+def save_task_npz(task_path: Path, compress: bool, **arrays) -> None:
+    """可视化编辑器仍使用自身的独立 NPZ 导出，不进入训练 task store。"""
+
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = task_path.with_suffix(".tmp")
+    with temporary.open("wb") as file:
+        if compress:
+            np.savez_compressed(file, **arrays)
+        else:
+            np.savez(file, **arrays)
+    temporary.replace(task_path)
 
 
 def utc_now() -> str:

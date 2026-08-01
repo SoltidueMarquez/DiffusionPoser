@@ -23,6 +23,7 @@ from data_loaders.sensor_masking import (
     HIP_TRACKER_INDEX,
     JOINT_GLOBAL_ROTATION_DIM,
     MISSING_AGE_CAP,
+    REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     ROOT_YAW_RELATIVE_START,
     ROTATION_6D_DIM,
@@ -183,6 +184,23 @@ def build_known_target_np(
     return known_target, known_mask
 
 
+def build_known_mask_from_measured_np(measured_valid: np.ndarray) -> np.ndarray:
+    """把当前六个 Tracker 的测量状态映射到 140 维 hard-condition mask。"""
+
+    measured = np.asarray(measured_valid, dtype=bool)
+    if measured.shape != (TRACKER_COUNT,):
+        raise ValueError(f"measured_valid 必须为 [{TRACKER_COUNT}]，实际为 {measured.shape}")
+    known_mask = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=bool)
+    for tracker_index in (HEAD_TRACKER_INDEX, *HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES):
+        if measured[tracker_index]:
+            joint_index = TRACKER_TO_JOINT[tracker_index]
+            start = (joint_index - 1) * ROTATION_6D_DIM
+            known_mask[start : start + ROTATION_6D_DIM] = True
+    if measured[HIP_TRACKER_INDEX]:
+        known_mask[ROOT_YAW_RELATIVE_START:] = True
+    return known_mask
+
+
 def decode_target_head_rotations_np(
     target: np.ndarray,
     rest_local_rotations: np.ndarray,
@@ -258,6 +276,60 @@ def reexpress_pose_target_between_head_yaws_torch(
     result[:, ROOT_YAW_RELATIVE_START] = torch.sin(destination_relative)
     result[:, ROOT_YAW_RELATIVE_START + 1] = torch.cos(destination_relative)
     return result
+
+
+def advance_rollout_pose_history_torch(
+    pose_history: torch.Tensor,
+    prediction: torch.Tensor,
+    source_head_yaw_world: torch.Tensor,
+    destination_head_yaw_world: torch.Tensor,
+    normalizer_mean: torch.Tensor | None = None,
+    normalizer_std: torch.Tensor | None = None,
+    detach_prediction: bool = True,
+) -> torch.Tensor:
+    """重表达整段历史并追加预测；后续 step 不再读取离线 GT pose_history。"""
+
+    if pose_history.ndim != 3 or pose_history.shape[1:] != (
+        REALTIME_POSE_HISTORY_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+    ):
+        raise ValueError(
+            f"pose_history 应为 [B,{REALTIME_POSE_HISTORY_LENGTH},{REALTIME_POSE_TARGET_DIM}]，"
+            f"实际为 {tuple(pose_history.shape)}"
+        )
+    if prediction.shape != pose_history[:, -1].shape:
+        raise ValueError("prediction 必须与单帧 pose history 同形。")
+    prediction = prediction.detach() if detach_prediction else prediction
+    if normalizer_mean is not None and normalizer_std is not None:
+        mean = normalizer_mean.to(device=pose_history.device, dtype=pose_history.dtype)
+        std = normalizer_std.to(device=pose_history.device, dtype=pose_history.dtype)
+        history_raw = pose_history * std + mean
+        prediction_raw = prediction * std + mean
+    else:
+        mean = std = None
+        history_raw = pose_history
+        prediction_raw = prediction
+
+    batch_size, history_length, target_dim = history_raw.shape
+    source_yaw = source_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
+    destination_yaw = destination_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
+    history_reexpressed = reexpress_pose_target_between_head_yaws_torch(
+        history_raw.reshape(batch_size * history_length, target_dim),
+        source_yaw[:, None].expand(-1, history_length).reshape(-1),
+        destination_yaw[:, None].expand(-1, history_length).reshape(-1),
+    ).reshape(batch_size, history_length, target_dim)
+    prediction_reexpressed = reexpress_pose_target_between_head_yaws_torch(
+        prediction_raw,
+        source_yaw,
+        destination_yaw,
+    )
+    next_history = torch.cat(
+        [history_reexpressed[:, 1:], prediction_reexpressed[:, None]],
+        dim=1,
+    )
+    if mean is None or std is None:
+        return next_history
+    return (next_history - mean) / std
 
 
 def pelvis_relative_joint_positions_np(

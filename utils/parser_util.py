@@ -74,11 +74,17 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--data_split", default="train", type=str)
     group.add_argument("--normalizer_dir", default="dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz", type=str)
     group.add_argument("--normalize_input", default=True, type=str2bool)
-    group.add_argument("--preload_data", default=False, type=str2bool)
     group.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     group.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--num_workers", default=0, type=int)
     group.add_argument("--rollout_steps", default=1, type=int)
+    group.add_argument(
+        "--scenario_weights",
+        nargs=5,
+        default=[1.0, 1.0, 1.0, 1.0, 1.0],
+        type=float,
+        metavar=("SIX", "THREE", "3TO6", "6TO3", "DROPOUT"),
+    )
 
 
 def add_sampling_options(parser: ArgumentParser):

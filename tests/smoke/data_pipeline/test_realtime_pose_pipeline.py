@@ -51,7 +51,7 @@ def write_latest_task_artifact(task_root: Path, split: str = "train") -> Path:
     task_dir = task_root / "20260101_000000_rtp_tasks"
     split_dir = task_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
-    (split_dir / "manifest.jsonl").write_text("", encoding="utf-8")
+    (split_dir / "task_store.json").write_text("{}\n", encoding="utf-8")
     write_latest_pointer(
         root_dir=task_root,
         kind="tasks",
@@ -141,3 +141,32 @@ def test_pipeline_passes_parallel_converter_args(tmp_path):
 
     assert convert_args[convert_args.index("--num_workers") + 1] == "3"
     assert convert_args[convert_args.index("--worker_torch_threads") + 1] == "2"
+
+
+def test_pipeline_passes_new_task_store_and_training_sampling_args(tmp_path):
+    args = parse_pipeline_args(
+        tmp_path,
+        "--base_windows_per_source",
+        "7",
+        "--max_rollout_steps",
+        "4",
+        "--shard_size",
+        "128",
+        "--rollout_steps",
+        "3",
+        "--scenario_weights",
+        "5",
+        "4",
+        "3",
+        "2",
+        "1",
+    )
+    task_args = pipeline.build_task_args(args)
+    train_args = pipeline.build_train_args(args)
+    assert task_args[task_args.index("--base_windows_per_source") + 1] == "7"
+    assert task_args[task_args.index("--max_rollout_steps") + 1] == "4"
+    assert task_args[task_args.index("--shard_size") + 1] == "128"
+    assert "--samples_per_file" not in task_args
+    assert train_args[train_args.index("--rollout_steps") + 1] == "3"
+    weights = train_args.index("--scenario_weights")
+    assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]

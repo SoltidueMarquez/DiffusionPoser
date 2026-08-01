@@ -10,11 +10,9 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
-from data_loaders.realtime_pose_geometry import reexpress_pose_target_between_head_yaws_torch
+from data_loaders.realtime_pose_geometry import advance_rollout_pose_history_torch
 
 from data_loaders.sensor_masking import (
-    REALTIME_POSE_HISTORY_LENGTH,
-    REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     TASK_MODE_REALTIME_POSE,
 )
@@ -76,6 +74,7 @@ class TrainLoop:
         self.global_batch = self.batch_size
         self.num_steps = args.num_steps
         self.data_num_batches = len(self.data)
+        self.data_wait_times: list[float] = []
         if self.data_num_batches <= 0:
             raise RuntimeError(
                 "训练 DataLoader 没有可用 batch；请降低 --batch_size 或增加训练样本，"
@@ -222,17 +221,28 @@ class TrainLoop:
     # region 训练循环
     def run_loop(self):
         self.model.train()
+        if not hasattr(self, "data_wait_times"):
+            self.data_wait_times = []
         if self._should_stop():
             logger.log(f"resume step {self.resume_step} has already reached num_steps={self.num_steps}; skip training.")
             return
 
         last_step_end = time.perf_counter()
         for epoch in range(self.num_epochs):
-            dataset = getattr(self.data, "dataset", None)
-            if hasattr(dataset, "set_epoch"):
-                dataset.set_epoch(epoch)
+            batch_sampler = getattr(self.data, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
             for batch in self.data:
                 batch_ready_time = time.perf_counter()
+                data_wait = batch_ready_time - last_step_end
+                if len(self.data_wait_times) < 100:
+                    self.data_wait_times.append(data_wait)
+                    if len(self.data_wait_times) == 100:
+                        logger.log(
+                            "first 100 batch data wait: "
+                            f"mean={sum(self.data_wait_times) / 100.0:.4f}s, "
+                            f"max={max(self.data_wait_times):.4f}s"
+                        )
                 batch = move_batch_to_device(batch, self.device)
                 train_start_time = time.perf_counter()
                 self.run_step(batch)
@@ -241,7 +251,7 @@ class TrainLoop:
                 global_step = self.step + self.resume_step
                 print(
                     f"step[{global_step}] "
-                    f"data={batch_ready_time - last_step_end:.3f}s "
+                    f"data={data_wait:.3f}s "
                     f"train={train_end_time - train_start_time:.3f}s",
                     flush=True,
                 )
@@ -417,17 +427,16 @@ class TrainLoop:
             or self.rollout_joint_vel_loss_weight > 0.0
             or self.rollout_rot_vel_loss_weight > 0.0
         )
-        if self.rollout_steps <= 1 or not rollout_weight_enabled or self.rollout_prob <= 0.0:
+        if self.rollout_steps <= 1 or not rollout_weight_enabled:
             return False
         if not self.model.training or not torch.is_grad_enabled():
             return False
         rollout = batch.get("rollout")
+        if rollout is None:
+            return False
         if not isinstance(rollout, (list, tuple)) or len(rollout) < self.rollout_steps - 1:
-            raise ValueError(
-                f"rollout_steps={self.rollout_steps} 需要 Dataset 返回 rollout 子窗口，"
-                "请先生成 rollout task 并启用 enable_rollout。"
-            )
-        return bool(torch.rand((), device=self.device).item() < self.rollout_prob)
+            raise ValueError(f"batch rollout 不足以提供 rollout_steps={self.rollout_steps}。")
+        return True
 
     def compute_rollout_losses(
         self,
@@ -518,77 +527,15 @@ class TrainLoop:
     ) -> torch.Tensor:
         """把当前历史整体换到下一帧参考系，并追加当前模型预测。"""
 
-        if pose_history.ndim != 3 or tuple(pose_history.shape[1:]) != (
-            REALTIME_POSE_HISTORY_LENGTH,
-            REALTIME_POSE_TARGET_DIM,
-        ):
-            raise ValueError(
-                f"pose_history 应为 [B,{REALTIME_POSE_HISTORY_LENGTH},{REALTIME_POSE_TARGET_DIM}]，"
-                f"实际为 {tuple(pose_history.shape)}"
-            )
-        if pred_xstart.shape != pose_history[:, -1].shape:
-            raise ValueError("pred_xstart 必须与单帧 pose history 同形。")
-
-        pred_for_history = pred_xstart.detach() if self.detach_rollout_history else pred_xstart
-        if self.normalizer_mean is not None and self.normalizer_std is not None:
-            mean = self.normalizer_mean.to(device=pose_history.device, dtype=pose_history.dtype)
-            std = self.normalizer_std.to(device=pose_history.device, dtype=pose_history.dtype)
-            history_raw = pose_history * std + mean
-            pred_raw = pred_for_history * std + mean
-        else:
-            mean = std = None
-            history_raw = pose_history
-            pred_raw = pred_for_history
-
-        batch_size, history_length, target_dim = history_raw.shape
-        source_yaw = source_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
-        destination_yaw = destination_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
-        history_reexpressed = reexpress_pose_target_between_head_yaws_torch(
-            history_raw.reshape(batch_size * history_length, target_dim),
-            source_yaw[:, None].expand(-1, history_length).reshape(-1),
-            destination_yaw[:, None].expand(-1, history_length).reshape(-1),
-        ).reshape(batch_size, history_length, target_dim)
-        pred_reexpressed = reexpress_pose_target_between_head_yaws_torch(
-            pred_raw,
-            source_yaw,
-            destination_yaw,
+        return advance_rollout_pose_history_torch(
+            pose_history=pose_history,
+            prediction=pred_xstart,
+            source_head_yaw_world=source_head_yaw_world,
+            destination_head_yaw_world=destination_head_yaw_world,
+            normalizer_mean=self.normalizer_mean,
+            normalizer_std=self.normalizer_std,
+            detach_prediction=self.detach_rollout_history,
         )
-        next_history_raw = torch.cat(
-            [history_reexpressed[:, 1:], pred_reexpressed[:, None]],
-            dim=1,
-        )
-        if mean is None or std is None:
-            return next_history_raw
-        return (next_history_raw - mean) / std
-
-    def build_one_step_rollout_pose_history(
-        self,
-        current_batch: dict,
-        rollout_batch: dict,
-        pred_xstart: torch.Tensor,
-    ) -> torch.Tensor:
-        """把 frame t 预测重表达到 frame t+1 的 Head 参考系后回灌。"""
-
-        next_history = rollout_batch["pose_history"].clone()
-        pred_target_t = pred_xstart
-        if self.detach_rollout_history:
-            pred_target_t = pred_target_t.detach()
-        if self.normalizer_mean is not None and self.normalizer_std is not None:
-            mean = self.normalizer_mean.to(device=pred_target_t.device, dtype=pred_target_t.dtype)
-            std = self.normalizer_std.to(device=pred_target_t.device, dtype=pred_target_t.dtype)
-            pred_raw = pred_target_t * std + mean
-        else:
-            mean = std = None
-            pred_raw = pred_target_t
-        reexpressed = reexpress_pose_target_between_head_yaws_torch(
-            pred_raw,
-            current_batch["current_head_yaw_world"],
-            rollout_batch["current_head_yaw_world"],
-        )
-        if mean is not None and std is not None:
-            reexpressed = (reexpressed - mean) / std
-        next_history[:, -1] = reexpressed
-        return next_history
 
     def _anneal_lr(self):
         if self.lr_anneal_steps <= 0:

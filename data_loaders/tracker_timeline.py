@@ -53,6 +53,95 @@ def stable_source_seed(source_id: str, global_seed: int) -> int:
     return int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**32)
 
 
+def stable_context_seed(*parts: object) -> int:
+    """把显式上下文编码为 PCG64 可用的稳定 128-bit seed。"""
+
+    payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:16], byteorder="little", signed=False)
+
+
+def build_task_config_plan(task_id: str, global_seed: int, max_rollout_steps: int) -> list[dict]:
+    """为一个基础窗口确定五套配置；计划内容可直接参与 generation-plan hash。"""
+
+    rollout_steps = int(max_rollout_steps)
+    if not 1 <= rollout_steps <= 4:
+        raise ValueError("max_rollout_steps 必须在 [1,4]。")
+    common_start = rollout_steps - 1
+    common_stop = REALTIME_POSE_SEQ_LEN - 1
+    plans: list[dict] = []
+    for config_index, scenario in enumerate(TRACKER_PATTERN_CATEGORIES):
+        rng = np.random.Generator(
+            np.random.PCG64(stable_context_seed(global_seed, task_id, config_index, "config"))
+        )
+        plan: dict = {"config_index": config_index, "scenario": scenario}
+        if scenario in (SCENARIO_THREE_TO_SIX, SCENARIO_SIX_TO_THREE):
+            # transition_frame 是“切换后”的首帧，因此至少要比最晚窗口起点晚一帧。
+            plan["transition_frame"] = int(rng.integers(common_start + 1, common_stop + 1))
+        elif scenario == SCENARIO_DROPOUT:
+            drop_count = int(rng.integers(1, 3))
+            dropped = rng.choice(np.asarray(NON_HEAD_TRACKER_INDICES), size=drop_count, replace=False)
+            duration = int(rng.integers(1, MISSING_AGE_CAP + 1))
+            anchor = int(rng.integers(common_start, common_stop + 1))
+            offset = int(rng.integers(0, duration))
+            plan.update(
+                {
+                    "dropped_trackers": sorted(int(value) for value in dropped.tolist()),
+                    "dropout_start": anchor - offset,
+                    "dropout_duration": duration,
+                }
+            )
+        plans.append(plan)
+    return plans
+
+
+def materialize_task_configurations(
+    config_plans: list[dict],
+    frame_count: int = REALTIME_POSE_SEQ_LEN + 3,
+    missing_age_prefix: int = MISSING_AGE_CAP,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """物化 `[5,64,6]` 状态；missing_age 从额外 60 帧前缀连续计算。"""
+
+    frame_count = int(frame_count)
+    prefix = int(missing_age_prefix)
+    configured_all = np.empty((len(config_plans), frame_count, TRACKER_COUNT), dtype=bool)
+    measured_all = np.empty_like(configured_all)
+    missing_all = np.empty(configured_all.shape, dtype=np.uint8)
+    absolute_frames = np.arange(-prefix, frame_count, dtype=np.int64)
+
+    for plan in config_plans:
+        config_index = int(plan["config_index"])
+        scenario = str(plan["scenario"])
+        padded_configured = np.empty((len(absolute_frames), TRACKER_COUNT), dtype=bool)
+        if scenario == SCENARIO_FIXED_SIX or scenario == SCENARIO_DROPOUT:
+            padded_configured[:] = FIXED_SIX_CONFIG
+        elif scenario == SCENARIO_FIXED_THREE:
+            padded_configured[:] = FIXED_THREE_CONFIG
+        elif scenario in (SCENARIO_THREE_TO_SIX, SCENARIO_SIX_TO_THREE):
+            transition = int(plan["transition_frame"])
+            before = FIXED_THREE_CONFIG if scenario == SCENARIO_THREE_TO_SIX else FIXED_SIX_CONFIG
+            after = FIXED_SIX_CONFIG if scenario == SCENARIO_THREE_TO_SIX else FIXED_THREE_CONFIG
+            padded_configured[:] = before
+            padded_configured[absolute_frames >= transition] = after
+        else:
+            raise ValueError(f"未知 Tracker 配置：{scenario}")
+
+        padded_measured = padded_configured.copy()
+        if scenario == SCENARIO_DROPOUT:
+            start = int(plan["dropout_start"])
+            stop = start + int(plan["dropout_duration"])
+            event_rows = np.flatnonzero((absolute_frames >= start) & (absolute_frames < stop))
+            dropped = np.asarray(plan["dropped_trackers"], dtype=np.int64)
+            padded_measured[np.ix_(event_rows, dropped)] = False
+
+        validate_tracker_states(padded_configured, padded_measured)
+        padded_missing = compute_missing_age(padded_configured, padded_measured)
+        configured_all[config_index] = padded_configured[prefix:]
+        measured_all[config_index] = padded_measured[prefix:]
+        missing_all[config_index] = padded_missing[prefix:].astype(np.uint8)
+
+    return configured_all, measured_all, missing_all
+
+
 def build_tracker_timeline(
     source_id: str,
     frame_count: int,

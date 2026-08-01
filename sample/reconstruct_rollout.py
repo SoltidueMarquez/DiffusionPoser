@@ -6,11 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
+from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset, TaskRequest
 from data_loaders.realtime_pose_geometry import (
+    advance_rollout_pose_history_torch,
     decode_target_head_rotations_np,
     global_head_rotations_to_local_delta_6d_np,
-    reexpress_pose_target_between_head_yaws_torch,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
 from sample.reconstruct_stream import inverse_normalized_target, reconstruct_batch
@@ -47,29 +47,6 @@ def _batch_item(item: dict, device: torch.device) -> dict:
     }
 
 
-def _inject_prediction_into_next_history(
-    predicted_normalized: torch.Tensor,
-    current_batch: dict,
-    next_batch: dict,
-    normalizer,
-) -> None:
-    if normalizer is None:
-        predicted_raw = predicted_normalized
-        mean = std = None
-    else:
-        mean = normalizer.pose_mean.to(device=predicted_normalized.device, dtype=predicted_normalized.dtype)
-        std = normalizer.pose_std.to(device=predicted_normalized.device, dtype=predicted_normalized.dtype)
-        predicted_raw = predicted_normalized * std + mean
-    reexpressed = reexpress_pose_target_between_head_yaws_torch(
-        predicted_raw,
-        current_batch["current_head_yaw_world"],
-        next_batch["current_head_yaw_world"],
-    )
-    if mean is not None and std is not None:
-        reexpressed = (reexpressed - mean) / std
-    next_batch["pose_history"][:, -1] = reexpressed
-
-
 def rollout_dataset_item(
     model,
     diffusion,
@@ -77,8 +54,10 @@ def rollout_dataset_item(
     index: int,
     device: torch.device,
     use_ddim: bool,
+    rollout_steps: int = 1,
+    config_index: int = 0,
 ) -> dict[str, np.ndarray]:
-    item = dataset[index]
+    item = dataset[TaskRequest(index, config_index, rollout_steps)]
     sequence = [item, *item.get("rollout", [])]
     reconstructed_raw: list[np.ndarray] = []
     reference_raw: list[np.ndarray] = []
@@ -101,16 +80,26 @@ def rollout_dataset_item(
     known_errors: list[float] = []
     previous_prediction: torch.Tensor | None = None
     previous_batch: dict | None = None
+    pose_history: torch.Tensor | None = None
 
     for step_item in sequence:
         batch = _batch_item(step_item, device)
         if previous_prediction is not None and previous_batch is not None:
-            _inject_prediction_into_next_history(
-                previous_prediction,
-                previous_batch,
-                batch,
-                dataset.normalizer,
+            assert pose_history is not None
+            mean = None if dataset.normalizer is None else dataset.normalizer.pose_mean
+            std = None if dataset.normalizer is None else dataset.normalizer.pose_std
+            pose_history = advance_rollout_pose_history_torch(
+                pose_history=pose_history,
+                prediction=previous_prediction,
+                source_head_yaw_world=previous_batch["current_head_yaw_world"],
+                destination_head_yaw_world=batch["current_head_yaw_world"],
+                normalizer_mean=mean,
+                normalizer_std=std,
+                detach_prediction=True,
             )
+            batch["pose_history"] = pose_history
+        else:
+            pose_history = batch["pose_history"]
         predicted = reconstruct_batch(model, diffusion, batch, device, use_ddim=use_ddim)
         pred_raw = inverse_normalized_target(predicted, dataset.normalizer)[0]
         ref_raw = inverse_normalized_target(batch["x"], dataset.normalizer)[0]
@@ -222,13 +211,22 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
         folder_path=getattr(args, "folder_path", "") or None,
-        enable_rollout=args.rollout_steps > 1,
-        rollout_steps=args.rollout_steps,
     )
     model, diffusion = create_model_and_diffusion(args)
     model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
     limit = len(dataset) if int(args.rollout_limit) <= 0 else min(len(dataset), int(args.rollout_limit))
-    payloads = [rollout_dataset_item(model, diffusion, dataset, index, device, True) for index in range(limit)]
+    payloads = [
+        rollout_dataset_item(
+            model,
+            diffusion,
+            dataset,
+            index,
+            device,
+            True,
+            rollout_steps=args.rollout_steps,
+        )
+        for index in range(limit)
+    ]
     payload = {
         key: np.asarray([item[key] for item in payloads])
         for key in payloads[0]

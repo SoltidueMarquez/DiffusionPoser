@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import torch
 
-from data_loaders.generate_realtime_pose_tasks import build_task_arrays, compute_source_joint_rotations_world
-from data_loaders.realtime_pose_geometry import extract_forward_yaw_np
+from data_loaders.generate_realtime_pose_tasks import (
+    build_task_bundle_row,
+    compute_source_joint_rotations_world,
+)
+from data_loaders.realtime_pose_geometry import build_known_mask_from_measured_np, extract_forward_yaw_np
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
-from data_loaders.tracker_timeline import build_tracker_timeline, classify_tracker_window
+from data_loaders.tracker_timeline import build_task_config_plan
 from diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     LossType,
@@ -51,39 +52,50 @@ def test_save_reconstruction_writes_unified_evaluation_fields(tmp_path):
     rotations_world = compute_source_joint_rotations_world(source)
     head_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"][:, 0])
     head_yaws = extract_forward_yaw_np(head_rotations, initial_yaw=0.0)
-    timeline_window = build_tracker_timeline("toy", 70, global_seed=10).window(0)
-    scenario = classify_tracker_window(timeline_window.configured, timeline_window.measured_valid)
-    task = build_task_arrays(
+    row = build_task_bundle_row(
         source=source,
-        source_path=Path("toy.npz"),
-        source_frames=70,
         joint_rotations_world=rotations_world,
         head_yaws=head_yaws,
-        timeline_window=timeline_window,
         start_frame=0,
-        scenario=str(scenario),
+        source_index=0,
+        config_plans=build_task_config_plan("toy", global_seed=10, max_rollout_steps=4),
+        max_rollout_steps=4,
     )
-    tracker = task["tracker_window"]
+    configured = row["configured"][0, :61].astype(bool)
+    measured_valid = row["measured_valid"][0, :61].astype(bool)
+    missing_age = row["missing_age"][0, :61]
+    tracker = np.concatenate(
+        [
+            row["tracker_continuous"][0],
+            configured[..., None],
+            measured_valid[..., None],
+            (missing_age.astype(np.float32) / 60.0)[..., None],
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    tracker[..., :9] *= measured_valid[..., None]
+    known_mask_np = build_known_mask_from_measured_np(measured_valid[-1])
+    scenario = "fixed_six"
     batch = {
         "current_tracker_pos_head_ref": torch.from_numpy(tracker[-1:, :, :3]),
         "current_tracker_rot_head_ref_6d": torch.from_numpy(tracker[-1:, :, 3:9]),
-        "configured": torch.from_numpy(task["configured"][None]),
-        "measured_valid": torch.from_numpy(task["measured_valid"][None]),
-        "missing_age": torch.from_numpy(task["missing_age"][None]),
+        "configured": torch.from_numpy(configured[None]),
+        "measured_valid": torch.from_numpy(measured_valid[None]),
+        "missing_age": torch.from_numpy(missing_age[None].astype(np.int64)),
         "missing_age_norm": torch.from_numpy(tracker[None, :, :, 11]),
-        "current_head_yaw_world": torch.from_numpy(np.asarray(task["current_head_yaw_world"]).reshape(1)),
-        "current_head_position_world": torch.from_numpy(task["current_head_position_world"][None]),
-        "floor_y": torch.from_numpy(np.asarray(task["floor_y"]).reshape(1)),
-        "joint_offsets_parent": torch.from_numpy(task["joint_offsets_parent"][None]),
-        "joint_rest_local_rotations_6d": torch.from_numpy(task["joint_rest_local_rotations_6d"][None]),
-        "target_joints_head_ref": torch.from_numpy(task["target_joints_head_ref"][None]),
-        "target_root_position_head_ref": torch.from_numpy(task["target_root_position_head_ref"][None]),
-        "target_root_yaw_world": torch.from_numpy(np.asarray(task["target_root_yaw_world"]).reshape(1)),
-        "target_hip_height": torch.from_numpy(np.asarray(task["target_hip_height"]).reshape(1)),
+        "current_head_yaw_world": torch.from_numpy(row["current_head_yaw_world"][0:1]),
+        "current_head_position_world": torch.from_numpy(row["current_head_position_world"][0:1]),
+        "floor_y": torch.from_numpy(row["floor_y"][0:1]),
+        "joint_offsets_parent": torch.from_numpy(source["joint_offsets_parent"][None]),
+        "joint_rest_local_rotations_6d": torch.from_numpy(source["joint_rest_local_rotations_6d"][None]),
+        "target_joints_head_ref": torch.from_numpy(row["target_joints_head_ref"][0:1]),
+        "target_root_position_head_ref": torch.from_numpy(row["target_root_position_head_ref"][0:1]),
+        "target_root_yaw_world": torch.from_numpy(row["target_root_yaw_world"][0:1]),
+        "target_hip_height": torch.from_numpy(row["target_hip_height"][0:1]),
         "scenario": str(scenario),
     }
-    reference = torch.from_numpy(task["current_target"][None])
-    known_mask = torch.from_numpy(task["known_mask"][None])
+    reference = torch.from_numpy(row["current_target"][0:1])
+    known_mask = torch.from_numpy(known_mask_np[None])
     result_path = tmp_path / "reconstruction.npz"
     save_reconstruction(
         path=result_path,
