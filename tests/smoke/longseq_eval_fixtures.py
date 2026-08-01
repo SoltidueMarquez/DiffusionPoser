@@ -13,7 +13,7 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
     source_root = tmp_path / "sources"
     task_root = tmp_path / "tasks"
     task_run = task_root / "manual_run"
-    manifest_path = task_run / "test" / "manifest.jsonl"
+    manifest_path = task_run / "test" / "sources.jsonl"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     records = [
@@ -28,21 +28,33 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
             source_path = source_root / relative_path
             write_toy_source_npz(source_path=source_path, frame_count=frame_count)
             entry = {
-                "task_id": f"task_{index:03d}",
-                "task_path": f"tasks/task_{index:03d}.npz",
-                "split": "test",
+                "source_id": str(Path(relative_path).with_suffix(".npy")).replace("\\", "/"),
+                "source_index": index,
                 "source_path": str(source_path),
                 "source_relative_path": relative_path,
-                "stablemotion_split_key": str(Path(relative_path).with_suffix(".npy")).replace("\\", "/"),
                 "source_frames": frame_count,
                 "target_fps": 60.0,
                 "is_mirrored": is_mirrored,
-                "start_frame": 0,
-                "seq_len": 61,
-                "max_rollout_steps": 1,
-                "rollout_task_paths": [],
             }
             file.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+    (manifest_path.parent / "task_store.json").write_text(
+        json.dumps(
+            {
+                "generation_plan_hash": "toy_plan_hash",
+                "split": "test",
+                "sample_count": len(records),
+                "source_count": len(records),
+                "max_rollout_steps": 4,
+                "config_names": ["fixed_six", "fixed_three", "three_to_six", "six_to_three", "dropout"],
+                "shards": [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     write_latest_pointer(
         root_dir=task_root,

@@ -13,13 +13,13 @@ from typing import Any
 import numpy as np
 
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
-from data_loaders.realtime_pose_validation import validate_realtime_task_manifest_entry
+from data_loaders.realtime_pose_task_store import read_store_metadata
 from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY
 from utils.run_dirs import read_latest_pointer, write_latest_pointer
 
 
-DEFAULT_TASK_ROOT = "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks"
-DEFAULT_LONGSEQ_EVAL_ROOT = "dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_longseq_eval"
+DEFAULT_TASK_ROOT = "../artifactStore/DiffusionPoser/active/generated/tasks/realpose140_60hz"
+DEFAULT_LONGSEQ_EVAL_ROOT = "../artifactStore/DiffusionPoser/active/generated/longseq_eval/realpose140_60hz"
 DEFAULT_LONGSEQ_RUN_NAME = "v1_test_stress_long_seed10"
 LONGSEQ_LATEST_KIND = "longseq_eval"
 PRESET_STRESS_LONG = "stress_long"
@@ -53,7 +53,7 @@ def resolve_task_run_dir(task_dir: str | Path, task_run: str = "latest") -> Path
         latest = read_latest_pointer(root, kind="tasks")
         if latest is not None:
             return latest.resolve()
-        if (root / "test" / "manifest.jsonl").exists() or (root / "train" / "manifest.jsonl").exists():
+        if (root / "test" / "sources.jsonl").exists() or (root / "train" / "sources.jsonl").exists():
             return root
         raise FileNotFoundError(f"Cannot resolve latest task run under {root}")
 
@@ -111,16 +111,19 @@ def build_sequence_output_dir_name(entry: dict[str, Any]) -> str:
 
 def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
     task_run_dir = resolve_task_run_dir(task_dir=args.task_dir, task_run=args.task_run)
-    manifest_path = task_run_dir / str(args.split) / "manifest.jsonl"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Task manifest not found: {manifest_path}")
+    split_dir = task_run_dir / str(args.split)
+    source_manifest_path = split_dir / "sources.jsonl"
+    if not source_manifest_path.exists():
+        raise FileNotFoundError(f"Task source manifest not found: {source_manifest_path}")
 
-    entries = read_jsonl(manifest_path)
-    for index, entry in enumerate(entries, start=1):
-        validate_realtime_task_manifest_entry(entry, label=f"{manifest_path}:{index}")
+    store_metadata = read_store_metadata(split_dir)
+    if str(store_metadata.get("split", "")) != str(args.split):
+        raise ValueError(
+            f"task_store split={store_metadata.get('split')} 与请求 split={args.split} 不一致。"
+        )
+    entries = read_jsonl(source_manifest_path)
     selected = select_longseq_entries(
         entries=entries,
-        split=str(args.split),
         min_frames=int(args.min_frames),
         include_mirror=bool(args.include_mirror),
     )
@@ -141,14 +144,16 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
         output_dir=output_dir,
         sequence_dir=sequence_dir,
         task_run_dir=task_run_dir,
-        task_manifest_path=manifest_path,
+        source_manifest_path=source_manifest_path,
+        split=str(args.split),
         preset=str(args.preset),
     )
 
     config = build_config(
         args=args,
         task_run_dir=task_run_dir,
-        task_manifest_path=manifest_path,
+        source_manifest_path=source_manifest_path,
+        store_metadata=store_metadata,
     )
     summary = build_summary(
         manifest_entries=manifest_entries,
@@ -172,14 +177,11 @@ def build_realtime_longseq_eval_set(args: argparse.Namespace) -> Path:
 
 def select_longseq_entries(
     entries: list[dict[str, Any]],
-    split: str,
     min_frames: int,
     include_mirror: bool,
 ) -> list[dict[str, Any]]:
     deduped: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        if str(entry.get("split", split)) != split:
-            continue
         source_relative_path = normalize_slashes(str(entry.get("source_relative_path", "")))
         if not source_relative_path:
             continue
@@ -208,13 +210,17 @@ def copy_selected_sources(
     output_dir: Path,
     sequence_dir: Path,
     task_run_dir: Path,
-    task_manifest_path: Path,
+    source_manifest_path: Path,
+    split: str,
     preset: str,
 ) -> list[dict[str, Any]]:
     manifest_entries = []
     used_sequence_ids: set[str] = set()
     for index, task_entry in enumerate(selected):
-        original_source_path = resolve_task_source_path(task_entry=task_entry, task_manifest_path=task_manifest_path)
+        original_source_path = resolve_task_source_path(
+            task_entry=task_entry,
+            source_manifest_path=source_manifest_path,
+        )
         source = load_realtime_source(original_source_path)
         frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
         declared_frames = int(task_entry["source_frames"])
@@ -233,21 +239,23 @@ def copy_selected_sources(
                 "source_path": normalize_slashes(copied_path.relative_to(output_dir).as_posix()),
                 "original_source_path": str(original_source_path),
                 "source_relative_path": source_relative_path,
-                "stablemotion_split_key": normalize_slashes(str(task_entry.get("stablemotion_split_key", ""))),
-                "split": str(task_entry.get("split", "test")),
+                "stablemotion_split_key": normalize_slashes(
+                    str(task_entry.get("stablemotion_split_key") or task_entry.get("source_id", ""))
+                ),
+                "split": str(split),
                 "num_frames": frame_count,
                 "fps": float(task_entry["target_fps"]),
                 "preset": preset,
                 "is_mirrored": bool(task_entry.get("is_mirrored", False)) or source_relative_path.startswith("M/"),
                 "rank": index,
                 "task_run_dir": str(task_run_dir),
-                "task_manifest_path": str(task_manifest_path),
+                "source_manifest_path": str(source_manifest_path),
             }
         )
     return manifest_entries
 
 
-def resolve_task_source_path(task_entry: dict[str, Any], task_manifest_path: Path) -> Path:
+def resolve_task_source_path(task_entry: dict[str, Any], source_manifest_path: Path) -> Path:
     value = str(task_entry.get("source_path") or "")
     if not value:
         raise KeyError(f"Task entry missing source_path: {task_entry.get('task_id', '<unknown>')}")
@@ -256,7 +264,7 @@ def resolve_task_source_path(task_entry: dict[str, Any], task_manifest_path: Pat
         return path.resolve()
     if path.exists():
         return path.resolve()
-    return (task_manifest_path.parent / path).resolve()
+    return (source_manifest_path.parent / path).resolve()
 
 
 def reset_output_dir(output_root: Path, output_dir: Path, overwrite: bool) -> None:
@@ -281,7 +289,8 @@ def reset_output_dir(output_root: Path, output_dir: Path, overwrite: bool) -> No
 def build_config(
     args: argparse.Namespace,
     task_run_dir: Path,
-    task_manifest_path: Path,
+    source_manifest_path: Path,
+    store_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "kind": LONGSEQ_LATEST_KIND,
@@ -290,7 +299,8 @@ def build_config(
         "min_frames": int(args.min_frames),
         "include_mirror": bool(args.include_mirror),
         "task_run_dir": str(task_run_dir),
-        "task_manifest_path": str(task_manifest_path),
+        "source_manifest_path": str(source_manifest_path),
+        "generation_plan_hash": str(store_metadata["generation_plan_hash"]),
         "storage_mode": "copied_npz",
     }
 

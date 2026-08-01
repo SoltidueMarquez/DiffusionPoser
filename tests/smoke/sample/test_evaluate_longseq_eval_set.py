@@ -71,6 +71,8 @@ def test_longseq_140d_rollout_reinjects_prediction_and_keeps_missing_age(monkeyp
 
     assert payload["reconstructed_target_raw"].shape == (1, 3, 140)
     assert payload["predicted_joints_world"].shape == (1, 3, 24, 3)
+    assert payload["sampling_latency_ms"].shape == (1, 3)
+    assert np.isnan(payload["sampling_latency_ms"]).all()
     assert payload["missing_age"][0, :, 3].tolist() == [0, 1, 2]
     assert payload["scenario"].tolist() == [["fixed_six", "dropout", "dropout"]]
     assert len(captured_histories) == 3
@@ -86,3 +88,13 @@ def test_longseq_140d_rollout_reinjects_prediction_and_keeps_missing_age(monkeyp
     result = evaluate_rollout_file(result_path)
     assert result["samples"] == 3
     assert result["velocity_pairs"] == 2
+    assert result["acceleration_triplets"] == 1
+
+
+def test_longseq_defaults_to_five_steps_and_latency_summary_excludes_warmup():
+    args = longseq.build_arg_parser().parse_args(["--model_path", "model.pt"])
+    assert args.inference_steps == 5
+    summary = longseq.summarize_latency(np.asarray([100.0, 10.0, 20.0]), warmup_frames=1)
+    assert summary["frames"] == 2
+    assert summary["mean_ms"] == 15.0
+    assert summary["p95_ms"] == 19.5

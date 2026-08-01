@@ -50,4 +50,5 @@ def test_longseq_eval_builder_selects_test_non_mirror_long_sources(tmp_path):
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["sequence_count"] == 2
     assert summary["total_frames"] == 145
+    assert summary["config"]["generation_plan_hash"] == "toy_plan_hash"
     assert read_latest_pointer(output_root, "longseq_eval") == output_dir

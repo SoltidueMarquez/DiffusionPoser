@@ -60,6 +60,18 @@ def test_paper_metrics_use_expected_units_and_keep_sequence_boundaries(tmp_path)
     assert result["mpjre_deg"] == pytest.approx(expected_mpjre, abs=1e-5)
     assert result["mpjpe_cm"] == pytest.approx(1.25, abs=1e-6)
     assert result["mpjve_cm_s"] == pytest.approx(30.0, abs=1e-5)
+    assert result["mpjae_cm_s2"] is None
+
+
+def test_acceleration_error_uses_three_continuous_frames(tmp_path):
+    payload = _payload(sequence_count=1, steps=3)
+    payload["predicted_joints_world"][0, 2, :22, 0] = 0.01
+    path = tmp_path / "acceleration.npz"
+    np.savez(path, **payload)
+
+    result = evaluate_file(path)
+    assert result["acceleration_triplets"] == 1
+    assert result["mpjae_cm_s2"] == pytest.approx(3600.0, abs=1e-3)
 
 
 def test_paper_metrics_exclude_two_hand_end_joints(tmp_path):
@@ -86,6 +98,7 @@ def test_evaluation_reports_scenarios_and_missing_age_buckets(tmp_path):
 
     result = evaluate_file(path)
     assert result["mpjve_cm_s"] is None
+    assert result["mpjae_cm_s2"] is None
     assert result["by_scenario"]["dropout"]["samples"] == 4
     assert all(
         result["by_missing_age"][name]["samples"] == 1

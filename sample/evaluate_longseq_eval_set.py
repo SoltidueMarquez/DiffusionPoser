@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from argparse import BooleanOptionalAction
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from data_loaders.build_realtime_longseq_eval_set import (
     DEFAULT_LONGSEQ_EVAL_ROOT,
@@ -40,6 +42,7 @@ from sample.realtime_pose_runtime import (
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
 from sample.utils import load_checkpoint_model
 from utils import dist_util
+from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
 from utils.normalizer import RealtimePoseNormalizer
 from utils.parser_util import (
@@ -71,6 +74,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     longseq.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     longseq.add_argument("--limit", default=0, type=int)
     longseq.add_argument("--timeline_seed", default=10, type=int)
+    longseq.add_argument("--inference_steps", default=5, type=int)
+    longseq.add_argument("--latency_warmup_frames", default=20, type=int)
+    longseq.add_argument("--require_cuda", default=True, action=BooleanOptionalAction)
+    longseq.add_argument("--show_progress", default=True, action=BooleanOptionalAction)
 
     render = parser.add_argument_group("render")
     render.add_argument("--render_mp4", default=False, action=BooleanOptionalAction)
@@ -106,6 +113,9 @@ def rollout_long_sequence_source(
     timeline: TrackerTimeline,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
+    measure_latency: bool = False,
+    show_progress: bool = False,
+    progress_desc: str = "",
 ) -> dict[str, np.ndarray]:
     """对一个完整 source 做逐帧闭环采样，输出形状统一为 `[1,T,...]`。"""
 
@@ -137,8 +147,22 @@ def rollout_long_sequence_source(
     missing_ages: list[np.ndarray] = []
     scenarios: list[str] = []
     known_errors: list[float] = []
+    sampling_latency_ms: list[float] = []
+    e2e_latency_ms: list[float] = []
 
-    for absolute_frame in range(REALTIME_POSE_HISTORY_LENGTH, frame_count):
+    evaluated_frames = frame_count - REALTIME_POSE_HISTORY_LENGTH
+    frame_indices = range(REALTIME_POSE_HISTORY_LENGTH, frame_count)
+    if show_progress:
+        frame_indices = tqdm(
+            frame_indices,
+            total=evaluated_frames,
+            desc=progress_desc or "longseq",
+            unit="frame",
+            dynamic_ncols=True,
+        )
+
+    for absolute_frame in frame_indices:
+        frame_started = time.perf_counter()
         window_start = absolute_frame - REALTIME_POSE_HISTORY_LENGTH
         frame_slice = slice(window_start, absolute_frame + 1)
         timeline_window = timeline.window(window_start)
@@ -155,6 +179,9 @@ def rollout_long_sequence_source(
             normalizer=normalizer,
             initial_head_yaw=previous_head_yaw,
         )
+        if measure_latency:
+            torch.cuda.synchronize(device)
+            sampling_started = time.perf_counter()
         predicted_target = sample_online_target(
             model=model,
             diffusion=diffusion,
@@ -162,6 +189,11 @@ def rollout_long_sequence_source(
             device=device,
             normalizer=normalizer,
         )
+        if measure_latency:
+            torch.cuda.synchronize(device)
+            sampling_latency_ms.append((time.perf_counter() - sampling_started) * 1000.0)
+        else:
+            sampling_latency_ms.append(float("nan"))
         current_head_yaw = float(conditioning["current_head_yaw_world"])
         current_head_position = np.asarray(conditioning["current_head_position_world"], dtype=np.float32)
         resolved = decode_and_resolve_pose(
@@ -173,6 +205,14 @@ def rollout_long_sequence_source(
             joint_offsets_parent=source["joint_offsets_parent"],
             joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
         )
+        # 端到端延迟只覆盖在线必需路径；GT指标构造和结果收集不计入实时预算。
+        pose_history = [*pose_history[1:], resolved.as_world_state()]
+        if measure_latency:
+            torch.cuda.synchronize(device)
+            e2e_latency_ms.append((time.perf_counter() - frame_started) * 1000.0)
+        else:
+            e2e_latency_ms.append(float("nan"))
+
         reference_target = build_pose_target_np(
             joint_rotations_world[absolute_frame : absolute_frame + 1],
             source["root_yaw"][absolute_frame : absolute_frame + 1],
@@ -205,10 +245,6 @@ def rollout_long_sequence_source(
         scenarios.append(scenario)
         known_errors.append(resolved.known_rotation_max_error)
 
-        # 这里只回灌模型输出；GT pose 在第 60 帧之后不会再次进入历史。
-        pose_history = [*pose_history[1:], resolved.as_world_state()]
-
-    evaluated_frames = frame_count - REALTIME_POSE_HISTORY_LENGTH
     return {
         "fps": np.float32(60.0),
         "absolute_frame_index": np.arange(
@@ -236,6 +272,43 @@ def rollout_long_sequence_source(
         "scenario": np.asarray(scenarios)[None],
         "eval_frame_mask": np.ones((1, evaluated_frames), dtype=bool),
         "known_rotation_max_error": np.asarray(known_errors, dtype=np.float32)[None],
+        "sampling_latency_ms": np.asarray(sampling_latency_ms, dtype=np.float32)[None],
+        "e2e_latency_ms": np.asarray(e2e_latency_ms, dtype=np.float32)[None],
+    }
+
+
+def summarize_latency(values_ms: np.ndarray, warmup_frames: int = 0) -> dict[str, float | int | None]:
+    """汇总逐帧延迟；预热帧仍参与质量评估，但不参与性能统计。"""
+
+    values = np.asarray(values_ms, dtype=np.float64).reshape(-1)
+    warmup = min(max(int(warmup_frames), 0), values.size)
+    measured = values[warmup:]
+    measured = measured[np.isfinite(measured)]
+    if measured.size == 0:
+        return {
+            "frames": 0,
+            "warmup_frames": warmup,
+            "mean_ms": None,
+            "p50_ms": None,
+            "p90_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "max_ms": None,
+            "effective_fps": None,
+            "frames_under_16_67ms_ratio": None,
+        }
+    mean_ms = float(measured.mean())
+    return {
+        "frames": int(measured.size),
+        "warmup_frames": warmup,
+        "mean_ms": mean_ms,
+        "p50_ms": float(np.percentile(measured, 50)),
+        "p90_ms": float(np.percentile(measured, 90)),
+        "p95_ms": float(np.percentile(measured, 95)),
+        "p99_ms": float(np.percentile(measured, 99)),
+        "max_ms": float(measured.max()),
+        "effective_fps": 1000.0 / mean_ms if mean_ms > 0.0 else None,
+        "frames_under_16_67ms_ratio": float(np.mean(measured <= (1000.0 / 60.0))),
     }
 
 
@@ -257,6 +330,9 @@ def evaluate_longseq_entries(
     render_camera_mode: str = "follow",
     render_layout: str = "overlay",
     render_local_radius: float = 1.25,
+    latency_warmup_frames: int = 20,
+    runtime_metadata: dict[str, Any] | None = None,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     eval_set_dir = Path(eval_set_dir).resolve()
     output_dir = Path(output_dir).resolve()
@@ -266,7 +342,9 @@ def evaluate_longseq_entries(
         raise RuntimeError("长序列评估集合为空。")
 
     results = []
-    for entry in selected_entries:
+    sampling_latency_values: list[np.ndarray] = []
+    e2e_latency_values: list[np.ndarray] = []
+    for entry_index, entry in enumerate(selected_entries):
         sequence_id = str(entry["sequence_id"])
         source_path = resolve_manifest_source_path(eval_set_dir=eval_set_dir, entry=entry)
         source = load_realtime_source(source_path)
@@ -284,6 +362,9 @@ def evaluate_longseq_entries(
             timeline=timeline,
             device=device,
             normalizer=normalizer,
+            measure_latency=device.type == "cuda",
+            show_progress=bool(show_progress),
+            progress_desc=f"{entry_index + 1}/{len(selected_entries)} {sequence_id}",
         )
 
         sequence_dir = output_dir / build_sequence_output_dir_name(entry)
@@ -291,6 +372,13 @@ def evaluate_longseq_entries(
         result_path = sequence_dir / "rollout_result.npz"
         np.savez(result_path, **payload)
         result = evaluate_rollout_file(result_path)
+        sequence_warmup = int(latency_warmup_frames) if entry_index == 0 else 0
+        result["latency"] = {
+            "sampling": summarize_latency(payload["sampling_latency_ms"], sequence_warmup),
+            "e2e": summarize_latency(payload["e2e_latency_ms"], sequence_warmup),
+        }
+        sampling_latency_values.append(payload["sampling_latency_ms"].reshape(-1)[sequence_warmup:])
+        e2e_latency_values.append(payload["e2e_latency_ms"].reshape(-1)[sequence_warmup:])
         result.update(
             {
                 "sequence_id": sequence_id,
@@ -327,6 +415,13 @@ def evaluate_longseq_entries(
         results.append(result)
 
     aggregate = summarize_rollouts(results)
+    aggregate["latency"] = {
+        "sampling": summarize_latency(np.concatenate(sampling_latency_values)),
+        "e2e": summarize_latency(np.concatenate(e2e_latency_values)),
+    }
+    metadata = dict(runtime_metadata or {})
+    if device.type == "cuda":
+        metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
     summary_payload = {
         "summary": aggregate,
         "files": [public_result(result) for result in results],
@@ -338,6 +433,7 @@ def evaluate_longseq_entries(
             "weights": str(weights),
             "timeline_seed": int(timeline_seed),
             "sequence_count": len(results),
+            **metadata,
         },
     }
     aggregate_path = output_dir / "longseq_eval_summary.json"
@@ -355,7 +451,15 @@ def build_default_output_dir(eval_set_dir: Path, model_path: str | Path, weights
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
-    args = parse_and_load_from_model(build_arg_parser(), argv=argv)
+    args = parse_and_load_from_model(
+        build_arg_parser(),
+        argv=argv,
+        ignore_keys={"ts_respace"},
+    )
+    if int(args.inference_steps) <= 0:
+        raise ValueError("inference_steps 必须大于 0。")
+    args.ts_respace = f"ddim{int(args.inference_steps)}"
+    fixseed(int(args.seed))
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     entries = read_longseq_manifest(eval_set_dir)
     normalizer = (
@@ -364,10 +468,26 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         else None
     )
 
+    if bool(args.require_cuda) and (not bool(args.cuda) or not torch.cuda.is_available()):
+        raise RuntimeError("长序列实时评测要求使用可用的 CUDA GPU。")
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
+    if bool(args.require_cuda) and device.type != "cuda":
+        raise RuntimeError(f"长序列实时评测期望 CUDA，实际设备为 {device}。")
     model, diffusion = create_model_and_diffusion(args)
+    if int(diffusion.num_timesteps) != int(args.inference_steps):
+        raise RuntimeError(
+            f"期望 {args.inference_steps} 个 DDIM 推理步，实际为 {diffusion.num_timesteps}。"
+        )
     model, weights = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
+    model.eval()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    timestep_map = [int(value) for value in diffusion.timestep_map]
+    print(
+        f"[longseq] device={device}, train_steps={args.diffusion_steps}, "
+        f"inference_steps={diffusion.num_timesteps}, timestep_map={timestep_map}"
+    )
     output_dir = (
         Path(args.output_dir).resolve()
         if str(args.output_dir).strip()
@@ -391,6 +511,20 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         render_camera_mode=str(args.render_camera_mode),
         render_layout=str(args.render_layout),
         render_local_radius=float(args.render_local_radius),
+        latency_warmup_frames=int(args.latency_warmup_frames),
+        runtime_metadata={
+            "device": str(device),
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "",
+            "batch_size": 1,
+            "training_diffusion_steps": int(args.diffusion_steps),
+            "inference_steps": int(diffusion.num_timesteps),
+            "timestep_map": timestep_map,
+            "use_ema": bool(args.use_ema),
+            "diffusion_seed": int(args.seed),
+            "latency_warmup_frames": int(args.latency_warmup_frames),
+            "history_initialization": "ground_truth_60_frames",
+        },
+        show_progress=bool(args.show_progress),
     )
     print(f"[evaluate_longseq_eval_set] wrote {summary['summary_path']}")
     return summary

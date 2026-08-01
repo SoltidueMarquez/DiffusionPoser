@@ -5,6 +5,7 @@ METRIC_KEYS = (
     "mpjre_deg",
     "mpjpe_cm",
     "mpjve_cm_s",
+    "mpjae_cm_s2",
     "unknown_rotation_deg",
     "root_yaw_error_deg",
     "root_xz_error_m",
@@ -17,10 +18,12 @@ def _result(samples: int, mpjpe_sum: float, mpjpe_count: int, known_max: float) 
     stats = {key: {"sum": 0.0, "count": samples} for key in METRIC_KEYS}
     stats["mpjpe_cm"] = {"sum": mpjpe_sum, "count": mpjpe_count}
     stats["mpjve_cm_s"] = {"sum": 0.0, "count": 0}
+    stats["mpjae_cm_s2"] = {"sum": 0.0, "count": 0}
     return {
         "sequences": 1,
         "samples": samples,
         "velocity_pairs": 0,
+        "acceleration_triplets": 0,
         "known_tracker_rotation_max_error_deg": known_max,
         "by_scenario": {},
         "by_missing_age": {},

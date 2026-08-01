@@ -120,9 +120,11 @@ def _load_result(path: Path) -> dict[str, np.ndarray]:
 def _group_metrics(
     frame_select: np.ndarray,
     pair_select: np.ndarray,
+    triple_select: np.ndarray,
     mpjre_per_frame: np.ndarray,
     mpjpe_per_frame_m: np.ndarray,
     mpjve_per_frame_m_s: np.ndarray,
+    mpjae_per_frame_m_s2: np.ndarray,
     unknown_rotation_per_frame: np.ndarray,
     root_yaw_error: np.ndarray,
     root_unknown: np.ndarray,
@@ -134,10 +136,12 @@ def _group_metrics(
     return {
         "samples": int(frame_select.sum()),
         "velocity_pairs": int(pair_select.sum()),
+        "acceleration_triplets": int(triple_select.sum()),
         "root_yaw_samples": int(root_yaw_select.sum()),
         "mpjre_deg": _mean_or_zero(mpjre_per_frame, frame_select),
         "mpjpe_cm": _mean_or_zero(mpjpe_per_frame_m, frame_select, scale=100.0),
         "mpjve_cm_s": _mean_or_none(mpjve_per_frame_m_s, pair_select, scale=100.0),
+        "mpjae_cm_s2": _mean_or_none(mpjae_per_frame_m_s2, triple_select, scale=100.0),
         "unknown_rotation_deg": _mean_or_zero(unknown_rotation_per_frame, frame_select, scale=180.0 / np.pi),
         "root_yaw_error_deg": _mean_or_zero(root_yaw_error, root_yaw_select, scale=180.0 / np.pi),
         "root_xz_error_m": _mean_or_zero(root_xz_error, frame_select),
@@ -185,6 +189,16 @@ def evaluate_file(path: Path) -> dict[str, object]:
     mpjve_per_frame_m_s[:, 1:] = velocity_error.mean(axis=-1)
     pair_frame_mask = np.zeros(frame_shape, dtype=bool)
     pair_frame_mask[:, 1:] = pair_mask
+
+    # 加速度误差需要三个连续有效帧；结果对齐到三元组的最后一帧。
+    triple_mask = eval_mask[:, 2:] & eval_mask[:, 1:-1] & eval_mask[:, :-2]
+    predicted_acceleration = np.diff(predicted_velocity, axis=1) * fps
+    reference_acceleration = np.diff(reference_velocity, axis=1) * fps
+    acceleration_error = np.linalg.norm(predicted_acceleration - reference_acceleration, axis=-1)
+    mpjae_per_frame_m_s2 = np.zeros(frame_shape, dtype=np.float64)
+    mpjae_per_frame_m_s2[:, 2:] = acceleration_error.mean(axis=-1)
+    triple_frame_mask = np.zeros(frame_shape, dtype=bool)
+    triple_frame_mask[:, 2:] = triple_mask
 
     known = values["known_mask"].reshape(sequence_count, steps, 140).astype(bool)
     reference_global = rotation_6d_to_matrix_np(
@@ -238,12 +252,15 @@ def evaluate_file(path: Path) -> dict[str, object]:
     for scenario in sorted(set(scenarios[eval_mask].tolist())):
         frame_select = eval_mask & (scenarios == scenario)
         pair_select = pair_frame_mask & (scenarios == scenario)
+        triple_select = triple_frame_mask & (scenarios == scenario)
         per_scenario[scenario] = _group_metrics(
             frame_select,
             pair_select,
+            triple_select,
             mpjre_per_frame,
             mpjpe_per_frame_m,
             mpjve_per_frame_m_s,
+            mpjae_per_frame_m_s2,
             unknown_rotation_per_frame,
             root_yaw_error,
             root_unknown,
@@ -256,12 +273,15 @@ def evaluate_file(path: Path) -> dict[str, object]:
     for name, lower, upper in MISSING_AGE_BUCKETS:
         frame_select = eval_mask & (max_missing_age >= lower) & (max_missing_age <= upper)
         pair_select = pair_frame_mask & (max_missing_age >= lower) & (max_missing_age <= upper)
+        triple_select = triple_frame_mask & (max_missing_age >= lower) & (max_missing_age <= upper)
         by_missing_age[name] = _group_metrics(
             frame_select,
             pair_select,
+            triple_select,
             mpjre_per_frame,
             mpjpe_per_frame_m,
             mpjve_per_frame_m_s,
+            mpjae_per_frame_m_s2,
             unknown_rotation_per_frame,
             root_yaw_error,
             root_unknown,
@@ -275,6 +295,7 @@ def evaluate_file(path: Path) -> dict[str, object]:
         "mpjre_deg": _sum_count(mpjre_components, eval_mask[..., None, None]),
         "mpjpe_cm": _sum_count(joint_distance, eval_mask[..., None], scale=100.0),
         "mpjve_cm_s": _sum_count(velocity_error, pair_mask[..., None], scale=100.0),
+        "mpjae_cm_s2": _sum_count(acceleration_error, triple_mask[..., None], scale=100.0),
         "unknown_rotation_deg": _sum_count(unknown_rotation_per_frame, eval_mask, scale=180.0 / np.pi),
         "root_yaw_error_deg": _sum_count(root_yaw_error, eval_mask & root_unknown, scale=180.0 / np.pi),
         "root_xz_error_m": _sum_count(root_xz_error, eval_mask),
@@ -287,9 +308,11 @@ def evaluate_file(path: Path) -> dict[str, object]:
         "sequences": sequence_count,
         "samples": int(eval_mask.sum()),
         "velocity_pairs": int(pair_mask.sum()),
+        "acceleration_triplets": int(triple_mask.sum()),
         "mpjre_deg": _metric_from_stats(metric_stats["mpjre_deg"]),
         "mpjpe_cm": _metric_from_stats(metric_stats["mpjpe_cm"]),
         "mpjve_cm_s": _metric_from_stats(metric_stats["mpjve_cm_s"], empty=None),
+        "mpjae_cm_s2": _metric_from_stats(metric_stats["mpjae_cm_s2"], empty=None),
         "unknown_rotation_deg": _metric_from_stats(metric_stats["unknown_rotation_deg"]),
         "root_yaw_error_deg": _metric_from_stats(metric_stats["root_yaw_error_deg"]),
         "root_xz_error_m": _metric_from_stats(metric_stats["root_xz_error_m"]),
@@ -310,6 +333,7 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
         "mpjre_deg",
         "mpjpe_cm",
         "mpjve_cm_s",
+        "mpjae_cm_s2",
         "unknown_rotation_deg",
         "root_yaw_error_deg",
         "root_xz_error_m",
@@ -321,13 +345,17 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
         "sequences": int(sum(int(result["sequences"]) for result in results)),
         "samples": int(sum(int(result["samples"]) for result in results)),
         "velocity_pairs": int(sum(int(result["velocity_pairs"]) for result in results)),
+        "acceleration_triplets": int(sum(int(result["acceleration_triplets"]) for result in results)),
     }
     for key in metric_keys:
         stats = {
             "sum": sum(float(result["_metric_stats"][key]["sum"]) for result in results),
             "count": sum(int(result["_metric_stats"][key]["count"]) for result in results),
         }
-        summary[key] = _metric_from_stats(stats, empty=None if key == "mpjve_cm_s" else 0.0)
+        summary[key] = _metric_from_stats(
+            stats,
+            empty=None if key in {"mpjve_cm_s", "mpjae_cm_s2"} else 0.0,
+        )
     summary["known_tracker_rotation_max_error_deg"] = max(
         float(result["known_tracker_rotation_max_error_deg"]) for result in results
     )
@@ -341,6 +369,7 @@ def _summarize_groups(results: list[dict[str, object]], group_key: str) -> dict[
         "mpjre_deg",
         "mpjpe_cm",
         "mpjve_cm_s",
+        "mpjae_cm_s2",
         "unknown_rotation_deg",
         "root_yaw_error_deg",
         "root_xz_error_m",
@@ -359,15 +388,19 @@ def _summarize_groups(results: list[dict[str, object]], group_key: str) -> dict[
         groups = [result[group_key][name] for result in results if name in result[group_key]]
         samples = sum(int(group["samples"]) for group in groups)
         velocity_pairs = sum(int(group["velocity_pairs"]) for group in groups)
+        acceleration_triplets = sum(int(group["acceleration_triplets"]) for group in groups)
         root_yaw_samples = sum(int(group["root_yaw_samples"]) for group in groups)
         values: dict[str, object] = {
             "samples": samples,
             "velocity_pairs": velocity_pairs,
+            "acceleration_triplets": acceleration_triplets,
             "root_yaw_samples": root_yaw_samples,
         }
         for key in metric_keys:
             if key == "mpjve_cm_s":
                 weight_key = "velocity_pairs"
+            elif key == "mpjae_cm_s2":
+                weight_key = "acceleration_triplets"
             elif key == "root_yaw_error_deg":
                 weight_key = "root_yaw_samples"
             else:
@@ -381,7 +414,7 @@ def _summarize_groups(results: list[dict[str, object]], group_key: str) -> dict[
             values[key] = (
                 sum(value * weight for value, weight in weighted) / total_weight
                 if total_weight
-                else None if key == "mpjve_cm_s" else 0.0
+                else None if key in {"mpjve_cm_s", "mpjae_cm_s2"} else 0.0
             )
         aggregated[name] = values
     return aggregated
