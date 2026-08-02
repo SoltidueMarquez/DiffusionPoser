@@ -78,6 +78,7 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
         "sample_count",
         "source_count",
         "max_rollout_steps",
+        "two_point_phase_counts",
         "config_names",
         "tracker_feature_dim",
         "schema_fields",
@@ -92,6 +93,15 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
         raise ValueError(f"{path} sample_count/source_count 必须大于 0。")
     if tuple(value["config_names"]) != TRACKER_PATTERN_CATEGORIES:
         raise ValueError(f"{path} 场景列表与当前五类训练契约不一致。")
+    phase_counts = value["two_point_phase_counts"]
+    if not isinstance(phase_counts, dict) or set(phase_counts) != {"dropout", "reconnect"}:
+        raise ValueError(f"{path} 两点掉线 phase 统计结构无效。")
+    phase_counts = {phase: int(count) for phase, count in phase_counts.items()}
+    if min(phase_counts.values()) < 0 or sum(phase_counts.values()) != int(value["sample_count"]):
+        raise ValueError(f"{path} 两点掉线 phase 统计与 sample_count 不一致。")
+    allowed_difference = max(1, int(np.ceil(int(value["sample_count"]) * 0.2)))
+    if abs(phase_counts["dropout"] - phase_counts["reconnect"]) > allowed_difference:
+        raise ValueError(f"{path} 两点掉线 phase 统计不满足近似 1:1 契约。")
     required_fields = {
         "pose_history",
         "current_target",

@@ -5,8 +5,15 @@ import numpy as np
 from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
+    LEFT_HAND_TRACKER_INDEX,
+    REALTIME_POSE_TARGET_START,
+    RIGHT_HAND_TRACKER_INDEX,
     SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
     TRACKER_PATTERN_CATEGORIES,
+)
+from data_loaders.generate_realtime_pose_tasks import (
+    select_window_starts,
+    validate_two_point_phase_balance,
 )
 from data_loaders.tracker_reliability import (
     compute_hard_rotation_state_np,
@@ -139,6 +146,14 @@ def test_task_generation_uses_source_absolute_events_for_overlapping_windows():
     np.testing.assert_array_equal(first.measured_valid[:, 1:], second.measured_valid[:, :-1])
     np.testing.assert_array_equal(first.d_off[:, 1:], second.d_off[:, :-1])
     np.testing.assert_array_equal(first.d_on[:, 1:], second.d_on[:, :-1])
+    selected_starts = select_window_starts(
+        frame_count=720,
+        count=20,
+        max_rollout_steps=4,
+        global_seed=12,
+        split="train",
+        source_id=source_id,
+    )
     phases = [
         build_task_config_plan(
             f"phase-{start}",
@@ -148,6 +163,78 @@ def test_task_generation_uses_source_absolute_events_for_overlapping_windows():
             start_frame=start,
             source_frame_count=720,
         )[-1]["target_phase"]
-        for start in starts
+        for start in selected_starts
     ]
-    assert abs(phases.count("dropout") - phases.count("reconnect")) <= 5
+    assert len(selected_starts) == 20
+    assert abs(phases.count("dropout") - phases.count("reconnect")) <= 1
+
+
+def test_reconnect_candidates_cover_full_warmup_and_hand_hard_reentry():
+    source_id = "source/full-reconnect"
+    starts = candidate_source_window_starts(source_id, 720, 4, global_seed=21)
+    recovery_offsets: set[int] = set()
+    hard_entry: tuple[int, list[dict]] | None = None
+
+    for start in starts:
+        plans = build_task_config_plan(
+            f"reconnect-{start}",
+            21,
+            4,
+            source_id=source_id,
+            start_frame=start,
+            source_frame_count=720,
+        )
+        dropout = plans[-1]
+        if dropout["target_phase"] != "reconnect":
+            continue
+        reconnect_frame = int(dropout["dropout_start"]) + int(dropout["dropout_duration"])
+        target_frame = int(start) + REALTIME_POSE_TARGET_START
+        recovery_offset = target_frame - reconnect_frame
+        recovery_offsets.add(recovery_offset)
+        if recovery_offset == 14:
+            hard_entry = (start, plans)
+
+    assert recovery_offsets == set(range(15))
+    assert hard_entry is not None
+
+    start, plans = hard_entry
+    # 显式改成双手掉线，保护“手部只能通过两点重连覆盖 Hard 重入”的契约。
+    hand_plans = [dict(plan) for plan in plans]
+    hand_plans[-1]["dropped_trackers"] = [LEFT_HAND_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX]
+    states = materialize_task_configurations(
+        hand_plans,
+        frame_count=64,
+        absolute_start_frame=start,
+    )
+    hand_indices = np.asarray([LEFT_HAND_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX], dtype=np.int64)
+    previous = REALTIME_POSE_TARGET_START - 1
+    current = REALTIME_POSE_TARGET_START
+    np.testing.assert_array_equal(states.d_on[-1, previous, hand_indices], np.full(2, 14))
+    assert not states.hard_rotation_state[-1, previous, hand_indices].any()
+    np.testing.assert_array_equal(states.d_on[-1, current, hand_indices], np.full(2, 15))
+    assert states.hard_rotation_state[-1, current, hand_indices].all()
+
+
+def test_split_phase_balance_validation_rejects_large_bias():
+    def task(task_id: str, phase: str) -> dict:
+        return {
+            "task_id": task_id,
+            "configs": [
+                {
+                    "scenario": SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
+                    "target_phase": phase,
+                }
+            ],
+        }
+
+    balanced = [task(f"dropout-{index}", "dropout") for index in range(5)]
+    balanced += [task(f"reconnect-{index}", "reconnect") for index in range(5)]
+    assert validate_two_point_phase_balance(balanced, "train") == {
+        "dropout": 5,
+        "reconnect": 5,
+    }
+
+    biased = [task(f"dropout-{index}", "dropout") for index in range(9)]
+    biased.append(task("reconnect-0", "reconnect"))
+    with np.testing.assert_raises_regex(RuntimeError, "两点掉线阶段失衡"):
+        validate_two_point_phase_balance(biased, "train")

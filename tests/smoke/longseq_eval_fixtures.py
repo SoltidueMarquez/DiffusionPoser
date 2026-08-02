@@ -48,6 +48,10 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
                 "sample_count": len(records),
                 "source_count": len(records),
                 "max_rollout_steps": 4,
+                "two_point_phase_counts": {
+                    "dropout": (len(records) + 1) // 2,
+                    "reconnect": len(records) // 2,
+                },
                 "config_names": list(TRACKER_PATTERN_CATEGORIES),
                 "tracker_feature_dim": TRACKER_FEATURE_DIM,
                 "schema_fields": sorted(shard_fields(4)),

@@ -39,14 +39,16 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
+    SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
     TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_PATTERN_CATEGORIES,
 )
 from data_loaders.tracker_timeline import (
+    TWO_POINT_TARGET_PHASES,
     build_task_config_plan,
-    candidate_source_window_starts,
+    candidate_source_window_starts_by_phase,
     materialize_task_configurations,
     stable_context_seed,
 )
@@ -65,6 +67,7 @@ class SplitTaskPlan:
     split: str
     sources: list[dict]
     tasks: list[dict]
+    two_point_phase_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -205,8 +208,49 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
                 )
         if not tasks:
             raise RuntimeError(f"split={split} 没有可生成的 task。")
-        split_plans.append(SplitTaskPlan(split=split, sources=sources, tasks=tasks))
+        phase_counts = validate_two_point_phase_balance(tasks, split)
+        split_plans.append(
+            SplitTaskPlan(
+                split=split,
+                sources=sources,
+                tasks=tasks,
+                two_point_phase_counts=phase_counts,
+            )
+        )
     return TaskGenerationPlan(source_dir, output_root, output_dir, split_plans)
+
+
+def validate_two_point_phase_balance(tasks: list[dict], split: str) -> dict[str, int]:
+    """统计并验证 split 级两点掉线阶段，避免短 source 回填累积成分布偏差。"""
+
+    counts = {phase: 0 for phase in TWO_POINT_TARGET_PHASES}
+    for task in tasks:
+        two_point_plan = next(
+            (
+                plan
+                for plan in task["configs"]
+                if plan["scenario"] == SCENARIO_TWO_POINT_DROPOUT_RECONNECT
+            ),
+            None,
+        )
+        if two_point_plan is None:
+            raise RuntimeError(f"split={split} 的 task={task['task_id']} 缺少两点掉线场景。")
+        phase = str(two_point_plan["target_phase"])
+        if phase not in counts:
+            raise RuntimeError(f"split={split} 出现未知的两点掉线阶段：{phase}")
+        counts[phase] += 1
+
+    total = sum(counts.values())
+    # 默认选择器在可用时做到精确 1:1；这里为短 source 缺少某个 phase
+    # 时的回填留出 20% 总量容差，但不允许失衡静默进入正式 task store。
+    allowed_difference = max(1, int(np.ceil(total * 0.2)))
+    difference = abs(counts["dropout"] - counts["reconnect"])
+    if difference > allowed_difference:
+        raise RuntimeError(
+            f"split={split} 的两点掉线阶段失衡：{counts}，"
+            f"允许的最大数量差为 {allowed_difference}。"
+        )
+    return counts
 
 
 def select_window_starts(
@@ -217,25 +261,66 @@ def select_window_starts(
     split: str,
     source_id: str,
 ) -> list[int]:
-    candidates = candidate_source_window_starts(
+    candidates_by_phase = candidate_source_window_starts_by_phase(
         source_id=source_id,
         frame_count=frame_count,
         max_rollout_steps=max_rollout_steps,
         global_seed=global_seed,
     )
+    candidates = sorted({start for values in candidates_by_phase.values() for start in values})
     if not candidates:
         return []
     if len(candidates) <= int(count):
         return candidates
-    rng = np.random.Generator(
-        np.random.PCG64(stable_context_seed(global_seed, split, source_id, "window"))
-    )
-    starts: list[int] = []
-    for interval_index in range(int(count)):
-        low = interval_index * len(candidates) // int(count)
-        high = (interval_index + 1) * len(candidates) // int(count)
-        starts.append(int(candidates[int(rng.integers(low, high))]))
-    return sorted(starts)
+
+    # phase 数量由选择器控制，不再依赖单个 15 帧事件内部切半。
+    # 每个 phase 内仍按绝对时间分层，避免样本聚集在少数 source 片段。
+    phase_offset = int(stable_context_seed(global_seed, split, source_id, "window_phase") % 2)
+    phase_order = TWO_POINT_TARGET_PHASES[phase_offset:] + TWO_POINT_TARGET_PHASES[:phase_offset]
+    quotas = {phase: int(count) // 2 for phase in TWO_POINT_TARGET_PHASES}
+    quotas[phase_order[0]] += int(count) % 2
+
+    selected: list[int] = []
+    for phase in TWO_POINT_TARGET_PHASES:
+        phase_rng = np.random.Generator(
+            np.random.PCG64(stable_context_seed(global_seed, split, source_id, "window", phase))
+        )
+        selected.extend(
+            _select_stratified_starts(candidates_by_phase[phase], quotas[phase], phase_rng)
+        )
+
+    # 短 source 可能只含一种 phase；先保证不丢失可用任务，全 split 的
+    # 1:1 覆盖由生成计划和 smoke test 继续监督。
+    remaining_count = int(count) - len(selected)
+    if remaining_count > 0:
+        selected_set = set(selected)
+        remaining = [start for start in candidates if start not in selected_set]
+        remainder_rng = np.random.Generator(
+            np.random.PCG64(stable_context_seed(global_seed, split, source_id, "window", "remainder"))
+        )
+        selected.extend(_select_stratified_starts(remaining, remaining_count, remainder_rng))
+    return sorted(selected)
+
+
+def _select_stratified_starts(
+    candidates: list[int],
+    count: int,
+    rng: np.random.Generator,
+) -> list[int]:
+    """沿绝对时间均匀选取窗口，同时保持 seed 可复现。"""
+
+    values = sorted(set(int(value) for value in candidates))
+    requested = int(count)
+    if requested <= 0:
+        return []
+    if len(values) <= requested:
+        return values
+    selected: list[int] = []
+    for interval_index in range(requested):
+        low = interval_index * len(values) // requested
+        high = (interval_index + 1) * len(values) // requested
+        selected.append(values[int(rng.integers(low, high))])
+    return selected
 
 
 def materialize_split(
@@ -359,6 +444,7 @@ def materialize_split(
             "sample_count": len(split_plan.tasks),
             "source_count": len(split_plan.sources),
             "max_rollout_steps": max_rollout_steps,
+            "two_point_phase_counts": split_plan.two_point_phase_counts,
             "config_names": list(TRACKER_PATTERN_CATEGORIES),
             "tracker_feature_dim": TRACKER_FEATURE_DIM,
             "schema_fields": sorted(shard_fields(max_rollout_steps)),

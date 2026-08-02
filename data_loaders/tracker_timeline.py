@@ -29,6 +29,7 @@ DROPOUT_DURATION_MIN = 5
 DROPOUT_DURATION_MAX = 30
 RECOVERY_WINDOW_FRAMES = 15
 SOURCE_EVENT_PERIOD = 120
+TWO_POINT_TARGET_PHASES = ("dropout", "reconnect")
 
 
 @dataclass(frozen=True)
@@ -128,8 +129,10 @@ def build_task_config_plan(
                 duration = int(selected_event["dropout_duration"])
                 dropped = np.asarray(selected_event["dropped_trackers"], dtype=np.int64)
                 dropout_start = int(selected_event["dropout_start"])
-                reconnect_frame = dropout_start + duration
-                phase = "dropout" if absolute_target < reconnect_frame else "reconnect"
+                reconnect_frame = int(selected_event["reconnect_frame"])
+                phase = str(selected_event["target_phase"])
+                if reconnect_frame != dropout_start + duration:
+                    raise RuntimeError("两点掉线事件的重连帧与掉线时长不一致。")
             else:
                 duration = int(rng.integers(DROPOUT_DURATION_MIN, DROPOUT_DURATION_MAX + 1))
                 dropped = rng.choice(np.asarray(NON_HEAD_TRACKER_INDICES), size=2, replace=False)
@@ -165,6 +168,9 @@ def build_source_scenario_events(
     rng = np.random.Generator(np.random.PCG64(stable_source_seed(source_id, global_seed)))
     available_phase = min(SOURCE_EVENT_PERIOD - 1, last_target - REALTIME_POSE_TARGET_START)
     first_event = REALTIME_POSE_TARGET_START + int(rng.integers(0, available_phase + 1))
+    # 同一事件的 15 个候选帧只承担一种阶段，避免从中点切分后
+    # 恢复阶段最多只剩 7～8 帧。首个阶段由 source hash 决定，短 source 也不会固定偏向某一类。
+    phase_offset = int(stable_context_seed(global_seed, source_id, "two_point_phase") % 2)
     events: list[dict] = []
     for event_index, transition_frame in enumerate(
         range(first_event, last_target + 1, SOURCE_EVENT_PERIOD)
@@ -179,21 +185,54 @@ def build_source_scenario_events(
                 np.asarray(NON_HEAD_TRACKER_INDICES), size=2, replace=False
             ).tolist()
         )
-        # 一个绝对事件同时提供掉线中和刚重连目标，7/8 帧切分使候选近似 1:1。
         event_window = min(RECOVERY_WINDOW_FRAMES, last_target - transition_frame + 1)
-        midpoint = max(1, event_window // 2)
-        reconnect_offset = midpoint if event_index % 2 == 0 else min(event_window - 1, midpoint + 1)
-        dropout_start = transition_frame + reconnect_offset - duration
+        target_phase = TWO_POINT_TARGET_PHASES[(event_index + phase_offset) % 2]
+        # reconnect 事件从重连帧开始枚举 0～14；dropout 事件把重连点
+        # 放在候选窗口之后，使被接受的目标帧仍严格处于掉线期。
+        reconnect_frame = (
+            int(transition_frame)
+            if target_phase == "reconnect"
+            else int(transition_frame + event_window)
+        )
+        dropout_start = reconnect_frame - duration
         events.append(
             {
                 "transition_frame": int(transition_frame),
                 "dropout_start": int(dropout_start),
                 "dropout_duration": duration,
                 "dropped_trackers": dropped,
-                "reconnect_frame": int(transition_frame + reconnect_offset),
+                "reconnect_frame": reconnect_frame,
+                "target_phase": target_phase,
             }
         )
     return events
+
+
+def candidate_source_window_starts_by_phase(
+    source_id: str,
+    frame_count: int,
+    max_rollout_steps: int,
+    global_seed: int = 10,
+) -> dict[str, list[int]]:
+    """按两点掉线阶段返回满足动态场景契约的窗口起点。"""
+
+    starts = {phase: [] for phase in TWO_POINT_TARGET_PHASES}
+    for event in build_source_scenario_events(
+        source_id, frame_count, max_rollout_steps, global_seed
+    ):
+        anchor = int(event["transition_frame"])
+        phase = str(event["target_phase"])
+        if phase not in starts:
+            raise RuntimeError(f"未知的两点掉线目标阶段：{phase}")
+        for offset in range(RECOVERY_WINDOW_FRAMES):
+            target = anchor + offset
+            start = target - REALTIME_POSE_TARGET_START
+            if start < 0 or not _event_accepts_target(event, target):
+                continue
+            if target + int(max_rollout_steps) - 1 + 3 >= int(frame_count):
+                continue
+            starts[phase].append(start)
+    return {phase: sorted(set(values)) for phase, values in starts.items()}
 
 
 def candidate_source_window_starts(
@@ -202,29 +241,27 @@ def candidate_source_window_starts(
     max_rollout_steps: int,
     global_seed: int = 10,
 ) -> list[int]:
-    """只返回同时满足切换 0～14 帧和两点掉线/重连分桶的绝对窗口起点。"""
+    """返回同时满足切换 0～14 帧和两点掉线/重连契约的窗口起点。"""
 
-    starts: list[int] = []
-    for event in build_source_scenario_events(
-        source_id, frame_count, max_rollout_steps, global_seed
-    ):
-        anchor = int(event["transition_frame"])
-        for offset in range(RECOVERY_WINDOW_FRAMES):
-            target = anchor + offset
-            start = target - REALTIME_POSE_TARGET_START
-            if start < 0 or not _event_accepts_target(event, target):
-                continue
-            if target + int(max_rollout_steps) - 1 + 3 >= int(frame_count):
-                continue
-            starts.append(start)
-    return sorted(set(starts))
+    starts_by_phase = candidate_source_window_starts_by_phase(
+        source_id=source_id,
+        frame_count=frame_count,
+        max_rollout_steps=max_rollout_steps,
+        global_seed=global_seed,
+    )
+    return sorted({start for values in starts_by_phase.values() for start in values})
 
 
 def _event_accepts_target(event: dict, target_frame: int) -> bool:
     dropout_start = int(event["dropout_start"])
     reconnect_frame = dropout_start + int(event["dropout_duration"])
     target = int(target_frame)
-    return dropout_start <= target < reconnect_frame or 0 <= target - reconnect_frame < RECOVERY_WINDOW_FRAMES
+    phase = str(event["target_phase"])
+    if phase == "dropout":
+        return dropout_start <= target < reconnect_frame
+    if phase == "reconnect":
+        return 0 <= target - reconnect_frame < RECOVERY_WINDOW_FRAMES
+    raise ValueError(f"未知的两点掉线目标阶段：{phase}")
 
 
 def materialize_task_configurations(

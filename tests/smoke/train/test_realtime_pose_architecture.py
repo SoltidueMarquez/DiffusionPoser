@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS
@@ -91,6 +93,121 @@ def test_self_attention_and_mlp_use_independent_six_parameter_adaln():
         atol=1e-5,
         rtol=0.0,
     )
+
+
+def test_condition_branches_share_the_same_initial_query():
+    torch.manual_seed(0)
+    model = _model()
+    block = model.blocks[0]
+    values = _conditioning(batch_size=1)
+    prepared = model.prepare_conditioning(*values)
+    hidden = torch.randn(1, 144)
+
+    joint_values = hidden.reshape(1, 24, 6)
+    joint_ids = torch.arange(24)
+    initial_target = (
+        model.joint_input(joint_values)
+        + model.joint_identity(joint_ids)[None]
+        + model.region_identity(model.joint_regions)[None]
+    )
+    expected_query = block.conditioning_norm(initial_target)
+    captured_queries: dict[str, torch.Tensor] = {}
+    normalization_outputs: list[torch.Tensor] = []
+
+    def capture_normalization(_module, _inputs, output) -> None:
+        normalization_outputs.append(output.detach().clone())
+
+    def capture_query(name: str):
+        def hook(_module, inputs) -> None:
+            captured_queries[name] = inputs[0].detach().clone()
+
+        return hook
+
+    handles = [
+        block.conditioning_norm.register_forward_hook(capture_normalization),
+        block.context_attention.register_forward_pre_hook(capture_query("state")),
+        block.position_attention.register_forward_pre_hook(capture_query("position")),
+        block.rotation_attention.register_forward_pre_hook(capture_query("rotation")),
+        block.prior_attention.register_forward_pre_hook(capture_query("prior")),
+    ]
+    try:
+        with torch.no_grad():
+            model(
+                hidden,
+                torch.ones(1, dtype=torch.long),
+                prepared_conditioning=prepared,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # 条件融合阶段只允许从 block 初始 residual state 计算一次公共 query。
+    assert len(normalization_outputs) == 1
+    torch.testing.assert_close(normalization_outputs[0], expected_query)
+    assert set(captured_queries) == {"state", "position", "rotation", "prior"}
+    for query in captured_queries.values():
+        torch.testing.assert_close(query, expected_query)
+
+
+def test_dit_context_attention_reads_only_current_state_tokens():
+    model = _model()
+    values = _conditioning(batch_size=1)
+    prepared = model.prepare_conditioning(*values)
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_context(_module, inputs) -> None:
+        captured["key"] = inputs[1].detach().clone()
+        captured["value"] = inputs[2].detach().clone()
+
+    handle = model.blocks[0].context_attention.register_forward_pre_hook(capture_context)
+    try:
+        with torch.no_grad():
+            model(
+                torch.randn(1, 144),
+                torch.ones(1, dtype=torch.long),
+                prepared_conditioning=prepared,
+            )
+    finally:
+        handle.remove()
+
+    assert captured["key"].shape == (1, 6, model.latent_dim)
+    torch.testing.assert_close(captured["key"], prepared.observation.state_tokens)
+    torch.testing.assert_close(captured["value"], prepared.observation.state_tokens)
+
+
+def test_history_summary_reaches_dit_only_through_motion_prior():
+    torch.manual_seed(0)
+    model = _model()
+    values = list(_conditioning(batch_size=1))
+    prepared = model.prepare_conditioning(*values)
+
+    # 固定 Motion Encoder 输出后，单独篡改 U 不应再改变 DiT；这可排除 U 到 context 的直连。
+    changed_observation = replace(
+        prepared.observation,
+        history_summary=prepared.observation.history_summary + 100.0,
+    )
+    changed_prepared = replace(prepared, observation=changed_observation)
+    hidden = torch.randn(1, 144)
+    timestep = torch.ones(1, dtype=torch.long)
+    with torch.no_grad():
+        original_output = model(hidden, timestep, prepared_conditioning=prepared)
+        changed_output = model(hidden, timestep, prepared_conditioning=changed_prepared)
+    torch.testing.assert_close(original_output, changed_output)
+
+    # 从原始 Tracker history 重新编码时，U 仍须改变 Motion Encoder 生成的结构化先验。
+    changed_values = list(values)
+    changed_values[1] = values[1].clone()
+    changed_values[1][:, :, 1, :9] += 5.0
+    history_changed = model.prepare_conditioning(*changed_values)
+    assert not torch.allclose(
+        prepared.observation.history_summary,
+        history_changed.observation.history_summary,
+    )
+    assert not torch.allclose(
+        prepared.motion.temporal_tokens,
+        history_changed.motion.temporal_tokens,
+    )
+    assert not torch.allclose(prepared.motion.latents, history_changed.motion.latents)
 
 
 def test_observation_encoder_excludes_head_position_branch():

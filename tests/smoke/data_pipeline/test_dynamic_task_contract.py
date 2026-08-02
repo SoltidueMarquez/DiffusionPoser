@@ -115,6 +115,7 @@ def test_mmap_dataset_returns_new_batch_contract(tmp_path):
             "sample_count": 1,
             "source_count": 1,
             "max_rollout_steps": 4,
+            "two_point_phase_counts": {"dropout": 1, "reconnect": 0},
             "config_names": list(TRACKER_PATTERN_CATEGORIES),
             "tracker_feature_dim": TRACKER_FEATURE_DIM,
             "schema_fields": sorted(shard_fields(4)),

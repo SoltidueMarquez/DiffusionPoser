@@ -135,7 +135,7 @@ Head rotation 始终 hard。其他 Tracker 的 hard 状态直接定义为 `confi
 - `contact_target: [M,K,2]`
 - 当前 FK、Root 和 source 索引辅助字段。
 
-`task_store.json` 必须记录 `tracker_feature_dim=13`、五类 `config_names` 和完整 `schema_fields`。缺少任一新字段时直接拒绝读取。
+`task_store.json` 必须记录 `tracker_feature_dim=13`、五类 `config_names`、完整 `schema_fields` 以及 `two_point_phase_counts`。后者统计两点掉线与重连样本，数量必须与 `sample_count` 一致并满足近似 1:1。缺少任一新字段时直接拒绝读取。
 
 ## Normalizer
 

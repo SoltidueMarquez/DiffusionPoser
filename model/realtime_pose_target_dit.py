@@ -86,19 +86,25 @@ class RegionAdaptiveDiTBlock(nn.Module):
         trajectory_multipliers: torch.Tensor,
     ) -> torch.Tensor:
         observation = prepared.observation
-        context = torch.cat([observation.state_tokens, observation.history_summary], dim=1)
-        query = self.conditioning_norm(target)
-        target = target + self.context_attention(query, context, context, need_weights=False)[0]
+        # 五类条件必须读取同一个 block 输入，避免前序条件改变后续 attention 的 query，
+        # 从而让可靠性 gate 只控制对应证据的强弱，而不会间接改变其他条件分支。
+        conditioning_query = self.conditioning_norm(target)
+        state_value = self.context_attention(
+            conditioning_query,
+            observation.state_tokens,
+            observation.state_tokens,
+            need_weights=False,
+        )[0]
 
         pos_value = self.position_attention(
-            self.conditioning_norm(target),
+            conditioning_query,
             observation.position_tokens,
             observation.position_tokens,
             attn_mask=position_bias,
             need_weights=False,
         )[0]
         rot_value = self.rotation_attention(
-            self.conditioning_norm(target),
+            conditioning_query,
             observation.rotation_tokens,
             observation.rotation_tokens,
             attn_mask=rotation_bias,
@@ -106,7 +112,6 @@ class RegionAdaptiveDiTBlock(nn.Module):
         )[0]
         rho_pos = observation.rho_position.index_select(1, joint_regions)
         rho_rot = observation.rho_rotation.index_select(1, joint_regions)
-        target = target + rho_pos[..., None] * pos_value + rho_rot[..., None] * rot_value
 
         # 每个 region 同时提供 60 个 past-only temporal token 和 1 个汇总 latent。
         prior_keys = torch.cat(
@@ -114,21 +119,30 @@ class RegionAdaptiveDiTBlock(nn.Module):
             dim=2,
         ).flatten(1, 2)
         prior_value = self.prior_attention(
-            self.conditioning_norm(target),
+            conditioning_query,
             prior_keys,
             prior_keys,
             attn_mask=prior_bias,
             need_weights=False,
         )[0]
         prior_gate = torch.clamp(1.0 - 0.5 * (rho_pos + rho_rot), min=0.1)
-        target = target + prior_gate[..., None] * prior_value
 
         trajectory_shift, trajectory_scale = self.trajectory_modulation(
             prepared.trajectory_token[:, 0]
         ).chunk(2, dim=-1)
         multiplier = trajectory_multipliers.index_select(0, joint_regions)[None, :, None]
-        target = target + multiplier * (
-            trajectory_shift[:, None] + trajectory_scale[:, None] * self.conditioning_norm(target)
+        trajectory_value = multiplier * (
+            trajectory_shift[:, None] + trajectory_scale[:, None] * conditioning_query
+        )
+
+        # 所有条件值先独立生成，再一次性写回 residual state，与文档中的加性融合一致。
+        target = (
+            target
+            + state_value
+            + rho_pos[..., None] * pos_value
+            + rho_rot[..., None] * rot_value
+            + prior_gate[..., None] * prior_value
+            + trajectory_value
         )
 
         (
