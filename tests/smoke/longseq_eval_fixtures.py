@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
+from data_loaders.generate_realtime_pose_tasks import shard_fields
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 from utils.run_dirs import write_latest_pointer
 
@@ -46,7 +48,9 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
                 "sample_count": len(records),
                 "source_count": len(records),
                 "max_rollout_steps": 4,
-                "config_names": ["fixed_six", "fixed_three", "three_to_six", "six_to_three", "dropout"],
+                "config_names": list(TRACKER_PATTERN_CATEGORIES),
+                "tracker_feature_dim": TRACKER_FEATURE_DIM,
+                "schema_fields": sorted(shard_fields(4)),
                 "shards": [],
             },
             ensure_ascii=False,

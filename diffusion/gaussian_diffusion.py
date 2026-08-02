@@ -16,22 +16,8 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from data_loaders.realtime_pose_kinematics import (
-    JOINT_INDEX,
-    SMPL_PARENTS,
-)
-from data_loaders.realtime_pose_geometry import (
-    decode_target_head_rotations_torch,
-    resolve_root_head_reference_torch,
-)
-from data_loaders.sensor_masking import (
-    FOOT_TRACKER_INDICES,
-    HAND_TRACKER_INDICES,
-    REALTIME_POSE_TARGET_DIM,
-    ROTATION_6D_DIM,
-    SMPL_JOINT_COUNT,
-    TRACKER_TO_JOINT,
-)
+from diffusion.realtime_pose_losses import compute_raw_deployed_losses
+from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -142,12 +128,16 @@ class GaussianDiffusion:
         rotation_loss_weight=1.0,
         fk_loss_weight=2.0,
         local_rot_loss_weight=1.0,
-        pelvis_fk_loss_weight=2.0,
-        pelvis_offset_loss_weight=1.0,
-        pelvis_consistency_loss_weight=0.5,
-        transition_loss_weight=0.5,
-        tracker_pos_loss_weight=5.0,
+        tracker_pos_loss_weight=10.0,
         tracker_pos_huber_beta=0.05,
+        diffusion_loss_weight=1.0,
+        tracker_rot_loss_weight=1.0,
+        root_loss_weight=1.0,
+        world_joint_loss_weight=1.0,
+        head_to_root_xz_loss_weight=1.0,
+        future_leg_loss_weight=0.5,
+        contact_loss_weight=0.1,
+        foot_slide_loss_weight=0.5,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -157,14 +147,18 @@ class GaussianDiffusion:
         self.rotation_loss_weight = float(rotation_loss_weight)
         self.fk_loss_weight = float(fk_loss_weight)
         self.local_rot_loss_weight = float(local_rot_loss_weight)
-        self.pelvis_fk_loss_weight = float(pelvis_fk_loss_weight)
-        self.pelvis_offset_loss_weight = float(pelvis_offset_loss_weight)
-        self.pelvis_consistency_loss_weight = float(pelvis_consistency_loss_weight)
-        self.transition_loss_weight = float(transition_loss_weight)
         self.tracker_pos_loss_weight = float(tracker_pos_loss_weight)
         self.tracker_pos_huber_beta = float(tracker_pos_huber_beta)
-        if self.tracker_pos_huber_beta <= 0.0:
-            raise ValueError("tracker_pos_huber_beta 必须大于 0")
+        if not np.isfinite(self.tracker_pos_huber_beta) or self.tracker_pos_huber_beta <= 0.0:
+            raise ValueError("tracker_pos_huber_beta 必须是有限正数。")
+        self.diffusion_loss_weight = float(diffusion_loss_weight)
+        self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
+        self.root_loss_weight = float(root_loss_weight)
+        self.world_joint_loss_weight = float(world_joint_loss_weight)
+        self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
+        self.future_leg_loss_weight = float(future_leg_loss_weight)
+        self.contact_loss_weight = float(contact_loss_weight)
+        self.foot_slide_loss_weight = float(foot_slide_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -315,6 +309,11 @@ class GaussianDiffusion:
         assert t.shape == (B,)
         # 模型的时间步输入可能需要 rescale（_scale_timesteps），因此封装它
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        auxiliary_outputs = None
+        if isinstance(model_output, tuple):
+            if len(model_output) != 2 or not isinstance(model_output[1], dict):
+                raise TypeError("模型 tuple 输出必须为 (prediction, auxiliary_outputs)。")
+            model_output, auxiliary_outputs = model_output
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -376,12 +375,15 @@ class GaussianDiffusion:
         assert (
             model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
         )
-        return {
+        result = {
             "mean": model_mean,
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
         }
+        if auxiliary_outputs is not None:
+            result["auxiliary_outputs"] = auxiliary_outputs
+        return result
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -499,7 +501,6 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         const_noise=False,
-        replaceGT = True,
     ):
         """
         在给定时间步下，根据模型预测从 x_t 跳到 x_{t-1}。
@@ -510,22 +511,11 @@ class GaussianDiffusion:
         :param clip_denoised: 若为 True，则将模型预测的 x_start 裁剪到 [-1, 1]。
         :param denoised_fn: 若传入函数，则在使用模型预测前先处理一次 x_start。
         :param cond_fn: 若不为 None，则该函数计算一个与模型等效的梯度，作为额外条件。
-        :param model_kwargs: 扩散模型的额外条件（例如 inpainting 掩码）。
+        :param model_kwargs: 扩散模型的额外条件。
         :return: 包含以下键的字典：
                  - 'sample': 本步采样得到的 x_{t-1}。
                  - 'pred_xstart': 当前模型对 x_0 的预测值。
         """
-
-        ############################################################################
-        # prepare conditioning frame for inpainting
-        ############################################################################
-
-        if 'inpaint_cond' in model_kwargs.keys():
-            inpaint_cond = model_kwargs['inpaint_cond']
-            x_gt = model_kwargs['y']['inpainted_motion']
-            if replaceGT:
-                # 在投影阶段，把需要保持的 “好帧” 直接用原始动作替换，避免模型对这些帧重新建模
-                x = torch.where(inpaint_cond, x, x_gt)
 
         out = self.p_mean_variance(
             model,
@@ -551,19 +541,6 @@ class GaussianDiffusion:
             )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
 
-        ############################################################################
-        # prepare conditioning frame for inpainting
-        ############################################################################
-
-        if 'inpaint_cond' in model_kwargs.keys():
-            inpaint_cond = model_kwargs['inpaint_cond']
-            x_gt = model_kwargs['y']['inpainted_motion']
-            # 终点再投影一次：确保输出的“好帧”与原始一致，防止后续步继续偏移
-            # 注意：在 postedit 模式下（replaceGT=False），跳过此替换，让朗之万优化和条件锚定混合来处理好帧
-            if replaceGT:
-                sample = torch.where(inpaint_cond, sample, x_gt)
-                out["pred_xstart"] = torch.where(inpaint_cond, out["pred_xstart"], x_gt)
-
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_with_grad(
@@ -575,7 +552,6 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        replaceGT = True,
     ):
         """
         与 p_sample 相似，但在内部打开梯度计算，使得 cond_fn_with_grad 也能使用。
@@ -586,7 +562,7 @@ class GaussianDiffusion:
         :param clip_denoised: 若为 True，则对模型预测的 x_start 做 [-1, 1] 裁剪。
         :param denoised_fn: 若传入函数，在使用模型预测前先处理一次。
         :param cond_fn: 若不为空，则表示需要在梯度流中应用额外的条件引导。
-        :param model_kwargs: 模型额外输入（如 inpainting 掩码等）。
+        :param model_kwargs: 模型额外输入。
         :return: dict，包含
                  - 'sample': 当前时间步的去噪输出 x_{t-1}。
                  - 'pred_xstart': 模型对 x_0 的预测（detach 后输出）。
@@ -630,8 +606,6 @@ class GaussianDiffusion:
         cond_fn_with_grad=False,
         dump_steps=None,
         const_noise=False,
-        soft_inpaint_ts: th.LongTensor=None,
-        replaceGT = True,
     ):
         """
         Generate samples from the model.
@@ -672,8 +646,6 @@ class GaussianDiffusion:
             init_image=init_image,
             cond_fn_with_grad=cond_fn_with_grad,
             const_noise=const_noise,
-            soft_inpaint_ts=soft_inpaint_ts,
-            replaceGT = replaceGT,
         )):
             # 如果当前步数在 dump_steps 列表中，则保存当前采样结果的副本
             if dump_steps is not None and i in dump_steps:
@@ -698,8 +670,6 @@ class GaussianDiffusion:
         init_image=None,
         cond_fn_with_grad=False,
         const_noise=False,
-        soft_inpaint_ts: th.LongTensor=None,
-        replaceGT = True,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -737,15 +707,6 @@ class GaussianDiffusion:
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
 
-            ############################################################################
-            # prepare soft inpainting based on imputation
-            ############################################################################
-            if soft_inpaint_ts is not None:
-                noise_img = self.q_sample(init_image, t)
-
-                # replace denosing frames with forward diffused frames
-                img = torch.where(soft_inpaint_ts <= i+1, noise_img, img)
-                
             with th.no_grad():
                 sample_fn = self.p_sample_with_grad if cond_fn_with_grad else self.p_sample
                 out = sample_fn(
@@ -757,7 +718,6 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                     const_noise=const_noise,
-                    replaceGT = replaceGT,
                 )
                 yield out
                 img = out["sample"]
@@ -778,12 +738,6 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
-        if 'inpaint_cond' in model_kwargs.keys():
-            # fix a bug that not using clean frame condition at init step
-            inpaint_cond = model_kwargs['inpaint_cond']
-            x_gt = model_kwargs['y']['inpainted_motion']
-            x = torch.where(inpaint_cond, x, x_gt)
-
         out_orig = self.p_mean_variance(
             model,
             x,
@@ -818,11 +772,6 @@ class GaussianDiffusion:
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
-        if 'inpaint_cond' in model_kwargs.keys():
-            inpaint_cond = model_kwargs['inpaint_cond']
-            x_gt = model_kwargs['y']['inpainted_motion']
-            sample = torch.where(inpaint_cond, sample, x_gt)
-            out["pred_xstart"] = torch.where(inpaint_cond, out["pred_xstart"], x_gt)
         return {"sample": sample, "pred_xstart": out_orig["pred_xstart"]}
 
     def ddim_sample_with_grad(
@@ -881,6 +830,120 @@ class GaussianDiffusion:
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out_orig["pred_xstart"].detach()}
+
+    def projected_ddim_sample(
+        self,
+        model,
+        x,
+        t,
+        projection_fn,
+        clip_denoised=False,
+        model_kwargs=None,
+        eta=0.0,
+        projection_mode="all_steps",
+        late_steps=5,
+    ):
+        """用 projected x0 重算 epsilon；新 realtime pose 路径不再执行 x_t inpainting。"""
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        step_model_kwargs = dict(model_kwargs)
+        if bool(torch.all(t == 0)):
+            step_model_kwargs["return_aux_outputs"] = True
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            model_kwargs=step_model_kwargs,
+        )
+        raw_pred_xstart = out["pred_xstart"]
+        should_project = self._should_project_ddim_step(
+            t,
+            projection_mode=projection_mode,
+            late_steps=late_steps,
+        )
+        projected = projection_fn(raw_pred_xstart)
+        selector = should_project.view(-1, *([1] * (x.ndim - 1)))
+        deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
+        eps = self._predict_eps_from_xstart(x, t, deployed_pred_xstart)
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        sigma = (
+            eta
+            * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+            * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+        )
+        mean_pred = (
+            deployed_pred_xstart * th.sqrt(alpha_bar_prev)
+            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+        )
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (x.ndim - 1)))
+        sample = mean_pred + nonzero_mask * sigma * th.randn_like(x)
+        # 最终步无条件返回 deployed pose，保证 late/final ablation 也遵守部署契约。
+        sample = torch.where(nonzero_mask.bool(), sample, deployed_pred_xstart)
+        result = {
+            "sample": sample,
+            "pred_xstart": deployed_pred_xstart,
+            "raw_pred_xstart": raw_pred_xstart,
+            "deployed_pred_xstart": deployed_pred_xstart,
+        }
+        if "auxiliary_outputs" in out:
+            result["auxiliary_outputs"] = out["auxiliary_outputs"]
+        return result
+
+    def projected_ddim_sample_loop(
+        self,
+        model,
+        shape,
+        projection_fn,
+        noise=None,
+        clip_denoised=False,
+        model_kwargs=None,
+        device=None,
+        eta=0.0,
+        projection_mode="all_steps",
+        late_steps=5,
+        progress=False,
+    ):
+        """执行完整 Projected DDIM，并保留最终 raw/deployed x0。"""
+
+        if device is None:
+            device = next(model.parameters()).device
+        image = noise if noise is not None else th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+        if progress:
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+        final = None
+        for index in indices:
+            timestep = th.full((shape[0],), index, device=device, dtype=th.long)
+            with th.no_grad():
+                final = self.projected_ddim_sample(
+                    model,
+                    image,
+                    timestep,
+                    projection_fn=projection_fn,
+                    clip_denoised=clip_denoised,
+                    model_kwargs=model_kwargs,
+                    eta=eta,
+                    projection_mode=projection_mode,
+                    late_steps=late_steps,
+                )
+            image = final["sample"]
+        if final is None:
+            raise RuntimeError("Projected DDIM 没有执行任何时间步。")
+        return final
+
+    def _should_project_ddim_step(self, t, projection_mode, late_steps):
+        if projection_mode == "all_steps":
+            return th.ones_like(t, dtype=th.bool)
+        if projection_mode == "late_steps":
+            return t < max(1, int(late_steps))
+        if projection_mode == "final_step":
+            return t == 0
+        raise ValueError(f"未知 Projected DDIM 模式：{projection_mode}")
 
     def ddim_reverse_sample(
         self,
@@ -1359,177 +1422,6 @@ class GaussianDiffusion:
         x_t = x_start * negnoise_level_mask + x_t * (1 - negnoise_level_mask)
         return x_t
 
-    def _realtime_pose_aux_losses(
-        self,
-        pred_xstart,
-        x_start,
-        model_kwargs,
-        model_aux_outputs=None,
-        timesteps=None,
-    ):
-        """144D 路径的全局旋转、局部链、FK、pelvis 辅助与切换连续性损失。"""
-
-        del timesteps
-        y = model_kwargs.get("y", {}) if model_kwargs is not None else {}
-        required = (
-            "known_mask",
-            "pose_history",
-            "target_joints_head_ref",
-            "joint_offsets_parent",
-            "current_tracker_pos_head_ref",
-            "measured_valid",
-            "configured",
-            "missing_age",
-        )
-        missing = [name for name in required if name not in y]
-        if missing:
-            raise KeyError(f"144D auxiliary loss 缺少 batch 字段：{missing}")
-        if pred_xstart.ndim != 2 or pred_xstart.shape[1] != REALTIME_POSE_TARGET_DIM:
-            raise ValueError(f"144D auxiliary loss 收到错误形状：{tuple(pred_xstart.shape)}")
-        if model_aux_outputs is None or "pelvis_head_offset" not in model_aux_outputs:
-            raise KeyError("144D auxiliary loss 需要模型返回 pelvis_head_offset。")
-
-        device = pred_xstart.device
-        dtype = pred_xstart.dtype
-        mean = y.get("normalizer_mean")
-        std = y.get("normalizer_std")
-
-        def to_raw(value):
-            if mean is None or std is None:
-                return value
-            return value * std.to(device=device, dtype=dtype) + mean.to(device=device, dtype=dtype)
-
-        def rotation_angle(first, second):
-            relative = first.transpose(-1, -2) @ second
-            cosine = ((relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(
-                -1.0 + 1e-6,
-                1.0 - 1e-6,
-            )
-            angle = torch.acos(cosine)
-            return torch.where(cosine >= 1.0 - 1e-6, torch.zeros_like(angle), angle)
-
-        pred_raw = to_raw(pred_xstart)
-        target_raw = to_raw(x_start)
-        known_mask = y["known_mask"].to(device=device).bool()
-        joint_unknown = ~known_mask.reshape(
-            -1,
-            SMPL_JOINT_COUNT,
-            ROTATION_6D_DIM,
-        ).all(dim=-1)
-        pred_global_rot, root_yaw_head = decode_target_head_rotations_torch(pred_raw)
-        target_global_rot, _ = decode_target_head_rotations_torch(target_raw)
-
-        rotation_error = rotation_angle(pred_global_rot, target_global_rot)
-        joint_weight = joint_unknown.to(dtype=dtype)
-        joint_denom = joint_weight.sum(dim=1).clamp_min(1.0)
-        rotation_loss = (rotation_error * joint_weight).sum(dim=1) / joint_denom
-
-        parent_indices = torch.as_tensor(SMPL_PARENTS[1:], device=device, dtype=torch.long)
-        pred_local = pred_global_rot[:, parent_indices].transpose(-1, -2) @ pred_global_rot[:, 1:]
-        target_local = target_global_rot[:, parent_indices].transpose(-1, -2) @ target_global_rot[:, 1:]
-        local_error = rotation_angle(pred_local, target_local).square()
-        edge_active = joint_unknown[:, 1:] | joint_unknown[:, parent_indices]
-        edge_weight = edge_active.to(dtype=dtype)
-        local_rotation_loss = (local_error * edge_weight).sum(dim=1) / edge_weight.sum(dim=1).clamp_min(1.0)
-
-        offsets = y["joint_offsets_parent"].to(device=device, dtype=dtype)
-        tracker_pos = y["current_tracker_pos_head_ref"].to(device=device, dtype=dtype)
-        measured = y["measured_valid"].to(device=device).bool()
-        current_measured = measured[:, -1] if measured.ndim == 3 else measured
-        _, _, pred_joints = resolve_root_head_reference_torch(
-            pred_global_rot,
-            root_yaw_head,
-            offsets,
-            observed_head_height=tracker_pos[:, 0, 1],
-        )
-        target_joints = y["target_joints_head_ref"].to(device=device, dtype=dtype)
-        fk_loss = torch.square(pred_joints - target_joints).flatten(1).mean(dim=1)
-
-        pelvis_region = torch.as_tensor(
-            [JOINT_INDEX["pelvis"], JOINT_INDEX["left_hip"], JOINT_INDEX["right_hip"]],
-            device=device,
-            dtype=torch.long,
-        )
-        pelvis_fk_loss = torch.square(
-            pred_joints[:, pelvis_region] - target_joints[:, pelvis_region]
-        ).flatten(1).mean(dim=1)
-
-        head_index = JOINT_INDEX["head"]
-        pelvis_index = JOINT_INDEX["pelvis"]
-        target_pelvis_offset = target_joints[:, pelvis_index] - target_joints[:, head_index]
-        predicted_pelvis_offset = pred_joints[:, pelvis_index] - pred_joints[:, head_index]
-        auxiliary_pelvis_offset = model_aux_outputs["pelvis_head_offset"].to(device=device, dtype=dtype)
-        if auxiliary_pelvis_offset.shape != target_pelvis_offset.shape:
-            raise ValueError(
-                "pelvis_head_offset 应为 "
-                f"{tuple(target_pelvis_offset.shape)}，实际为 {tuple(auxiliary_pelvis_offset.shape)}"
-            )
-        pelvis_offset_loss = torch.nn.functional.smooth_l1_loss(
-            auxiliary_pelvis_offset,
-            target_pelvis_offset,
-            reduction="none",
-        ).mean(dim=-1)
-        pelvis_consistency_loss = torch.nn.functional.smooth_l1_loss(
-            auxiliary_pelvis_offset,
-            predicted_pelvis_offset,
-            reduction="none",
-        ).mean(dim=-1)
-
-        tracker_indices = torch.as_tensor(
-            [*HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES],
-            device=device,
-            dtype=torch.long,
-        )
-        joint_indices = torch.as_tensor(
-            [TRACKER_TO_JOINT[index] for index in [*HAND_TRACKER_INDICES, *FOOT_TRACKER_INDICES]],
-            device=device,
-            dtype=torch.long,
-        )
-        tracker_distance = torch.linalg.norm(
-            pred_joints[:, joint_indices] - tracker_pos[:, tracker_indices],
-            dim=-1,
-        )
-        beta = torch.as_tensor(self.tracker_pos_huber_beta, device=device, dtype=dtype)
-        tracker_huber = torch.where(
-            tracker_distance < beta,
-            0.5 * tracker_distance.square() / beta,
-            tracker_distance - 0.5 * beta,
-        )
-        tracker_valid = current_measured[:, tracker_indices].float()
-        tracker_pos_loss = (tracker_huber * tracker_valid).sum(dim=1) / tracker_valid.sum(dim=1).clamp_min(1.0)
-
-        pose_history = y["pose_history"].to(device=device, dtype=dtype)
-        previous_raw = to_raw(pose_history[:, -1])
-        previous_global_rot, _ = decode_target_head_rotations_torch(previous_raw)
-        continuity_error = rotation_angle(pred_global_rot, previous_global_rot)
-        continuity_rotation = (continuity_error * joint_weight).sum(dim=1) / joint_denom
-
-        configured = y["configured"].to(device=device).bool()
-        missing_age = y["missing_age"].to(device=device)
-        if configured.ndim == 3:
-            state_changed = (
-                (configured[:, -1] != configured[:, -2])
-                | (measured[:, -1] != measured[:, -2])
-            ).any(dim=1)
-            current_age = missing_age[:, -1]
-        else:
-            state_changed = torch.zeros(pred_xstart.shape[0], device=device, dtype=torch.bool)
-            current_age = missing_age
-        early_dropout = ((current_age > 0) & (current_age <= 5)).any(dim=1)
-        transition_weight = (state_changed | early_dropout).float()
-        transition_loss = continuity_rotation * transition_weight
-
-        return {
-            "rotation_loss": rotation_loss,
-            "local_rotation_loss": local_rotation_loss,
-            "fk_loss": fk_loss,
-            "pelvis_fk_loss": pelvis_fk_loss,
-            "pelvis_offset_loss": pelvis_offset_loss,
-            "pelvis_consistency_loss": pelvis_consistency_loss,
-            "sensor_reprojection_pos_loss": tracker_pos_loss,
-            "transition_loss": transition_loss,
-        }
-
     def training_losses(
         self,
         model,
@@ -1538,155 +1430,127 @@ class GaussianDiffusion:
         model_kwargs=None,
         noise=None,
         feature_w=None,
-        snr_gamma=5,
+        snr_gamma=0.0,
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """
-        计算单个时间步的训练损失。
+        """计算当前 144D RealtimePose 路径的单时间步训练损失。"""
 
-        :param model: 用于评估损失的模型。
-        :param x_start: 形状为 [N x C x ...] 的输入张量。
-        :param t: 一批时间步索引。
-        :param model_kwargs: 若不为 None，提供给模型的额外关键字参数（可用于条件）。
-        :param noise: 如指定，表示尝试去除的特定高斯噪声。
-        :return: 一个包含键 "loss" 的字典，对应形状为 [N] 的张量；
-                 某些均值或方差设置下还会返回其他键。
-        """
-
-        # 与 DiffusionPoser 的 mask_manager 对应：
-        # - y["mask"] 表示扩散损失需要监督的位置，形状为 [B, C, T]；
-        # - inpaint_cond 表示前向加噪的位置，True 代表待补全，False 代表已知条件。
-        # 这个约定让同一套扩散过程可以复用到不同特征维度的稀疏传感器重建任务。
-        if model_kwargs is None:             # 若未传额外条件参数，则用空字典占位
-            model_kwargs = {}
-        mask = model_kwargs['y']['mask']
-        inpaint_cond = model_kwargs['inpaint_cond']  # [B, C, T]
-        conditioning_motion = model_kwargs.get("y", {}).get("inpainted_motion", x_start)
-        if conditioning_motion.shape != x_start.shape:
+        if model_kwargs is None:
+            raise ValueError("RealtimePose 训练必须提供动态 Tracker 条件。")
+        batch = model_kwargs.get("y", model_kwargs)
+        if "current_tracker" not in model_kwargs and "current_tracker" not in batch:
             raise ValueError(
-                f"inpainted_motion shape must match x_start: {tuple(conditioning_motion.shape)} vs {tuple(x_start.shape)}"
+                "GaussianDiffusion 已不兼容旧 mask/inpainting 训练路径；"
+                "请传入当前动态 Tracker batch。"
             )
-        if noise is None:                    # 若未指定噪声，按 x_start 形状采样标准高斯噪声
+        return self._realtime_pose_training_losses(
+            model=model,
+            x_start=x_start,
+            t=t,
+            model_kwargs=model_kwargs,
+            noise=noise,
+            feature_w=feature_w,
+            snr_gamma=snr_gamma,
+            use_l1=use_l1,
+            return_pred_xstart=return_pred_xstart,
+        )
+
+    def _realtime_pose_training_losses(
+        self,
+        model,
+        x_start,
+        t,
+        model_kwargs,
+        noise=None,
+        feature_w=None,
+        snr_gamma=0.0,
+        use_l1=False,
+        return_pred_xstart=False,
+    ):
+        """完整 144D 加噪，并显式分离 raw/deployed x0 的训练路径。"""
+
+        if noise is None:
             noise = th.randn_like(x_start)
-        
-        # 只在待补全部分加噪；条件区使用 conditioned_x，而不是 GT x_start。
-        # 缺失 tracker 的 pos/rot 在 conditioned_x 中为 0，避免把真实绑点泄漏给模型。
         x_t = self.q_sample(x_start, t, noise=noise)
-        x_t = torch.where(inpaint_cond, x_t, conditioning_motion)
-
-        terms = {}
-        pred_xstart = None
-        model_aux_outputs = None
-
-        # 会在每个时间步调用传入的模型 model(x_t, timestep, **model_kwargs) 获取预测，用它与目标（噪声或 x0）计算 loss。
-        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL: # 计算 KL 损失
-            terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
-            if self.loss_type == LossType.RESCALED_KL:
-                terms["loss"] *= self.num_timesteps
-        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE: # 计算 MSE 损失，走的是这
-            model_call_kwargs = dict(model_kwargs)
-            model_call_kwargs["return_aux_outputs"] = True
-            model_result = model(x_t, self._scale_timesteps(t), **model_call_kwargs)
-            if not isinstance(model_result, tuple) or len(model_result) != 2:
-                raise TypeError("RealtimePose 训练模型必须返回 (pose_output, aux_outputs)。")
-            model_output, model_aux_outputs = model_result
-            if not isinstance(model_aux_outputs, dict):
-                raise TypeError("RealtimePose 训练模型的 aux_outputs 必须是 dict。")
-
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                model_output, model_var_values = th.split(model_output, C, dim=1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-                if self.loss_type == LossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.num_timesteps / 1000.0
-
-            target = {
-                # ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                #     x_start=x_start, x_t=x_t, t=t
-                # )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape
-            if self.model_mean_type == ModelMeanType.START_X:
-                pred_xstart = model_output
-            elif self.model_mean_type == ModelMeanType.EPSILON:
-                pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
-            else:
-                pred_xstart = None
-            if pred_xstart is not None:
-                # 辅助损失与 rollout 也必须看到硬写回后的已知关节。
-                pred_xstart = torch.where(inpaint_cond, pred_xstart, conditioning_motion)
-
-            terms["simple_loss"] = self.masked_l2(target, model_output, mask, feature_w, use_l1) 
-
-            terms["loss"] = terms["simple_loss"] + terms.get('vb', 0.)
-
-            if snr_gamma:
-                snr = compute_snr(self, t)
-                mse_loss_weights = torch.stack([snr, snr_gamma * torch.ones_like(t)], dim=1).min(
-                            dim=1
-                        )[0]
-                if self.model_mean_type == ModelMeanType.EPSILON:
-                    mse_loss_weights = mse_loss_weights / snr
-                if self.model_mean_type == ModelMeanType.PREVIOUS_X:
-                    mse_loss_weights = mse_loss_weights / (snr + 1)
-                terms["loss"] *= mse_loss_weights
-
-            if pred_xstart is not None:
-                aux_terms = self._realtime_pose_aux_losses(
-                    pred_xstart,
-                    x_start,
-                    model_kwargs,
-                    timesteps=t,
-                    model_aux_outputs=model_aux_outputs,
+        call_kwargs = dict(model_kwargs)
+        call_kwargs["return_aux_outputs"] = True
+        model_result = model(x_t, self._scale_timesteps(t), **call_kwargs)
+        if not isinstance(model_result, tuple) or len(model_result) != 2:
+            raise TypeError("RealtimePose 模型训练时必须返回 (raw_output, auxiliary_outputs)。")
+        model_output, auxiliary_outputs = model_result
+        target = x_start if self.model_mean_type == ModelMeanType.START_X else noise
+        if model_output.shape != target.shape:
+            raise ValueError("模型输出、diffusion target 和 x_start 必须同形。")
+        raw_pred_xstart = (
+            model_output
+            if self.model_mean_type == ModelMeanType.START_X
+            else self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+        )
+        batch = model_kwargs.get("y", model_kwargs)
+        deployed_pred_xstart = project_realtime_pose_xstart(
+            raw_pred_xstart,
+            batch["current_tracker_raw"],
+            batch["hard_rotation_state"].bool(),
+            batch.get("normalizer_mean"),
+            batch.get("normalizer_std"),
+        )
+        # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
+        # reconstruction term，feature_w 按 [B,144] 对特征维加权。
+        elementwise_loss = (
+            (target - model_output).abs()
+            if bool(use_l1)
+            else (target - model_output).square()
+        )
+        if feature_w is not None:
+            feature_weight = feature_w.to(
+                device=elementwise_loss.device,
+                dtype=elementwise_loss.dtype,
+            )
+            if feature_weight.ndim == 1:
+                feature_weight = feature_weight.unsqueeze(0).expand(elementwise_loss.shape[0], -1)
+            if feature_weight.shape != elementwise_loss.shape:
+                raise ValueError(
+                    "动态 RealtimePose feature_w 必须为 [144] 或 [B,144]，"
+                    f"实际为 {tuple(feature_weight.shape)}"
                 )
-                if aux_terms:
-                    terms.update(aux_terms)
-                    aux_loss = (
-                        self.rotation_loss_weight * terms["rotation_loss"]
-                        + self.local_rot_loss_weight * terms["local_rotation_loss"]
-                        + self.fk_loss_weight * terms["fk_loss"]
-                        + self.pelvis_fk_loss_weight * terms["pelvis_fk_loss"]
-                        + self.pelvis_offset_loss_weight * terms["pelvis_offset_loss"]
-                        + self.pelvis_consistency_loss_weight * terms["pelvis_consistency_loss"]
-                        + self.transition_loss_weight * terms["transition_loss"]
-                    )
-                    if "sensor_reprojection_pos_loss" in terms:
-                        aux_loss = aux_loss + self.tracker_pos_loss_weight * terms["sensor_reprojection_pos_loss"]
-                    terms["aux_loss"] = self.aux_loss_weight * aux_loss
-                    terms["loss"] = terms["loss"] + terms["aux_loss"]
-
-        else:
-            raise NotImplementedError(self.loss_type)
-
+            elementwise_loss = elementwise_loss * feature_weight
+        simple_loss = mean_flat(elementwise_loss)
+        if snr_gamma:
+            snr = compute_snr(self, t)
+            weight = torch.minimum(snr, torch.full_like(snr, float(snr_gamma)))
+            if self.model_mean_type == ModelMeanType.EPSILON:
+                weight = weight / snr.clamp_min(1e-8)
+            simple_loss = simple_loss * weight
+        terms = {"simple_loss": simple_loss}
+        terms.update(
+            compute_raw_deployed_losses(
+                raw_pred_xstart,
+                deployed_pred_xstart,
+                x_start,
+                batch,
+                auxiliary_outputs,
+                tracker_pos_huber_beta=self.tracker_pos_huber_beta,
+            )
+        )
+        auxiliary_loss = (
+            self.rotation_loss_weight * terms["global_rotation_loss"]
+            + self.local_rot_loss_weight * terms["local_rotation_loss"]
+            + self.tracker_rot_loss_weight * terms["tracker_rotation_loss"]
+            + self.fk_loss_weight * terms["fk_loss"]
+            + self.tracker_pos_loss_weight * terms["tracker_position_loss"]
+            + self.root_loss_weight * terms["root_loss"]
+            + self.world_joint_loss_weight * terms["world_joint_loss"]
+            + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
+            + self.future_leg_loss_weight * terms["future_leg_loss"]
+            + self.contact_loss_weight * terms["contact_loss"]
+        )
+        terms["aux_loss"] = auxiliary_loss
+        terms["loss"] = self.diffusion_loss_weight * simple_loss + self.aux_loss_weight * auxiliary_loss
         if return_pred_xstart:
-            if pred_xstart is None:
-                raise ValueError("return_pred_xstart=True 只支持可恢复 pred_xstart 的训练目标。")
-            terms["pred_xstart"] = pred_xstart
+            terms["raw_pred_xstart"] = raw_pred_xstart
+            terms["deployed_pred_xstart"] = deployed_pred_xstart
+            terms["pred_xstart"] = deployed_pred_xstart
         return terms
 
     def _prior_bpd(self, x_start):

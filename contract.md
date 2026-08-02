@@ -1,98 +1,155 @@
-# RealPose Contract
+# RealPose Python Contract
 
-本文档是当前 Python 本地主链路的数据结构唯一说明。代码和产物不保存 schema 名称、版本或表示方式元数据；结构调整时直接同步修改本文档与实现。
+本文档是当前 Python 主链路的数据结构唯一说明。旧 task、normalizer 与 checkpoint 不兼容，读取时必须明确报错，不提供兼容路径。
 
-## 时序任务
+## 时序与参考系
 
-- 历史长度：60 帧。
-- 当前目标：第 61 帧。
-- 一个基础窗口连续保存最多 4 个目标帧，因此默认覆盖 64 帧；训练可以请求 1～4 步。
-- 每个 source 默认在所有合法起点中确定性保留 20 个窗口。source、起点和 task 均按稳定键排序。
+- 历史长度固定为 60 帧，当前目标为第 61 帧。
+- `pose_history` 与 `tracker_history` 统一表达在上一帧 Head-yaw/floor 参考系 \(C_{n-1}\)。
+- `current_target` 与 `current_tracker` 表达在当前参考系 \(C_n\)。
+- rollout 最多物化 4 个连续目标；下一步历史只能追加 `deployed_pred_xstart.detach()`，不得读取后续 GT pose history。
+- 冷启动时三类历史统一左侧补零，补零帧对应 `valid_frame_mask=False`；padding 是归一化后模型输入空间中的字面量零。
+- 虚拟会话首帧从零状态重新推进 `d_off/d_on` 与 hard hysteresis，不得继承被裁掉历史的持续时间。首帧 Head trajectory 的平移/yaw 增量为零，`cos(delta_yaw)=1`。
+- rollout 的有效历史长度按 `min(60,H+s)` 增长；同一 rollout 必须沿同一虚拟会话状态线连续推进，不能逐步重置 duration。
+
+参考系原点为当前 Head 水平位置与地面：
+
+\[
+o_n^W=[p^W_{H,n,x}, floor_y, p^W_{H,n,z}]^\top.
+\]
+
+Head forward 水平投影退化时沿用上一合法 yaw。
 
 ## Source
 
-Source 保存从 AMASS 转换得到的完整运动缓存：
+原始 AMASS realtime source 保持现有缓存字段：
 
-- `body_pose_body_fbx_local_delta_6d`: `[T, 144]`，24 个关节的 body.fbx local delta rotation6D；Pelvis 保留移除 Root heading 后的完整 residual rotation。
-- `root_pos_world`: `[T, 3]`，其中 world y 固定为 0。
-- `root_yaw`: `[T]`。
-- `root_heading_delta_sincos`: `[T, 2]`。
-- `root_delta_xz_ref`: `[T, 2]`。
-- `pelvis_height`: `[T, 1]`，等于 `joints_world[:, 0, 1]`。
-- `tracker_pos_world`: `[T, 6, 3]`。
-- `tracker_rot_world_6d`: `[T, 6, 6]`。
-- `joints_world`: `[T, 24, 3]`。
-- `joint_offsets_parent`: `[24, 3]`。
-- `joint_rest_local_rotations_6d`: `[24, 6]`。
-- `stationary_prob_5`: `[T, 5]`。
+- `body_pose_body_fbx_local_delta_6d: [T,144]`
+- `root_pos_world: [T,3]`
+- `root_yaw: [T]`
+- `pelvis_height: [T,1]`
+- `tracker_pos_world: [T,6,3]`
+- `tracker_rot_world_6d: [T,6,6]`
+- `joints_world: [T,24,3]`
+- `joint_offsets_parent: [24,3]`
+- `joint_rest_local_rotations_6d: [24,6]`
+- `stationary_prob_5: [T,5]`
 
-Source 的 `metadata` 必须包含与实际数组一致的 `frames` 和 `target_fps`；当前主链路只接受 `target_fps = 60`。
+只接受 60 Hz source。Source 本身可以复用；task 及其下游产物必须重建。
 
-## 144 维姿态
+## Batch
 
-- `0:6`：Pelvis 全局 rotation6D。
-- `6:144`：关节 1～23 的全局 rotation6D。
-- 24 个关节的旋转都表达在当前目标帧的 Head-yaw 参考系中。Root heading 从 Pelvis 全局旋转的水平朝向派生。
-- Pelvis 位移、高度、stationary 概率和 Tracker 不进入 144 维姿态。
-- Hip Tracker 有效时硬写入 Pelvis 的完整 rotation6D；无效时 Pelvis 六个通道全部由模型预测。
+| 字段 | 形状 | 语义 |
+|---|---:|---|
+| `x` / `current_target` | `[B,144]` | 当前完整扩散状态/监督，位于 \(C_n\) |
+| `pose_history` | `[B,60,144]` | 过去 deployed pose，位于 \(C_{n-1}\) |
+| `tracker_history` | `[B,60,6,13]` | 过去 Tracker，位于 \(C_{n-1}\) |
+| `current_tracker` | `[B,6,13]` | 归一化当前 Tracker，位于 \(C_n\) |
+| `current_tracker_raw` | `[B,6,13]` | 未归一化当前 Tracker，供投影和几何损失 |
+| `trajectory_history` | `[B,60,5]` | 过去 Head trajectory |
+| `current_trajectory` | `[B,1,5]` | 当前 Head trajectory |
+| `valid_frame_mask` | `[B,60]` | 历史有效帧 |
+| `history_length` | `[B]` | 本步有效历史帧数，范围 `[0,60]` |
+| `hard_rotation_state` | `[B,6]` | 本帧固定 hard 集合 |
+| `joint_offsets_parent` | `[B,24,3]` | 目标骨架父子偏移 |
+| `future_leg_target` | `[B,3,8,6]` | 未来 3 帧双腿监督 |
+| `contact_target` | `[B,2]` | 左右脚接触监督 |
+| `raw_pred_xstart` | `[B,144]` | 投影前预测 |
+| `deployed_pred_xstart` | `[B,144]` | SO(3) 与 hard rotation 投影后预测 |
 
-## 生成计划
+新链路不存在 `known_target`、`known_mask`、`inpaint_mask` 或 `inpaint_cond`。
 
-`generation_plan.jsonl` 在数据物化前写入。其 SHA-256 保存于 `generation_plan.sha256`，绝对路径和时间戳不参与计划内容。`task_id` 只由 split、source ID 和起始帧决定。
+## 144D pose
 
-每个基础窗口包含五套固定索引的 Tracker 配置：
+144 维由 24 个 joint 的全局 rotation6D 顺序拼接，全部表达在目标参考系中。扩散前向过程对完整 144D 加噪；hard joint 仍必须在 raw 分支接受生成监督。
 
-0. `fixed_six`
-1. `fixed_three`
-2. `three_to_six`
-3. `six_to_three`
-4. `dropout`
+## 13D Tracker
 
-同一配置贯穿四个 rollout 窗口。切换或掉线事件位于这些窗口的公共帧内；dropout 从六点配置中选择 1～2 个非 Head Tracker，持续 1～60 帧。Head 始终 configured 且 measured valid。`missing_age` 使用额外 60 帧前缀计算，最大为 60。
+每个 Tracker 的固定顺序为：
 
-## mmap Task Store
+`position3 + rotation6D + configured + measured_valid + d_off + d_on`
 
-每个 split 的 `task_store.json` 记录 generation-plan hash、样本数、source 数、最大 rollout 步数和 shard 列表。默认每个 shard 包含 4096 个基础窗口，数据为未压缩 `.npy`，Dataset 使用 `mmap_mode="r"` 读取。
+对应 offset：
 
-一个含 `M` 个窗口、最大四步的 shard 包含：
+- `0:3`: position
+- `3:9`: rotation6D
+- `9`: configured
+- `10`: measured_valid
+- `11`: d_off
+- `12`: d_on
 
-- `pose_history`: `[M, 60, 144] float32`，只保存 step 0。
-- `current_target`: `[M, 4, 144] float32`。
-- `tracker_continuous`: `[M, 4, 61, 6, 9] float32`，未应用掉线。
-- `full_known_target`: `[M, 4, 144] float32`，保存六个 Tracker 全有效时的硬条件值。
-- `configured`: `[M, 5, 64, 6] uint8`。
-- `measured_valid`: `[M, 5, 64, 6] uint8`。
-- `missing_age`: `[M, 5, 64, 6] uint8`。
-- `target_joints_head_ref`、`prev_joints_head_ref`: `[M, 4, 24, 3] float32`。
-- `target_root_position_head_ref`: `[M, 4, 3] float32`。
-- `target_root_yaw_world`、`target_hip_height`、`current_head_yaw_world`、`floor_y`: `[M, 4] float32`。
-- `current_head_position_world`: `[M, 4, 3] float32`。
-- `source_index`、`start_frame`: `[M] int32`。
+无效测量的前 9 维必须严格清零。只有前 9 维连续量参与 Tracker normalizer；配置、有效性、duration 和 hard 状态不参与统计。`d_off/d_on` 对模型输入除以 60，物理状态仍保存整数帧数。
 
-`joint_offsets_parent` 与 `joint_rest_local_rotations_6d` 按 source 各保存一次，由 `source_index` 引用。shard 使用 `open_memmap` 写入临时目录，完成后原子重命名。
+## Head trajectory
 
-## Dataset 与 batch
+\[
+\tau_n=[\Delta x^{C_{n-1}},\Delta z^{C_{n-1}},h_{head},\sin\Delta\psi,\cos\Delta\psi].
+\]
 
-Dataset 接收 `TaskRequest(task_index, config_index, rollout_steps)`。普通整数索引等价于配置 0、单步请求。每个 worker 最多缓存两个打开的 shard。
+`delta xz` 与 `sin/cos` 不缩放；只有 Head 相对地面高度使用独立 normalizer。Head position 不进入普通 position measurement token。
 
-Dataset 从所选配置切出 61 帧状态，把连续量与 `configured`、`measured_valid`、归一化 `missing_age` 拼成 `[61, 6, 12]`。无效测量的前 9 维严格置零。当前帧 `measured_valid` 映射为 `[144] known_mask`，`known_target` 的 unknown 位置在归一化后再次置零。`valid_frame_mask` 固定为 `[60]` 全 True。
+## 可靠性与 hard rotation gate
 
-对外 batch 保持：
+默认配置：
 
-- 当前扩散状态：`[B, 144]`。
-- 历史姿态：`[B, 60, 144]`。
-- Tracker 条件：`[B, 61, 6, 12]`。
-- `known_target`、`known_mask`：`[B, 144]`。
-- 输出：`[B, 144]`。
+- `D_warm_pos=15`
+- `D_warm_rot=15`
+- `D_h=15`
+- duration cap `60`
 
-rollout 子项不保存或返回 GT `pose_history`。训练和重建均从 step 0 的历史持续推进，保留所有先前预测。
+\[
+\kappa_i^a=c_i v_i\min(1,d_i^{on}/D_{warm}^a),
+\qquad
+\rho_r^a=1-\prod_i(1-A_{r,i}^a\kappa_i^a).
+\]
+
+Head rotation 始终 hard。其他 Tracker 的 hard 状态直接定义为 `configured & measured_valid & (d_on >= D_h)`：掉线或取消配置时立即退出，恢复连续有效 15 帧后进入。恢复期的渐进影响只由 \(\kappa\) 负责，hard 判定不依赖上一帧状态。本帧 hard 集合在所有 DDIM step 间保持不变。
+
+## 五类训练场景
+
+| ID | 名称 | 规则 |
+|---:|---|---|
+| 0 | `fixed_six` | 六点持续配置有效 |
+| 1 | `fixed_three` | 仅 Head 与双手持续配置有效 |
+| 2 | `three_to_six` | Hip 与双脚在切换帧恢复 |
+| 3 | `six_to_three` | Hip 与双脚在切换帧取消配置 |
+| 4 | `two_point_dropout_reconnect` | 两个不同非 Head Tracker 同步掉线重连 |
+
+默认采样权重各 `0.2`，CLI 可覆盖。切换 target 位于事件后 0～14 帧。两点掉线持续 5～30 帧，掉线中与重连后 0～14 帧按 1:1 采样。可靠度只由配置、测量有效性和连续恢复时长决定。事件必须按 `global_seed + source_id` 在绝对时间线上确定，重叠窗口状态一致。
+
+训练默认以 `cold_start_prob=0.1` 把样本替换为部分历史冷启动；命中时 `H` 在 `[0,59]` 均匀采样，否则使用完整 60 帧历史。验证集保持完整历史，长序列评估另外报告 `cold_start_0_59`、`steady_state_60_plus` 和全帧指标。
+
+## mmap task store
+
+当前 shard 至少包含：
+
+- `pose_history: [M,60,144]`
+- `current_target: [M,K,144]`
+- `tracker_history_continuous: [M,K,60,6,9]`
+- `current_tracker_continuous: [M,K,6,9]`
+- `trajectory_history: [M,K,60,5]`
+- `current_trajectory: [M,K,1,5]`
+- `configured/measured_valid/d_off/d_on/hard_rotation_state: [M,5,60+K,6]`
+- `history_head_yaw_world/current_head_yaw_world: [M,K]`
+- `future_leg_target: [M,K,3,8,6]`
+- `contact_target: [M,K,2]`
+- 当前 FK、Root 和 source 索引辅助字段。
+
+`task_store.json` 必须记录 `tracker_feature_dim=13`、五类 `config_names` 和完整 `schema_fields`。缺少任一新字段时直接拒绝读取。
 
 ## Normalizer
 
-- `pose_mean.pt`、`pose_std.pt`: `[144]`。
-- `tracker_mean.pt`、`tracker_std.pt`: `[6, 9]`。
-- Pose 只统计每个基础窗口的 `pose_history + current_target[:, 0]`。
-- Tracker 只统计未遮挡的 `tracker_continuous[:, 0]`，六个 Tracker 全部计入。
-- 每个 shard 保存 float64 `sum/sumsq/count`，normalizer 按 shard 编号合并，std 使用 population 定义。
-- `normalizer_meta.json` 保存 generation-plan hash、split、样本数和观察数；训练只校验 task 与 normalizer 的 plan hash 一致。
-- 场景权重、rollout 概率和 rollout 长度不影响 normalizer。
+- `pose_mean.pt`、`pose_std.pt`: `[144]`
+- `tracker_mean.pt`、`tracker_std.pt`: `[6,9]`
+- `head_height_mean.pt`、`head_height_std.pt`: 标量
+
+normalizer 元数据必须与 task generation-plan hash 一致。场景权重不参与 normalizer 统计。
+
+## 模型与扩散输出
+
+- DynamicObservationEncoder: `S:[B,6,D]`、`M_pos:[B,5,D]`、`M_rot:[B,6,D]`、`U:[B,6,D]`。
+- RegionalMotionEncoder 只读取 past 条件，输出 global/pelvis/left-leg/right-leg temporal token 与 latent。
+- TargetDiT 输出 raw `[B,144]`、future-leg `[B,3,8,6]`、contact logits `[B,2]`。
+- `prepare_conditioning()` 每个目标帧只执行一次。
+- Projected DDIM 默认每一步投影，支持 `all_steps`、`late_steps`、`final_step`。
+- Resolver 只严格检查 hard Tracker rotation，不对 soft Tracker 做硬约束。

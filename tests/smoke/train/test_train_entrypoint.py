@@ -8,19 +8,57 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
-from utils.parser_util import add_data_options, add_training_options
+from utils import model_util
+from utils.parser_util import add_data_options, add_model_options, add_training_options
 
 
 class TrainEntrypointTest(unittest.TestCase):
+    def test_model_factory_uses_fixed_default_reliability_config(self):
+        args = Namespace(
+            input_feats=144,
+            latent_dim=64,
+            layers=1,
+            heads=8,
+            dropout=0.0,
+            zero_init=True,
+            max_seq_len=61,
+            d_warm_pos=999,
+            tracker_duration_cap=999,
+        )
+
+        with (
+            patch("utils.model_util.RealtimePoseTargetDiT") as model_constructor,
+            patch("utils.model_util.create_gaussian_diffusion", return_value=object()),
+        ):
+            model_util.create_model_and_diffusion(args)
+
+        reliability_config = model_constructor.call_args.kwargs["reliability_config"]
+        self.assertEqual(reliability_config, TrackerReliabilityConfig())
+
+    def test_model_options_do_not_expose_unpropagated_reliability_controls(self):
+        parser = ArgumentParser()
+        add_model_options(parser)
+
+        invalid_options = (
+            "--d_warm_pos",
+            "--d_warm_rot",
+            "--d_hard",
+            "--tracker_duration_cap",
+        )
+        for option in invalid_options:
+            self.assertNotIn(option, parser._option_string_actions)
+
     def test_data_options_only_expose_materialized_task_controls(self):
         parser = ArgumentParser()
         add_data_options(parser)
 
         args = parser.parse_args(["--data_dir", "dataset/tasks"])
 
-        self.assertEqual(args.rollout_steps, 1)
+        self.assertEqual(args.rollout_steps, 4)
+        self.assertEqual(args.cold_start_prob, 0.1)
         self.assertNotIn("--history_pose_noise_std", parser._option_string_actions)
         self.assertNotIn("--tracker_latency_max_frames", parser._option_string_actions)
         self.assertNotIn("--tracker_mask_policy", parser._option_string_actions)
@@ -37,6 +75,14 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertTrue(args.model_ema)
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
+        removed_legacy_losses = (
+            "--pelvis_fk_loss_weight",
+            "--pelvis_offset_loss_weight",
+            "--pelvis_consistency_loss_weight",
+            "--transition_loss_weight",
+        )
+        for option in removed_legacy_losses:
+            self.assertNotIn(option, parser._option_string_actions)
 
     def test_training_options_can_disable_default_model_ema(self):
         parser = ArgumentParser()

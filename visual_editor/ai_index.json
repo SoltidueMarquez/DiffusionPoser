@@ -1,8 +1,0 @@
-{
-  "purpose": "Local realtime pose source/task/result 3D viewer and task exporter.",
-  "entrypoints": {
-    "api": "python -m visual_editor.server --source_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz --data_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks --result_dir output --output_dir visual_editor/.runtime/exports",
-    "frontend": "npm --prefix visual_editor run viewer:dev"
-  },
-  "contract": "../contract.md"
-}

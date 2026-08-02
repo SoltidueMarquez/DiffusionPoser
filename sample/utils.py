@@ -60,11 +60,13 @@ def load_checkpoint_model(model, model_path: str | Path, device, use_ema: bool =
     if use_ema:
         ema_path = model_path.with_name(model_path.name.replace("model", "ema", 1))
         if ema_path.exists():
-            ema_model = EMA(model, include_online_model=False)
-            ema_model.load_state_dict(torch.load(ema_path, map_location="cpu"))
-            ema_model.to(device)
-            ema_model.eval()
-            return ema_model, "ema"
+            ema = EMA(model, include_online_model=False)
+            ema.load_state_dict(torch.load(ema_path, map_location="cpu"))
+            # 采样链路需要调用 prepare_conditioning 等模型自定义方法，因此统一返回内部推理模型。
+            inference_model = ema.ema_model
+            inference_model.to(device)
+            inference_model.eval()
+            return inference_model, "ema"
 
     state_dict = torch.load(model_path, map_location="cpu")
     # 采样入口最怕“权重没完整加载但程序继续跑”：结果文件会生成，却没有可解释性。

@@ -29,7 +29,7 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="执行 144D Head-anchor 显式 rollout。")
+    parser = argparse.ArgumentParser(description="执行 144D deployed-history 显式 rollout。")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -53,150 +53,176 @@ def rollout_dataset_item(
     dataset: RealtimePoseTaskDataset,
     index: int,
     device: torch.device,
-    use_ddim: bool,
-    rollout_steps: int = 1,
+    rollout_steps: int = 4,
     config_index: int = 0,
+    projection_mode: str = "all_steps",
+    late_steps: int = 5,
 ) -> dict[str, np.ndarray]:
     item = dataset[TaskRequest(index, config_index, rollout_steps)]
     sequence = [item, *item.get("rollout", [])]
-    reconstructed_raw: list[np.ndarray] = []
-    reference_raw: list[np.ndarray] = []
-    predicted_local_delta: list[np.ndarray] = []
-    reference_local_delta: list[np.ndarray] = []
-    predicted_roots_world: list[np.ndarray] = []
-    reference_roots_world: list[np.ndarray] = []
-    root_yaws: list[float] = []
-    reference_root_yaws: list[float] = []
-    hip_heights: list[float] = []
-    reference_hip_heights: list[float] = []
-    predicted_joints_world: list[np.ndarray] = []
-    reference_joints_world: list[np.ndarray] = []
-    known_masks: list[np.ndarray] = []
-    tracker_positions_world: list[np.ndarray] = []
-    configured_values: list[np.ndarray] = []
-    measured_values: list[np.ndarray] = []
-    missing_ages: list[np.ndarray] = []
-    scenarios: list[str] = []
-    known_errors: list[float] = []
-    previous_prediction: torch.Tensor | None = None
-    previous_batch: dict | None = None
+    result_lists: dict[str, list] = {
+        name: []
+        for name in (
+            "reference_target_raw",
+            "raw_pred_target_raw",
+            "deployed_pred_target_raw",
+            "reference_body_local_delta_6d",
+            "predicted_body_local_delta_6d",
+            "reference_joints_world",
+            "predicted_joints_world",
+            "reference_root_position_world",
+            "predicted_root_position_world",
+            "reference_root_yaw_world",
+            "predicted_root_yaw_world",
+            "reference_hip_height",
+            "predicted_hip_height",
+            "tracker_pos_world",
+            "current_tracker_raw",
+            "configured",
+            "measured_valid",
+            "d_off",
+            "d_on",
+            "hard_rotation_state",
+            "current_trajectory",
+            "contact_target",
+            "contact_logits",
+            "future_leg_prediction",
+            "future_leg_target",
+            "scenario",
+            "hard_rotation_max_error",
+        )
+    }
     pose_history: torch.Tensor | None = None
+    previous_deployed: torch.Tensor | None = None
+    previous_batch: dict | None = None
 
     for step_item in sequence:
         batch = _batch_item(step_item, device)
-        if previous_prediction is not None and previous_batch is not None:
-            assert pose_history is not None
+        if pose_history is None:
+            pose_history = batch["pose_history"]
+        else:
+            assert previous_deployed is not None and previous_batch is not None
             mean = None if dataset.normalizer is None else dataset.normalizer.pose_mean
             std = None if dataset.normalizer is None else dataset.normalizer.pose_std
             pose_history = advance_rollout_pose_history_torch(
-                pose_history=pose_history,
-                prediction=previous_prediction,
-                source_head_yaw_world=previous_batch["current_head_yaw_world"],
-                destination_head_yaw_world=batch["current_head_yaw_world"],
-                normalizer_mean=mean,
-                normalizer_std=std,
+                pose_history,
+                previous_deployed,
+                previous_batch["history_head_yaw_world"],
+                batch["history_head_yaw_world"],
+                mean,
+                std,
                 detach_prediction=True,
             )
             batch["pose_history"] = pose_history
-        else:
-            pose_history = batch["pose_history"]
-        predicted = reconstruct_batch(model, diffusion, batch, device, use_ddim=use_ddim)
-        pred_raw = inverse_normalized_target(predicted, dataset.normalizer)[0]
-        ref_raw = inverse_normalized_target(batch["x"], dataset.normalizer)[0]
-        tracker_current = np.concatenate(
-            [
-                batch["current_tracker_pos_head_ref"][0].cpu().numpy(),
-                batch["current_tracker_rot_head_ref_6d"][0].cpu().numpy(),
-                batch["configured"][0, -1, :, None].cpu().numpy(),
-                batch["measured_valid"][0, -1, :, None].cpu().numpy(),
-                batch["missing_age_norm"][0, -1, :, None].cpu().numpy(),
-            ],
-            axis=-1,
+
+        reconstruction = reconstruct_batch(
+            model,
+            diffusion,
+            batch,
+            device,
+            normalizer=dataset.normalizer,
+            projection_mode=projection_mode,
+            late_steps=late_steps,
         )
+        raw_prediction = inverse_normalized_target(
+            reconstruction["raw_pred_xstart"], dataset.normalizer
+        )[0]
+        deployed_prediction = inverse_normalized_target(
+            reconstruction["deployed_pred_xstart"], dataset.normalizer
+        )[0]
+        reference = inverse_normalized_target(batch["x"], dataset.normalizer)[0]
+        current_tracker_raw = batch["current_tracker_raw"][0].detach().cpu().numpy()
+        hard = batch["hard_rotation_state"][0].detach().cpu().numpy()
         resolved = decode_and_resolve_pose(
-            pred_raw,
-            tracker_current,
+            deployed_prediction,
+            current_tracker_raw,
+            hard,
             float(batch["current_head_yaw_world"][0].item()),
-            batch["current_head_position_world"][0].cpu().numpy(),
+            batch["current_head_position_world"][0].detach().cpu().numpy(),
             float(batch["floor_y"][0].item()),
-            batch["joint_offsets_parent"][0].cpu().numpy(),
-            batch["joint_rest_local_rotations_6d"][0].cpu().numpy(),
+            batch["joint_offsets_parent"][0].detach().cpu().numpy(),
+            batch["joint_rest_local_rotations_6d"][0].detach().cpu().numpy(),
         )
-        reconstructed_raw.append(pred_raw)
-        reference_raw.append(ref_raw)
         head_yaw = float(batch["current_head_yaw_world"][0].item())
-        head_position = batch["current_head_position_world"][0].cpu().numpy()
+        head_position = batch["current_head_position_world"][0].detach().cpu().numpy()
         floor_y = float(batch["floor_y"][0].item())
         origin = np.asarray([head_position[0], floor_y, head_position[2]], dtype=np.float32)
         yaw_rotation = make_yaw_rotation_np(np.asarray([head_yaw], dtype=np.float32))[0]
-        predicted_roots_world.append(resolved.root_position_world)
-        reference_roots_world.append(
-            origin + yaw_rotation @ batch["target_root_position_head_ref"][0].cpu().numpy()
+        reference_joints_world = origin[None] + np.einsum(
+            "ij,aj->ai",
+            yaw_rotation,
+            batch["target_joints_head_ref"][0].detach().cpu().numpy(),
         )
-        root_yaws.append(resolved.root_yaw_world)
-        reference_root_yaws.append(float(batch["target_root_yaw_world"][0].item()))
-        hip_heights.append(resolved.hip_height)
-        reference_hip_heights.append(float(batch["target_hip_height"][0].item()))
-        predicted_joints_world.append(resolved.joints_world)
-        reference_joints_world.append(
-            origin[None]
-            + np.einsum(
-                "ij,aj->ai",
-                yaw_rotation,
-                batch["target_joints_head_ref"][0].cpu().numpy(),
-            )
+        reference_root_world = origin + yaw_rotation @ batch[
+            "target_root_position_head_ref"
+        ][0].detach().cpu().numpy()
+        tracker_positions_world = origin[None] + np.einsum(
+            "ij,aj->ai", yaw_rotation, current_tracker_raw[:, :3]
         )
-        predicted_local_delta.append(resolved.body_local_delta_6d)
+        reference_rotations, reference_heading = decode_target_head_rotations_np(reference)
         rest_rotations = rotation_6d_to_matrix_np(
-            batch["joint_rest_local_rotations_6d"][0].cpu().numpy()
+            batch["joint_rest_local_rotations_6d"][0].detach().cpu().numpy()
         )
-        reference_head_rotations, reference_heading_head = decode_target_head_rotations_np(ref_raw)
-        reference_local_delta.append(
+
+        result_lists["reference_target_raw"].append(reference)
+        result_lists["raw_pred_target_raw"].append(raw_prediction)
+        result_lists["deployed_pred_target_raw"].append(deployed_prediction)
+        result_lists["reference_body_local_delta_6d"].append(
             global_head_rotations_to_local_delta_6d_np(
-                reference_head_rotations,
-                root_heading_head=reference_heading_head,
+                reference_rotations,
+                root_heading_head=reference_heading,
                 rest_local_rotations=rest_rotations,
             )
         )
-        known_masks.append(batch["known_mask"][0].cpu().numpy())
-        tracker_positions_world.append(
-            origin[None]
-            + np.einsum(
-                "ij,aj->ai",
-                yaw_rotation,
-                batch["current_tracker_pos_head_ref"][0].cpu().numpy(),
-            )
+        result_lists["predicted_body_local_delta_6d"].append(resolved.body_local_delta_6d)
+        result_lists["reference_joints_world"].append(reference_joints_world)
+        result_lists["predicted_joints_world"].append(resolved.joints_world)
+        result_lists["reference_root_position_world"].append(reference_root_world)
+        result_lists["predicted_root_position_world"].append(resolved.root_position_world)
+        result_lists["reference_root_yaw_world"].append(
+            float(batch["target_root_yaw_world"][0].item())
         )
-        configured_values.append(batch["configured"][0, -1].cpu().numpy())
-        measured_values.append(batch["measured_valid"][0, -1].cpu().numpy())
-        missing_ages.append(batch["missing_age"][0, -1].cpu().numpy())
-        scenarios.append(str(step_item.get("scenario", "")))
-        known_errors.append(resolved.known_rotation_max_error)
-        previous_prediction = predicted
+        result_lists["predicted_root_yaw_world"].append(resolved.root_yaw_world)
+        result_lists["reference_hip_height"].append(float(batch["target_hip_height"][0].item()))
+        result_lists["predicted_hip_height"].append(resolved.hip_height)
+        result_lists["tracker_pos_world"].append(tracker_positions_world)
+        result_lists["current_tracker_raw"].append(current_tracker_raw)
+        for name in (
+            "configured",
+            "measured_valid",
+            "d_off",
+            "d_on",
+        ):
+            result_lists[name].append(batch[name][0, -1].detach().cpu().numpy())
+        result_lists["hard_rotation_state"].append(hard)
+        result_lists["current_trajectory"].append(
+            batch["current_trajectory"][0, 0].detach().cpu().numpy()
+        )
+        result_lists["contact_target"].append(batch["contact_target"][0].detach().cpu().numpy())
+        result_lists["contact_logits"].append(
+            reconstruction.get(
+                "contact_logits",
+                torch.full_like(batch["contact_target"], float("nan")),
+            )[0].detach().cpu().numpy()
+        )
+        result_lists["future_leg_prediction"].append(
+            reconstruction.get(
+                "future_leg",
+                torch.full_like(batch["future_leg_target"], float("nan")),
+            )[0].detach().cpu().numpy()
+        )
+        result_lists["future_leg_target"].append(
+            batch["future_leg_target"][0].detach().cpu().numpy()
+        )
+        result_lists["scenario"].append(str(step_item.get("scenario", "")))
+        result_lists["hard_rotation_max_error"].append(resolved.hard_rotation_max_error)
+        # 只有 deployed 输出可以进入下一帧历史，且显式断开采样图。
+        previous_deployed = reconstruction["deployed_pred_xstart"].detach()
         previous_batch = batch
 
-    return {
-        "reference_target_raw": np.asarray(reference_raw, dtype=np.float32),
-        "reconstructed_target_raw": np.asarray(reconstructed_raw, dtype=np.float32),
-        "reference_body_local_delta_6d": np.asarray(reference_local_delta, dtype=np.float32),
-        "predicted_body_local_delta_6d": np.asarray(predicted_local_delta, dtype=np.float32),
-        "reference_joints_world": np.asarray(reference_joints_world, dtype=np.float32),
-        "predicted_joints_world": np.asarray(predicted_joints_world, dtype=np.float32),
-        "reference_root_position_world": np.asarray(reference_roots_world, dtype=np.float32),
-        "predicted_root_position_world": np.asarray(predicted_roots_world, dtype=np.float32),
-        "reference_root_yaw_world": np.asarray(reference_root_yaws, dtype=np.float32),
-        "predicted_root_yaw_world": np.asarray(root_yaws, dtype=np.float32),
-        "reference_hip_height": np.asarray(reference_hip_heights, dtype=np.float32),
-        "predicted_hip_height": np.asarray(hip_heights, dtype=np.float32),
-        "known_mask": np.asarray(known_masks, dtype=bool),
-        "tracker_pos_world": np.asarray(tracker_positions_world, dtype=np.float32),
-        "configured": np.asarray(configured_values, dtype=bool),
-        "measured_valid": np.asarray(measured_values, dtype=bool),
-        "missing_age": np.asarray(missing_ages, dtype=np.int64),
-        "scenario": np.asarray(scenarios),
-        "eval_frame_mask": np.ones(len(sequence), dtype=bool),
-        "known_rotation_max_error": np.asarray(known_errors, dtype=np.float32),
-    }
+    payload = {name: np.asarray(values) for name, values in result_lists.items()}
+    payload["eval_frame_mask"] = np.ones(len(sequence), dtype=bool)
+    return payload
 
 
 def save_rollout(path: Path, payload: dict[str, np.ndarray]) -> None:
@@ -217,8 +243,12 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         folder_path=getattr(args, "folder_path", "") or None,
     )
     model, diffusion = create_model_and_diffusion(args)
-    model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-    limit = len(dataset) if int(args.rollout_limit) <= 0 else min(len(dataset), int(args.rollout_limit))
+    model, source = load_checkpoint_model(
+        model, args.model_path, device=device, use_ema=args.use_ema
+    )
+    limit = len(dataset) if int(args.rollout_limit) <= 0 else min(
+        len(dataset), int(args.rollout_limit)
+    )
     payloads = [
         rollout_dataset_item(
             model,
@@ -226,15 +256,15 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
             dataset,
             index,
             device,
-            True,
             rollout_steps=args.rollout_steps,
+            projection_mode=args.projected_ddim_mode,
+            late_steps=args.projected_ddim_late_steps,
         )
         for index in range(limit)
     ]
-    payload = {
-        key: np.asarray([item[key] for item in payloads])
-        for key in payloads[0]
-    }
+    if not payloads:
+        raise ValueError("rollout 数据集为空。")
+    payload = {key: np.asarray([item[key] for item in payloads]) for key in payloads[0]}
     payload["fps"] = np.float32(60.0)
     output_dir = Path(args.output_dir or "output/realtime_pose_144d_rollout").resolve()
     output_path = output_dir / "rollout_result.npz"

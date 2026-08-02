@@ -23,22 +23,20 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
 )
-from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_forward_yaw_np
-from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_geometry import build_pose_target_np
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
 )
-from data_loaders.tracker_timeline import TrackerTimeline, build_tracker_timeline, classify_tracker_window
+from data_loaders.tracker_timeline import (
+    TrackerTimeline,
+    build_tracker_timeline,
+    classify_tracker_frame,
+)
 from eval.evaluate_realtime_pose import public_result
 from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize_rollouts
-from sample.realtime_pose_runtime import (
-    WorldPoseState,
-    build_online_conditioning,
-    decode_and_resolve_pose,
-    sample_online_target,
-)
+from sample.realtime_pose_runtime import RealtimePoseRuntime
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
 from sample.utils import load_checkpoint_model
 from utils import dist_util
@@ -89,23 +87,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_initial_pose_history(
-    source: dict[str, np.ndarray],
-    joint_rotations_world: np.ndarray,
-) -> list[WorldPoseState]:
-    """前 60 帧只用于启动自回归，不进入评估结果。"""
-
-    return [
-        WorldPoseState(
-            joint_rotations_world=joint_rotations_world[frame_index].copy(),
-            root_yaw_world=float(source["root_yaw"][frame_index]),
-            hip_height=float(source["pelvis_height"][frame_index, 0]),
-            root_position_world=source["root_pos_world"][frame_index].copy(),
-        )
-        for frame_index in range(REALTIME_POSE_HISTORY_LENGTH)
-    ]
-
-
 def rollout_long_sequence_source(
     model,
     diffusion,
@@ -113,167 +94,171 @@ def rollout_long_sequence_source(
     timeline: TrackerTimeline,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
+    projected_ddim_mode: str = "all_steps",
+    projected_ddim_late_steps: int = 5,
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
 ) -> dict[str, np.ndarray]:
-    """对一个完整 source 做逐帧闭环采样，输出形状统一为 `[1,T,...]`。"""
+    """从首帧冷启动逐帧闭环采样，不使用任何 GT pose warmup。"""
 
     frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
-    if frame_count <= REALTIME_POSE_HISTORY_LENGTH:
-        raise ValueError(f"长序列至少需要 61 帧，实际为 {frame_count}")
-
+    if frame_count <= 0:
+        raise ValueError("长序列 source 不能为空。")
     joint_rotations_world = compute_source_joint_rotations_world(source)
-    head_rotations_world = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"][:, 0])
-    head_yaws = extract_forward_yaw_np(head_rotations_world, initial_yaw=0.0)
-    pose_history = build_initial_pose_history(source, joint_rotations_world)
-
-    reference_targets: list[np.ndarray] = []
-    predicted_targets: list[np.ndarray] = []
-    reference_local_delta: list[np.ndarray] = []
-    predicted_local_delta: list[np.ndarray] = []
-    reference_joints: list[np.ndarray] = []
-    predicted_joints: list[np.ndarray] = []
-    reference_roots: list[np.ndarray] = []
-    predicted_roots: list[np.ndarray] = []
-    reference_root_yaws: list[float] = []
-    predicted_root_yaws: list[float] = []
-    reference_hip_heights: list[float] = []
-    predicted_hip_heights: list[float] = []
-    known_masks: list[np.ndarray] = []
-    tracker_positions: list[np.ndarray] = []
-    configured_values: list[np.ndarray] = []
-    measured_values: list[np.ndarray] = []
-    missing_ages: list[np.ndarray] = []
-    scenarios: list[str] = []
-    known_errors: list[float] = []
-    sampling_latency_ms: list[float] = []
-    e2e_latency_ms: list[float] = []
-
-    evaluated_frames = frame_count - REALTIME_POSE_HISTORY_LENGTH
-    frame_indices = range(REALTIME_POSE_HISTORY_LENGTH, frame_count)
+    runtime = RealtimePoseRuntime(
+        model,
+        diffusion,
+        device,
+        source["joint_offsets_parent"],
+        source["joint_rest_local_rotations_6d"],
+        normalizer=normalizer,
+        projected_ddim_mode=projected_ddim_mode,
+        projected_ddim_late_steps=projected_ddim_late_steps,
+    )
+    values: dict[str, list] = {
+        name: []
+        for name in (
+            "reference_target_raw",
+            "raw_pred_target_raw",
+            "deployed_pred_target_raw",
+            "reference_body_local_delta_6d",
+            "predicted_body_local_delta_6d",
+            "reference_joints_world",
+            "predicted_joints_world",
+            "reference_root_position_world",
+            "predicted_root_position_world",
+            "reference_root_yaw_world",
+            "predicted_root_yaw_world",
+            "reference_hip_height",
+            "predicted_hip_height",
+            "tracker_pos_world",
+            "tracker_rot_world_6d",
+            "current_tracker_raw",
+            "configured",
+            "measured_valid",
+            "d_off",
+            "d_on",
+            "hard_rotation_state",
+            "history_length",
+            "current_trajectory",
+            "contact_target",
+            "contact_logits",
+            "future_leg_prediction",
+            "future_leg_target",
+            "scenario",
+            "hard_rotation_max_error",
+            "sampling_latency_ms",
+            "e2e_latency_ms",
+        )
+    }
+    frame_indices = range(frame_count)
     if show_progress:
         frame_indices = tqdm(
             frame_indices,
-            total=evaluated_frames,
+            total=frame_count,
             desc=progress_desc or "longseq",
             unit="frame",
             dynamic_ncols=True,
         )
-
-    for absolute_frame in frame_indices:
+    for frame_index in frame_indices:
         frame_started = time.perf_counter()
-        window_start = absolute_frame - REALTIME_POSE_HISTORY_LENGTH
-        frame_slice = slice(window_start, absolute_frame + 1)
-        timeline_window = timeline.window(window_start)
-        previous_head_yaw = float(head_yaws[window_start - 1]) if window_start > 0 else 0.0
-        floor_y = float(source["root_pos_world"][absolute_frame, 1])
-        conditioning = build_online_conditioning(
-            pose_history_world=pose_history,
-            tracker_pos_world=source["tracker_pos_world"][frame_slice],
-            tracker_rot_world_6d=source["tracker_rot_world_6d"][frame_slice],
-            configured=timeline_window.configured,
-            measured_valid=timeline_window.measured_valid,
-            missing_age=timeline_window.missing_age,
-            floor_y=floor_y,
-            normalizer=normalizer,
-            initial_head_yaw=previous_head_yaw,
-        )
+        history_length = len(runtime.pose_history)
         if measure_latency:
             torch.cuda.synchronize(device)
             sampling_started = time.perf_counter()
-        predicted_target = sample_online_target(
-            model=model,
-            diffusion=diffusion,
-            conditioning=conditioning,
-            device=device,
-            normalizer=normalizer,
+        step = runtime.step(
+            source["tracker_pos_world"][frame_index],
+            source["tracker_rot_world_6d"][frame_index],
+            timeline.configured[frame_index],
+            timeline.measured_valid[frame_index],
+            float(source["root_pos_world"][frame_index, 1]),
         )
         if measure_latency:
             torch.cuda.synchronize(device)
-            sampling_latency_ms.append((time.perf_counter() - sampling_started) * 1000.0)
+            elapsed = (time.perf_counter() - sampling_started) * 1000.0
+            total_elapsed = (time.perf_counter() - frame_started) * 1000.0
         else:
-            sampling_latency_ms.append(float("nan"))
-        current_head_yaw = float(conditioning["current_head_yaw_world"])
-        current_head_position = np.asarray(conditioning["current_head_position_world"], dtype=np.float32)
-        resolved = decode_and_resolve_pose(
-            target_raw=predicted_target,
-            tracker_current_raw=conditioning["tracker_window_raw"][-1],
-            current_head_yaw_world=current_head_yaw,
-            current_head_position_world=current_head_position,
-            floor_y=floor_y,
-            joint_offsets_parent=source["joint_offsets_parent"],
-            joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
-        )
-        # 端到端延迟只覆盖在线必需路径；GT指标构造和结果收集不计入实时预算。
-        pose_history = [*pose_history[1:], resolved.as_world_state()]
-        if measure_latency:
-            torch.cuda.synchronize(device)
-            e2e_latency_ms.append((time.perf_counter() - frame_started) * 1000.0)
-        else:
-            e2e_latency_ms.append(float("nan"))
-
+            elapsed = total_elapsed = float("nan")
+        resolved = step.resolved_pose
         reference_target = build_pose_target_np(
-            joint_rotations_world[absolute_frame : absolute_frame + 1],
-            current_head_yaw,
+            joint_rotations_world[frame_index : frame_index + 1],
+            runtime.previous_head_yaw,
         )[0]
-        scenario = classify_tracker_window(
-            configured=timeline_window.configured,
-            measured_valid=timeline_window.measured_valid,
+        values["reference_target_raw"].append(reference_target)
+        values["raw_pred_target_raw"].append(step.raw_pred_xstart)
+        values["deployed_pred_target_raw"].append(step.deployed_pred_xstart)
+        values["reference_body_local_delta_6d"].append(
+            source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][frame_index]
         )
-        if scenario is None:
-            raise ValueError(f"绝对帧 {absolute_frame} 的 Tracker 窗口无法归入五类场景")
+        values["predicted_body_local_delta_6d"].append(resolved.body_local_delta_6d)
+        values["reference_joints_world"].append(source["joints_world"][frame_index])
+        values["predicted_joints_world"].append(resolved.joints_world)
+        values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
+        values["predicted_root_position_world"].append(resolved.root_position_world)
+        values["reference_root_yaw_world"].append(float(source["root_yaw"][frame_index]))
+        values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
+        values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
+        values["predicted_hip_height"].append(resolved.hip_height)
+        for name in ("tracker_pos_world", "tracker_rot_world_6d"):
+            values[name].append(source[name][frame_index])
+        values["current_tracker_raw"].append(step.current_tracker_raw)
+        for name in ("configured", "measured_valid"):
+            values[name].append(getattr(timeline, name)[frame_index])
+        values["d_off"].append(runtime.previous_d_off.copy())
+        values["d_on"].append(runtime.previous_d_on.copy())
+        values["hard_rotation_state"].append(step.hard_rotation_state)
+        values["history_length"].append(history_length)
+        values["current_trajectory"].append(runtime.trajectory_history[-1])
+        values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
+        values["contact_logits"].append(
+            np.full(2, np.nan, dtype=np.float32)
+            if step.contact_logits is None
+            else step.contact_logits
+        )
+        values["future_leg_prediction"].append(
+            np.full((3, 8, 6), np.nan, dtype=np.float32)
+            if step.future_leg_prediction is None
+            else step.future_leg_prediction
+        )
+        if frame_index + 3 < frame_count:
+            future_pose = build_pose_target_np(
+                joint_rotations_world[frame_index + 1 : frame_index + 4],
+                runtime.previous_head_yaw,
+            ).reshape(3, 24, 6)
+            values["future_leg_target"].append(
+                future_pose[:, np.asarray([1, 4, 7, 10, 2, 5, 8, 11])]
+            )
+        else:
+            values["future_leg_target"].append(np.full((3, 8, 6), np.nan, dtype=np.float32))
+        values["scenario"].append(_classify_timeline_frame(timeline, frame_index))
+        values["hard_rotation_max_error"].append(resolved.hard_rotation_max_error)
+        values["sampling_latency_ms"].append(elapsed)
+        values["e2e_latency_ms"].append(total_elapsed)
 
-        reference_targets.append(reference_target)
-        predicted_targets.append(predicted_target)
-        reference_local_delta.append(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][absolute_frame])
-        predicted_local_delta.append(resolved.body_local_delta_6d)
-        reference_joints.append(source["joints_world"][absolute_frame])
-        predicted_joints.append(resolved.joints_world)
-        reference_roots.append(source["root_pos_world"][absolute_frame])
-        predicted_roots.append(resolved.root_position_world)
-        reference_root_yaws.append(float(source["root_yaw"][absolute_frame]))
-        predicted_root_yaws.append(resolved.root_yaw_world)
-        reference_hip_heights.append(float(source["pelvis_height"][absolute_frame, 0]))
-        predicted_hip_heights.append(resolved.hip_height)
-        known_masks.append(np.asarray(conditioning["known_mask"], dtype=bool))
-        tracker_positions.append(source["tracker_pos_world"][absolute_frame])
-        configured_values.append(timeline.configured[absolute_frame])
-        measured_values.append(timeline.measured_valid[absolute_frame])
-        missing_ages.append(timeline.missing_age[absolute_frame])
-        scenarios.append(scenario)
-        known_errors.append(resolved.known_rotation_max_error)
-
-    return {
-        "fps": np.float32(60.0),
-        "absolute_frame_index": np.arange(
-            REALTIME_POSE_HISTORY_LENGTH,
-            frame_count,
-            dtype=np.int64,
-        ),
-        "reference_target_raw": np.asarray(reference_targets, dtype=np.float32)[None],
-        "reconstructed_target_raw": np.asarray(predicted_targets, dtype=np.float32)[None],
-        "reference_body_local_delta_6d": np.asarray(reference_local_delta, dtype=np.float32)[None],
-        "predicted_body_local_delta_6d": np.asarray(predicted_local_delta, dtype=np.float32)[None],
-        "reference_joints_world": np.asarray(reference_joints, dtype=np.float32)[None],
-        "predicted_joints_world": np.asarray(predicted_joints, dtype=np.float32)[None],
-        "reference_root_position_world": np.asarray(reference_roots, dtype=np.float32)[None],
-        "predicted_root_position_world": np.asarray(predicted_roots, dtype=np.float32)[None],
-        "reference_root_yaw_world": np.asarray(reference_root_yaws, dtype=np.float32)[None],
-        "predicted_root_yaw_world": np.asarray(predicted_root_yaws, dtype=np.float32)[None],
-        "reference_hip_height": np.asarray(reference_hip_heights, dtype=np.float32)[None],
-        "predicted_hip_height": np.asarray(predicted_hip_heights, dtype=np.float32)[None],
-        "known_mask": np.asarray(known_masks, dtype=bool)[None],
-        "tracker_pos_world": np.asarray(tracker_positions, dtype=np.float32)[None],
-        "configured": np.asarray(configured_values, dtype=bool)[None],
-        "measured_valid": np.asarray(measured_values, dtype=bool)[None],
-        "missing_age": np.asarray(missing_ages, dtype=np.int64)[None],
-        "scenario": np.asarray(scenarios)[None],
-        "eval_frame_mask": np.ones((1, evaluated_frames), dtype=bool),
-        "known_rotation_max_error": np.asarray(known_errors, dtype=np.float32)[None],
-        "sampling_latency_ms": np.asarray(sampling_latency_ms, dtype=np.float32)[None],
-        "e2e_latency_ms": np.asarray(e2e_latency_ms, dtype=np.float32)[None],
+    payload = {
+        name: np.asarray(items, dtype=np.float32 if name not in {
+            "configured", "measured_valid", "hard_rotation_state", "scenario"
+        } else None)[None]
+        for name, items in values.items()
     }
+    payload["configured"] = payload["configured"].astype(bool)
+    payload["measured_valid"] = payload["measured_valid"].astype(bool)
+    payload["hard_rotation_state"] = payload["hard_rotation_state"].astype(bool)
+    payload["d_off"] = payload["d_off"].astype(np.int64)
+    payload["d_on"] = payload["d_on"].astype(np.int64)
+    payload["history_length"] = payload["history_length"].astype(np.int64)
+    payload["scenario"] = np.asarray(values["scenario"])[None]
+    payload["fps"] = np.float32(60.0)
+    payload["absolute_frame_index"] = np.arange(frame_count, dtype=np.int64)
+    payload["eval_frame_mask"] = np.ones((1, frame_count), dtype=bool)
+    return payload
+
+
+def _classify_timeline_frame(timeline: TrackerTimeline, frame_index: int) -> str:
+    """复用数据管线的事件语义，避免评估脚本维护另一套分类规则。"""
+
+    return classify_tracker_frame(timeline, frame_index)
 
 
 def summarize_latency(values_ms: np.ndarray, warmup_frames: int = 0) -> dict[str, float | int | None]:
@@ -319,6 +304,8 @@ def evaluate_longseq_entries(
     diffusion,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
+    projected_ddim_mode: str = "all_steps",
+    projected_ddim_late_steps: int = 5,
     model_path: str | Path = "",
     weights: str = "",
     limit: int = 0,
@@ -361,6 +348,8 @@ def evaluate_longseq_entries(
             timeline=timeline,
             device=device,
             normalizer=normalizer,
+            projected_ddim_mode=projected_ddim_mode,
+            projected_ddim_late_steps=projected_ddim_late_steps,
             measure_latency=device.type == "cuda",
             show_progress=bool(show_progress),
             progress_desc=f"{entry_index + 1}/{len(selected_entries)} {sequence_id}",
@@ -383,7 +372,7 @@ def evaluate_longseq_entries(
                 "sequence_id": sequence_id,
                 "source_relative_path": str(entry.get("source_relative_path", "")),
                 "num_frames": frame_count,
-                "evaluated_frames": frame_count - REALTIME_POSE_HISTORY_LENGTH,
+                "evaluated_frames": frame_count,
                 "result_path": str(result_path),
             }
         )
@@ -419,6 +408,8 @@ def evaluate_longseq_entries(
         "e2e": summarize_latency(np.concatenate(e2e_latency_values)),
     }
     metadata = dict(runtime_metadata or {})
+    metadata["projected_ddim_mode"] = str(projected_ddim_mode)
+    metadata["projected_ddim_late_steps"] = int(projected_ddim_late_steps)
     if device.type == "cuda":
         metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
     summary_payload = {
@@ -442,11 +433,20 @@ def evaluate_longseq_entries(
     return summary_payload
 
 
-def build_default_output_dir(eval_set_dir: Path, model_path: str | Path, weights: str) -> Path:
+def build_default_output_dir(
+    eval_set_dir: Path,
+    model_path: str | Path,
+    weights: str,
+    projected_ddim_mode: str = "all_steps",
+    projected_ddim_late_steps: int = 5,
+) -> Path:
     checkpoint_tag = sanitize_path_token(Path(model_path).stem)
     if weights:
         checkpoint_tag = f"{checkpoint_tag}_{sanitize_path_token(weights)}"
-    return Path("output") / "longseq_eval" / eval_set_dir.name / checkpoint_tag
+    projection_tag = str(projected_ddim_mode)
+    if projection_tag == "late_steps":
+        projection_tag = f"{projection_tag}_{int(projected_ddim_late_steps)}"
+    return Path("output") / "longseq_eval" / eval_set_dir.name / f"{checkpoint_tag}_{projection_tag}"
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
@@ -457,6 +457,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     )
     if int(args.inference_steps) <= 0:
         raise ValueError("inference_steps 必须大于 0。")
+    if int(args.projected_ddim_late_steps) <= 0:
+        raise ValueError("projected_ddim_late_steps 必须大于 0。")
     args.ts_respace = f"ddim{int(args.inference_steps)}"
     fixseed(int(args.seed))
     eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
@@ -490,7 +492,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     output_dir = (
         Path(args.output_dir).resolve()
         if str(args.output_dir).strip()
-        else build_default_output_dir(eval_set_dir, args.model_path, weights).resolve()
+        else build_default_output_dir(
+            eval_set_dir,
+            args.model_path,
+            weights,
+            projected_ddim_mode=args.projected_ddim_mode,
+            projected_ddim_late_steps=args.projected_ddim_late_steps,
+        ).resolve()
     )
     summary = evaluate_longseq_entries(
         entries=entries,
@@ -500,6 +508,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         diffusion=diffusion,
         device=device,
         normalizer=normalizer,
+        projected_ddim_mode=str(args.projected_ddim_mode),
+        projected_ddim_late_steps=int(args.projected_ddim_late_steps),
         model_path=args.model_path,
         weights=weights,
         limit=int(args.limit),
@@ -520,8 +530,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "timestep_map": timestep_map,
             "use_ema": bool(args.use_ema),
             "diffusion_seed": int(args.seed),
+            "projected_ddim_mode": str(args.projected_ddim_mode),
+            "projected_ddim_late_steps": int(args.projected_ddim_late_steps),
             "latency_warmup_frames": int(args.latency_warmup_frames),
-            "history_initialization": "ground_truth_60_frames",
+            "history_initialization": "cold_start_zero_padding",
         },
         show_progress=bool(args.show_progress),
     )

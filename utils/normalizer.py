@@ -42,11 +42,15 @@ class RealtimePoseNormalizer:
         self.pose_std_path = self.base_dir / "pose_std.pt"
         self.tracker_mean_path = self.base_dir / "tracker_mean.pt"
         self.tracker_std_path = self.base_dir / "tracker_std.pt"
+        self.head_height_mean_path = self.base_dir / "head_height_mean.pt"
+        self.head_height_std_path = self.base_dir / "head_height_std.pt"
         self.meta_path = self.base_dir / "normalizer_meta.json"
         self.pose_mean: torch.Tensor | None = None
         self.pose_std: torch.Tensor | None = None
         self.tracker_mean: torch.Tensor | None = None
         self.tracker_std: torch.Tensor | None = None
+        self.head_height_mean: torch.Tensor | None = None
+        self.head_height_std: torch.Tensor | None = None
         self.metadata: dict[str, Any] = {}
         # 训练循环仍通过 mean/std 读取姿态统计；这里明确只指 144 维姿态。
         self.mean: torch.Tensor | None = None
@@ -60,6 +64,8 @@ class RealtimePoseNormalizer:
             self.pose_std_path,
             self.tracker_mean_path,
             self.tracker_std_path,
+            self.head_height_mean_path,
+            self.head_height_std_path,
         )
         missing = [path.name for path in required if not path.exists()]
         if missing:
@@ -74,6 +80,12 @@ class RealtimePoseNormalizer:
         self.tracker_std = _stabilize_std(
             torch.load(self.tracker_std_path, map_location="cpu", weights_only=True).float()
         )
+        self.head_height_mean = torch.load(
+            self.head_height_mean_path, map_location="cpu", weights_only=True
+        ).float().reshape(())
+        self.head_height_std = _stabilize_std(
+            torch.load(self.head_height_std_path, map_location="cpu", weights_only=True).float().reshape(1)
+        ).reshape(())
         self._validate_stats()
         if self.meta_path.exists():
             value = json.loads(self.meta_path.read_text(encoding="utf-8"))
@@ -88,6 +100,8 @@ class RealtimePoseNormalizer:
         pose_std: Any,
         tracker_mean: Any,
         tracker_std: Any,
+        head_height_mean: Any,
+        head_height_std: Any,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self.pose_mean = torch.as_tensor(pose_mean, dtype=torch.float32).reshape(-1)
@@ -100,12 +114,18 @@ class RealtimePoseNormalizer:
                 TRACKER_COUNT, TRACKER_CONTINUOUS_DIM
             )
         )
+        self.head_height_mean = torch.as_tensor(head_height_mean, dtype=torch.float32).reshape(())
+        self.head_height_std = _stabilize_std(
+            torch.as_tensor(head_height_std, dtype=torch.float32).reshape(1)
+        ).reshape(())
         self._validate_stats()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.pose_mean, self.pose_mean_path)
         torch.save(self.pose_std, self.pose_std_path)
         torch.save(self.tracker_mean, self.tracker_mean_path)
         torch.save(self.tracker_std, self.tracker_std_path)
+        torch.save(self.head_height_mean, self.head_height_mean_path)
+        torch.save(self.head_height_std, self.head_height_std_path)
         self._write_meta(metadata or {})
         self.metadata = {"eps": self.eps, **(metadata or {})}
         self.mean = self.pose_mean
@@ -160,6 +180,16 @@ class RealtimePoseNormalizer:
         mean, std = self._tracker_stats_for(value)
         return value * (std + self.eps) + mean
 
+    def normalize_head_height(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """只归一化 trajectory 的 Head height 标量，其他四维保持物理量。"""
+
+        mean, std = self._head_height_stats_for(value)
+        return (value - mean) / (std + self.eps)
+
+    def inverse_head_height(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        mean, std = self._head_height_stats_for(value)
+        return value * (std + self.eps) + mean
+
     def _pose_stats_for(
         self, value: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
@@ -199,6 +229,7 @@ class RealtimePoseNormalizer:
     def _validate_stats(self) -> None:
         assert self.pose_mean is not None and self.pose_std is not None
         assert self.tracker_mean is not None and self.tracker_std is not None
+        assert self.head_height_mean is not None and self.head_height_std is not None
         if tuple(self.pose_mean.shape) != (REALTIME_POSE_TARGET_DIM,) or tuple(self.pose_std.shape) != (
             REALTIME_POSE_TARGET_DIM,
         ):
@@ -206,11 +237,34 @@ class RealtimePoseNormalizer:
         expected_tracker = (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM)
         if tuple(self.tracker_mean.shape) != expected_tracker or tuple(self.tracker_std.shape) != expected_tracker:
             raise ValueError("Tracker normalizer 必须为 [6,9]。")
-        tensors = (self.pose_mean, self.pose_std, self.tracker_mean, self.tracker_std)
+        tensors = (
+            self.pose_mean,
+            self.pose_std,
+            self.tracker_mean,
+            self.tracker_std,
+            self.head_height_mean,
+            self.head_height_std,
+        )
         if not all(torch.isfinite(tensor).all() for tensor in tensors):
             raise ValueError("normalizer 统计包含 NaN 或 Inf。")
-        if torch.any(self.pose_std <= 0) or torch.any(self.tracker_std <= 0):
+        if torch.any(self.pose_std <= 0) or torch.any(self.tracker_std <= 0) or self.head_height_std <= 0:
             raise ValueError("normalizer std 必须全大于零。")
+
+    def _head_height_stats_for(
+        self, value: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, np.ndarray | torch.Tensor]:
+        if self.head_height_mean is None or self.head_height_std is None:
+            self.load()
+        assert self.head_height_mean is not None and self.head_height_std is not None
+        if isinstance(value, np.ndarray):
+            return (
+                np.asarray(self.head_height_mean.item(), dtype=value.dtype),
+                np.asarray(self.head_height_std.item(), dtype=value.dtype),
+            )
+        return (
+            self.head_height_mean.to(device=value.device, dtype=value.dtype),
+            self.head_height_std.to(device=value.device, dtype=value.dtype),
+        )
 
     def _write_meta(self, extra: dict[str, Any]) -> None:
         meta = {

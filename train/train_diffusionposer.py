@@ -41,6 +41,7 @@ def main():
             args.rollout_loss_weight
             + args.rollout_joint_vel_loss_weight
             + args.rollout_rot_vel_loss_weight
+            + args.foot_slide_loss_weight
         )
         enable_rollout_training = (
             args.rollout_steps > 1
@@ -62,6 +63,7 @@ def main():
             enable_rollout=enable_rollout_training,
             rollout_steps=args.rollout_steps,
             rollout_prob=args.rollout_prob,
+            cold_start_prob=args.cold_start_prob,
             scenario_weights=args.scenario_weights,
             seed=args.seed,
         )
@@ -81,6 +83,7 @@ def main():
                 enable_rollout=False,
                 rollout_steps=1,
                 rollout_prob=0.0,
+                cold_start_prob=0.0,
                 scenario_weights=args.scenario_weights,
                 seed=args.seed,
             )

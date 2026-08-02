@@ -1,6 +1,7 @@
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.realtime_pose_target_dit import RealtimePoseTargetDiT
+from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 
 
 def create_model_and_diffusion(args):
@@ -15,6 +16,10 @@ def create_model_and_diffusion(args):
         dropout=args.dropout,
         zero_init=args.zero_init,
         max_seq_len=args.max_seq_len,
+        motion_layers=getattr(args, "motion_layers", 4),
+        # Task 与 Runtime 当前都固定使用默认可靠度配置；在 metadata 契约完成前，
+        # 模型工厂也禁止从 CLI 覆盖，避免同一持续时间被按不同 duration_cap 解释。
+        reliability_config=TrackerReliabilityConfig().validate(),
     )
     return model, create_gaussian_diffusion(args)
 
@@ -36,10 +41,13 @@ def create_gaussian_diffusion(args):
         rotation_loss_weight=getattr(args, "rotation_loss_weight", 1.0),
         fk_loss_weight=getattr(args, "fk_loss_weight", 2.0),
         local_rot_loss_weight=getattr(args, "local_rot_loss_weight", 1.0),
-        pelvis_fk_loss_weight=getattr(args, "pelvis_fk_loss_weight", 2.0),
-        pelvis_offset_loss_weight=getattr(args, "pelvis_offset_loss_weight", 1.0),
-        pelvis_consistency_loss_weight=getattr(args, "pelvis_consistency_loss_weight", 0.5),
-        transition_loss_weight=getattr(args, "transition_loss_weight", 0.5),
         tracker_pos_loss_weight=getattr(args, "tracker_pos_loss_weight", 10.0),
         tracker_pos_huber_beta=getattr(args, "tracker_pos_huber_beta", 0.05),
+        tracker_rot_loss_weight=getattr(args, "tracker_rot_loss_weight", 1.0),
+        root_loss_weight=getattr(args, "root_loss_weight", 1.0),
+        world_joint_loss_weight=getattr(args, "world_joint_loss_weight", 1.0),
+        head_to_root_xz_loss_weight=getattr(args, "head_to_root_xz_loss_weight", 1.0),
+        future_leg_loss_weight=getattr(args, "future_leg_loss_weight", 0.5),
+        contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
+        foot_slide_loss_weight=getattr(args, "foot_slide_loss_weight", 0.5),
     )

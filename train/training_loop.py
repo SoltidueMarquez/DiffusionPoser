@@ -13,12 +13,29 @@ from torch.optim import AdamW
 from data_loaders.realtime_pose_geometry import advance_rollout_pose_history_torch
 
 from data_loaders.sensor_masking import (
+    REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     TASK_MODE_REALTIME_POSE,
 )
 from diffusion import logger
 from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 from utils import dist_util
+
+
+def zero_invalid_pose_history(
+    pose_history: torch.Tensor,
+    valid_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """把 `[B,60,144]` 中无效历史恢复为模型输入空间的字面量零。"""
+
+    if pose_history.ndim != 3 or pose_history.shape[1:] != (
+        REALTIME_POSE_HISTORY_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+    ):
+        raise ValueError("pose_history 必须为 [B,60,144]。")
+    if tuple(valid_frame_mask.shape) != tuple(pose_history.shape[:2]):
+        raise ValueError("valid_frame_mask 必须与 pose_history 的前两维一致。")
+    return pose_history.masked_fill(~valid_frame_mask.bool()[..., None], 0.0)
 
 
 class TrainLoop:
@@ -338,9 +355,14 @@ class TrainLoop:
     def run_step(self, batch):
         self.forward_backward(batch)
 
-        if self.gradient_clip:
-            self.scaler.unscale_(self.opt)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        # 先恢复真实梯度，再统一检查 NaN/Inf；关闭裁剪时仍需在 optimizer step 前失败。
+        self.scaler.unscale_(self.opt)
+        max_grad_norm = 1.0 if self.gradient_clip else float("inf")
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            max_norm=max_grad_norm,
+            error_if_nonfinite=True,
+        )
 
         self._anneal_lr()
         self.scaler.step(self.opt)
@@ -389,6 +411,8 @@ class TrainLoop:
             return_pred_xstart=do_rollout,
         )
         pred_xstart = losses.pop("pred_xstart", None)
+        losses.pop("raw_pred_xstart", None)
+        losses.pop("deployed_pred_xstart", None)
         if not do_rollout:
             return losses
 
@@ -401,9 +425,11 @@ class TrainLoop:
         rollout_frame_loss = rollout_losses.pop("loss")
         joint_vel_loss = rollout_losses.pop("joint_vel_loss")
         rotation_vel_loss = rollout_losses.pop("rotation_vel_loss")
+        foot_slide_loss = rollout_losses.pop("foot_slide_loss")
         rollout_loss_weighted = rollout_frame_loss * self.rollout_loss_weight
         joint_vel_loss_weighted = joint_vel_loss * self.rollout_joint_vel_loss_weight
         rotation_vel_loss_weighted = rotation_vel_loss * self.rollout_rot_vel_loss_weight
+        foot_slide_loss_weighted = foot_slide_loss * float(self.diffusion.foot_slide_loss_weight)
         losses["base_loss"] = base_loss
         losses["rollout_loss"] = rollout_frame_loss
         losses["rollout_loss_weighted"] = rollout_loss_weighted
@@ -411,11 +437,14 @@ class TrainLoop:
         losses["rollout_joint_vel_loss_weighted"] = joint_vel_loss_weighted
         losses["rollout_rotation_vel_loss"] = rotation_vel_loss
         losses["rollout_rotation_vel_loss_weighted"] = rotation_vel_loss_weighted
+        losses["rollout_foot_slide_loss"] = foot_slide_loss
+        losses["rollout_foot_slide_loss_weighted"] = foot_slide_loss_weighted
         losses["loss"] = (
             base_loss
             + rollout_loss_weighted
             + joint_vel_loss_weighted
             + rotation_vel_loss_weighted
+            + foot_slide_loss_weighted
         )
         for key, value in rollout_losses.items():
             losses[f"rollout_{key}"] = value
@@ -426,6 +455,7 @@ class TrainLoop:
             self.rollout_loss_weight > 0.0
             or self.rollout_joint_vel_loss_weight > 0.0
             or self.rollout_rot_vel_loss_weight > 0.0
+            or float(self.diffusion.foot_slide_loss_weight) > 0.0
         )
         if self.rollout_steps <= 1 or not rollout_weight_enabled:
             return False
@@ -468,9 +498,14 @@ class TrainLoop:
             # 持续滚动同一份历史，防止第三步以后较早的模型预测被离线 GT 历史重新覆盖。
             pose_history = self.build_next_rollout_pose_history(
                 pose_history=pose_history,
-                source_head_yaw_world=current_batch["current_head_yaw_world"],
-                destination_head_yaw_world=next_batch["current_head_yaw_world"],
+                source_head_yaw_world=current_batch["history_head_yaw_world"],
+                destination_head_yaw_world=next_batch["history_head_yaw_world"],
                 pred_xstart=predictions[-1],
+            )
+            # reference 变换会改变归一化 padding 的数值；下一步送入模型前必须再次严格清零。
+            pose_history = zero_invalid_pose_history(
+                pose_history,
+                next_batch["valid_frame_mask"],
             )
             next_batch["pose_history"] = pose_history
 
@@ -486,6 +521,8 @@ class TrainLoop:
                 return_pred_xstart=True,
             )
             next_prediction = next_terms.pop("pred_xstart", None)
+            next_terms.pop("raw_pred_xstart", None)
+            next_terms.pop("deployed_pred_xstart", None)
             if next_prediction is None:
                 raise ValueError(f"rollout step {rollout_index} 没有返回 pred_xstart。")
             predictions.append(next_prediction)
@@ -552,39 +589,25 @@ class TrainLoop:
         return self.feature_w.to(self.device)[None].repeat(batch_size, 1)
 
     def mask_manager(self, batch, sample):
-        """统一使用 known=True / unknown=False 的关节级硬 inpainting 契约。"""
+        """构造新动态观测条件；扩散状态始终对完整 144D 加噪。"""
 
         batch_size = sample.shape[0]
-        valid_frame_mask = batch.get("valid_frame_mask", batch.get("attention_mask"))
+        valid_frame_mask = batch.get("valid_frame_mask")
         if valid_frame_mask is None:
             valid_frame_mask = torch.ones(batch_size, 60, dtype=torch.bool, device=sample.device)
         valid_frame_mask = valid_frame_mask.bool()
         if valid_frame_mask.shape != (batch_size, 60):
             raise ValueError(f"valid_frame_mask 应为 [B,60]，实际为 {tuple(valid_frame_mask.shape)}")
 
-        known_mask = batch.get("known_mask")
-        if known_mask is None or known_mask.shape != sample.shape:
-            raise ValueError("batch 必须包含与 [B,144] 同形的 known_mask。")
-        known_mask = known_mask.bool()
-        inpaint_mask = ~known_mask
-        if not inpaint_mask.any():
-            raise ValueError("当前 batch 没有未知关节。")
-        joint_atomic = known_mask.reshape(batch_size, 24, 6)
-        if torch.any(joint_atomic.any(dim=-1) != joint_atomic.all(dim=-1)):
-            raise ValueError("rotation6D 的六个通道必须使用原子 known mask。")
-
-        conditioned_sample = batch.get("known_target")
-        if conditioned_sample is None:
-            raise ValueError("batch 缺少 known_target。")
-        if conditioned_sample.shape != sample.shape:
-            raise ValueError(f"known_target 应为 {tuple(sample.shape)}，实际为 {tuple(conditioned_sample.shape)}")
-
         y = {
-            "mask": inpaint_mask,
-            "inpainted_motion": conditioned_sample,
-            "known_mask": known_mask,
             "pose_history": batch["pose_history"],
-            "tracker_window": batch["tracker_window"],
+            "tracker_history": batch["tracker_history"],
+            "current_tracker": batch["current_tracker"],
+            "current_tracker_raw": batch["current_tracker_raw"],
+            "trajectory_history": batch["trajectory_history"],
+            "current_trajectory": batch["current_trajectory"],
+            "valid_frame_mask": valid_frame_mask,
+            "hard_rotation_state": batch["hard_rotation_state"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
             "prev_joints_head_ref": batch["prev_joints_head_ref"],
             "current_tracker_pos_head_ref": batch["current_tracker_pos_head_ref"],
@@ -592,19 +615,25 @@ class TrainLoop:
             "joint_rest_local_rotations_6d": batch["joint_rest_local_rotations_6d"],
             "configured": batch["configured"],
             "measured_valid": batch["measured_valid"],
-            "missing_age": batch["missing_age"],
+            "d_off": batch["d_off"],
+            "d_on": batch["d_on"],
+            "target_root_position_head_ref": batch["target_root_position_head_ref"],
+            "target_root_yaw_world": batch["target_root_yaw_world"],
+            "current_head_yaw_world": batch["current_head_yaw_world"],
+            "future_leg_target": batch["future_leg_target"],
+            "contact_target": batch["contact_target"],
         }
         if self.normalizer_mean is not None and self.normalizer_std is not None:
             y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
             y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)
 
         return {
-            "inpaint_cond": inpaint_mask,
-            "known_mask": known_mask,
             "pose_history": batch["pose_history"],
-            "tracker_window": batch["tracker_window"],
+            "tracker_history": batch["tracker_history"],
+            "current_tracker": batch["current_tracker"],
+            "trajectory_history": batch["trajectory_history"],
+            "current_trajectory": batch["current_trajectory"],
             "valid_frame_mask": valid_frame_mask,
-            "attention_mask": valid_frame_mask,
             "y": y,
         }
 

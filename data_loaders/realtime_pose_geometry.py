@@ -17,14 +17,14 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
-    MISSING_AGE_CAP,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
     TRACKER_COUNT,
+    TRACKER_D_OFF_OFFSET,
+    TRACKER_D_ON_OFFSET,
     TRACKER_FEATURE_DIM,
-    TRACKER_MISSING_AGE_OFFSET,
     TRACKER_TO_JOINT,
 )
 
@@ -90,91 +90,103 @@ def build_pose_target_np(
     ).astype(np.float32)
 
 
-def build_tracker_window_np(
+def build_tracker_measurements_np(
     tracker_pos_world: np.ndarray,
     tracker_rot_world_6d: np.ndarray,
-    current_head_pos_world: np.ndarray,
+    reference_head_pos_world: np.ndarray,
     floor_y: float,
-    current_head_yaw: float,
-    configured: np.ndarray,
-    measured_valid: np.ndarray,
-    missing_age_norm: np.ndarray,
+    reference_head_yaw: float,
 ) -> np.ndarray:
-    """构造 `[61,6,12]` Tracker 条件，并彻底清除无效测量连续量。"""
+    """把任意连续帧 Tracker 世界变换统一表达在指定 Head-yaw 参考系。"""
 
     positions = np.asarray(tracker_pos_world, dtype=np.float64)
     rotations = rotation_6d_to_matrix_np(np.asarray(tracker_rot_world_6d, dtype=np.float64))
-    configured = np.asarray(configured, dtype=bool)
-    measured_valid = np.asarray(measured_valid, dtype=bool)
-    missing_age_norm = np.asarray(missing_age_norm, dtype=np.float32)
     if positions.ndim != 3 or positions.shape[1:] != (TRACKER_COUNT, 3):
         raise ValueError(f"tracker_pos_world 必须为 [T,6,3]，实际为 {positions.shape}")
-    expected_state_shape = positions.shape[:2]
-    if configured.shape != expected_state_shape or measured_valid.shape != expected_state_shape:
-        raise ValueError("Tracker 状态形状必须与位置的 [T,6] 一致。")
-    if missing_age_norm.shape != expected_state_shape:
-        raise ValueError("missing_age_norm 必须为 [T,6]。")
+    if rotations.shape != (*positions.shape[:2], 3, 3):
+        raise ValueError("tracker_rot_world_6d 必须为 [T,6,6]。")
 
     origin = np.asarray(
-        [current_head_pos_world[0], float(floor_y), current_head_pos_world[2]],
+        [reference_head_pos_world[0], float(floor_y), reference_head_pos_world[2]],
         dtype=np.float64,
     )
-    head_yaw_inv = make_yaw_rotation_np(np.asarray([current_head_yaw], dtype=np.float64))[0].T
+    head_yaw_inv = make_yaw_rotation_np(np.asarray([reference_head_yaw], dtype=np.float64))[0].T
     positions_head = np.einsum("ij,taj->tai", head_yaw_inv, positions - origin[None, None])
     rotations_head = np.einsum("ij,tajk->taik", head_yaw_inv, rotations)
-
-    result = np.zeros((positions.shape[0], TRACKER_COUNT, TRACKER_FEATURE_DIM), dtype=np.float32)
+    result = np.empty((positions.shape[0], TRACKER_COUNT, 9), dtype=np.float32)
     result[..., 0:3] = positions_head.astype(np.float32)
     result[..., 3:9] = rotation_6d_forward_up_np(rotations_head).astype(np.float32)
-    result[..., 9] = configured.astype(np.float32)
-    result[..., 10] = measured_valid.astype(np.float32)
-    result[..., TRACKER_MISSING_AGE_OFFSET] = np.clip(missing_age_norm, 0.0, 1.0)
-    result[..., 0:9] *= measured_valid[..., None]
     return result
 
 
-def build_known_target_np(
-    current_tracker_features: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """只通过当前可信 Tracker 构造 hard inpainting 值和 mask。"""
+def assemble_tracker_features_np(
+    measurements: np.ndarray,
+    configured: np.ndarray,
+    measured_valid: np.ndarray,
+    d_off: np.ndarray,
+    d_on: np.ndarray,
+    duration_cap: int = 60,
+) -> np.ndarray:
+    """组合 `[T,6,13]`，且只归一化 duration 两个状态通道。"""
 
-    tracker = np.asarray(current_tracker_features, dtype=np.float32)
-    if tracker.shape != (TRACKER_COUNT, TRACKER_FEATURE_DIM):
-        raise ValueError(f"current_tracker_features 必须为 [6,12]，实际为 {tracker.shape}")
-    measured = tracker[:, 10] > 0.5
-    known_target = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float32)
-    known_mask = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=bool)
-
-    for tracker_index in range(TRACKER_COUNT):
-        if not measured[tracker_index]:
-            continue
-        joint_index = TRACKER_TO_JOINT[tracker_index]
-        start = joint_index * ROTATION_6D_DIM
-        target_slice = slice(start, start + ROTATION_6D_DIM)
-        known_target[target_slice] = tracker[tracker_index, 3:9]
-        known_mask[target_slice] = True
-
-    # Head 是模型的硬前提；该断言可发现 task 构造或 runtime gating 错误。
-    head_start = TRACKER_TO_JOINT[HEAD_TRACKER_INDEX] * ROTATION_6D_DIM
-    head_slice = slice(head_start, head_start + ROTATION_6D_DIM)
-    if not known_mask[head_slice].all():
-        raise ValueError("Head rotation 必须始终写入 known_target。")
-    return known_target, known_mask
-
-
-def build_known_mask_from_measured_np(measured_valid: np.ndarray) -> np.ndarray:
-    """把当前六个 Tracker 的测量状态映射到 144 维 hard-condition mask。"""
-
+    continuous = np.asarray(measurements, dtype=np.float32)
+    if continuous.ndim != 3 or continuous.shape[1:] != (TRACKER_COUNT, 9):
+        raise ValueError("measurements 必须为 [T,6,9]。")
+    state_shape = continuous.shape[:2]
+    configured = np.asarray(configured, dtype=bool)
     measured = np.asarray(measured_valid, dtype=bool)
-    if measured.shape != (TRACKER_COUNT,):
-        raise ValueError(f"measured_valid 必须为 [{TRACKER_COUNT}]，实际为 {measured.shape}")
-    known_mask = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=bool)
-    for tracker_index in range(TRACKER_COUNT):
-        if measured[tracker_index]:
-            joint_index = TRACKER_TO_JOINT[tracker_index]
-            start = joint_index * ROTATION_6D_DIM
-            known_mask[start : start + ROTATION_6D_DIM] = True
-    return known_mask
+    d_off = np.asarray(d_off, dtype=np.float32)
+    d_on = np.asarray(d_on, dtype=np.float32)
+    if any(value.shape != state_shape for value in (configured, measured, d_off, d_on)):
+        raise ValueError("Tracker 状态必须与 measurements 的 [T,6] 轴一致。")
+    if np.any(measured & ~configured):
+        raise ValueError("measured_valid 必须是 configured 子集。")
+    if not configured[:, HEAD_TRACKER_INDEX].all() or not measured[:, HEAD_TRACKER_INDEX].all():
+        raise ValueError("Head 必须始终 configured 且 measured_valid。")
+    result = np.zeros((*state_shape, TRACKER_FEATURE_DIM), dtype=np.float32)
+    result[..., :9] = continuous
+    result[..., 9] = configured
+    result[..., 10] = measured
+    result[..., TRACKER_D_OFF_OFFSET] = np.clip(d_off, 0, duration_cap) / float(duration_cap)
+    result[..., TRACKER_D_ON_OFFSET] = np.clip(d_on, 0, duration_cap) / float(duration_cap)
+    result[..., :9] *= measured[..., None]
+    validate_tracker_features_np(result)
+    return result
+
+
+def build_head_trajectory_np(
+    head_pos_world: np.ndarray,
+    head_yaw_world: np.ndarray,
+    floor_y: float | np.ndarray,
+    head_height_mean: float = 0.0,
+    head_height_std: float = 1.0,
+) -> np.ndarray:
+    """构造逐帧 5D Head trajectory；位移使用上一帧 Head yaw 参考系。"""
+
+    positions = np.asarray(head_pos_world, dtype=np.float64)
+    yaws = np.asarray(head_yaw_world, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or yaws.shape != (positions.shape[0],):
+        raise ValueError("Head trajectory 输入必须为 [T,3] 和 [T]。")
+    floor = np.asarray(floor_y, dtype=np.float64)
+    if floor.shape == ():
+        floor = np.full(positions.shape[0], float(floor), dtype=np.float64)
+    if floor.shape != (positions.shape[0],):
+        raise ValueError("floor_y 必须是标量或 [T]。")
+    if float(head_height_std) <= 0.0:
+        raise ValueError("head_height_std 必须大于 0。")
+    delta_world = np.zeros_like(positions)
+    delta_yaw = np.zeros_like(yaws)
+    if positions.shape[0] > 1:
+        delta_world[1:] = positions[1:] - positions[:-1]
+        delta_yaw[1:] = (yaws[1:] - yaws[:-1] + math.pi) % (2.0 * math.pi) - math.pi
+    previous_yaw = np.concatenate([yaws[:1], yaws[:-1]], axis=0)
+    previous_yaw_inv = np.swapaxes(make_yaw_rotation_np(previous_yaw), -1, -2)
+    delta_ref = np.einsum("tij,tj->ti", previous_yaw_inv, delta_world)
+    height = (positions[:, 1] - floor - float(head_height_mean)) / float(head_height_std)
+    return np.stack(
+        [delta_ref[:, 0], delta_ref[:, 2], height, np.sin(delta_yaw), np.cos(delta_yaw)],
+        axis=-1,
+    ).astype(np.float32)
 
 
 def extract_rotation_heading_np(rotations: np.ndarray) -> np.ndarray:
@@ -262,7 +274,7 @@ def advance_rollout_pose_history_torch(
     normalizer_std: torch.Tensor | None = None,
     detach_prediction: bool = True,
 ) -> torch.Tensor:
-    """重表达整段历史并追加预测；后续 step 不再读取离线 GT pose_history。"""
+    """把旧历史换到下一历史参考系，并追加已位于该参考系的 deployed 预测。"""
 
     if pose_history.ndim != 3 or pose_history.shape[1:] != (
         REALTIME_POSE_HISTORY_LENGTH,
@@ -293,13 +305,8 @@ def advance_rollout_pose_history_torch(
         source_yaw[:, None].expand(-1, history_length).reshape(-1),
         destination_yaw[:, None].expand(-1, history_length).reshape(-1),
     ).reshape(batch_size, history_length, target_dim)
-    prediction_reexpressed = reexpress_pose_target_between_head_yaws_torch(
-        prediction_raw,
-        source_yaw,
-        destination_yaw,
-    )
     next_history = torch.cat(
-        [history_reexpressed[:, 1:], prediction_reexpressed[:, None]],
+        [history_reexpressed[:, 1:], prediction_raw[:, None]],
         dim=1,
     )
     if mean is None or std is None:
@@ -460,16 +467,21 @@ def global_head_rotations_to_local_delta_6d_np(
     return rotation_6d_forward_up_np(delta).reshape(*rotations.shape[:-3], 144).astype(np.float32)
 
 
-def validate_missing_age_feature(tracker_window: np.ndarray) -> None:
+def validate_tracker_features_np(tracker_window: np.ndarray) -> None:
     tracker = np.asarray(tracker_window)
     if tracker.shape[-2:] != (TRACKER_COUNT, TRACKER_FEATURE_DIM):
-        raise ValueError(f"tracker_window 尾部形状必须为 [6,12]，实际为 {tracker.shape}")
-    age = tracker[..., TRACKER_MISSING_AGE_OFFSET]
-    if np.any(age < 0.0) or np.any(age > 1.0):
-        raise ValueError("missing_age_norm 必须在 [0,1]。")
+        raise ValueError(f"Tracker 特征尾部形状必须为 [6,13]，实际为 {tracker.shape}")
+    d_off = tracker[..., TRACKER_D_OFF_OFFSET]
+    d_on = tracker[..., TRACKER_D_ON_OFFSET]
+    if np.any((d_off < 0.0) | (d_off > 1.0)) or np.any((d_on < 0.0) | (d_on > 1.0)):
+        raise ValueError("d_off/d_on norm 必须在 [0,1]。")
     configured = tracker[..., 9] > 0.5
     measured = tracker[..., 10] > 0.5
     if np.any(measured & ~configured):
         raise ValueError("measured_valid 必须是 configured 子集。")
-    if np.any((~configured | measured) & (np.abs(age) > 1e-7)):
-        raise ValueError("未配置或有效 Tracker 的 missing_age_norm 必须为 0。")
+    if np.any((~configured | measured) & (np.abs(d_off) > 1e-7)):
+        raise ValueError("未配置或有效 Tracker 的 d_off 必须为 0。")
+    if np.any((~configured | ~measured) & (np.abs(d_on) > 1e-7)):
+        raise ValueError("未配置或掉线 Tracker 的 d_on 必须为 0。")
+    if np.any(np.abs(tracker[..., :9][~measured]) > 1e-7):
+        raise ValueError("无效测量的前 9 维必须严格清零。")

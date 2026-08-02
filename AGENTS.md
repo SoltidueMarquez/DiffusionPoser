@@ -54,7 +54,6 @@ conda run -n diffusionposer5070 pytest tests/smoke/train
 conda run -n diffusionposer5070 pytest tests/smoke/sample
 conda run -n diffusionposer5070 pytest tests/smoke/eval
 conda run -n diffusionposer5070 pytest tests/smoke/export
-conda run -n diffusionposer5070 pytest tests/smoke/visual_editor
 ```
 
 如果改动训练、数据生成、在线重建、评估或导出链路，至少运行相关领域的冒烟测试；改动跨模块契约时运行完整 `tests/smoke`。

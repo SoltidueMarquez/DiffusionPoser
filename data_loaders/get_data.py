@@ -15,9 +15,10 @@ def get_dataset_loader(
     pin_memory: bool = False,
     folder_path: str | None = None,
     enable_rollout: bool = False,
-    rollout_steps: int = 1,
-    rollout_prob: float = 0.0,
-    scenario_weights: list[float] | tuple[float, ...] = (1, 1, 1, 1, 1),
+    rollout_steps: int = 4,
+    rollout_prob: float = 0.5,
+    cold_start_prob: float = 0.1,
+    scenario_weights: list[float] | tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2),
     seed: int = 10,
 ):
     """返回 mmap task store 的训练/评估 DataLoader。"""
@@ -40,22 +41,18 @@ def get_dataset_loader(
     if int(num_workers) > 0:
         worker_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
 
-    if "train" in str(split):
-        sampler = RealtimePoseBatchSampler(
-            dataset=dataset,
-            batch_size=batch_size,
-            seed=seed,
-            scenario_weights=scenario_weights,
-            rollout_steps=rollout_steps if enable_rollout else 1,
-            rollout_prob=rollout_prob if enable_rollout else 0.0,
-            shuffle=True,
-            drop_last=True,
-        )
-        return DataLoader(dataset, batch_sampler=sampler, **worker_kwargs)
-    return DataLoader(
-        dataset,
+    is_train_split = "train" in str(split).lower()
+    # Dataset 的整数索引只表示 task_index，会固定读取 config_index=0。
+    # 所有 split 都通过 TaskRequest 取样，验证集才能真正遵守 scenario_weights。
+    sampler = RealtimePoseBatchSampler(
+        dataset=dataset,
         batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        **worker_kwargs,
+        seed=seed,
+        scenario_weights=scenario_weights,
+        rollout_steps=rollout_steps if is_train_split and enable_rollout else 1,
+        rollout_prob=rollout_prob if is_train_split and enable_rollout else 0.0,
+        cold_start_prob=cold_start_prob if is_train_split else 0.0,
+        shuffle=is_train_split,
+        drop_last=is_train_split,
     )
+    return DataLoader(dataset, batch_sampler=sampler, **worker_kwargs)

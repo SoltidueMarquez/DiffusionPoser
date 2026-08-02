@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from scripts import run_realtime_pose_pipeline as pipeline
+from data_loaders.generate_realtime_pose_tasks import shard_fields
+from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
 from utils.run_dirs import write_latest_pointer
 
 
@@ -51,7 +53,23 @@ def write_latest_task_artifact(task_root: Path, split: str = "train") -> Path:
     task_dir = task_root / "20260101_000000_rtp_tasks"
     split_dir = task_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
-    (split_dir / "task_store.json").write_text("{}\n", encoding="utf-8")
+    (split_dir / "task_store.json").write_text(
+        json.dumps(
+            {
+                "generation_plan_hash": "temporary",
+                "split": split,
+                "sample_count": 1,
+                "source_count": 1,
+                "max_rollout_steps": 4,
+                "config_names": list(TRACKER_PATTERN_CATEGORIES),
+                "tracker_feature_dim": TRACKER_FEATURE_DIM,
+                "schema_fields": sorted(shard_fields(4)),
+                "shards": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     write_latest_pointer(
         root_dir=task_root,
         kind="tasks",
@@ -68,6 +86,9 @@ def write_latest_normalizer_artifact(normalizer_root: Path) -> Path:
     (normalizer_dir / "pose_std.pt").write_bytes(b"std")
     (normalizer_dir / "tracker_mean.pt").write_bytes(b"mean")
     (normalizer_dir / "tracker_std.pt").write_bytes(b"std")
+    (normalizer_dir / "head_height_mean.pt").write_bytes(b"mean")
+    (normalizer_dir / "head_height_std.pt").write_bytes(b"std")
+    (normalizer_dir / "normalizer_meta.json").write_text("{}\n", encoding="utf-8")
     write_latest_pointer(
         root_dir=normalizer_root,
         kind="normalizer",
@@ -170,3 +191,10 @@ def test_pipeline_passes_new_task_store_and_training_sampling_args(tmp_path):
     assert train_args[train_args.index("--rollout_steps") + 1] == "3"
     weights = train_args.index("--scenario_weights")
     assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]
+    invalid_reliability_options = {
+        "--d_warm_pos",
+        "--d_warm_rot",
+        "--d_hard",
+        "--tracker_duration_cap",
+    }
+    assert invalid_reliability_options.isdisjoint(train_args)

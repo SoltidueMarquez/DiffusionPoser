@@ -10,8 +10,6 @@ from data_loaders.realtime_pose_geometry import (
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_torch
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
-    ROTATION_6D_DIM,
-    SMPL_JOINT_COUNT,
 )
 
 
@@ -76,16 +74,12 @@ def decode_rollout_frame_world_geometry(
     pred_rot_world = torch.einsum("bij,bajk->baik", head_to_world, pred_rot_head)
     target_rot_world = torch.einsum("bij,bajk->baik", head_to_world, target_rot_head)
 
-    known_mask = batch["known_mask"].to(device=device).bool()
-    rotation_unknown = ~known_mask.reshape(
-        pred_xstart.shape[0], SMPL_JOINT_COUNT, ROTATION_6D_DIM
-    ).all(dim=-1)
     return {
         "pred_joints_world": pred_joints_world,
         "target_joints_world": target_joints_world,
         "pred_rot_world": pred_rot_world,
         "target_rot_world": target_rot_world,
-        "rotation_unknown": rotation_unknown,
+        "contact_target": batch["contact_target"].to(device=device, dtype=dtype),
     }
 
 
@@ -94,12 +88,12 @@ def rollout_temporal_losses_from_geometry(
     target_joints_world: torch.Tensor,
     pred_rot_world: torch.Tensor,
     target_rot_world: torch.Tensor,
-    rotation_unknown: torch.Tensor,
+    contact_target: torch.Tensor | None = None,
     joint_huber_beta: float = 0.01,
 ) -> dict[str, torch.Tensor]:
     """计算内部预测帧之间的关节速度与相对旋转损失。
 
-    输入形状分别为 `[B,K,J,3]`、`[B,K,J,3,3]` 和 `[B,K,J]`。
+    输入形状分别为 `[B,K,J,3]`、`[B,K,J,3,3]` 和 `[B,K,2]`。
     这里只比较 rollout 内部的预测帧，不把 GT 历史边界伪装成速度监督。
     """
 
@@ -109,8 +103,6 @@ def rollout_temporal_losses_from_geometry(
         raise ValueError("pred/target joints 形状必须一致。")
     if pred_rot_world.ndim != 5 or target_rot_world.shape != pred_rot_world.shape:
         raise ValueError("pred/target rotations 应为同形的 [B,K,J,3,3]。")
-    if rotation_unknown.shape != pred_rot_world.shape[:3]:
-        raise ValueError("rotation_unknown 应为 [B,K,J]。")
     if joint_huber_beta <= 0.0:
         raise ValueError("joint_huber_beta 必须大于 0。")
 
@@ -132,14 +124,24 @@ def rollout_temporal_losses_from_geometry(
     rotation_error = torch.acos(safe_cosine)
     rotation_error = torch.where(cosine >= 1.0 - 1e-6, torch.zeros_like(rotation_error), rotation_error)
 
-    pair_unknown = rotation_unknown[:, 1:] & rotation_unknown[:, :-1]
-    pair_weight = pair_unknown.to(dtype=rotation_error.dtype)
-    rotation_vel_loss = (rotation_error * pair_weight).sum(dim=(1, 2)) / pair_weight.sum(
-        dim=(1, 2)
-    ).clamp_min(1.0)
+    rotation_vel_loss = rotation_error.mean(dim=(1, 2))
+    foot_slide_loss = torch.zeros_like(rotation_vel_loss)
+    if contact_target is not None:
+        if tuple(contact_target.shape[:2]) != tuple(pred_joints_world.shape[:2]) or contact_target.shape[-1] != 2:
+            raise ValueError("contact_target 必须为 [B,K,2]。")
+        feet = torch.as_tensor([10, 11], device=pred_joints_world.device, dtype=torch.long)
+        foot_delta = torch.linalg.norm(
+            pred_joints_world[:, 1:].index_select(2, feet)
+            - pred_joints_world[:, :-1].index_select(2, feet),
+            dim=-1,
+        )
+        active = (contact_target[:, 1:] >= 0.5) & (contact_target[:, :-1] >= 0.5)
+        weight = active.to(foot_delta.dtype)
+        foot_slide_loss = (foot_delta * weight).sum(dim=(1, 2)) / weight.sum(dim=(1, 2)).clamp_min(1.0)
     return {
         "joint_vel_loss": joint_vel_loss,
         "rotation_vel_loss": rotation_vel_loss,
+        "foot_slide_loss": foot_slide_loss,
     }
 
 
@@ -167,5 +169,5 @@ def compute_rollout_temporal_losses(
         target_joints_world=torch.stack([frame["target_joints_world"] for frame in decoded], dim=1),
         pred_rot_world=torch.stack([frame["pred_rot_world"] for frame in decoded], dim=1),
         target_rot_world=torch.stack([frame["target_rot_world"] for frame in decoded], dim=1),
-        rotation_unknown=torch.stack([frame["rotation_unknown"] for frame in decoded], dim=1),
+        contact_target=torch.stack([frame["contact_target"] for frame in decoded], dim=1),
     )

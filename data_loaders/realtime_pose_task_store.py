@@ -10,6 +10,8 @@ from typing import Any, Iterable
 import numpy as np
 from numpy.lib.format import open_memmap
 
+from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
+
 
 STORE_METADATA_FILE = "task_store.json"
 PLAN_FILE = "generation_plan.jsonl"
@@ -70,6 +72,42 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"{path} 必须是 JSON object。")
+    required = {
+        "generation_plan_hash",
+        "split",
+        "sample_count",
+        "source_count",
+        "max_rollout_steps",
+        "config_names",
+        "tracker_feature_dim",
+        "schema_fields",
+        "shards",
+    }
+    missing = sorted(required.difference(value))
+    if missing:
+        raise ValueError(f"{path} 缺少新 task store 字段 {missing}；旧 task 不可复用。")
+    if int(value["tracker_feature_dim"]) != TRACKER_FEATURE_DIM:
+        raise ValueError(f"{path} Tracker 维度不是当前要求的 {TRACKER_FEATURE_DIM}。")
+    if int(value["sample_count"]) <= 0 or int(value["source_count"]) <= 0:
+        raise ValueError(f"{path} sample_count/source_count 必须大于 0。")
+    if tuple(value["config_names"]) != TRACKER_PATTERN_CATEGORIES:
+        raise ValueError(f"{path} 场景列表与当前五类训练契约不一致。")
+    required_fields = {
+        "pose_history",
+        "current_target",
+        "tracker_history_continuous",
+        "current_tracker_continuous",
+        "trajectory_history",
+        "current_trajectory",
+        "configured",
+        "measured_valid",
+        "d_off",
+        "d_on",
+        "hard_rotation_state",
+        "history_head_yaw_world",
+    }
+    if not required_fields.issubset(set(value["schema_fields"])):
+        raise ValueError(f"{path} 不满足当前 task schema；旧 task 不可复用。")
     return value
 
 

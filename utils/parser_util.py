@@ -4,12 +4,17 @@ import json
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
+from data_loaders.realtime_pose_config import RealtimePoseLossWeights
 from data_loaders.sensor_masking import (
+    DEFAULT_SCENARIO_WEIGHTS,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     TASK_MODE_REALTIME_POSE,
     TASK_MODES,
 )
+
+
+_LOSS_DEFAULTS = RealtimePoseLossWeights()
 
 
 def build_train_arg_parser() -> ArgumentParser:
@@ -81,13 +86,19 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     group.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--num_workers", default=0, type=int)
-    group.add_argument("--rollout_steps", default=1, type=int)
+    group.add_argument("--rollout_steps", default=4, type=int)
+    group.add_argument(
+        "--cold_start_prob",
+        default=0.1,
+        type=float,
+        help="训练时使用 0～59 帧部分历史的概率；其余样本保留完整 60 帧历史。",
+    )
     group.add_argument(
         "--scenario_weights",
         nargs=5,
-        default=[1.0, 1.0, 1.0, 1.0, 1.0],
+        default=list(DEFAULT_SCENARIO_WEIGHTS),
         type=float,
-        metavar=("SIX", "THREE", "3TO6", "6TO3", "DROPOUT"),
+        metavar=("SIX", "THREE", "3TO6", "6TO3", "TWO_DROP_RECONNECT"),
     )
 
 
@@ -108,6 +119,12 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--ik_init_rot_weight", default=0.2, type=float)
     group.add_argument("--ik_init_reg_weight", default=0.01, type=float)
     group.add_argument("--ik_init_delta_limit", default=0.15, type=float)
+    group.add_argument(
+        "--projected_ddim_mode",
+        default="all_steps",
+        choices=["all_steps", "late_steps", "final_step"],
+    )
+    group.add_argument("--projected_ddim_late_steps", default=5, type=int)
 
 
 def add_model_options(parser: ArgumentParser):
@@ -119,6 +136,7 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--zero_init", action="store_true")
     group.add_argument("--max_seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--model_arch", default="target_dit", choices=["target_dit"], type=str)
+    group.add_argument("--motion_layers", default=4, type=int)
 
 
 def add_diffusion_options(parser: ArgumentParser):
@@ -150,17 +168,20 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--snr_gamma", default=0.0, type=float)
     group.add_argument("--l1_loss", action="store_true")
     group.add_argument("--aux_loss_weight", default=1.0, type=float)
-    group.add_argument("--rotation_loss_weight", default=1.0, type=float)
-    group.add_argument("--fk_loss_weight", default=2.0, type=float)
-    group.add_argument("--local_rot_loss_weight", default=1.0, type=float)
-    group.add_argument("--pelvis_fk_loss_weight", default=2.0, type=float)
-    group.add_argument("--pelvis_offset_loss_weight", default=1.0, type=float)
-    group.add_argument("--pelvis_consistency_loss_weight", default=0.5, type=float)
-    group.add_argument("--transition_loss_weight", default=0.5, type=float)
-    group.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
+    group.add_argument("--rotation_loss_weight", default=_LOSS_DEFAULTS.global_rotation, type=float)
+    group.add_argument("--fk_loss_weight", default=_LOSS_DEFAULTS.fk, type=float)
+    group.add_argument("--local_rot_loss_weight", default=_LOSS_DEFAULTS.local_rotation, type=float)
+    group.add_argument("--tracker_pos_loss_weight", default=_LOSS_DEFAULTS.tracker_position, type=float)
     group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)
-    group.add_argument("--rollout_loss_weight", default=0.0, type=float)
-    group.add_argument("--rollout_prob", default=0.0, type=float)
+    group.add_argument("--tracker_rot_loss_weight", default=_LOSS_DEFAULTS.tracker_rotation, type=float)
+    group.add_argument("--root_loss_weight", default=_LOSS_DEFAULTS.root, type=float)
+    group.add_argument("--world_joint_loss_weight", default=_LOSS_DEFAULTS.world_joint, type=float)
+    group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
+    group.add_argument("--future_leg_loss_weight", default=_LOSS_DEFAULTS.future_leg, type=float)
+    group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
+    group.add_argument("--foot_slide_loss_weight", default=_LOSS_DEFAULTS.foot_slide, type=float)
+    group.add_argument("--rollout_loss_weight", default=_LOSS_DEFAULTS.rollout, type=float)
+    group.add_argument("--rollout_prob", default=0.5, type=float)
     group.add_argument("--detach_rollout_history", default=True, type=str2bool)
     group.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
     group.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)

@@ -8,7 +8,6 @@ import numpy as np
 
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
-    MISSING_AGE_CAP,
     REALTIME_POSE_FPS,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
@@ -19,7 +18,8 @@ from data_loaders.sensor_masking import (
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_MEASURED_VALID_OFFSET,
-    TRACKER_MISSING_AGE_OFFSET,
+    TRACKER_D_OFF_OFFSET,
+    TRACKER_D_ON_OFFSET,
     validate_tracker_states,
 )
 
@@ -44,11 +44,14 @@ SOURCE_STATIC_SHAPES = {
 
 TASK_SHAPES = {
     "pose_history": (REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM),
-    "tracker_window": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "tracker_history": (REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "current_tracker": (TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "current_tracker_raw": (TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "trajectory_history": (REALTIME_POSE_HISTORY_LENGTH, 5),
+    "current_trajectory": (1, 5),
     "current_target": (REALTIME_POSE_TARGET_DIM,),
-    "known_target": (REALTIME_POSE_TARGET_DIM,),
-    "known_mask": (REALTIME_POSE_TARGET_DIM,),
     "valid_frame_mask": (REALTIME_POSE_HISTORY_LENGTH,),
+    "hard_rotation_state": (TRACKER_COUNT,),
     "target_joints_head_ref": (24, 3),
     "prev_joints_head_ref": (24, 3),
     "target_root_position_head_ref": (3,),
@@ -57,24 +60,23 @@ TASK_SHAPES = {
     "joint_rest_local_rotations_6d": (24, 6),
     "configured": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
     "measured_valid": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
-    "missing_age": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
+    "d_off": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
+    "d_on": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
+    "future_leg_target": (3, 8, 6),
+    "contact_target": (2,),
 }
 
 TASK_SCALAR_FIELDS = (
     "target_root_yaw_world",
     "target_hip_height",
+    "history_head_yaw_world",
     "current_head_yaw_world",
     "floor_y",
     "scenario",
     "source_path",
     "start_frame",
-    "target_start",
-    "target_length",
-    "valid_length",
-    "source_frames",
-    "seq_len",
-    "rollout_step",
-    "max_rollout_steps",
+    "scenario_id",
+    "task_id",
 )
 
 
@@ -151,71 +153,31 @@ def validate_realtime_task_arrays(
         if np.asarray(task[key]).shape != ():
             raise ValueError(f"{label}{key} 必须是标量，实际为 {np.asarray(task[key]).shape}")
 
-    if int(np.asarray(task["seq_len"]).item()) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{label}task.seq_len 必须为 {REALTIME_POSE_SEQ_LEN}")
-    if int(np.asarray(task["target_start"]).item()) != REALTIME_POSE_TARGET_START:
-        raise ValueError(f"{label}task.target_start 必须为 {REALTIME_POSE_TARGET_START}")
-    if int(np.asarray(task["target_length"]).item()) != REALTIME_POSE_TARGET_LENGTH:
-        raise ValueError(f"{label}task.target_length 必须为 {REALTIME_POSE_TARGET_LENGTH}")
-    if int(np.asarray(task["valid_length"]).item()) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{label}task.valid_length 必须为 {REALTIME_POSE_SEQ_LEN}")
-
     start_frame = int(np.asarray(task["start_frame"]).item())
-    source_frames = int(np.asarray(task["source_frames"]).item())
-    if start_frame < 0 or source_frames < start_frame + REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{label}start_frame/source_frames 无法容纳完整 61 帧窗口")
-
-    known_mask = np.asarray(task["known_mask"])
-    if known_mask.dtype != np.bool_:
-        raise ValueError(f"{label}known_mask 必须为 bool，实际为 {known_mask.dtype}")
-    known_target = np.asarray(task["known_target"])
-    if not np.allclose(known_target[~known_mask], 0.0, atol=1e-7):
-        raise ValueError(f"{label}known_target 的未知维必须为零")
+    if start_frame < 0:
+        raise ValueError(f"{label}start_frame 不能为负数")
 
     configured = np.asarray(task["configured"], dtype=bool)
     measured_valid = np.asarray(task["measured_valid"], dtype=bool)
     validate_tracker_states(configured, measured_valid)
-    tracker_window = np.asarray(task["tracker_window"])
-    if not np.array_equal(tracker_window[..., TRACKER_CONFIGURED_OFFSET] > 0.5, configured):
-        raise ValueError(f"{label}tracker_window.configured 与 task.configured 不一致")
-    if not np.array_equal(tracker_window[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5, measured_valid):
-        raise ValueError(f"{label}tracker_window.measured_valid 与 task.measured_valid 不一致")
-
-    missing_age = np.asarray(task["missing_age"], dtype=np.int64)
-    if np.any(missing_age < 0) or np.any(missing_age > MISSING_AGE_CAP):
-        raise ValueError(f"{label}missing_age 必须位于 [0,{MISSING_AGE_CAP}]")
-    expected_age_norm = missing_age.astype(np.float32) / float(MISSING_AGE_CAP)
-    if not np.allclose(tracker_window[..., TRACKER_MISSING_AGE_OFFSET], expected_age_norm, atol=1e-6):
-        raise ValueError(f"{label}tracker_window.missing_age_norm 与 task.missing_age 不一致")
-
-
-def validate_realtime_task_manifest_entry(entry: Mapping[str, Any], label: str = "task manifest") -> None:
-    required = {
-        "task_id",
-        "task_path",
-        "split",
-        "source_path",
-        "source_relative_path",
-        "source_frames",
-        "target_fps",
-        "start_frame",
-        "seq_len",
-        "max_rollout_steps",
-        "rollout_task_paths",
-    }
-    missing = sorted(required.difference(entry))
-    if missing:
-        raise KeyError(f"{label} 缺少字段: {missing}")
-    if int(entry["source_frames"]) <= 0:
-        raise ValueError(f"{label} source_frames 必须大于 0")
-    if int(entry["seq_len"]) != REALTIME_POSE_SEQ_LEN:
-        raise ValueError(f"{label} seq_len 必须为 {REALTIME_POSE_SEQ_LEN}")
-    if not np.isclose(float(entry["target_fps"]), REALTIME_POSE_FPS, rtol=0.0, atol=1e-6):
-        raise ValueError(f"{label} target_fps 必须为 {REALTIME_POSE_FPS:g}Hz")
-    rollout_steps = int(entry["max_rollout_steps"])
-    rollout_paths = entry["rollout_task_paths"]
-    if rollout_steps < 1 or not isinstance(rollout_paths, list) or len(rollout_paths) != rollout_steps - 1:
-        raise ValueError(f"{label} rollout_task_paths 与 max_rollout_steps 不一致")
+    tracker = np.concatenate(
+        [np.asarray(task["tracker_history"]), np.asarray(task["current_tracker"])[None]],
+        axis=0,
+    )
+    if not np.array_equal(tracker[..., TRACKER_CONFIGURED_OFFSET] > 0.5, configured):
+        raise ValueError(f"{label}Tracker configured 与 task.configured 不一致")
+    if not np.array_equal(tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5, measured_valid):
+        raise ValueError(f"{label}Tracker measured_valid 与 task.measured_valid 不一致")
+    d_off = np.asarray(task["d_off"], dtype=np.int64)
+    d_on = np.asarray(task["d_on"], dtype=np.int64)
+    if np.any((d_off < 0) | (d_off > 60)) or np.any((d_on < 0) | (d_on > 60)):
+        raise ValueError(f"{label}d_off/d_on 必须位于 [0,60]")
+    if not np.allclose(tracker[..., TRACKER_D_OFF_OFFSET], d_off / 60.0, atol=1e-6):
+        raise ValueError(f"{label}Tracker d_off 与 task.d_off 不一致")
+    if not np.allclose(tracker[..., TRACKER_D_ON_OFFSET], d_on / 60.0, atol=1e-6):
+        raise ValueError(f"{label}Tracker d_on 与 task.d_on 不一致")
+    if not np.allclose(tracker[..., :9][~measured_valid], 0.0, atol=1e-7):
+        raise ValueError(f"{label}无效测量的前 9 维必须清零")
 
 
 def _validate_array(payload: Mapping[str, Any], key: str, shape: tuple[int, ...], label: str) -> None:

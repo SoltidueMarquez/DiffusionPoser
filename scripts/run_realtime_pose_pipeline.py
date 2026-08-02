@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from data_loaders.realtime_pose_task_store import read_store_metadata
 from utils.run_dirs import resolve_latest_or_self
 
 
@@ -111,17 +112,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--layers", default=8, type=int)
     train.add_argument("--heads", default=8, type=int)
     train.add_argument("--latent_dim", default=512, type=int)
+    train.add_argument("--motion_layers", default=4, type=int)
     train.add_argument("--diffusion_steps", default=50, type=int)
     train.add_argument("--ts_respace", default="", type=str)
     train.add_argument("--model_ema", action=BooleanOptionalAction, default=True)
     train.add_argument("--gradient_clip", action=BooleanOptionalAction, default=True)
-    train.add_argument("--rollout_loss_weight", default=0.0, type=float)
-    train.add_argument("--rollout_steps", default=1, type=int)
-    train.add_argument("--rollout_prob", default=0.0, type=float)
-    train.add_argument("--scenario_weights", nargs=5, default=[1.0] * 5, type=float)
+    train.add_argument("--rollout_loss_weight", default=1.0, type=float)
+    train.add_argument("--rollout_steps", default=4, type=int)
+    train.add_argument("--rollout_prob", default=0.5, type=float)
+    train.add_argument("--scenario_weights", nargs=5, default=[0.2] * 5, type=float)
     train.add_argument("--detach_rollout_history", default=True, type=str2bool)
     train.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
     train.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)
+    train.add_argument("--rotation_loss_weight", default=1.0, type=float)
+    train.add_argument("--local_rot_loss_weight", default=1.0, type=float)
+    train.add_argument("--fk_loss_weight", default=2.0, type=float)
+    train.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
+    train.add_argument("--tracker_rot_loss_weight", default=1.0, type=float)
+    train.add_argument("--root_loss_weight", default=1.0, type=float)
+    train.add_argument("--world_joint_loss_weight", default=1.0, type=float)
+    train.add_argument("--head_to_root_xz_loss_weight", default=1.0, type=float)
+    train.add_argument("--future_leg_loss_weight", default=0.5, type=float)
+    train.add_argument("--contact_loss_weight", default=0.1, type=float)
+    train.add_argument("--foot_slide_loss_weight", default=0.5, type=float)
     return parser
 
 
@@ -269,8 +282,10 @@ def has_task_stores(task_dir: Path, splits: list[str]) -> bool:
     if not task_dir.exists():
         return False
     for split in splits:
-        metadata_path = task_dir / str(split) / "task_store.json"
-        if not metadata_path.exists():
+        split_dir = task_dir / str(split)
+        try:
+            read_store_metadata(split_dir)
+        except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
             return False
     return True
 
@@ -281,6 +296,9 @@ def has_normalizer_artifact(normalizer_dir: Path) -> bool:
         "pose_std.pt",
         "tracker_mean.pt",
         "tracker_std.pt",
+        "head_height_mean.pt",
+        "head_height_std.pt",
+        "normalizer_meta.json",
     )
     return all((normalizer_dir / name).exists() for name in required)
 
@@ -364,6 +382,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--layers", str(args.layers),
         "--heads", str(args.heads),
         "--latent_dim", str(args.latent_dim),
+        "--motion_layers", str(args.motion_layers),
         "--diffusion_steps", str(args.diffusion_steps),
         "--rollout_steps", str(args.rollout_steps),
         "--rollout_loss_weight", str(args.rollout_loss_weight),
@@ -372,6 +391,17 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--detach_rollout_history", "true" if args.detach_rollout_history else "false",
         "--rollout_joint_vel_loss_weight", str(args.rollout_joint_vel_loss_weight),
         "--rollout_rot_vel_loss_weight", str(args.rollout_rot_vel_loss_weight),
+        "--rotation_loss_weight", str(args.rotation_loss_weight),
+        "--local_rot_loss_weight", str(args.local_rot_loss_weight),
+        "--fk_loss_weight", str(args.fk_loss_weight),
+        "--tracker_pos_loss_weight", str(args.tracker_pos_loss_weight),
+        "--tracker_rot_loss_weight", str(args.tracker_rot_loss_weight),
+        "--root_loss_weight", str(args.root_loss_weight),
+        "--world_joint_loss_weight", str(args.world_joint_loss_weight),
+        "--head_to_root_xz_loss_weight", str(args.head_to_root_xz_loss_weight),
+        "--future_leg_loss_weight", str(args.future_leg_loss_weight),
+        "--contact_loss_weight", str(args.contact_loss_weight),
+        "--foot_slide_loss_weight", str(args.foot_slide_loss_weight),
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
     command.extend(["--device", str(args.device)])

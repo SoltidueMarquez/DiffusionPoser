@@ -41,6 +41,9 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
     tracker_sumsq = np.zeros_like(tracker_sum)
     tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
+    head_height_sum = np.float64(0.0)
+    head_height_sumsq = np.float64(0.0)
+    head_height_count = 0
     for shard in shards:
         stats = load_shard_stats(split_dir, shard)
         pose_sum += stats["pose_sum"]
@@ -49,10 +52,16 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         tracker_sum += stats["tracker_sum"]
         tracker_sumsq += stats["tracker_sumsq"]
         tracker_count += stats["tracker_count"]
+        head_height_sum += np.float64(stats["head_height_sum"])
+        head_height_sumsq += np.float64(stats["head_height_sumsq"])
+        head_height_count += int(stats["head_height_count"])
 
     pose_mean, pose_std = finalize_mean_std(pose_sum, pose_sumsq, pose_count, float(args.eps))
     tracker_mean, tracker_std = finalize_mean_std(
         tracker_sum, tracker_sumsq, tracker_count, float(args.eps)
+    )
+    head_height_mean, head_height_std = finalize_mean_std(
+        head_height_sum, head_height_sumsq, head_height_count, float(args.eps)
     )
     output_root = Path(args.output_dir).resolve()
     label = "rtp_144d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
@@ -67,7 +76,15 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         "tracker_observation_counts": tracker_count[:, 0].astype(int).tolist(),
         "std_definition": "population",
     }
-    normalizer.save(pose_mean, pose_std, tracker_mean, tracker_std, metadata=normalizer_metadata)
+    normalizer.save(
+        pose_mean,
+        pose_std,
+        tracker_mean,
+        tracker_std,
+        head_height_mean,
+        head_height_std,
+        metadata=normalizer_metadata,
+    )
     result = {"output_dir": str(output_dir), **normalizer_metadata}
     write_latest_pointer(output_root, "normalizer", output_dir, result)
     return result

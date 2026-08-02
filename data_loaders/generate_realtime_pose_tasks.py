@@ -13,9 +13,9 @@ from tqdm.auto import tqdm
 
 from data_loaders.body_fbx_kinematics import BodyFbxRest, fk_body_fbx_local_delta_root_y0
 from data_loaders.realtime_pose_geometry import (
-    build_known_target_np,
+    build_head_trajectory_np,
     build_pose_target_np,
-    build_tracker_window_np,
+    build_tracker_measurements_np,
     extract_forward_yaw_np,
 )
 from data_loaders.realtime_pose_kinematics import (
@@ -31,6 +31,7 @@ from data_loaders.realtime_pose_task_store import (
     write_generation_plan,
     write_json,
 )
+from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.realtime_pose_validation import load_realtime_metadata, validate_realtime_source_arrays
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
@@ -40,9 +41,12 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_START,
     TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
+    TRACKER_FEATURE_DIM,
+    TRACKER_PATTERN_CATEGORIES,
 )
 from data_loaders.tracker_timeline import (
     build_task_config_plan,
+    candidate_source_window_starts,
     materialize_task_configurations,
     stable_context_seed,
 )
@@ -149,7 +153,8 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         raise RuntimeError(f"{source_dir} 中没有可用 source。")
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     split_plans: list[SplitTaskPlan] = []
-    required_frames = REALTIME_POSE_HISTORY_LENGTH + int(args.max_rollout_steps)
+    # future-leg 固定监督当前帧之后 3 帧，因此 source 末尾必须额外留出 3 帧。
+    required_frames = REALTIME_POSE_HISTORY_LENGTH + int(args.max_rollout_steps) + 3
     for raw_split in args.splits:
         split = str(raw_split)
         split_entries = filter_entries_by_split(entries, read_split_keys(split_dir, split))
@@ -187,10 +192,14 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
                         "source_frames": source_frames,
                         "start_frame": int(start_frame),
                         "task_id": task_id,
+                        "reliability": TrackerReliabilityConfig().to_dict(),
                         "configs": build_task_config_plan(
                             task_id=task_id,
                             global_seed=int(args.seed),
                             max_rollout_steps=int(args.max_rollout_steps),
+                            source_id=str(entry["stablemotion_split_key"]),
+                            start_frame=int(start_frame),
+                            source_frame_count=source_frames,
                         ),
                     }
                 )
@@ -208,19 +217,24 @@ def select_window_starts(
     split: str,
     source_id: str,
 ) -> list[int]:
-    available = int(frame_count) - (REALTIME_POSE_HISTORY_LENGTH + int(max_rollout_steps)) + 1
-    if available <= 0:
+    candidates = candidate_source_window_starts(
+        source_id=source_id,
+        frame_count=frame_count,
+        max_rollout_steps=max_rollout_steps,
+        global_seed=global_seed,
+    )
+    if not candidates:
         return []
-    if available <= int(count):
-        return list(range(available))
+    if len(candidates) <= int(count):
+        return candidates
     rng = np.random.Generator(
         np.random.PCG64(stable_context_seed(global_seed, split, source_id, "window"))
     )
     starts: list[int] = []
     for interval_index in range(int(count)):
-        low = interval_index * available // int(count)
-        high = (interval_index + 1) * available // int(count)
-        starts.append(int(rng.integers(low, high)))
+        low = interval_index * len(candidates) // int(count)
+        high = (interval_index + 1) * len(candidates) // int(count)
+        starts.append(int(candidates[int(rng.integers(low, high))]))
     return sorted(starts)
 
 
@@ -252,6 +266,9 @@ def materialize_split(
         tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
         tracker_sumsq = np.zeros_like(tracker_sum)
         tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
+        head_height_sum = np.float64(0.0)
+        head_height_sumsq = np.float64(0.0)
+        head_height_count = 0
 
         for row_index, task in enumerate(tqdm(shard_tasks, desc=f"生成 {split_plan.split} shard {shard_index}", unit="task")):
             source_id = str(task["source_id"])
@@ -298,10 +315,20 @@ def materialize_split(
             pose_sum += pose.sum(axis=0)
             pose_sumsq += np.square(pose).sum(axis=0)
             pose_count += pose.shape[0]
-            tracker = row["tracker_continuous"][0].astype(np.float64)
+            tracker = np.concatenate(
+                [row["tracker_history_continuous"][0], row["current_tracker_continuous"][0:1]],
+                axis=0,
+            ).astype(np.float64)
             tracker_sum += tracker.sum(axis=0)
             tracker_sumsq += np.square(tracker).sum(axis=0)
             tracker_count += tracker.shape[0]
+            head_height = np.concatenate(
+                [row["trajectory_history"][0, :, 2], row["current_trajectory"][0, :, 2]],
+                axis=0,
+            ).astype(np.float64)
+            head_height_sum += head_height.sum()
+            head_height_sumsq += np.square(head_height).sum()
+            head_height_count += int(head_height.shape[0])
 
         writer.finish()
         np.savez(
@@ -312,6 +339,9 @@ def materialize_split(
             tracker_sum=tracker_sum,
             tracker_sumsq=tracker_sumsq,
             tracker_count=tracker_count,
+            head_height_sum=head_height_sum,
+            head_height_sumsq=head_height_sumsq,
+            head_height_count=np.int64(head_height_count),
         )
         shards.append({"index": shard_index, "row_count": len(shard_tasks), "path": relative_dir.as_posix()})
 
@@ -329,7 +359,9 @@ def materialize_split(
             "sample_count": len(split_plan.tasks),
             "source_count": len(split_plan.sources),
             "max_rollout_steps": max_rollout_steps,
-            "config_names": ["fixed_six", "fixed_three", "three_to_six", "six_to_three", "dropout"],
+            "config_names": list(TRACKER_PATTERN_CATEGORIES),
+            "tracker_feature_dim": TRACKER_FEATURE_DIM,
+            "schema_fields": sorted(shard_fields(max_rollout_steps)),
             "shards": shards,
         },
     )
@@ -341,19 +373,26 @@ def shard_fields(max_rollout_steps: int) -> dict[str, tuple[tuple[int, ...], np.
     return {
         "pose_history": ((REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM), np.dtype("float32")),
         "current_target": ((steps, REALTIME_POSE_TARGET_DIM), np.dtype("float32")),
-        "tracker_continuous": ((steps, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), np.dtype("float32")),
-        "full_known_target": ((steps, REALTIME_POSE_TARGET_DIM), np.dtype("float32")),
+        "tracker_history_continuous": ((steps, REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), np.dtype("float32")),
+        "current_tracker_continuous": ((steps, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), np.dtype("float32")),
+        "trajectory_history": ((steps, REALTIME_POSE_HISTORY_LENGTH, 5), np.dtype("float32")),
+        "current_trajectory": ((steps, 1, 5), np.dtype("float32")),
         "configured": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
         "measured_valid": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "missing_age": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
+        "d_off": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
+        "d_on": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
+        "hard_rotation_state": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
         "target_joints_head_ref": ((steps, 24, 3), np.dtype("float32")),
         "prev_joints_head_ref": ((steps, 24, 3), np.dtype("float32")),
         "target_root_position_head_ref": ((steps, 3), np.dtype("float32")),
         "target_root_yaw_world": ((steps,), np.dtype("float32")),
         "target_hip_height": ((steps,), np.dtype("float32")),
+        "history_head_yaw_world": ((steps,), np.dtype("float32")),
         "current_head_yaw_world": ((steps,), np.dtype("float32")),
         "current_head_position_world": ((steps, 3), np.dtype("float32")),
         "floor_y": ((steps,), np.dtype("float32")),
+        "future_leg_target": ((steps, 3, 8, 6), np.dtype("float32")),
+        "contact_target": ((steps, 2), np.dtype("float32")),
         "source_index": ((), np.dtype("int32")),
         "start_frame": ((), np.dtype("int32")),
     }
@@ -369,53 +408,72 @@ def build_task_bundle_row(
     max_rollout_steps: int,
 ) -> dict[str, np.ndarray | int]:
     steps = int(max_rollout_steps)
-    configured, measured_valid, missing_age = materialize_task_configurations(
+    states = materialize_task_configurations(
         config_plans,
         frame_count=REALTIME_POSE_HISTORY_LENGTH + steps,
+        absolute_start_frame=int(start_frame),
     )
     row: dict[str, np.ndarray | int] = {
         "pose_history": np.empty((REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM), dtype=np.float32),
         "current_target": np.empty((steps, REALTIME_POSE_TARGET_DIM), dtype=np.float32),
-        "tracker_continuous": np.empty((steps, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float32),
-        "full_known_target": np.empty((steps, REALTIME_POSE_TARGET_DIM), dtype=np.float32),
-        "configured": configured.astype(np.uint8),
-        "measured_valid": measured_valid.astype(np.uint8),
-        "missing_age": missing_age,
+        "tracker_history_continuous": np.empty((steps, REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float32),
+        "current_tracker_continuous": np.empty((steps, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float32),
+        "trajectory_history": np.empty((steps, REALTIME_POSE_HISTORY_LENGTH, 5), dtype=np.float32),
+        "current_trajectory": np.empty((steps, 1, 5), dtype=np.float32),
+        "configured": states.configured.astype(np.uint8),
+        "measured_valid": states.measured_valid.astype(np.uint8),
+        "d_off": states.d_off,
+        "d_on": states.d_on,
+        "hard_rotation_state": states.hard_rotation_state.astype(np.uint8),
         "target_joints_head_ref": np.empty((steps, 24, 3), dtype=np.float32),
         "prev_joints_head_ref": np.empty((steps, 24, 3), dtype=np.float32),
         "target_root_position_head_ref": np.empty((steps, 3), dtype=np.float32),
         "target_root_yaw_world": np.empty(steps, dtype=np.float32),
         "target_hip_height": np.empty(steps, dtype=np.float32),
+        "history_head_yaw_world": np.empty(steps, dtype=np.float32),
         "current_head_yaw_world": np.empty(steps, dtype=np.float32),
         "current_head_position_world": np.empty((steps, 3), dtype=np.float32),
         "floor_y": np.empty(steps, dtype=np.float32),
+        "future_leg_target": np.empty((steps, 3, 8, 6), dtype=np.float32),
+        "contact_target": np.empty((steps, 2), dtype=np.float32),
         "source_index": int(source_index),
         "start_frame": int(start_frame),
     }
-    full_state = np.ones((REALTIME_POSE_SEQ_LEN, TRACKER_COUNT), dtype=bool)
-    zero_age = np.zeros_like(full_state, dtype=np.float32)
+    trajectory = build_head_trajectory_np(
+        source["tracker_pos_world"][:, 0],
+        head_yaws,
+        source["root_pos_world"][:, 1],
+    )
+    leg_joint_indices = np.asarray([1, 4, 7, 10, 2, 5, 8, 11], dtype=np.int64)
     for step in range(steps):
-        step_start = int(start_frame) + step
-        frame_slice = slice(step_start, step_start + REALTIME_POSE_SEQ_LEN)
-        current_absolute = step_start + REALTIME_POSE_TARGET_START
+        current_absolute = int(start_frame) + REALTIME_POSE_TARGET_START + step
+        history_slice = slice(current_absolute - REALTIME_POSE_HISTORY_LENGTH, current_absolute)
+        previous_absolute = current_absolute - 1
         current_head_yaw = float(head_yaws[current_absolute])
         current_head_position = source["tracker_pos_world"][current_absolute, 0].astype(np.float32)
         floor_y = float(source["root_pos_world"][current_absolute, 1])
-        pose_window = build_pose_target_np(
-            joint_rotations_world[frame_slice],
-            current_head_yaw,
+        pose_history = build_pose_target_np(
+            joint_rotations_world[history_slice],
+            float(head_yaws[previous_absolute]),
         )
-        tracker_window = build_tracker_window_np(
-            source["tracker_pos_world"][frame_slice],
-            source["tracker_rot_world_6d"][frame_slice],
+        current_target = build_pose_target_np(
+            joint_rotations_world[current_absolute : current_absolute + 1],
+            current_head_yaw,
+        )[0]
+        tracker_history = build_tracker_measurements_np(
+            source["tracker_pos_world"][history_slice],
+            source["tracker_rot_world_6d"][history_slice],
+            source["tracker_pos_world"][previous_absolute, 0],
+            float(source["root_pos_world"][previous_absolute, 1]),
+            float(head_yaws[previous_absolute]),
+        )
+        current_tracker = build_tracker_measurements_np(
+            source["tracker_pos_world"][current_absolute : current_absolute + 1],
+            source["tracker_rot_world_6d"][current_absolute : current_absolute + 1],
             current_head_position,
             floor_y,
             current_head_yaw,
-            full_state,
-            full_state,
-            zero_age,
-        )
-        full_known_target, _ = build_known_target_np(tracker_window[REALTIME_POSE_TARGET_START])
+        )[0]
         cos_yaw = np.cos(current_head_yaw)
         sin_yaw = np.sin(current_head_yaw)
         yaw_inv = np.asarray(
@@ -426,22 +484,31 @@ def build_task_bundle_row(
         joints_head = np.einsum(
             "ij,taj->tai",
             yaw_inv,
-            source["joints_world"][frame_slice].astype(np.float64) - origin[None, None],
+            source["joints_world"][previous_absolute : current_absolute + 1].astype(np.float64) - origin[None, None],
         ).astype(np.float32)
         root_head = yaw_inv @ (source["root_pos_world"][current_absolute].astype(np.float64) - origin)
         if step == 0:
-            row["pose_history"][:] = pose_window[:REALTIME_POSE_HISTORY_LENGTH]
-        row["current_target"][step] = pose_window[REALTIME_POSE_TARGET_START]
-        row["tracker_continuous"][step] = tracker_window[..., :TRACKER_CONTINUOUS_DIM]
-        row["full_known_target"][step] = full_known_target
-        row["target_joints_head_ref"][step] = joints_head[REALTIME_POSE_TARGET_START]
-        row["prev_joints_head_ref"][step] = joints_head[REALTIME_POSE_TARGET_START - 1]
+            row["pose_history"][:] = pose_history
+        row["current_target"][step] = current_target
+        row["tracker_history_continuous"][step] = tracker_history
+        row["current_tracker_continuous"][step] = current_tracker
+        row["trajectory_history"][step] = trajectory[history_slice]
+        row["current_trajectory"][step, 0] = trajectory[current_absolute]
+        row["target_joints_head_ref"][step] = joints_head[1]
+        row["prev_joints_head_ref"][step] = joints_head[0]
         row["target_root_position_head_ref"][step] = root_head.astype(np.float32)
         row["target_root_yaw_world"][step] = source["root_yaw"][current_absolute]
         row["target_hip_height"][step] = source["pelvis_height"][current_absolute, 0]
+        row["history_head_yaw_world"][step] = head_yaws[previous_absolute]
         row["current_head_yaw_world"][step] = current_head_yaw
         row["current_head_position_world"][step] = current_head_position
         row["floor_y"][step] = floor_y
+        future_pose = build_pose_target_np(
+            joint_rotations_world[current_absolute + 1 : current_absolute + 4],
+            current_head_yaw,
+        ).reshape(3, 24, 6)
+        row["future_leg_target"][step] = future_pose[:, leg_joint_indices]
+        row["contact_target"][step] = source["stationary_prob_5"][current_absolute, 1:3]
     return row
 
 
@@ -477,6 +544,7 @@ def load_realtime_source(path: Path, schema_name: str | None = None) -> dict[str
             "tracker_pos_world",
             "tracker_rot_world_6d",
             "joints_world",
+            "stationary_prob_5",
             "joint_offsets_parent",
             "joint_rest_local_rotations_6d",
         )

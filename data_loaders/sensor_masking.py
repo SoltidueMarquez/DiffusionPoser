@@ -32,11 +32,12 @@ REALTIME_POSE_INPUT_DIM = REALTIME_POSE_TARGET_DIM
 
 TRACKER_COUNT = 6
 TRACKER_CONTINUOUS_DIM = 9
-TRACKER_FEATURE_DIM = 12
+TRACKER_FEATURE_DIM = 13
 TRACKER_CONFIGURED_OFFSET = 9
 TRACKER_MEASURED_VALID_OFFSET = 10
-TRACKER_MISSING_AGE_OFFSET = 11
-MISSING_AGE_CAP = 60
+TRACKER_D_OFF_OFFSET = 11
+TRACKER_D_ON_OFFSET = 12
+TRACKER_DURATION_CAP = 60
 
 TRACKER_NAMES = (
     "head",
@@ -67,14 +68,15 @@ SCENARIO_FIXED_SIX = "fixed_six"
 SCENARIO_FIXED_THREE = "fixed_three"
 SCENARIO_THREE_TO_SIX = "three_to_six"
 SCENARIO_SIX_TO_THREE = "six_to_three"
-SCENARIO_DROPOUT = "dropout"
+SCENARIO_TWO_POINT_DROPOUT_RECONNECT = "two_point_dropout_reconnect"
 TRACKER_PATTERN_CATEGORIES = (
     SCENARIO_FIXED_SIX,
     SCENARIO_FIXED_THREE,
     SCENARIO_THREE_TO_SIX,
     SCENARIO_SIX_TO_THREE,
-    SCENARIO_DROPOUT,
+    SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
 )
+DEFAULT_SCENARIO_WEIGHTS = (0.2, 0.2, 0.2, 0.2, 0.2)
 
 TASK_MASK_POLICY_FULL = "full"
 TASK_MASK_POLICY_FIXED_PATTERNS = "fixed_patterns"
@@ -143,17 +145,6 @@ def validate_sensor_valid(sensor_valid: np.ndarray, min_valid_trackers: int = MI
     if not valid[:, HEAD_TRACKER_INDEX].all():
         raise ValueError("Head 必须在所有帧有效。")
     return valid
-
-
-def create_realtime_inpaint_mask(
-    seq_len: int = REALTIME_POSE_SEQ_LEN,
-) -> np.ndarray:
-    """返回旧调用方可识别的目标 mask；新训练路径使用逐样本 known_mask。"""
-
-    validate_realtime_seq_len(seq_len)
-    mask = np.zeros((seq_len, REALTIME_POSE_TARGET_DIM), dtype=bool)
-    mask[REALTIME_POSE_TARGET_START] = True
-    return mask
 
 
 def normalize_tracker_pattern_categories(categories: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:

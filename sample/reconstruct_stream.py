@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -13,8 +14,9 @@ from data_loaders.realtime_pose_geometry import (
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
-from sample.utils import choose_sampler, load_checkpoint_model
+from sample.utils import load_checkpoint_model
 from utils import dist_util
 from utils.model_util import create_model_and_diffusion
 from utils.parser_util import (
@@ -28,7 +30,7 @@ from utils.parser_util import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="采样 144D 动态 Tracker 单帧关节补全任务。")
+    parser = argparse.ArgumentParser(description="采样 144D 动态 Tracker 单帧姿态任务。")
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
@@ -37,31 +39,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_realtime_inpaint_mask(known_mask: torch.Tensor) -> torch.Tensor:
-    if known_mask.ndim != 2 or known_mask.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError("known_mask 必须与 144D sample 同形。")
-    return ~known_mask.bool()
+def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dict:
+    """每个目标帧只编码一次历史条件，后续 DDIM step 直接复用。"""
 
-
-def build_sampling_model_kwargs(batch: dict, device: torch.device) -> dict:
-    known_mask = batch["known_mask"].to(device).bool()
-    known_target = batch["known_target"].to(device)
-    pose_history = batch["pose_history"].to(device)
-    tracker_window = batch["tracker_window"].to(device)
-    valid_frame_mask = batch["valid_frame_mask"].to(device).bool()
-    unknown_mask = build_realtime_inpaint_mask(known_mask)
-    return {
-        "inpaint_cond": unknown_mask,
-        "known_mask": known_mask,
-        "pose_history": pose_history,
-        "tracker_window": tracker_window,
-        "valid_frame_mask": valid_frame_mask,
-        "attention_mask": valid_frame_mask,
-        "y": {
-            "mask": unknown_mask,
-            "inpainted_motion": known_target,
-        },
+    values = {
+        name: batch[name].to(device)
+        for name in (
+            "pose_history",
+            "tracker_history",
+            "current_tracker",
+            "trajectory_history",
+            "current_trajectory",
+            "valid_frame_mask",
+        )
     }
+    model_impl = getattr(model, "module", model)
+    with torch.no_grad():
+        prepared = model_impl.prepare_conditioning(
+            values["pose_history"],
+            values["tracker_history"],
+            values["current_tracker"],
+            values["trajectory_history"],
+            values["current_trajectory"],
+            values["valid_frame_mask"].bool(),
+        )
+    return {"prepared_conditioning": prepared}
+
+
+def build_projection_fn(
+    batch: dict,
+    device: torch.device,
+    normalizer=None,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    current_tracker_raw = batch["current_tracker_raw"].to(device)
+    hard_rotation_state = batch["hard_rotation_state"].to(device).bool()
+    if normalizer is None:
+        mean = std = None
+    else:
+        if normalizer.pose_mean is None or normalizer.pose_std is None:
+            normalizer.load()
+        mean = normalizer.pose_mean.to(device)
+        std = normalizer.pose_std.to(device)
+    return lambda value: project_realtime_pose_xstart(
+        value,
+        current_tracker_raw,
+        hard_rotation_state,
+        mean,
+        std,
+    )
 
 
 def reconstruct_batch(
@@ -69,28 +94,34 @@ def reconstruct_batch(
     diffusion,
     batch: dict,
     device: torch.device,
-    use_ddim: bool = True,
-    init_image: torch.Tensor | None = None,
-    start_timestep: int | None = None,
-) -> torch.Tensor:
-    del start_timestep
-    if init_image is not None:
-        raise ValueError("当前 144D 重构已关闭 local-delta IK initializer。")
+    normalizer=None,
+    projection_mode: str = "all_steps",
+    late_steps: int = 5,
+) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
     if reference.ndim != 2 or reference.shape[1] != REALTIME_POSE_TARGET_DIM:
         raise ValueError(f"sample 应为 [B,144]，实际为 {tuple(reference.shape)}")
-    model_kwargs = build_sampling_model_kwargs(batch, device)
-    sampler = choose_sampler(diffusion, use_ddim=use_ddim)
+    model_kwargs = build_sampling_model_kwargs(model, batch, device)
+    projection_fn = build_projection_fn(batch, device, normalizer)
     with torch.no_grad():
-        reconstructed = sampler(
+        result = diffusion.projected_ddim_sample_loop(
             model,
             shape=tuple(reference.shape),
-            noise=None,
+            projection_fn=projection_fn,
             clip_denoised=False,
             model_kwargs=model_kwargs,
+            device=device,
+            projection_mode=projection_mode,
+            late_steps=late_steps,
         )
-    known_mask = model_kwargs["known_mask"]
-    return torch.where(known_mask, model_kwargs["y"]["inpainted_motion"], reconstructed)
+    output = {
+        "sample": result["sample"],
+        "raw_pred_xstart": result["raw_pred_xstart"],
+        "deployed_pred_xstart": result["deployed_pred_xstart"],
+    }
+    if "auxiliary_outputs" in result:
+        output.update(result["auxiliary_outputs"])
+    return output
 
 
 def inverse_normalized_target(target: torch.Tensor, normalizer) -> np.ndarray:
@@ -103,32 +134,28 @@ def inverse_normalized_target(target: torch.Tensor, normalizer) -> np.ndarray:
 def save_reconstruction(
     path: Path,
     reference: torch.Tensor,
-    reconstructed: torch.Tensor,
-    known_mask: torch.Tensor,
+    reconstruction: dict[str, torch.Tensor],
     batch: dict,
     normalizer=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     reference_raw = inverse_normalized_target(reference, normalizer)
-    reconstructed_raw = inverse_normalized_target(reconstructed, normalizer)
+    raw_prediction = inverse_normalized_target(reconstruction["raw_pred_xstart"], normalizer)
+    deployed_prediction = inverse_normalized_target(
+        reconstruction["deployed_pred_xstart"], normalizer
+    )
     resolved = []
     reference_local_delta = []
     reference_joints_world = []
     reference_root_world = []
     tracker_positions_world = []
-    for batch_index in range(reconstructed_raw.shape[0]):
+    for batch_index in range(deployed_prediction.shape[0]):
+        current_tracker_raw = batch["current_tracker_raw"][batch_index].detach().cpu().numpy()
+        hard_rotation = batch["hard_rotation_state"][batch_index].detach().cpu().numpy()
         value = decode_and_resolve_pose(
-            reconstructed_raw[batch_index],
-            np.concatenate(
-                [
-                    batch["current_tracker_pos_head_ref"][batch_index].detach().cpu().numpy(),
-                    batch["current_tracker_rot_head_ref_6d"][batch_index].detach().cpu().numpy(),
-                    batch["configured"][batch_index, -1, :, None].detach().cpu().numpy(),
-                    batch["measured_valid"][batch_index, -1, :, None].detach().cpu().numpy(),
-                    batch["missing_age_norm"][batch_index, -1, :, None].detach().cpu().numpy(),
-                ],
-                axis=-1,
-            ),
+            deployed_prediction[batch_index],
+            current_tracker_raw,
+            hard_rotation,
             float(batch["current_head_yaw_world"][batch_index].item()),
             batch["current_head_position_world"][batch_index].detach().cpu().numpy(),
             float(batch["floor_y"][batch_index].item()),
@@ -151,15 +178,11 @@ def save_reconstruction(
         )
         reference_root_world.append(
             origin
-            + yaw_rotation @ batch["target_root_position_head_ref"][batch_index].detach().cpu().numpy()
+            + yaw_rotation
+            @ batch["target_root_position_head_ref"][batch_index].detach().cpu().numpy()
         )
         tracker_positions_world.append(
-            origin[None]
-            + np.einsum(
-                "ij,aj->ai",
-                yaw_rotation,
-                batch["current_tracker_pos_head_ref"][batch_index].detach().cpu().numpy(),
-            )
+            origin[None] + np.einsum("ij,aj->ai", yaw_rotation, current_tracker_raw[:, :3])
         )
         rest_rotations = rotation_6d_to_matrix_np(
             batch["joint_rest_local_rotations_6d"][batch_index].detach().cpu().numpy()
@@ -175,17 +198,18 @@ def save_reconstruction(
             )
         )
     scenario = batch.get("scenario", "")
-    if isinstance(scenario, str):
-        scenario_values = np.asarray([scenario] * reconstructed_raw.shape[0])
-    else:
-        scenario_values = np.asarray(scenario)
+    scenario_values = (
+        np.asarray([scenario] * deployed_prediction.shape[0])
+        if isinstance(scenario, str)
+        else np.asarray(scenario)
+    )
     add_time = lambda value: np.asarray(value)[:, None]
     np.savez(
         path,
         fps=np.float32(60.0),
         reference_target_raw=add_time(reference_raw.astype(np.float32)),
-        reconstructed_target_raw=add_time(reconstructed_raw.astype(np.float32)),
-        known_mask=add_time(known_mask.detach().cpu().numpy()),
+        raw_pred_target_raw=add_time(raw_prediction.astype(np.float32)),
+        deployed_pred_target_raw=add_time(deployed_prediction.astype(np.float32)),
         reference_body_local_delta_6d=add_time(np.asarray(reference_local_delta, dtype=np.float32)),
         predicted_body_local_delta_6d=add_time(
             np.stack([value.body_local_delta_6d for value in resolved]).astype(np.float32)
@@ -211,14 +235,32 @@ def save_reconstruction(
             np.asarray([value.hip_height for value in resolved], dtype=np.float32)
         ),
         tracker_pos_world=add_time(np.asarray(tracker_positions_world, dtype=np.float32)),
+        current_tracker_raw=add_time(batch["current_tracker_raw"].detach().cpu().numpy()),
         configured=add_time(batch["configured"][:, -1].detach().cpu().numpy()),
         measured_valid=add_time(batch["measured_valid"][:, -1].detach().cpu().numpy()),
-        missing_age=add_time(batch["missing_age"][:, -1].detach().cpu().numpy()),
+        d_off=add_time(batch["d_off"][:, -1].detach().cpu().numpy()),
+        d_on=add_time(batch["d_on"][:, -1].detach().cpu().numpy()),
+        hard_rotation_state=add_time(batch["hard_rotation_state"].detach().cpu().numpy()),
+        current_trajectory=add_time(batch["current_trajectory"].detach().cpu().numpy()[:, 0]),
+        contact_target=add_time(batch["contact_target"].detach().cpu().numpy()),
+        contact_logits=add_time(
+            reconstruction.get(
+                "contact_logits",
+                torch.full_like(batch["contact_target"], float("nan")),
+            ).detach().cpu().numpy()
+        ),
+        future_leg_prediction=add_time(
+            reconstruction.get(
+                "future_leg",
+                torch.full_like(batch["future_leg_target"], float("nan")),
+            ).detach().cpu().numpy()
+        ),
+        future_leg_target=add_time(batch["future_leg_target"].detach().cpu().numpy()),
         scenario=add_time(scenario_values),
-        eval_frame_mask=np.ones((reconstructed_raw.shape[0], 1), dtype=bool),
-        known_rotation_max_error=add_time(np.asarray(
-            [value.known_rotation_max_error for value in resolved], dtype=np.float32
-        )),
+        eval_frame_mask=np.ones((deployed_prediction.shape[0], 1), dtype=bool),
+        hard_rotation_max_error=add_time(
+            np.asarray([value.hard_rotation_max_error for value in resolved], dtype=np.float32)
+        ),
     )
 
 
@@ -240,21 +282,24 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         for key, value in item.items()
     }
     model, diffusion = create_model_and_diffusion(args)
-    model, source = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-    reconstructed = reconstruct_batch(
+    model, source = load_checkpoint_model(
+        model, args.model_path, device=device, use_ema=args.use_ema
+    )
+    reconstruction = reconstruct_batch(
         model,
         diffusion,
         batch,
         device=device,
-        use_ddim=str(args.ts_respace).startswith("ddim"),
+        normalizer=dataset.normalizer,
+        projection_mode=args.projected_ddim_mode,
+        late_steps=args.projected_ddim_late_steps,
     )
     output_dir = Path(args.output_dir or "output/realtime_pose_144d").resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"
     save_reconstruction(
         output_path,
         batch["x"],
-        reconstructed,
-        batch["known_mask"],
+        reconstruction,
         batch,
         normalizer=dataset.normalizer,
     )
