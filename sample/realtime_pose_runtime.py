@@ -15,7 +15,11 @@ from data_loaders.realtime_pose_geometry import (
     global_head_rotations_to_local_delta_6d_np,
     resolve_root_head_reference_np,
 )
-from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_kinematics import (
+    make_yaw_rotation_np,
+    rotation_6d_to_matrix_np,
+    wrap_radians,
+)
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     REALTIME_POSE_HISTORY_LENGTH,
@@ -192,6 +196,7 @@ class RealtimePoseRuntime:
             current_trajectory,
         )
         model_impl = getattr(self.model, "module", self.model)
+        prepare_kwargs = self._taid_prepare_kwargs(model_impl, current_tracker_raw, batch_size=1)
         # 历史条件在同一帧的全部 DDIM step 间复用；在线推理不保留其计算图。
         with torch.no_grad():
             prepared = model_impl.prepare_conditioning(
@@ -201,6 +206,7 @@ class RealtimePoseRuntime:
                 conditioning["trajectory_history"],
                 conditioning["current_trajectory"],
                 conditioning["valid_frame_mask"],
+                **prepare_kwargs,
             )
         model_kwargs = {"prepared_conditioning": prepared}
         current_tracker_tensor = torch.as_tensor(
@@ -381,6 +387,39 @@ class RealtimePoseRuntime:
             self.normalizer.pose_mean.to(self.device),
             self.normalizer.pose_std.to(self.device),
         )
+
+    def _normalizer_tracker_stats(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.normalizer is None:
+            return None, None
+        return (
+            self.normalizer.tracker_mean.to(self.device),
+            self.normalizer.tracker_std.to(self.device),
+        )
+
+    def _taid_prepare_kwargs(self, model_impl, current_tracker_raw, batch_size: int) -> dict:
+        taid_config = getattr(model_impl, "taid_config", None)
+        if taid_config is None or not taid_config.enabled:
+            return {}
+        current_raw = torch.as_tensor(
+            current_tracker_raw,
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(batch_size, TRACKER_COUNT, TRACKER_FEATURE_DIM)
+        offsets = torch.as_tensor(
+            self.joint_offsets_parent,
+            device=self.device,
+            dtype=torch.float32,
+        )[None].expand(batch_size, -1, -1)
+        pose_mean, pose_std = self._normalizer_pose_stats()
+        tracker_mean, tracker_std = self._normalizer_tracker_stats()
+        return {
+            "current_tracker_raw": current_raw,
+            "joint_offsets_parent": offsets,
+            "pose_mean": pose_mean,
+            "pose_std": pose_std,
+            "tracker_mean": tracker_mean,
+            "tracker_std": tracker_std,
+        }
 
     def _normalize_pose_numpy(self, value: np.ndarray) -> np.ndarray:
         return value if self.normalizer is None else np.asarray(self.normalizer.normalize_pose(value), dtype=np.float32)
@@ -591,6 +630,20 @@ def step_realtime_pose_batch(
         for name in prepared_steps[0].conditioning
     }
     model_impl = getattr(first.model, "module", first.model)
+    current_tracker_raw_batch = np.stack(
+        [step.current_tracker_raw for step in prepared_steps]
+    )
+    prepare_kwargs = first._taid_prepare_kwargs(
+        model_impl,
+        current_tracker_raw_batch,
+        batch_size=batch_size,
+    )
+    if prepare_kwargs:
+        prepare_kwargs["joint_offsets_parent"] = torch.as_tensor(
+            np.stack([runtime.joint_offsets_parent for runtime in runtimes]),
+            device=first.device,
+            dtype=torch.float32,
+        )
     # 历史编码在整个 DDIM 采样中复用，且评测时不保留计算图。
     with torch.no_grad():
         prepared_conditioning = model_impl.prepare_conditioning(
@@ -600,9 +653,10 @@ def step_realtime_pose_batch(
             conditioning["trajectory_history"],
             conditioning["current_trajectory"],
             conditioning["valid_frame_mask"],
+            **prepare_kwargs,
         )
     current_tracker_tensor = torch.as_tensor(
-        np.stack([step.current_tracker_raw for step in prepared_steps]),
+        current_tracker_raw_batch,
         device=first.device,
         dtype=torch.float32,
     )
@@ -714,7 +768,11 @@ def decode_and_resolve_pose(
         target_raw=target,
         joint_rotations_world=rotations_world.astype(np.float32),
         body_local_delta_6d=local_delta.astype(np.float32),
-        root_yaw_world=float(current_head_yaw_world + float(root_yaw_head)),
+        root_yaw_world=float(
+            wrap_radians(
+                np.asarray([current_head_yaw_world + float(root_yaw_head)], dtype=np.float64)
+            )[0]
+        ),
         hip_height=float(hip_height),
         root_position_world=root_world.astype(np.float32),
         joints_world=joints_world.astype(np.float32),

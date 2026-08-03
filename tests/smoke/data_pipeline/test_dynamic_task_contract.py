@@ -15,8 +15,13 @@ from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     TaskRequest,
 )
-from data_loaders.realtime_pose_geometry import extract_forward_yaw_np, extract_rotation_heading_np
-from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_geometry import (
+    decode_target_head_rotations_np,
+    decode_target_root_yaw_world_np,
+    extract_forward_yaw_np,
+    extract_rotation_heading_np,
+)
+from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np, wrap_radians
 from data_loaders.tracker_timeline import build_task_config_plan
 from data_loaders.realtime_pose_task_store import ShardWriter, read_store_metadata, write_json
 from data_loaders.sensor_masking import (
@@ -64,7 +69,46 @@ def test_task_bundle_materializes_new_history_current_contract_without_writing_a
         extract_rotation_heading_np(joint_rotations[60:64, 0]),
         atol=1e-6,
     )
+    _, pelvis_heading_head = decode_target_head_rotations_np(row["current_target"])
+    np.testing.assert_allclose(
+        wrap_radians(head_yaws[60:64] + pelvis_heading_head),
+        row["target_root_yaw_world"],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        decode_target_root_yaw_world_np(row["current_target"], head_yaws[60:64]),
+        row["target_root_yaw_world"],
+        atol=1e-6,
+    )
     assert not np.allclose(row["target_root_yaw_world"], source["root_yaw"][60:64])
+
+
+def test_target_root_yaw_stays_self_consistent_across_pi_boundary():
+    source = build_toy_realtime_source(frame_count=70)
+    pelvis_yaw_offset = np.pi - 0.02
+    source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][:, :6] = np.asarray(
+        [np.sin(pelvis_yaw_offset), 0.0, np.cos(pelvis_yaw_offset), 0.0, 1.0, 0.0],
+        dtype=np.float32,
+    )
+    joint_rotations = compute_source_joint_rotations_world(source)
+    tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
+    head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
+    row = build_task_bundle_row(
+        source,
+        joint_rotations,
+        head_yaws,
+        start_frame=0,
+        source_index=0,
+        config_plans=build_task_config_plan("toy-pi", 10, max_rollout_steps=4),
+        max_rollout_steps=4,
+    )
+
+    decoded = decode_target_root_yaw_world_np(row["current_target"], head_yaws[60:64])
+    np.testing.assert_allclose(decoded, row["target_root_yaw_world"], atol=1e-6)
+    source_difference = np.abs(
+        wrap_radians(source["root_yaw"][60:64] - row["target_root_yaw_world"])
+    )
+    assert np.all(source_difference > 3.0)
 
 
 def test_history_uses_previous_reference_while_current_head_is_local_origin():

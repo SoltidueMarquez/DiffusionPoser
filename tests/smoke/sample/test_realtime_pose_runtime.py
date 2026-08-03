@@ -5,7 +5,9 @@ import torch
 from ema_pytorch import EMA
 
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
-from sample.realtime_pose_runtime import RealtimePoseRuntime
+from data_loaders.realtime_pose_config import TaIDConfig
+from model.realtime_pose_target_dit import RealtimePoseTargetDiT
+from sample.realtime_pose_runtime import RealtimePoseRuntime, step_realtime_pose_batch
 from sample.utils import load_checkpoint_model
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, build_toy_realtime_source
 
@@ -150,3 +152,43 @@ def test_ema_checkpoint_returns_inner_model_and_runs_runtime(tmp_path) -> None:
     result = _step(runtime, source, 0, np.ones(6, dtype=bool))
     assert result.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,)
     assert loaded_model.valid_counts == [0]
+
+
+def test_taid_single_and_batch_runtime_prepare_full_geometry_contract() -> None:
+    source = build_toy_realtime_source(frame_count=2)
+    model = RealtimePoseTargetDiT(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        motion_layers=1,
+        dropout=0.0,
+        taid_config=TaIDConfig(ablation="B6", innovation_dim=16),
+    ).eval()
+    diffusion = _OneStepProjectedDiffusion()
+    first = RealtimePoseRuntime(
+        model,
+        diffusion,
+        torch.device("cpu"),
+        source["joint_offsets_parent"],
+        source["joint_rest_local_rotations_6d"],
+    )
+    single = _step(first, source, 0, np.ones(6, dtype=bool))
+    assert single.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,)
+
+    second = RealtimePoseRuntime(
+        model,
+        diffusion,
+        torch.device("cpu"),
+        source["joint_offsets_parent"],
+        source["joint_rest_local_rotations_6d"],
+    )
+    results = step_realtime_pose_batch(
+        [first, second],
+        np.stack([source["tracker_pos_world"][1], source["tracker_pos_world"][0]]),
+        np.stack([source["tracker_rot_world_6d"][1], source["tracker_rot_world_6d"][0]]),
+        np.ones((2, 6), dtype=bool),
+        np.ones((2, 6), dtype=bool),
+        np.asarray([source["root_pos_world"][1, 1], source["root_pos_world"][0, 1]]),
+    )
+    assert len(results) == 2
+    assert all(result.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,) for result in results)

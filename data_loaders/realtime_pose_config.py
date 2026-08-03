@@ -19,6 +19,95 @@ from data_loaders.sensor_masking import (
 TARGET_REGION_NAMES = ("torso", "left_arm", "right_arm", "left_leg", "right_leg")
 MOTION_REGION_NAMES = ("global", "pelvis", "left_leg", "right_leg")
 PROJECTED_DDIM_MODES = ("all_steps", "late_steps", "final_step")
+TAID_ABLATIONS = ("B0", "B1", "B2", "B3", "B4", "B5", "B6")
+
+
+@dataclass(frozen=True)
+class TrackerRoleConfig:
+    """TAID 第一版确定性角色与重连权重配置。"""
+
+    anchor_ramp_start: int = 5
+    anchor_ramp_end: int = 15
+    innovation_ramp_frames: int = 15
+
+    def validate(self) -> "TrackerRoleConfig":
+        if self.anchor_ramp_start < 0:
+            raise ValueError("anchor_ramp_start 必须大于等于 0。")
+        if self.anchor_ramp_end <= self.anchor_ramp_start:
+            raise ValueError("anchor_ramp_end 必须严格大于 anchor_ramp_start。")
+        if self.innovation_ramp_frames <= 0:
+            raise ValueError("innovation_ramp_frames 必须大于 0。")
+        return self
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TaIDConfig:
+    """TAID B0～B6 的结构、角色和确定性几何默认值。"""
+
+    ablation: str = "B0"
+    role: TrackerRoleConfig = TrackerRoleConfig()
+    innovation_dim: int = 64
+    innovation_clip: float = 3.0
+    # 顺序固定为 Head/LHand/RHand/Hip/LFoot/RFoot；Head 不进入 innovation。
+    position_scales: tuple[float, ...] = (1.0, 0.25, 0.25, 0.20, 0.20, 0.20)
+    rotation_scales: tuple[float, ...] = (1.0, 0.50, 0.50, 0.35, 0.35, 0.35)
+    hip_leg_secondary_weight: float = 0.25
+    hand_torso_weight: float = 0.10
+    foot_root_contact_weight: float = 0.25
+
+    def validate(self) -> "TaIDConfig":
+        if self.ablation not in TAID_ABLATIONS:
+            raise ValueError(f"TAID ablation 必须属于 {TAID_ABLATIONS}，实际为 {self.ablation}")
+        self.role.validate()
+        if self.innovation_dim <= 0 or self.innovation_clip <= 0.0:
+            raise ValueError("innovation_dim/innovation_clip 必须大于 0。")
+        if len(self.position_scales) != TRACKER_COUNT or len(self.rotation_scales) != TRACKER_COUNT:
+            raise ValueError("TAID residual scale 必须各提供 6 个 Tracker 值。")
+        if min(self.position_scales) <= 0.0 or min(self.rotation_scales) <= 0.0:
+            raise ValueError("TAID residual scale 必须全部大于 0。")
+        route_weights = (
+            self.hip_leg_secondary_weight,
+            self.hand_torso_weight,
+            self.foot_root_contact_weight,
+        )
+        if any(value < 0.0 or value > 1.0 for value in route_weights):
+            raise ValueError("TAID 固定路由权重必须位于 [0,1]。")
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.ablation != "B0"
+
+    @property
+    def prior_only(self) -> bool:
+        return self.ablation == "B1"
+
+    @property
+    def uses_prior_condition(self) -> bool:
+        return self.ablation in {"B2", "B3", "B4", "B5", "B6"}
+
+    @property
+    def uses_absolute_uncertain(self) -> bool:
+        return self.ablation == "B3"
+
+    @property
+    def uses_innovation(self) -> bool:
+        return self.ablation in {"B4", "B5", "B6"}
+
+    @property
+    def uses_fixed_routing(self) -> bool:
+        return self.ablation in {"B5", "B6"}
+
+    @property
+    def uses_continuous_transition(self) -> bool:
+        return self.ablation == "B6"
+
+    @property
+    def uses_uncertain_condition(self) -> bool:
+        return self.ablation in {"B3", "B4", "B5", "B6"}
 
 
 @dataclass(frozen=True)

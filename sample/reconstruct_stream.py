@@ -39,7 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dict:
+def build_sampling_model_kwargs(model, batch: dict, device: torch.device, normalizer=None) -> dict:
     """每个目标帧只编码一次历史条件，后续 DDIM step 直接复用。"""
 
     values = {
@@ -54,6 +54,22 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
         )
     }
     model_impl = getattr(model, "module", model)
+    taid_config = getattr(model_impl, "taid_config", None)
+    prepare_kwargs = {}
+    if taid_config is not None and taid_config.enabled:
+        prepare_kwargs = {
+            "current_tracker_raw": batch["current_tracker_raw"].to(device),
+            "joint_offsets_parent": batch["joint_offsets_parent"].to(device),
+        }
+        if normalizer is not None:
+            if normalizer.pose_mean is None or normalizer.pose_std is None:
+                normalizer.load()
+            prepare_kwargs.update(
+                pose_mean=normalizer.pose_mean.to(device),
+                pose_std=normalizer.pose_std.to(device),
+                tracker_mean=normalizer.tracker_mean.to(device),
+                tracker_std=normalizer.tracker_std.to(device),
+            )
     with torch.no_grad():
         prepared = model_impl.prepare_conditioning(
             values["pose_history"],
@@ -62,6 +78,7 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
             values["trajectory_history"],
             values["current_trajectory"],
             values["valid_frame_mask"].bool(),
+            **prepare_kwargs,
         )
     return {"prepared_conditioning": prepared}
 
@@ -101,7 +118,7 @@ def reconstruct_batch(
     reference = batch["x"].to(device)
     if reference.ndim != 2 or reference.shape[1] != REALTIME_POSE_TARGET_DIM:
         raise ValueError(f"sample 应为 [B,144]，实际为 {tuple(reference.shape)}")
-    model_kwargs = build_sampling_model_kwargs(model, batch, device)
+    model_kwargs = build_sampling_model_kwargs(model, batch, device, normalizer)
     projection_fn = build_projection_fn(batch, device, normalizer)
     with torch.no_grad():
         result = diffusion.projected_ddim_sample_loop(

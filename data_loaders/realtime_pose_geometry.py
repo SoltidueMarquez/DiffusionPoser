@@ -218,6 +218,62 @@ def extract_rotation_heading_torch(rotations: torch.Tensor) -> torch.Tensor:
     return torch.atan2(heading_x, heading_z)
 
 
+def so3_log_map_torch(rotations: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """把 ``[...,3,3]`` 相对旋转映射为弧度 axis-angle，含 0/π 邻域稳定分支。"""
+
+    if tuple(rotations.shape[-2:]) != (3, 3):
+        raise ValueError("SO(3) Log 输入尾部必须为 [3,3]。")
+    matrix = rotations
+    trace = matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = torch.clamp((trace - 1.0) * 0.5, min=-1.0, max=1.0)
+    skew = 0.5 * torch.stack(
+        [
+            matrix[..., 2, 1] - matrix[..., 1, 2],
+            matrix[..., 0, 2] - matrix[..., 2, 0],
+            matrix[..., 1, 0] - matrix[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = torch.linalg.norm(skew, dim=-1)
+    angle = torch.atan2(sine, cosine)
+    safe_sine = sine.clamp_min(float(eps))
+    regular = skew * (angle / safe_sine)[..., None]
+    small = skew * (1.0 + angle.square() / 6.0)[..., None]
+
+    # θ≈π 时反对称部分趋近 0，改从 (R+I)/2 的对角线恢复轴；符号由
+    # 非零反对称分量确定。该分支只用于避免 180° residual 退化为零。
+    diagonal_axis = torch.sqrt(
+        torch.clamp((matrix.diagonal(dim1=-2, dim2=-1) + 1.0) * 0.5, min=0.0)
+    )
+    axis_sign = torch.sign(skew)
+    axis_sign = torch.where(axis_sign == 0.0, torch.ones_like(axis_sign), axis_sign)
+    diagonal_axis = diagonal_axis * axis_sign
+    diagonal_axis = torch.nn.functional.normalize(diagonal_axis, dim=-1, eps=float(eps))
+    near_pi = diagonal_axis * angle[..., None]
+    result = torch.where((sine < 1e-4)[..., None], small, regular)
+    result = torch.where(((cosine < -0.9999) & (sine < 1e-3))[..., None], near_pi, result)
+    return result
+
+
+def reexpress_previous_position_residual_torch(
+    previous_residual: torch.Tensor,
+    current_trajectory: torch.Tensor,
+) -> torch.Tensor:
+    """把上一帧 C_(n-1) 中的位置 residual 旋转到当前 C_n。"""
+
+    if previous_residual.ndim != 3 or previous_residual.shape[-1] != 3:
+        raise ValueError("previous_residual 必须为 [B,Tracker,3]。")
+    batch_size = previous_residual.shape[0]
+    if tuple(current_trajectory.shape) != (batch_size, 1, 5):
+        raise ValueError("current_trajectory 必须为 [B,1,5]。")
+    delta_yaw = torch.atan2(current_trajectory[:, 0, 3], current_trajectory[:, 0, 4])
+    return torch.einsum(
+        "bij,btj->bti",
+        make_yaw_rotation_torch(-delta_yaw),
+        previous_residual,
+    )
+
+
 def decode_target_head_rotations_np(
     target: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -229,6 +285,32 @@ def decode_target_head_rotations_np(
     leading = values.shape[:-1]
     rotations = rotation_6d_to_matrix_np(values.reshape(*leading, SMPL_JOINT_COUNT, ROTATION_6D_DIM))
     return rotations, extract_rotation_heading_np(rotations[..., 0, :, :])
+
+
+def decode_target_root_yaw_world_np(
+    target: np.ndarray,
+    current_head_yaw_world: np.ndarray | float,
+) -> np.ndarray:
+    """从 144D target 与当前 Head yaw 组合出唯一的 Pelvis world heading。
+
+    Source 中的 ``root_yaw`` 是 Actor Root 的分解 heading；当 Pelvis local
+    residual 接近 180° 时，它可以与 Pelvis forward heading 相差约 π。训练与
+    评估必须从 target 本身恢复后者，避免把两种合法但不同的 yaw 语义混用。
+    """
+
+    _, pelvis_heading_head = decode_target_head_rotations_np(target)
+    head_yaw = np.asarray(current_head_yaw_world, dtype=np.float64)
+    try:
+        head_yaw = np.broadcast_to(head_yaw, pelvis_heading_head.shape)
+    except ValueError as error:
+        raise ValueError(
+            "current_head_yaw_world 必须可广播到 target 的前导形状。"
+        ) from error
+    return (
+        (head_yaw + pelvis_heading_head.astype(np.float64) + math.pi)
+        % (2.0 * math.pi)
+        - math.pi
+    ).astype(np.float32)
 
 
 def decode_target_head_rotations_torch(

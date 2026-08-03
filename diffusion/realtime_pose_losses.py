@@ -9,6 +9,7 @@ from data_loaders.realtime_pose_geometry import (
     decode_target_head_rotations_torch,
     resolve_root_head_reference_torch,
 )
+from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS
 from data_loaders.realtime_pose_kinematics import SMPL_PARENTS, rotation_6d_to_matrix_torch
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
@@ -46,7 +47,14 @@ def compute_raw_deployed_losses(
     measured = current_tracker[..., 10] > 0.5
     tracker_joints = torch.as_tensor(TRACKER_TO_JOINT, device=raw_pred.device, dtype=torch.long)
     tracker_rotation_error = _rotation_angle(raw_global.index_select(1, tracker_joints), tracker_rot)
-    tracker_rotation_loss = _masked_mean(tracker_rotation_error.square(), measured)
+    observation_weight = auxiliary_outputs.get("taid_observation_weight")
+    if observation_weight is None:
+        tracker_rotation_loss = _masked_mean(tracker_rotation_error.square(), measured)
+    else:
+        tracker_rotation_loss = _weighted_mean(
+            tracker_rotation_error.square(),
+            observation_weight.to(device=raw_pred.device, dtype=raw_pred.dtype),
+        )
 
     offsets = batch["joint_offsets_parent"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     tracker_pos = current_tracker[..., :3]
@@ -66,10 +74,19 @@ def compute_raw_deployed_losses(
         deployed_joints.index_select(1, non_head_joints) - tracker_pos.index_select(1, non_head_trackers),
         dim=-1,
     )
-    tracker_position_loss = _masked_mean(
-        _radial_huber_loss(tracker_distance, tracker_pos_huber_beta),
-        measured.index_select(1, non_head_trackers),
-    )
+    tracker_position_error = _radial_huber_loss(tracker_distance, tracker_pos_huber_beta)
+    if observation_weight is None:
+        tracker_position_loss = _masked_mean(
+            tracker_position_error,
+            measured.index_select(1, non_head_trackers),
+        )
+    else:
+        tracker_position_loss = _weighted_mean(
+            tracker_position_error,
+            observation_weight.to(device=raw_pred.device, dtype=raw_pred.dtype).index_select(
+                1, non_head_trackers
+            ),
+        )
 
     predicted_root = deployed_root_position
     target_root = batch["target_root_position_head_ref"].to(device=raw_pred.device, dtype=raw_pred.dtype)
@@ -111,6 +128,100 @@ def compute_raw_deployed_losses(
         "head_to_root_xz_loss": head_to_root_xz_loss,
         "future_leg_loss": future_leg_loss,
         "contact_loss": contact_loss,
+    }
+
+
+def compute_anchor_prior_losses(
+    target_xstart: torch.Tensor,
+    batch: dict,
+    auxiliary_outputs: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """计算 B1 Anchor Prior 的完整姿态、Root、速度与接触监督。"""
+
+    target_raw = _to_raw_pose(target_xstart, batch)
+    target_rotations, _ = decode_target_head_rotations_torch(target_raw)
+    prior_raw = auxiliary_outputs["taid_prior_pose_raw"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    prior_rotations, _ = decode_target_head_rotations_torch(prior_raw)
+    coverage = auxiliary_outputs["taid_alpha"].new_zeros(
+        (target_raw.shape[0], 5), dtype=target_raw.dtype
+    )
+    # region coverage 已在 Prior 内按 Anchor alpha 聚合，直接从已冻结的输出诊断张量读取。
+    if "taid_region_coverage" in auxiliary_outputs:
+        coverage = auxiliary_outputs["taid_region_coverage"].to(
+            device=target_raw.device, dtype=target_raw.dtype
+        )
+    else:
+        # 兼容第一版辅助字段：按角色 alpha 与固定覆盖矩阵恢复同一语义。
+        from data_loaders.tracker_roles import ANCHOR_REGION_COVERAGE
+
+        routes = torch.as_tensor(
+            ANCHOR_REGION_COVERAGE,
+            device=target_raw.device,
+            dtype=target_raw.dtype,
+        )
+        coverage = torch.einsum(
+            "bt,rt->br",
+            auxiliary_outputs["taid_alpha"].to(target_raw.dtype),
+            routes,
+        ).clamp(max=1.0)
+    joint_regions = torch.tensor(TARGET_JOINT_REGIONS.copy(), device=target_raw.device)
+    region_weight = 0.25 + 0.75 * coverage
+    joint_weight = region_weight.index_select(1, joint_regions)
+    rotation_error = _rotation_angle(prior_rotations, target_rotations)
+    prior_rotation_loss = _weighted_mean(rotation_error, joint_weight)
+
+    prior_joints = auxiliary_outputs["taid_prior_joints_head"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    target_joints = batch["target_joints_head_ref"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    joint_l1 = (prior_joints - target_joints).abs().mean(dim=-1)
+    prior_fk_loss = _weighted_mean(joint_l1, joint_weight)
+
+    root_head = auxiliary_outputs["taid_prior_root_head"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    target_root = batch["target_root_position_head_ref"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    target_root_yaw = batch["target_root_yaw_world"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    current_head_yaw = batch["current_head_yaw_world"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    relative_target_yaw = torch.remainder(
+        target_root_yaw - current_head_yaw + math.pi, 2.0 * math.pi
+    ) - math.pi
+    yaw_error = torch.remainder(
+        root_head[:, 3] - relative_target_yaw + math.pi, 2.0 * math.pi
+    ) - math.pi
+    prior_root_loss = (root_head[:, :3] - target_root).abs().mean(dim=-1) + yaw_error.abs()
+
+    previous_joints = batch["prev_joints_head_ref"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    predicted_velocity = auxiliary_outputs["taid_prior_joint_velocity_head"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    target_velocity = target_joints - previous_joints
+    velocity_l1 = (predicted_velocity - target_velocity).abs().mean(dim=-1)
+    prior_velocity_loss = _weighted_mean(velocity_l1, joint_weight)
+
+    contact_target = (batch["contact_target"].to(target_raw.device) >= 0.5).to(target_raw.dtype)
+    contact_logits = auxiliary_outputs["taid_prior_contact_logits"].to(target_raw.dtype)
+    prior_contact_loss = F.binary_cross_entropy_with_logits(
+        contact_logits, contact_target, reduction="none"
+    ).mean(dim=-1)
+    return {
+        "prior_rotation_loss": prior_rotation_loss,
+        "prior_fk_loss": prior_fk_loss,
+        "prior_root_loss": prior_root_loss,
+        "prior_velocity_loss": prior_velocity_loss,
+        "prior_contact_loss": prior_contact_loss,
     }
 
 
@@ -170,6 +281,11 @@ def _rotation_angle(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     weight = mask.to(value.dtype)
+    return (value * weight).sum(dim=-1) / weight.sum(dim=-1).clamp_min(1.0)
+
+
+def _weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    weight = weight.to(value.dtype)
     return (value * weight).sum(dim=-1) / weight.sum(dim=-1).clamp_min(1.0)
 
 

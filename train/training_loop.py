@@ -11,6 +11,7 @@ from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
 from data_loaders.realtime_pose_geometry import advance_rollout_pose_history_torch
+from data_loaders.realtime_pose_config import TAID_ABLATIONS
 
 from data_loaders.sensor_masking import (
     REALTIME_POSE_HISTORY_LENGTH,
@@ -20,6 +21,72 @@ from data_loaders.sensor_masking import (
 from diffusion import logger
 from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 from utils import dist_util
+
+
+def validate_taid_checkpoint_stage(
+    model,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    allow_stage_transition: bool,
+) -> tuple[str, str]:
+    """在加载参数前核对 TAID 阶段，防止同构 B1～B6 静默串用配置。"""
+
+    model_impl = getattr(model, "module", model)
+    target = getattr(getattr(model_impl, "taid_config", None), "ablation", "B0")
+    code = state_dict.get("taid_conditioner.ablation_code")
+    if code is None:
+        source = "B0"
+    else:
+        source_index = int(code.item())
+        if not 0 <= source_index < len(TAID_ABLATIONS):
+            raise RuntimeError(f"checkpoint TAID ablation code 非法：{source_index}。")
+        source = TAID_ABLATIONS[source_index]
+    if source != "B0" and target != "B0":
+        target_state = model_impl.state_dict()
+        contract_keys = (
+            "taid_conditioner.config_contract",
+            "taid_conditioner.position_scales",
+            "taid_conditioner.rotation_scales",
+        )
+        mismatched = []
+        for key in contract_keys:
+            source_value = state_dict.get(key)
+            target_value = target_state.get(key)
+            if (
+                source_value is None
+                or target_value is None
+                or source_value.shape != target_value.shape
+                or not torch.allclose(
+                    source_value.detach().cpu().to(torch.float64),
+                    target_value.detach().cpu().to(torch.float64),
+                    atol=1e-12,
+                    rtol=0.0,
+                )
+            ):
+                mismatched.append(key)
+        if mismatched:
+            raise RuntimeError(
+                "TAID checkpoint 配置与当前模型不兼容："
+                f" mismatched={mismatched}"
+            )
+    if source == target:
+        return source, target
+    allowed = allow_stage_transition and (
+        (source == "B0" and target == "B1")
+        or (source == "B1" and target in {"B2", "B3", "B4", "B5", "B6"})
+    )
+    if not allowed:
+        mode = "init" if allow_stage_transition else "resume"
+        raise RuntimeError(
+            f"TAID {mode} 阶段不兼容：checkpoint={source}, current={target}。"
+        )
+    if code is not None:
+        # B1→B2+ 复用同构参数，但 checkpoint 中的阶段标记必须改写为当前配置，
+        # 否则下一次保存会把新实验错误标成 B1。
+        state_dict["taid_conditioner.ablation_code"] = code.new_tensor(
+            TAID_ABLATIONS.index(target)
+        )
+    return source, target
 
 
 def zero_invalid_pose_history(
@@ -55,6 +122,9 @@ class TrainLoop:
         self.log_interval = args.log_interval
         self.save_interval = args.save_interval
         self.resume_checkpoint = args.resume_checkpoint
+        self.init_checkpoint = getattr(args, "init_checkpoint", "")
+        if self.resume_checkpoint and self.init_checkpoint:
+            raise ValueError("resume_checkpoint 与 init_checkpoint 不能同时设置。")
         self.weight_decay = args.weight_decay
         self.lr_anneal_steps = args.lr_anneal_steps
         self.gradient_clip = args.gradient_clip
@@ -120,7 +190,12 @@ class TrainLoop:
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
 
         self.feature_w = self._load_feature_weights(args)
-        self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
+        (
+            self.normalizer_mean,
+            self.normalizer_std,
+            self.tracker_normalizer_mean,
+            self.tracker_normalizer_std,
+        ) = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
 
         self.amp_dtype = self._select_amp_dtype()
@@ -131,7 +206,11 @@ class TrainLoop:
         )
         if self.device.type == "cuda":
             logger.log(f"amp dtype: {self.amp_dtype}, grad scaler enabled: {self.scaler.is_enabled()}")
-        self.opt = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.opt = AdamW(
+            (parameter for parameter in self.model.parameters() if parameter.requires_grad),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
         if self.resume_step:
             self._load_optimizer_state()
@@ -169,14 +248,41 @@ class TrainLoop:
         dataset = getattr(data, "dataset", None)
         normalizer = getattr(dataset, "normalizer", None)
         if normalizer is None or getattr(normalizer, "disable", False):
-            return None, None
+            return None, None, None, None
         mean = getattr(normalizer, "mean", None)
         std = getattr(normalizer, "std", None)
         if mean is None or std is None:
-            return None, None
-        return mean.detach().float().clone(), std.detach().float().clone()
+            return None, None, None, None
+        tracker_mean = getattr(normalizer, "tracker_mean", None)
+        tracker_std = getattr(normalizer, "tracker_std", None)
+        return (
+            mean.detach().float().clone(),
+            std.detach().float().clone(),
+            None if tracker_mean is None else tracker_mean.detach().float().clone(),
+            None if tracker_std is None else tracker_std.detach().float().clone(),
+        )
 
     def _load_and_sync_parameters(self):
+        if self.init_checkpoint:
+            logger.log(f"initializing model weights from checkpoint: {self.init_checkpoint}...")
+            state_dict = dist_util.load_state_dict(self.init_checkpoint, map_location=self.device)
+            source_stage, target_stage = validate_taid_checkpoint_stage(
+                self.model, state_dict, allow_stage_transition=True
+            )
+            incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
+            missing_keys = list(incompatible_keys.missing_keys)
+            unexpected_keys = list(incompatible_keys.unexpected_keys)
+            allowed_missing = source_stage == "B0" and target_stage == "B1" and all(
+                key.startswith("taid_conditioner.") for key in missing_keys
+            )
+            if unexpected_keys or (missing_keys and not allowed_missing):
+                raise RuntimeError(
+                    "init checkpoint 与当前模型不兼容："
+                    f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+                )
+            if allowed_missing:
+                logger.log("B0 checkpoint 未含 TAID 参数；保留新 TAID 模块初始化值。")
+            return
         resume_checkpoint = find_resume_checkpoint(
             save_dir=self.save_dir,
             requested_checkpoint=self.resume_checkpoint,
@@ -188,6 +294,7 @@ class TrainLoop:
         self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
         logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
         state_dict = dist_util.load_state_dict(resume_checkpoint, map_location=self.device)
+        validate_taid_checkpoint_stage(self.model, state_dict, allow_stage_transition=False)
         incompatible_keys = self.model.load_state_dict(state_dict, strict=False)
         missing_keys = list(incompatible_keys.missing_keys)
         unexpected_keys = list(incompatible_keys.unexpected_keys)
@@ -626,6 +733,13 @@ class TrainLoop:
         if self.normalizer_mean is not None and self.normalizer_std is not None:
             y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
             y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)
+        if self.tracker_normalizer_mean is not None and self.tracker_normalizer_std is not None:
+            y["tracker_normalizer_mean"] = self.tracker_normalizer_mean.to(
+                device=sample.device, dtype=sample.dtype
+            )
+            y["tracker_normalizer_std"] = self.tracker_normalizer_std.to(
+                device=sample.device, dtype=sample.dtype
+            )
 
         return {
             "pose_history": batch["pose_history"],

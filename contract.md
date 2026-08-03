@@ -20,6 +20,18 @@ o_n^W=[p^W_{H,n,x}, floor_y, p^W_{H,n,z}]^\top.
 
 Head forward 水平投影退化时沿用上一合法 yaw。
 
+`target_root_yaw_world` 与最终 `predicted_root_yaw_world` 统一表示 Pelvis forward
+的世界 heading，并 wrap 到 `[-π,π)`。它们不得直接读取 source 的 Actor Root
+分解量 `root_yaw`；必须满足：
+
+\[
+wrap(current\_head\_yaw\_world + decode(current\_target).pelvis\_heading)
+= target\_root\_yaw\_world.
+\]
+
+当 Pelvis local residual 接近 180° 时，source Actor Root heading 与该 Pelvis
+heading 可以相差约 π；这是两种语义的差异，不是 checkpoint 误差。
+
 ## Source
 
 原始 AMASS realtime source 保持现有缓存字段：
@@ -79,6 +91,10 @@ Head forward 水平投影退化时沿用上一合法 yaw。
 - `12`: d_on
 
 无效测量的前 9 维必须严格清零。只有前 9 维连续量参与 Tracker normalizer；配置、有效性、duration 和 hard 状态不参与统计。`d_off/d_on` 对模型输入除以 60，物理状态仍保存整数帧数。
+
+TAID 方案草案中曾写过 15D Tracker，但当前稳定 Python/Unity 契约明确保持
+13D：不新增 velocity 或 `delta_e` 字段。位置/旋转 innovation 及其时间差只从
+`tracker_history`、`pose_history`、当前 13D Tracker 和 Head trajectory 内部派生。
 
 ## Head trajectory
 
@@ -153,3 +169,50 @@ normalizer 元数据必须与 task generation-plan hash 一致。场景权重不
 - `prepare_conditioning()` 每个目标帧只执行一次。
 - Projected DDIM 默认每一步投影，支持 `all_steps`、`late_steps`、`final_step`。
 - Resolver 只严格检查 hard Tracker rotation，不对 soft Tracker 做硬约束。
+
+## TAID B0～B6 条件契约
+
+TAID 由 `--taid_ablation` 显式选择，默认 `B0`。B0 不创建 TAID 参数，保持旧
+TargetDiT state dict 与前向路径；B1～B6 仍输出完整 raw `[B,144]`，不改变
+Diffusion schedule、Projected DDIM 或 Unity 稳定输入输出。
+
+角色由 13D 中的 `configured/measured_valid/d_on` 确定：未配置、Missing、
+Uncertain、Anchor 四种身份不合并。Head 强制为 Anchor。第一版固定：
+
+- `K0=5`、`K1=15`、`KR=15`；
+- `alpha=valid*clip((d_on-K0)/(K1-K0),0,1)`；
+- `beta=valid*(1-alpha)*min(1,d_on/KR)`；
+- `region_coverage=1-prod(1-alpha*coverage)`。
+
+Anchor Prior 只读 deployed pose history、Head trajectory、逐 Tracker 独立编码后
+乘过 `alpha` 的 token 和 region coverage；Uncertain 当前测量不得通过共享聚合
+旁路进入。Prior 输出：
+
+- `prior_pose_raw/model: [B,144]`；
+- `prior_root_head: [B,4]`，依次为 Head-relative Actor Root `xyz+yaw`；
+- `prior_contact_logits: [B,2]`；
+- `prior_joint_velocity_head: [B,24,3]`，仅用于 B1 训练期速度监督；
+- `region_coverage: [B,5]`。
+
+Posterior innovation 固定为 `[B,6,6]`：位置使用米，旋转使用 SO(3) Log 的弧度。
+Head residual 恒为零；无效测量的 residual、`delta_e` 和 innovation token 必须严格
+为零。上一帧位置 residual 先按 `current_trajectory` 的 Head yaw 增量从
+`C_(n-1)` 旋到 `C_n`。第一版尺度按 Head/LHand/RHand/Hip/LFoot/RFoot 固定为：
+
+- position `(1.0,0.25,0.25,0.20,0.20,0.20)` 米；
+- rotation `(1.0,0.50,0.50,0.35,0.35,0.35)` 弧度；
+- 每维使用 `3*tanh(value/scale/3)` 确定性截断；
+- shared MLP 为 `12→128→64`，再适配到 TargetDiT latent。
+
+消融含义固定：B1=Prior only；B2=Prior absolute condition；B3=加 Uncertain
+绝对观测；B4=以 FK innovation 替代绝对观测；B5=加固定区域路由；B6=把
+Uncertain hard 权重换成互补连续 `alpha/beta`。B1/B2 的直接 posterior
+`beta=0`，B3～B5 使用 Uncertain hard beta，B6 使用连续 beta。固定路由为 Hip→Torso（弱到
+双腿）、Hand→对应 Arm（弱到 Torso）、Foot→对应 Leg（contact 时弱到
+Torso），Head 不进入 innovation。路由仅限制直接条件注入，不截断全身
+self-attention。
+
+B1 仅训练 Prior；B2～B6 冻结 Prior，并对用于 FK/条件的 Prior 输出
+stop-gradient。每个目标帧只执行一次 Prior/innovation，全部 DDIM step 复用。
+`init_checkpoint` 只允许 B0→B1 或 B1→B2～B6；`resume_checkpoint` 必须与当前
+ablation 完全相同。

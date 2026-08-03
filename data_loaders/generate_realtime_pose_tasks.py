@@ -16,8 +16,8 @@ from data_loaders.realtime_pose_geometry import (
     build_head_trajectory_np,
     build_pose_target_np,
     build_tracker_measurements_np,
+    decode_target_root_yaw_world_np,
     extract_forward_yaw_np,
-    extract_rotation_heading_np,
 )
 from data_loaders.realtime_pose_kinematics import (
     SMPL_JOINT_NAMES,
@@ -584,9 +584,11 @@ def build_task_bundle_row(
         row["target_joints_head_ref"][step] = joints_head[1]
         row["prev_joints_head_ref"][step] = joints_head[0]
         row["target_root_position_head_ref"][step] = root_head.astype(np.float32)
-        # 评估比较的是 pelvis forward 朝向；source root_yaw 是 actor heading，二者语义不同。
-        row["target_root_yaw_world"][step] = extract_rotation_heading_np(
-            joint_rotations_world[current_absolute, 0]
+        # 直接从当前 144D target 解码，确保监督 yaw 与模型输出使用完全相同的
+        # rotation6D 正交化和 Pelvis forward 语义；source actor heading 不能代替它。
+        row["target_root_yaw_world"][step] = decode_target_root_yaw_world_np(
+            current_target,
+            current_head_yaw,
         )
         row["target_hip_height"][step] = source["pelvis_height"][current_absolute, 0]
         row["history_head_yaw_world"][step] = head_yaws[previous_absolute]

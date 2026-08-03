@@ -16,7 +16,7 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from diffusion.realtime_pose_losses import compute_raw_deployed_losses
+from diffusion.realtime_pose_losses import compute_anchor_prior_losses, compute_raw_deployed_losses
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
@@ -138,6 +138,7 @@ class GaussianDiffusion:
         future_leg_loss_weight=0.5,
         contact_loss_weight=0.1,
         foot_slide_loss_weight=0.5,
+        taid_prior_velocity_loss_weight=0.25,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -159,6 +160,7 @@ class GaussianDiffusion:
         self.future_leg_loss_weight = float(future_leg_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
         self.foot_slide_loss_weight = float(foot_slide_loss_weight)
+        self.taid_prior_velocity_loss_weight = float(taid_prior_velocity_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1495,6 +1497,23 @@ class GaussianDiffusion:
             batch.get("normalizer_mean"),
             batch.get("normalizer_std"),
         )
+        if bool(auxiliary_outputs.get("taid_prior_only", False)):
+            terms = compute_anchor_prior_losses(x_start, batch, auxiliary_outputs)
+            prior_loss = (
+                self.rotation_loss_weight * terms["prior_rotation_loss"]
+                + self.fk_loss_weight * terms["prior_fk_loss"]
+                + self.root_loss_weight * terms["prior_root_loss"]
+                + self.taid_prior_velocity_loss_weight * terms["prior_velocity_loss"]
+                + self.contact_loss_weight * terms["prior_contact_loss"]
+            )
+            terms["simple_loss"] = terms["prior_rotation_loss"]
+            terms["aux_loss"] = prior_loss
+            terms["loss"] = prior_loss
+            if return_pred_xstart:
+                terms["raw_pred_xstart"] = raw_pred_xstart
+                terms["deployed_pred_xstart"] = deployed_pred_xstart
+                terms["pred_xstart"] = deployed_pred_xstart
+            return terms
         # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。
         elementwise_loss = (

@@ -1,13 +1,28 @@
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.realtime_pose_target_dit import RealtimePoseTargetDiT
-from data_loaders.realtime_pose_config import TrackerReliabilityConfig
+from data_loaders.realtime_pose_config import TaIDConfig, TrackerReliabilityConfig, TrackerRoleConfig
 
 
 def create_model_and_diffusion(args):
     model_arch = getattr(args, "model_arch", "target_dit")
     if model_arch != "target_dit":
         raise ValueError("144 维动态 Tracker 路径只支持 target_dit；旧 full_feature_dit 不兼容。")
+    taid_config = TaIDConfig(
+        ablation=getattr(args, "taid_ablation", "B0"),
+        role=TrackerRoleConfig(
+            anchor_ramp_start=getattr(args, "taid_anchor_ramp_start", 5),
+            anchor_ramp_end=getattr(args, "taid_anchor_ramp_end", 15),
+            innovation_ramp_frames=getattr(args, "taid_innovation_ramp_frames", 15),
+        ),
+        innovation_dim=getattr(args, "taid_innovation_dim", 64),
+        innovation_clip=getattr(args, "taid_innovation_clip", 3.0),
+        position_scales=tuple(getattr(args, "taid_position_scales", (1.0, 0.25, 0.25, 0.20, 0.20, 0.20))),
+        rotation_scales=tuple(getattr(args, "taid_rotation_scales", (1.0, 0.50, 0.50, 0.35, 0.35, 0.35))),
+        hip_leg_secondary_weight=getattr(args, "taid_hip_leg_secondary_weight", 0.25),
+        hand_torso_weight=getattr(args, "taid_hand_torso_weight", 0.10),
+        foot_root_contact_weight=getattr(args, "taid_foot_root_contact_weight", 0.25),
+    ).validate()
     model = RealtimePoseTargetDiT(
         input_feats=args.input_feats,
         latent_dim=args.latent_dim,
@@ -20,6 +35,7 @@ def create_model_and_diffusion(args):
         # Task 与 Runtime 当前都固定使用默认可靠度配置；在 metadata 契约完成前，
         # 模型工厂也禁止从 CLI 覆盖，避免同一持续时间被按不同 duration_cap 解释。
         reliability_config=TrackerReliabilityConfig().validate(),
+        taid_config=taid_config,
     )
     return model, create_gaussian_diffusion(args)
 
@@ -50,4 +66,5 @@ def create_gaussian_diffusion(args):
         future_leg_loss_weight=getattr(args, "future_leg_loss_weight", 0.5),
         contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
         foot_slide_loss_weight=getattr(args, "foot_slide_loss_weight", 0.5),
+        taid_prior_velocity_loss_weight=getattr(args, "taid_prior_velocity_loss_weight", 0.25),
     )

@@ -4,7 +4,7 @@ import json
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
-from data_loaders.realtime_pose_config import RealtimePoseLossWeights
+from data_loaders.realtime_pose_config import TAID_ABLATIONS, RealtimePoseLossWeights
 from data_loaders.sensor_masking import (
     DEFAULT_SCENARIO_WEIGHTS,
     REALTIME_POSE_SEQ_LEN,
@@ -137,6 +137,27 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--max_seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--model_arch", default="target_dit", choices=["target_dit"], type=str)
     group.add_argument("--motion_layers", default=4, type=int)
+    group.add_argument("--taid_ablation", default="B0", choices=TAID_ABLATIONS, type=str)
+    group.add_argument("--taid_anchor_ramp_start", default=5, type=int)
+    group.add_argument("--taid_anchor_ramp_end", default=15, type=int)
+    group.add_argument("--taid_innovation_ramp_frames", default=15, type=int)
+    group.add_argument("--taid_innovation_dim", default=64, type=int)
+    group.add_argument("--taid_innovation_clip", default=3.0, type=float)
+    group.add_argument(
+        "--taid_position_scales",
+        nargs=6,
+        default=[1.0, 0.25, 0.25, 0.20, 0.20, 0.20],
+        type=float,
+    )
+    group.add_argument(
+        "--taid_rotation_scales",
+        nargs=6,
+        default=[1.0, 0.50, 0.50, 0.35, 0.35, 0.35],
+        type=float,
+    )
+    group.add_argument("--taid_hip_leg_secondary_weight", default=0.25, type=float)
+    group.add_argument("--taid_hand_torso_weight", default=0.10, type=float)
+    group.add_argument("--taid_foot_root_contact_weight", default=0.25, type=float)
 
 
 def add_diffusion_options(parser: ArgumentParser):
@@ -162,6 +183,13 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--checkpoint_max_keep", default=0, type=int)
     group.add_argument("--num_steps", default=1_000_000, type=int)
     group.add_argument("--resume_checkpoint", default="", type=str)
+    group.add_argument(
+        "--init_checkpoint",
+        default="",
+        type=str,
+        help="只加载模型参数、不恢复 step/optimizer；用于 B0→B1 或 B1→B2+ 分阶段初始化。",
+    )
+    group.add_argument("--taid_prior_velocity_loss_weight", default=0.25, type=float)
     group.add_argument("--gradient_clip", action="store_true")
     group.add_argument("--weighted_loss", action="store_true")
     group.add_argument("--feature_w_file", default="feature_w.pt", type=str)

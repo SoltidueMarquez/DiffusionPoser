@@ -1,4 +1,4 @@
 interface:
-  display_name: "DiffusionPoser TAID ÊµÑé"
-  short_description: "ÊµÊ©¿ÉĞÅÃªµã Prior Óë FK Innovation Ìõ¼şÀ©É¢ÊµÑé"
-  default_prompt: "Use $diffusionposer-taid-experiment to audit and implement the TAID V1 experiment with contract checks, smoke tests, and controlled ablations."
+  display_name: "DiffusionPoser TAID å®éªŒ"
+  short_description: "å®æ–½å¯ä¿¡é”šç‚¹ Prior ä¸ FK Innovation æ¡ä»¶æ‰©æ•£å®éªŒ"
+  default_prompt: "Use $diffusionposer-taid-experiment to audit and implement the TAID experiment with contract checks, smoke tests, and controlled ablations."

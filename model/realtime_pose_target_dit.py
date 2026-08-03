@@ -11,6 +11,7 @@ from data_loaders.realtime_pose_config import (
     ROTATION_COVERAGE,
     TARGET_JOINT_REGIONS,
     TRAJECTORY_REGION_MULTIPLIERS,
+    TaIDConfig,
     TrackerReliabilityConfig,
 )
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX
@@ -26,6 +27,7 @@ from data_loaders.sensor_masking import (
 from model.timestep_embedding import SinusoidalTimestepEmbedding
 from model.realtime_pose_motion_encoder import MotionEncoding, RegionalMotionEncoder
 from model.realtime_pose_observation_encoder import DynamicObservationEncoder, ObservationEncoding
+from model.taid_conditioning import PreparedTaIDConditioning, TaIDConditioner
 
 
 @dataclass
@@ -33,6 +35,7 @@ class PreparedRealtimeConditioning:
     observation: ObservationEncoding
     motion: MotionEncoding
     trajectory_token: torch.Tensor
+    taid: PreparedTaIDConditioning | None = None
 
 
 def apply_adaln_modulation(
@@ -89,29 +92,41 @@ class RegionAdaptiveDiTBlock(nn.Module):
         # 五类条件必须读取同一个 block 输入，避免前序条件改变后续 attention 的 query，
         # 从而让可靠性 gate 只控制对应证据的强弱，而不会间接改变其他条件分支。
         conditioning_query = self.conditioning_norm(target)
-        state_value = self.context_attention(
-            conditioning_query,
-            observation.state_tokens,
-            observation.state_tokens,
-            need_weights=False,
-        )[0]
-
-        pos_value = self.position_attention(
-            conditioning_query,
-            observation.position_tokens,
-            observation.position_tokens,
-            attn_mask=position_bias,
-            need_weights=False,
-        )[0]
-        rot_value = self.rotation_attention(
-            conditioning_query,
-            observation.rotation_tokens,
-            observation.rotation_tokens,
-            attn_mask=rotation_bias,
-            need_weights=False,
-        )[0]
-        rho_pos = observation.rho_position.index_select(1, joint_regions)
-        rho_rot = observation.rho_rotation.index_select(1, joint_regions)
+        if prepared.taid is None:
+            state_value = self.context_attention(
+                conditioning_query,
+                observation.state_tokens,
+                observation.state_tokens,
+                need_weights=False,
+            )[0]
+            pos_value = self.position_attention(
+                conditioning_query,
+                observation.position_tokens,
+                observation.position_tokens,
+                attn_mask=position_bias,
+                need_weights=False,
+            )[0]
+            rot_value = self.rotation_attention(
+                conditioning_query,
+                observation.rotation_tokens,
+                observation.rotation_tokens,
+                attn_mask=rotation_bias,
+                need_weights=False,
+            )[0]
+            rho_pos = observation.rho_position.index_select(1, joint_regions)
+            rho_rot = observation.rho_rotation.index_select(1, joint_regions)
+        else:
+            # TAID 路径只允许 Anchor 进入 Prior；当前 Uncertain 观测必须经由
+            # absolute/innovation 分支进入，不能再旁路到旧测量注意力。
+            state_value = torch.zeros_like(conditioning_query)
+            pos_value = torch.zeros_like(conditioning_query)
+            rot_value = torch.zeros_like(conditioning_query)
+            rho_pos = torch.zeros(
+                conditioning_query.shape[:2],
+                device=conditioning_query.device,
+                dtype=conditioning_query.dtype,
+            )
+            rho_rot = torch.zeros_like(rho_pos)
 
         # 每个 region 同时提供 60 个 past-only temporal token 和 1 个汇总 latent。
         prior_keys = torch.cat(
@@ -182,6 +197,7 @@ class RealtimePoseTargetDiT(nn.Module):
         max_seq_len: int = 61,
         motion_layers: int = 4,
         reliability_config: TrackerReliabilityConfig | None = None,
+        taid_config: TaIDConfig | None = None,
     ):
         super().__init__()
         if int(input_feats) != REALTIME_POSE_TARGET_DIM or int(max_seq_len) != 61:
@@ -190,6 +206,7 @@ class RealtimePoseTargetDiT(nn.Module):
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
         self.num_heads = int(num_heads)
+        self.taid_config = (taid_config or TaIDConfig()).validate()
         self.observation_encoder = DynamicObservationEncoder(latent_dim, reliability_config)
         self.motion_encoder = RegionalMotionEncoder(latent_dim, motion_layers, num_heads, dropout)
         self.trajectory_encoder = nn.Sequential(
@@ -208,6 +225,9 @@ class RealtimePoseTargetDiT(nn.Module):
             nn.Linear(latent_dim * 8, latent_dim), nn.SiLU(), nn.Linear(latent_dim, 3 * 8 * 6)
         )
         self.contact_head = nn.Linear(latent_dim * 2, 2)
+        self.taid_conditioner = (
+            TaIDConditioner(latent_dim, self.taid_config) if self.taid_config.enabled else None
+        )
         self.register_buffer("joint_regions", torch.tensor(TARGET_JOINT_REGIONS.copy(), dtype=torch.long))
         self.register_buffer(
             "trajectory_multipliers", torch.tensor(TRAJECTORY_REGION_MULTIPLIERS.copy(), dtype=torch.float32)
@@ -221,6 +241,7 @@ class RealtimePoseTargetDiT(nn.Module):
         if zero_init:
             nn.init.zeros_(self.joint_output.weight)
             nn.init.zeros_(self.joint_output.bias)
+        self._configure_taid_trainable_parameters()
 
     def num_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
@@ -233,6 +254,13 @@ class RealtimePoseTargetDiT(nn.Module):
         trajectory_history: torch.Tensor,
         current_trajectory: torch.Tensor,
         valid_frame_mask: torch.Tensor,
+        *,
+        current_tracker_raw: torch.Tensor | None = None,
+        joint_offsets_parent: torch.Tensor | None = None,
+        pose_mean: torch.Tensor | None = None,
+        pose_std: torch.Tensor | None = None,
+        tracker_mean: torch.Tensor | None = None,
+        tracker_std: torch.Tensor | None = None,
     ) -> PreparedRealtimeConditioning:
         observation = self.observation_encoder(tracker_history, current_tracker, valid_frame_mask)
         motion = self.motion_encoder(
@@ -243,10 +271,31 @@ class RealtimePoseTargetDiT(nn.Module):
         )
         if tuple(current_trajectory.shape) != (pose_history.shape[0], 1, 5):
             raise ValueError("current_trajectory 必须为 [B,1,5]。")
+        trajectory_token = self.trajectory_encoder(current_trajectory)
+        taid = None
+        if self.taid_conditioner is not None:
+            if current_tracker_raw is None or joint_offsets_parent is None:
+                raise ValueError("TAID 条件准备缺少 current_tracker_raw 或 joint_offsets_parent。")
+            taid = self.taid_conditioner(
+                pose_history,
+                tracker_history,
+                current_tracker,
+                current_tracker_raw,
+                current_trajectory,
+                trajectory_token,
+                valid_frame_mask,
+                observation,
+                joint_offsets_parent,
+                pose_mean,
+                pose_std,
+                tracker_mean,
+                tracker_std,
+            )
         return PreparedRealtimeConditioning(
             observation=observation,
             motion=motion,
-            trajectory_token=self.trajectory_encoder(current_trajectory),
+            trajectory_token=trajectory_token,
+            taid=taid,
         )
 
     def forward(
@@ -259,6 +308,12 @@ class RealtimePoseTargetDiT(nn.Module):
         trajectory_history: Optional[torch.Tensor] = None,
         current_trajectory: Optional[torch.Tensor] = None,
         valid_frame_mask: Optional[torch.Tensor] = None,
+        current_tracker_raw: Optional[torch.Tensor] = None,
+        joint_offsets_parent: Optional[torch.Tensor] = None,
+        normalizer_mean: Optional[torch.Tensor] = None,
+        normalizer_std: Optional[torch.Tensor] = None,
+        tracker_normalizer_mean: Optional[torch.Tensor] = None,
+        tracker_normalizer_std: Optional[torch.Tensor] = None,
         prepared_conditioning: Optional[PreparedRealtimeConditioning] = None,
         y: Optional[dict] = None,
         return_aux_outputs: bool = False,
@@ -278,7 +333,46 @@ class RealtimePoseTargetDiT(nn.Module):
             required = (pose_history, tracker_history, current_tracker, trajectory_history, current_trajectory, valid_frame_mask)
             if any(value is None for value in required):
                 raise ValueError("TargetDiT 缺少新动态观测契约字段。")
-            prepared_conditioning = self.prepare_conditioning(*required)
+            prepare_kwargs = {}
+            if self.taid_config.enabled:
+                prepare_kwargs = {
+                    "current_tracker_raw": current_tracker_raw
+                    if current_tracker_raw is not None
+                    else values.get("current_tracker_raw"),
+                    "joint_offsets_parent": joint_offsets_parent
+                    if joint_offsets_parent is not None
+                    else values.get("joint_offsets_parent"),
+                    "pose_mean": normalizer_mean
+                    if normalizer_mean is not None
+                    else values.get("normalizer_mean"),
+                    "pose_std": normalizer_std
+                    if normalizer_std is not None
+                    else values.get("normalizer_std"),
+                    "tracker_mean": tracker_normalizer_mean
+                    if tracker_normalizer_mean is not None
+                    else values.get("tracker_normalizer_mean"),
+                    "tracker_std": tracker_normalizer_std
+                    if tracker_normalizer_std is not None
+                    else values.get("tracker_normalizer_std"),
+                }
+            prepared_conditioning = self.prepare_conditioning(*required, **prepare_kwargs)
+
+        if self.taid_config.prior_only:
+            if prepared_conditioning.taid is None:
+                raise RuntimeError("B1 必须生成 Anchor Prior 条件。")
+            prior = prepared_conditioning.taid.prior
+            if not return_aux_outputs:
+                return prior.pose_model
+            batch_size = hidden_states.shape[0]
+            auxiliary = self._taid_auxiliary(prepared_conditioning.taid)
+            auxiliary.update(
+                {
+                    "future_leg": hidden_states.new_zeros((batch_size, 3, 8, 6)),
+                    "contact_logits": prior.contact_logits,
+                    "taid_prior_only": True,
+                }
+            )
+            return prior.pose_model, auxiliary
 
         batch_size = hidden_states.shape[0]
         joint_values = hidden_states.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
@@ -288,6 +382,8 @@ class RealtimePoseTargetDiT(nn.Module):
             + self.joint_identity(joint_ids)[None]
             + self.region_identity(self.joint_regions)[None]
         )
+        if prepared_conditioning.taid is not None:
+            target = target + prepared_conditioning.taid.joint_condition
         position_bias = self._measurement_bias(
             prepared_conditioning.observation.kappa_position[:, NON_HEAD_TRACKER_INDICES],
             self.position_coverage[:, NON_HEAD_TRACKER_INDICES],
@@ -326,7 +422,44 @@ class RealtimePoseTargetDiT(nn.Module):
             ),
             "contact_logits": self.contact_head(target.index_select(1, feet_indices).flatten(1)),
         }
+        if prepared_conditioning.taid is not None:
+            auxiliary.update(self._taid_auxiliary(prepared_conditioning.taid))
+            auxiliary["taid_prior_only"] = False
         return raw_xstart, auxiliary
+
+    def _configure_taid_trainable_parameters(self) -> None:
+        """固定 B1/B2+ 的参数边界，避免 Prior 与 TargetDiT 意外联合漂移。"""
+
+        if not self.taid_config.enabled:
+            return
+        if self.taid_config.prior_only:
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(name.startswith("taid_conditioner.prior."))
+            return
+        assert self.taid_conditioner is not None
+        for parameter in self.taid_conditioner.prior.parameters():
+            parameter.requires_grad_(False)
+
+    @staticmethod
+    def _taid_auxiliary(prepared: PreparedTaIDConditioning) -> dict[str, torch.Tensor]:
+        prior = prepared.prior
+        return {
+            "taid_prior_pose_model": prior.pose_model,
+            "taid_prior_pose_raw": prior.pose_raw,
+            "taid_prior_root_head": prior.root_head,
+            "taid_prior_contact_logits": prior.contact_logits,
+            "taid_prior_joint_velocity_head": prior.joint_velocity_head,
+            "taid_prior_joints_head": prior.joints_head,
+            "taid_region_coverage": prior.region_coverage,
+            "taid_roles": prepared.role_state.roles,
+            "taid_alpha": prepared.role_state.alpha,
+            "taid_beta": prepared.role_state.beta,
+            "taid_observation_weight": prepared.observation_weight,
+            "taid_innovation_residual": prepared.innovation_residual,
+            "taid_innovation_delta": prepared.innovation_delta,
+            "taid_innovation_tokens": prepared.innovation_tokens,
+            "taid_region_injection": prepared.region_injection,
+        }
 
     def _measurement_bias(self, kappa: torch.Tensor, coverage: torch.Tensor) -> torch.Tensor:
         """返回 `[B*H,24,K]`，零可靠性或区域不覆盖的 key 使用 -inf。"""

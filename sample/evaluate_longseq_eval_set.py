@@ -23,7 +23,11 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
 )
-from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_rotation_heading_np
+from data_loaders.realtime_pose_geometry import (
+    build_pose_target_np,
+    decode_target_root_yaw_world_np,
+    extract_rotation_heading_np,
+)
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
@@ -220,7 +224,7 @@ def rollout_long_sequence_source(
         values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
         values["predicted_root_position_world"].append(resolved.root_position_world)
         values["reference_root_yaw_world"].append(
-            float(extract_rotation_heading_np(joint_rotations_world[frame_index, 0]))
+            float(decode_target_root_yaw_world_np(reference_target, runtime.previous_head_yaw))
         )
         values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
         values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
@@ -472,7 +476,7 @@ def _append_rollout_frame(
     values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
     values["predicted_root_position_world"].append(resolved.root_position_world)
     values["reference_root_yaw_world"].append(
-        float(extract_rotation_heading_np(joint_rotations_world[frame_index, 0]))
+        float(decode_target_root_yaw_world_np(reference_target, runtime.previous_head_yaw))
     )
     values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
     values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
