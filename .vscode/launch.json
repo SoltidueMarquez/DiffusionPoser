@@ -2,6 +2,114 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "数据处理 | 从 AMASS 重建 train+test（不训练）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "D:/Programme/Python/Anaconda3lenvs/diffusionposer5070/python.exe",
+            "module": "scripts.run_realtime_pose_pipeline",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "args": [
+                "--start_at", "convert",
+                "--stop_after", "normalizer",
+                "--run_name", "auto",
+                "--amass_dir", "${workspaceFolder}/dataset/AMASS",
+                "--smpl_model_dir", "${workspaceFolder}/dataset/body_models",
+                "--body_fbx_rest_json", "${workspaceFolder}/dataset/body_fbx_rest.json",
+                "--source_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+                "--task_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
+                "--split_dir", "${workspaceFolder}/data_loaders/splits",
+                "--splits", "train", "test",
+                "--target_fps", "60",
+                "--convert_batch_size", "256",
+                "--convert_num_workers", "4",
+                "--convert_worker_torch_threads", "1",
+                "--base_windows_per_source", "20",
+                "--max_rollout_steps", "4",
+                "--shard_size", "4096",
+                "--short_source_policy", "skip",
+                "--rebuild_source",
+                "--mirror",
+                "--overwrite"
+            ]
+        },
+        {
+            "name": "SMOKE 0 | 代码主链路 tests/smoke",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "D:/Programme/Python/Anaconda3lenvs/diffusionposer5070/python.exe",
+            "module": "pytest",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            },
+            "args": [
+                "-p", "no:cacheprovider",
+                "tests/smoke",
+                "-q"
+            ]
+        },
+        {
+            "name": "SMOKE 1 | test01 EMA120k 单样本推理（非效果评估）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "D:/Programme/Python/Anaconda3lenvs/diffusionposer5070/python.exe",
+            "module": "sample.reconstruct_stream",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            },
+            "args": [
+                "--model_path", "${workspaceFolder}/save/test01/model000120000.pt",
+                "--data_dir", "${workspaceFolder}/dataset/AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz_tasks",
+                "--data_split", "test",
+                "--normalizer_dir", "${workspaceFolder}/dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
+                "--output_dir", "${workspaceFolder}/output/smoke_test01/reconstruct_stream",
+                "--normalize_input", "true",
+                "--cuda", "true",
+                "--device", "0",
+                "--use_ema", "true",
+                "--ts_respace", "ddim5",
+                "--projected_ddim_mode", "all_steps",
+                "--num_workers", "0"
+            ]
+        },
+        {
+            "name": "SMOKE 2 | 评估 SMOKE 1 输出",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "D:/Programme/Python/Anaconda3lenvs/diffusionposer5070/python.exe",
+            "module": "eval.evaluate_realtime_pose",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            },
+            "args": [
+                "--input_dir", "${workspaceFolder}/output/smoke_test01/reconstruct_stream",
+                "--output_json", "${workspaceFolder}/output/smoke_test01/reconstruct_stream/eval_summary.json"
+            ]
+        },
+        {
             "name": "realtime_pose_root_y0 | one-stop convert-to-train",
             "type": "debugpy",
             "request": "launch",

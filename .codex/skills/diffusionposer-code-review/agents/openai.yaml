@@ -1,0 +1,4 @@
+interface:
+  display_name: "DiffusionPoser 代码审阅"
+  short_description: "核对实时稀疏姿态重建链路、张量契约、论文对应与实验效果证据"
+  default_prompt: "使用 $diffusionposer-code-review 核对当前 DiffusionPoser 实现链路，并按证据边界给出代码审阅结论和导师沟通话术。"
