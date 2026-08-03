@@ -1,0 +1,4 @@
+interface:
+  display_name: "DiffusionPoser TAID 实验"
+  short_description: "实施可信锚点 Prior 与 FK Innovation 条件扩散实验"
+  default_prompt: "Use $diffusionposer-taid-experiment to audit and implement the TAID V1 experiment with contract checks, smoke tests, and controlled ablations."
