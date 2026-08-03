@@ -21,9 +21,12 @@ from data_loaders.tracker_reliability import (
     compute_tracker_reliability_np,
 )
 from data_loaders.tracker_timeline import (
+    build_isolated_condition_timeline,
     build_task_config_plan,
     build_tracker_timeline,
     candidate_source_window_starts,
+    classify_tracker_frame,
+    isolated_condition_eval_mask,
     materialize_task_configurations,
 )
 
@@ -113,6 +116,34 @@ def test_source_absolute_timeline_overlap_is_identical():
     np.testing.assert_array_equal(first.measured_valid[40:], second.measured_valid[:60])
     np.testing.assert_array_equal(first.d_on[40:], second.d_on[:60])
     np.testing.assert_array_equal(first.hard_rotation_state[40:], second.hard_rotation_state[:60])
+
+
+def test_isolated_condition_timelines_only_score_the_requested_condition():
+    frame_count = 720
+    for condition in TRACKER_PATTERN_CATEGORIES:
+        timeline = build_isolated_condition_timeline(
+            source_id="source/isolated",
+            frame_count=frame_count,
+            condition=condition,
+            global_seed=10,
+        )
+        mask = isolated_condition_eval_mask(timeline, condition)
+        labels = np.asarray(
+            [classify_tracker_frame(timeline, index) for index in range(frame_count)]
+        )
+
+        assert mask.shape == (frame_count,)
+        assert mask.any()
+        assert np.all(labels[mask] == condition)
+        if condition in {"fixed_six", "fixed_three"}:
+            assert mask.all()
+        if condition in {"three_to_six", "six_to_three"}:
+            assert int(mask.sum()) == 15
+        if condition == SCENARIO_TWO_POINT_DROPOUT_RECONNECT:
+            missing = timeline.configured & ~timeline.measured_valid
+            assert np.any(missing)
+            assert np.all(missing.sum(axis=1) <= 2)
+            assert int(mask.sum()) > int(np.any(missing, axis=1).sum())
 
 
 def test_task_generation_uses_source_absolute_events_for_overlapping_windows():

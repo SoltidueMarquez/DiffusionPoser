@@ -362,6 +362,85 @@ def build_tracker_timeline(
     return TrackerTimeline(configured, measured, d_off, d_on, hard)
 
 
+def build_isolated_condition_timeline(
+    source_id: str,
+    frame_count: int,
+    condition: str,
+    global_seed: int = 10,
+    reliability_config: TrackerReliabilityConfig | None = None,
+) -> TrackerTimeline:
+    """为纯净对照实验构造只包含一类事件的绝对时间线。
+
+    固定条件覆盖整条序列；切换条件只在序列中点发生一次目标方向的
+    切换；两点掉线条件始终配置六点，仅注入确定性的掉线/重连事件。
+    """
+
+    frames = int(frame_count)
+    scenario = str(condition)
+    if frames <= 0:
+        raise ValueError("frame_count 必须大于 0。")
+    if scenario not in TRACKER_PATTERN_CATEGORIES:
+        raise ValueError(f"未知独立评测条件：{scenario}")
+
+    if scenario == SCENARIO_FIXED_THREE:
+        configured = np.repeat(FIXED_THREE_CONFIG[None], frames, axis=0)
+    elif scenario == SCENARIO_THREE_TO_SIX:
+        configured = np.repeat(FIXED_THREE_CONFIG[None], frames, axis=0)
+        configured[_isolated_transition_frame(frames) :] = FIXED_SIX_CONFIG
+    elif scenario == SCENARIO_SIX_TO_THREE:
+        configured = np.repeat(FIXED_SIX_CONFIG[None], frames, axis=0)
+        configured[_isolated_transition_frame(frames) :] = FIXED_THREE_CONFIG
+    else:
+        configured = np.repeat(FIXED_SIX_CONFIG[None], frames, axis=0)
+
+    measured = configured.copy()
+    if scenario == SCENARIO_TWO_POINT_DROPOUT_RECONNECT:
+        events = build_source_scenario_events(
+            source_id=source_id,
+            frame_count=frames,
+            max_rollout_steps=1,
+            global_seed=global_seed,
+        )
+        for event in events:
+            raw_start = int(event["dropout_start"])
+            start = max(0, raw_start)
+            stop = min(frames, raw_start + int(event["dropout_duration"]))
+            if stop <= start:
+                continue
+            dropped = np.asarray(event["dropped_trackers"], dtype=np.int64)
+            measured[np.ix_(np.arange(start, stop), dropped)] = False
+
+    validate_tracker_states(configured, measured)
+    d_off, d_on = compute_tracker_durations(configured, measured)
+    hard = compute_hard_rotation_state_np(
+        configured,
+        measured,
+        d_on,
+        config=reliability_config,
+    )
+    return TrackerTimeline(configured, measured, d_off, d_on, hard)
+
+
+def isolated_condition_eval_mask(timeline: TrackerTimeline, condition: str) -> np.ndarray:
+    """只让目标条件帧进入指标，但 rollout 仍保留完整历史与视频。"""
+
+    scenario = str(condition)
+    labels = np.asarray(
+        [classify_tracker_frame(timeline, index) for index in range(len(timeline.configured))]
+    )
+    mask = labels == scenario
+    if not np.any(mask):
+        raise RuntimeError(f"独立条件 {scenario} 没有产生可评估帧。")
+    return mask
+
+
+def _isolated_transition_frame(frame_count: int) -> int:
+    # 中点切换让前置条件充分填满 60 帧历史，后置条件也有足够观察区间。
+    lower = min(REALTIME_POSE_TARGET_START, max(0, int(frame_count) - 1))
+    upper = max(lower, int(frame_count) - RECOVERY_WINDOW_FRAMES)
+    return min(max(int(frame_count) // 2, lower), upper)
+
+
 def compute_tracker_durations(
     configured: np.ndarray,
     measured_valid: np.ndarray,

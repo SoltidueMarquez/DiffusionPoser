@@ -15,6 +15,7 @@ class _RecordingModel(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
         self.valid_counts: list[int] = []
+        self.batch_sizes: list[int] = []
         self.prepare_grad_enabled: list[bool] = []
 
     def forward(self, value, *_args, **_kwargs):
@@ -29,12 +30,17 @@ class _RecordingModel(torch.nn.Module):
         current_trajectory,
         valid_frame_mask,
     ):
-        assert tuple(pose_history.shape) == (1, 60, 144)
-        assert tuple(tracker_history.shape) == (1, 60, 6, 13)
-        assert tuple(current_tracker.shape) == (1, 6, 13)
-        assert tuple(trajectory_history.shape) == (1, 60, 5)
-        assert tuple(current_trajectory.shape) == (1, 1, 5)
-        self.valid_counts.append(int(valid_frame_mask.sum().item()))
+        batch_size = int(pose_history.shape[0])
+        assert tuple(pose_history.shape) == (batch_size, 60, 144)
+        assert tuple(tracker_history.shape) == (batch_size, 60, 6, 13)
+        assert tuple(current_tracker.shape) == (batch_size, 6, 13)
+        assert tuple(trajectory_history.shape) == (batch_size, 60, 5)
+        assert tuple(current_trajectory.shape) == (batch_size, 1, 5)
+        assert tuple(valid_frame_mask.shape) == (batch_size, 60)
+        self.valid_counts.extend(
+            int(value) for value in valid_frame_mask.sum(dim=1).detach().cpu().tolist()
+        )
+        self.batch_sizes.append(batch_size)
         self.prepare_grad_enabled.append(torch.is_grad_enabled())
         return {"frame": len(self.valid_counts)}
 
@@ -52,7 +58,7 @@ class _OneStepProjectedDiffusion:
         del model, model_kwargs, kwargs
         raw = torch.as_tensor(
             np.tile(IDENTITY_6D, 24), device=device, dtype=torch.float32
-        ).reshape(shape)
+        ).reshape(1, REALTIME_POSE_TARGET_DIM).expand(shape[0], -1).clone()
         deployed = projection_fn(raw)
         return {
             "sample": deployed,

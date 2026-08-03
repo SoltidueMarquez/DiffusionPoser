@@ -15,16 +15,25 @@ from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     TaskRequest,
 )
-from data_loaders.realtime_pose_geometry import extract_forward_yaw_np
+from data_loaders.realtime_pose_geometry import extract_forward_yaw_np, extract_rotation_heading_np
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
 from data_loaders.tracker_timeline import build_task_config_plan
 from data_loaders.realtime_pose_task_store import ShardWriter, read_store_metadata, write_json
-from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
+from data_loaders.sensor_masking import (
+    BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
+    TRACKER_FEATURE_DIM,
+    TRACKER_PATTERN_CATEGORIES,
+)
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
 
 def test_task_bundle_materializes_new_history_current_contract_without_writing_artifacts():
     source = build_toy_realtime_source(frame_count=70)
+    pelvis_yaw_offset = 0.7
+    source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][:, :6] = np.asarray(
+        [np.sin(pelvis_yaw_offset), 0.0, np.cos(pelvis_yaw_offset), 0.0, 1.0, 0.0],
+        dtype=np.float32,
+    )
     joint_rotations = compute_source_joint_rotations_world(source)
     tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
     head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
@@ -50,6 +59,12 @@ def test_task_bundle_materializes_new_history_current_contract_without_writing_a
     assert row["future_leg_target"].shape == (4, 3, 8, 6)
     assert row["contact_target"].shape == (4, 2)
     assert np.isfinite(row["current_target"]).all()
+    np.testing.assert_allclose(
+        row["target_root_yaw_world"],
+        extract_rotation_heading_np(joint_rotations[60:64, 0]),
+        atol=1e-6,
+    )
+    assert not np.allclose(row["target_root_yaw_world"], source["root_yaw"][60:64])
 
 
 def test_history_uses_previous_reference_while_current_head_is_local_origin():
