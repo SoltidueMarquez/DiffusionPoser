@@ -9,7 +9,6 @@ from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     TRACKER_JOINT_INDICES,
     derive_stationary_prob_5,
-    encode_root_delta_xz_ref,
     rotation_6d_forward_up_np,
 )
 from data_loaders.body_fbx_kinematics import build_synthetic_body_fbx_rest, fk_body_fbx_local_delta_root_y0
@@ -43,9 +42,6 @@ def build_toy_realtime_source(frame_count: int = 70) -> dict[str, np.ndarray]:
     root_pos = np.zeros((frame_count, 3), dtype=np.float32)
     root_pos[:, 0] = np.linspace(0.0, 0.3, frame_count, dtype=np.float32)
     root_yaw = np.linspace(0.0, 0.2, frame_count, dtype=np.float32)
-    yaw_delta = np.zeros((frame_count,), dtype=np.float32)
-    yaw_delta[1:] = root_yaw[1:] - root_yaw[:-1]
-    root_heading_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
 
     rest = build_synthetic_body_fbx_rest()
     pelvis_height = np.full((frame_count, 1), 0.9, dtype=np.float32)
@@ -60,14 +56,11 @@ def build_toy_realtime_source(frame_count: int = 70) -> dict[str, np.ndarray]:
     tracker_rot = rotation_6d_forward_up_np(joint_rotations[:, TRACKER_JOINT_INDICES]).astype(np.float32)
     offsets = rest.rest_local_positions.copy()
     rest_rotations_6d = rotation_6d_forward_up_np(rest.rest_local_rotations).astype(np.float32)
-    root_delta_xz_ref = encode_root_delta_xz_ref(root_pos_world=root_pos, root_yaw=root_yaw)
     pelvis_height = joints[:, 0, 1:2].astype(np.float32)
     source = {
         BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY: body_pose,
         "root_pos_world": root_pos,
         "root_yaw": root_yaw,
-        "root_heading_delta_sincos": root_heading_delta_sincos,
-        "root_delta_xz_ref": root_delta_xz_ref,
         "pelvis_height": pelvis_height,
         "tracker_pos_world": tracker_pos,
         "tracker_rot_world_6d": tracker_rot,

@@ -77,7 +77,6 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
         "split",
         "sample_count",
         "source_count",
-        "max_rollout_steps",
         "two_point_phase_counts",
         "config_names",
         "tracker_feature_dim",
@@ -103,18 +102,12 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
     if abs(phase_counts["dropout"] - phase_counts["reconnect"]) > allowed_difference:
         raise ValueError(f"{path} 两点掉线 phase 统计不满足近似 1:1 契约。")
     required_fields = {
-        "pose_history",
-        "current_target",
-        "tracker_history_continuous",
-        "current_tracker_continuous",
-        "trajectory_history",
-        "current_trajectory",
+        "pose_window_clean",
+        "tracker_window_continuous",
+        "head_path_window",
         "configured",
         "measured_valid",
-        "d_off",
-        "d_on",
-        "hard_rotation_state",
-        "history_head_yaw_world",
+        "current_head_yaw_world",
     }
     if not required_fields.issubset(set(value["schema_fields"])):
         raise ValueError(f"{path} 不满足当前 task schema；旧 task 不可复用。")

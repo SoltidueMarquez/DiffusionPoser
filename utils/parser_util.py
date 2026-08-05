@@ -9,6 +9,7 @@ from data_loaders.sensor_masking import (
     DEFAULT_SCENARIO_WEIGHTS,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     TASK_MODE_REALTIME_POSE,
     TASK_MODES,
 )
@@ -86,7 +87,6 @@ def add_data_options(parser: ArgumentParser):
     group.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
     group.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     group.add_argument("--num_workers", default=0, type=int)
-    group.add_argument("--rollout_steps", default=4, type=int)
     group.add_argument(
         "--cold_start_prob",
         default=0.1,
@@ -111,14 +111,6 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--source_fps", default=60.0, type=float)
     group.add_argument("--use_ema", default=True, type=str2bool)
-    group.add_argument("--ik_init_mode", default="random", choices=["random", "tracker_pose"], type=str)
-    group.add_argument("--ik_init_timestep", default=-1, type=int)
-    group.add_argument("--ik_init_iterations", default=16, type=int)
-    group.add_argument("--ik_init_lr", default=0.03, type=float)
-    group.add_argument("--ik_init_pos_weight", default=1.0, type=float)
-    group.add_argument("--ik_init_rot_weight", default=0.2, type=float)
-    group.add_argument("--ik_init_reg_weight", default=0.01, type=float)
-    group.add_argument("--ik_init_delta_limit", default=0.15, type=float)
     group.add_argument(
         "--projected_ddim_mode",
         default="all_steps",
@@ -134,9 +126,13 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--latent_dim", default=512, type=int)
     group.add_argument("--dropout", default=0.0, type=float)
     group.add_argument("--zero_init", action="store_true")
-    group.add_argument("--max_seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
-    group.add_argument("--model_arch", default="target_dit", choices=["target_dit"], type=str)
-    group.add_argument("--motion_layers", default=4, type=int)
+    group.add_argument("--max_seq_len", default=REALTIME_POSE_WINDOW_LENGTH, type=int)
+    group.add_argument(
+        "--model_arch",
+        default="spatiotemporal_dit",
+        choices=["spatiotemporal_dit"],
+        type=str,
+    )
 
 
 def add_diffusion_options(parser: ArgumentParser):
@@ -175,16 +171,20 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--tracker_pos_huber_beta", default=0.05, type=float)
     group.add_argument("--tracker_rot_loss_weight", default=_LOSS_DEFAULTS.tracker_rotation, type=float)
     group.add_argument("--root_loss_weight", default=_LOSS_DEFAULTS.root, type=float)
-    group.add_argument("--world_joint_loss_weight", default=_LOSS_DEFAULTS.world_joint, type=float)
+    group.add_argument(
+        "--head_ref_joint_distance_loss_weight",
+        default=_LOSS_DEFAULTS.head_ref_joint_distance,
+        type=float,
+    )
     group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
     group.add_argument("--future_leg_loss_weight", default=_LOSS_DEFAULTS.future_leg, type=float)
     group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
-    group.add_argument("--foot_slide_loss_weight", default=_LOSS_DEFAULTS.foot_slide, type=float)
-    group.add_argument("--rollout_loss_weight", default=_LOSS_DEFAULTS.rollout, type=float)
-    group.add_argument("--rollout_prob", default=0.5, type=float)
-    group.add_argument("--detach_rollout_history", default=True, type=str2bool)
-    group.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
-    group.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)
+    group.add_argument("--history_noise_prob", default=0.8, type=float)
+    group.add_argument("--history_noise_min_deg", default=2.0, type=float)
+    group.add_argument("--history_noise_max_deg", default=10.0, type=float)
+    group.add_argument("--history_noise_temporal_rho", default=0.95, type=float)
+    group.add_argument("--history_noise_region_ratio", default=0.75, type=float)
+    group.add_argument("--history_noise_joint_ratio", default=0.25, type=float)
     group.add_argument("--model_ema", default=True, action=BooleanOptionalAction)
     group.add_argument("--model_ema_steps", type=int, default=10)
     group.add_argument("--model_ema_decay", type=float, default=0.995)

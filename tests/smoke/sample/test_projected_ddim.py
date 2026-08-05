@@ -31,7 +31,7 @@ def _tracker(batch_size: int = 2) -> torch.Tensor:
 
 def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
     torch.manual_seed(1)
-    raw = torch.randn(2, 144)
+    raw = torch.randn(2, 11, 144)
     tracker = _tracker()
     hard = torch.zeros(2, 6, dtype=torch.bool)
     hard[:, 0] = True
@@ -39,24 +39,30 @@ def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     repeated = project_realtime_pose_xstart(deployed, tracker, hard)
     torch.testing.assert_close(deployed, repeated, atol=1e-5, rtol=1e-5)
-    rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 24, 6))
+    rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 11, 24, 6))
     identity = torch.eye(3).expand_as(rotations)
     torch.testing.assert_close(rotations.transpose(-1, -2) @ rotations, identity, atol=1e-5, rtol=1e-5)
     assert torch.all(torch.linalg.det(rotations) > 0.9999)
     for tracker_index in (0, 3):
         joint_index = TRACKER_TO_JOINT[tracker_index]
-        torch.testing.assert_close(deployed[:, joint_index * 6 : joint_index * 6 + 6], tracker[:, tracker_index, 3:9])
+        torch.testing.assert_close(
+            deployed[:, -1, joint_index * 6 : joint_index * 6 + 6],
+            tracker[:, tracker_index, 3:9],
+        )
 
 
 def test_soft_tracker_is_not_replaced():
-    raw = project_rotation_6d_to_so3(torch.randn(1, 24, 6)).reshape(1, 144)
+    raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
     tracker = _tracker(batch_size=1)
     tracker[:, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
     hard = torch.zeros(1, 6, dtype=torch.bool)
     hard[:, 0] = True
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     wrist = TRACKER_TO_JOINT[1]
-    torch.testing.assert_close(deployed[:, wrist * 6 : wrist * 6 + 6], raw[:, wrist * 6 : wrist * 6 + 6])
+    torch.testing.assert_close(
+        deployed[:, -1, wrist * 6 : wrist * 6 + 6],
+        raw[:, -1, wrist * 6 : wrist * 6 + 6],
+    )
 
 
 class _ConstantXStart(nn.Module):
@@ -123,3 +129,33 @@ def test_projected_ddim_returns_final_auxiliary_heads():
     )
     assert result["auxiliary_outputs"]["future_leg"].shape == (1, 3, 8, 6)
     assert result["auxiliary_outputs"]["contact_logits"].shape == (1, 2)
+
+
+def test_projected_ddim_only_calls_projection_on_selected_steps():
+    diffusion = GaussianDiffusion(
+        betas=np.asarray([0.1, 0.15, 0.2, 0.25], dtype=np.float64),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+    )
+    model = _ConstantXStart(torch.zeros(1, 4))
+    for mode, late_steps, expected_calls in (
+        ("all_steps", 2, 4),
+        ("late_steps", 2, 2),
+        ("final_step", 2, 1),
+    ):
+        projection_calls = []
+
+        def projection_fn(value):
+            projection_calls.append(1)
+            return value
+
+        diffusion.projected_ddim_sample_loop(
+            model,
+            shape=(1, 4),
+            projection_fn=projection_fn,
+            device=torch.device("cpu"),
+            projection_mode=mode,
+            late_steps=late_steps,
+        )
+        assert len(projection_calls) == expected_calls

@@ -1,3 +1,11 @@
-"""DiffusionPoser 模型模块。"""
+"""当前 realtime pose 主模型。"""
 
-from .diffusionposer_dit import DiffusionPoserDiT
+from .realtime_pose_spatiotemporal_dit import (
+    PreparedSpatioTemporalConditioning,
+    RealtimePoseSpatioTemporalDiT,
+)
+
+__all__ = [
+    "PreparedSpatioTemporalConditioning",
+    "RealtimePoseSpatioTemporalDiT",
+]

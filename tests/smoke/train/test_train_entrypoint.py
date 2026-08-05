@@ -12,7 +12,12 @@ from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
 from utils import model_util
-from utils.parser_util import add_data_options, add_model_options, add_training_options
+from utils.parser_util import (
+    add_data_options,
+    add_model_options,
+    add_sampling_options,
+    add_training_options,
+)
 
 
 class TrainEntrypointTest(unittest.TestCase):
@@ -24,13 +29,14 @@ class TrainEntrypointTest(unittest.TestCase):
             heads=8,
             dropout=0.0,
             zero_init=True,
-            max_seq_len=61,
+            max_seq_len=11,
+            model_arch="spatiotemporal_dit",
             d_warm_pos=999,
             tracker_duration_cap=999,
         )
 
         with (
-            patch("utils.model_util.RealtimePoseTargetDiT") as model_constructor,
+            patch("utils.model_util.RealtimePoseSpatioTemporalDiT") as model_constructor,
             patch("utils.model_util.create_gaussian_diffusion", return_value=object()),
         ):
             model_util.create_model_and_diffusion(args)
@@ -57,11 +63,27 @@ class TrainEntrypointTest(unittest.TestCase):
 
         args = parser.parse_args(["--data_dir", "dataset/tasks"])
 
-        self.assertEqual(args.rollout_steps, 4)
         self.assertEqual(args.cold_start_prob, 0.1)
+        self.assertNotIn("--rollout_steps", parser._option_string_actions)
         self.assertNotIn("--history_pose_noise_std", parser._option_string_actions)
         self.assertNotIn("--tracker_latency_max_frames", parser._option_string_actions)
         self.assertNotIn("--tracker_mask_policy", parser._option_string_actions)
+
+    def test_sampling_options_do_not_expose_abandoned_diffusion_ik(self):
+        parser = ArgumentParser()
+        add_sampling_options(parser)
+
+        for option in (
+            "--ik_init_mode",
+            "--ik_init_timestep",
+            "--ik_init_iterations",
+            "--ik_init_lr",
+            "--ik_init_pos_weight",
+            "--ik_init_rot_weight",
+            "--ik_init_reg_weight",
+            "--ik_init_delta_limit",
+        ):
+            self.assertNotIn(option, parser._option_string_actions)
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -75,6 +97,10 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertTrue(args.model_ema)
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
+        self.assertEqual(args.head_ref_joint_distance_loss_weight, 1.0)
+        self.assertEqual(args.history_noise_prob, 0.8)
+        self.assertNotIn("--world_joint_loss_weight", parser._option_string_actions)
+        self.assertNotIn("--rollout_prob", parser._option_string_actions)
         removed_legacy_losses = (
             "--pelvis_fk_loss_weight",
             "--pelvis_offset_loss_weight",
@@ -135,7 +161,7 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="debug run",
-                model_arch="target_dit",
+                model_arch="spatiotemporal_dit",
                 seed=123,
             )
 
@@ -156,7 +182,7 @@ class TrainEntrypointTest(unittest.TestCase):
                 overwrite=False,
                 resume_checkpoint="",
                 run_name="same",
-                model_arch="target_dit",
+                model_arch="spatiotemporal_dit",
                 seed=123,
             )
 

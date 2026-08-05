@@ -37,18 +37,6 @@ def main():
     try:
         train_platform.report_args(args, name="Args")
         save_args(args)
-        rollout_objective_weight = (
-            args.rollout_loss_weight
-            + args.rollout_joint_vel_loss_weight
-            + args.rollout_rot_vel_loss_weight
-            + args.foot_slide_loss_weight
-        )
-        enable_rollout_training = (
-            args.rollout_steps > 1
-            and rollout_objective_weight > 0.0
-            and args.rollout_prob > 0.0
-        )
-
         print("creating data loader...")
         data = get_dataset_loader(
             data_dir=args.data_dir,
@@ -60,9 +48,6 @@ def main():
             normalize_input=args.normalize_input,
             num_workers=args.num_workers,
             pin_memory=args.cuda,
-            enable_rollout=enable_rollout_training,
-            rollout_steps=args.rollout_steps,
-            rollout_prob=args.rollout_prob,
             cold_start_prob=args.cold_start_prob,
             scenario_weights=args.scenario_weights,
             seed=args.seed,
@@ -80,9 +65,6 @@ def main():
                 normalize_input=args.normalize_input,
                 num_workers=args.num_workers,
                 pin_memory=args.cuda,
-                enable_rollout=False,
-                rollout_steps=1,
-                rollout_prob=0.0,
                 cold_start_prob=0.0,
                 scenario_weights=args.scenario_weights,
                 seed=args.seed,

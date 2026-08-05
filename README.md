@@ -21,7 +21,6 @@ conda run -n diffusionposer5070 python -m data_loaders.generate_realtime_pose_ta
   --split_dir data_loaders/splits `
   --splits train test `
   --base_windows_per_source 20 `
-  --max_rollout_steps 4 `
   --shard_size 4096 `
   --seed 10
 
@@ -35,17 +34,15 @@ conda run -n diffusionposer5070 python -m data_loaders.compute_realtime_pose_nor
 
 ```powershell
 conda run -n diffusionposer5070 python -m train.train_diffusionposer `
-  --model_arch target_dit `
+  --model_arch spatiotemporal_dit `
   --data_dir dataset/AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz_tasks `
   --data_split train `
   --normalizer_dir dataset/meta_AMASS_realtime_pose_body_fbx_local_root_y0_stationary5_60hz `
-  --save_dir runs/realtime_pose_body_fbx_local_root_y0_stationary5_target_dit `
-  --rollout_steps 4 `
-  --rollout_prob 0.25 `
+  --save_dir runs/your_experiment `
   --scenario_weights 1 1 1 1 1 `
   --overwrite
 ```
 
-Task 生成后由未压缩 `.npy` shard 直接 mmap 读取。每个基础动作窗口保存固定五套 Tracker 配置，训练期只选择配置与是否读取后续 rollout step；这些训练参数不会改变 normalizer。
+`--save_dir` 没有默认值，必须为每次实验显式指定。Task 生成后由未压缩 `.npy` shard 直接 mmap 读取；每个基础动作窗口保存固定五套 Tracker 配置，训练期选择其中一套并构造当前 11 帧时空窗口。
 
 Unity 与导出链路暂未同步到这次 Python 本地改动。

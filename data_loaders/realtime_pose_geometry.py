@@ -11,13 +11,11 @@ from data_loaders.realtime_pose_kinematics import (
     make_yaw_rotation_np,
     make_yaw_rotation_torch,
     rotation_6d_forward_up_np,
-    rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_np,
     rotation_6d_to_matrix_torch,
 )
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
-    REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
@@ -119,6 +117,46 @@ def build_tracker_measurements_np(
     return result
 
 
+def build_head_path_window_np(
+    head_pos_world: np.ndarray,
+    head_yaw_world: np.ndarray,
+    reference_head_pos_world: np.ndarray,
+    floor_y: float,
+    reference_head_yaw: float,
+) -> np.ndarray:
+    """把同步锚点构造成当前参考系下的绝对 Head 路径 `[T,5]`。
+
+    与旧的逐帧增量 trajectory 不同，这里保存每个锚点相对当前 Head 原点的
+    绝对 XZ 位置和相对当前 yaw。这样下采样后仍能直接表达整条历史路径。
+    """
+
+    positions = np.asarray(head_pos_world, dtype=np.float64)
+    yaws = np.asarray(head_yaw_world, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or yaws.shape != (positions.shape[0],):
+        raise ValueError("Head 路径输入必须为 [T,3] 和 [T]。")
+    origin = np.asarray(
+        [reference_head_pos_world[0], float(floor_y), reference_head_pos_world[2]],
+        dtype=np.float64,
+    )
+    yaw_inverse = make_yaw_rotation_np(
+        np.asarray([reference_head_yaw], dtype=np.float64)
+    )[0].T
+    positions_reference = np.einsum(
+        "ij,tj->ti", yaw_inverse, positions - origin[None]
+    )
+    relative_yaw = (yaws - float(reference_head_yaw) + math.pi) % (2.0 * math.pi) - math.pi
+    return np.stack(
+        [
+            positions_reference[:, 0],
+            positions_reference[:, 2],
+            positions_reference[:, 1],
+            np.sin(relative_yaw),
+            np.cos(relative_yaw),
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+
 def assemble_tracker_features_np(
     measurements: np.ndarray,
     configured: np.ndarray,
@@ -152,41 +190,6 @@ def assemble_tracker_features_np(
     result[..., :9] *= measured[..., None]
     validate_tracker_features_np(result)
     return result
-
-
-def build_head_trajectory_np(
-    head_pos_world: np.ndarray,
-    head_yaw_world: np.ndarray,
-    floor_y: float | np.ndarray,
-    head_height_mean: float = 0.0,
-    head_height_std: float = 1.0,
-) -> np.ndarray:
-    """构造逐帧 5D Head trajectory；位移使用上一帧 Head yaw 参考系。"""
-
-    positions = np.asarray(head_pos_world, dtype=np.float64)
-    yaws = np.asarray(head_yaw_world, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3 or yaws.shape != (positions.shape[0],):
-        raise ValueError("Head trajectory 输入必须为 [T,3] 和 [T]。")
-    floor = np.asarray(floor_y, dtype=np.float64)
-    if floor.shape == ():
-        floor = np.full(positions.shape[0], float(floor), dtype=np.float64)
-    if floor.shape != (positions.shape[0],):
-        raise ValueError("floor_y 必须是标量或 [T]。")
-    if float(head_height_std) <= 0.0:
-        raise ValueError("head_height_std 必须大于 0。")
-    delta_world = np.zeros_like(positions)
-    delta_yaw = np.zeros_like(yaws)
-    if positions.shape[0] > 1:
-        delta_world[1:] = positions[1:] - positions[:-1]
-        delta_yaw[1:] = (yaws[1:] - yaws[:-1] + math.pi) % (2.0 * math.pi) - math.pi
-    previous_yaw = np.concatenate([yaws[:1], yaws[:-1]], axis=0)
-    previous_yaw_inv = np.swapaxes(make_yaw_rotation_np(previous_yaw), -1, -2)
-    delta_ref = np.einsum("tij,tj->ti", previous_yaw_inv, delta_world)
-    height = (positions[:, 1] - floor - float(head_height_mean)) / float(head_height_std)
-    return np.stack(
-        [delta_ref[:, 0], delta_ref[:, 2], height, np.sin(delta_yaw), np.cos(delta_yaw)],
-        axis=-1,
-    ).astype(np.float32)
 
 
 def extract_rotation_heading_np(rotations: np.ndarray) -> np.ndarray:
@@ -241,77 +244,6 @@ def decode_target_head_rotations_torch(
         target.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
     )
     return rotations, extract_rotation_heading_torch(rotations[:, 0])
-
-
-def reexpress_pose_target_between_head_yaws_torch(
-    target: torch.Tensor,
-    source_head_yaw_world: torch.Tensor,
-    destination_head_yaw_world: torch.Tensor,
-) -> torch.Tensor:
-    """把已生成姿态从旧 Head-yaw 参考系精确转到下一帧 Head-yaw 参考系。"""
-
-    if target.ndim != 2 or target.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError(f"target 必须为 [B,{REALTIME_POSE_TARGET_DIM}]。")
-    batch_size = target.shape[0]
-    rotations = rotation_6d_to_matrix_torch(
-        target.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
-    )
-    source_yaw = source_head_yaw_world.to(device=target.device, dtype=target.dtype).reshape(-1)
-    destination_yaw = destination_head_yaw_world.to(device=target.device, dtype=target.dtype).reshape(-1)
-    reference_delta = make_yaw_rotation_torch(source_yaw - destination_yaw)
-    rotations = torch.einsum("bij,bajk->baik", reference_delta, rotations)
-    result = target.clone()
-    result[:] = rotation_6d_forward_up_torch(rotations).reshape(batch_size, REALTIME_POSE_TARGET_DIM)
-    return result
-
-
-def advance_rollout_pose_history_torch(
-    pose_history: torch.Tensor,
-    prediction: torch.Tensor,
-    source_head_yaw_world: torch.Tensor,
-    destination_head_yaw_world: torch.Tensor,
-    normalizer_mean: torch.Tensor | None = None,
-    normalizer_std: torch.Tensor | None = None,
-    detach_prediction: bool = True,
-) -> torch.Tensor:
-    """把旧历史换到下一历史参考系，并追加已位于该参考系的 deployed 预测。"""
-
-    if pose_history.ndim != 3 or pose_history.shape[1:] != (
-        REALTIME_POSE_HISTORY_LENGTH,
-        REALTIME_POSE_TARGET_DIM,
-    ):
-        raise ValueError(
-            f"pose_history 应为 [B,{REALTIME_POSE_HISTORY_LENGTH},{REALTIME_POSE_TARGET_DIM}]，"
-            f"实际为 {tuple(pose_history.shape)}"
-        )
-    if prediction.shape != pose_history[:, -1].shape:
-        raise ValueError("prediction 必须与单帧 pose history 同形。")
-    prediction = prediction.detach() if detach_prediction else prediction
-    if normalizer_mean is not None and normalizer_std is not None:
-        mean = normalizer_mean.to(device=pose_history.device, dtype=pose_history.dtype)
-        std = normalizer_std.to(device=pose_history.device, dtype=pose_history.dtype)
-        history_raw = pose_history * std + mean
-        prediction_raw = prediction * std + mean
-    else:
-        mean = std = None
-        history_raw = pose_history
-        prediction_raw = prediction
-
-    batch_size, history_length, target_dim = history_raw.shape
-    source_yaw = source_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
-    destination_yaw = destination_head_yaw_world.to(device=pose_history.device).reshape(batch_size)
-    history_reexpressed = reexpress_pose_target_between_head_yaws_torch(
-        history_raw.reshape(batch_size * history_length, target_dim),
-        source_yaw[:, None].expand(-1, history_length).reshape(-1),
-        destination_yaw[:, None].expand(-1, history_length).reshape(-1),
-    ).reshape(batch_size, history_length, target_dim)
-    next_history = torch.cat(
-        [history_reexpressed[:, 1:], prediction_raw[:, None]],
-        dim=1,
-    )
-    if mean is None or std is None:
-        return next_history
-    return (next_history - mean) / std
 
 
 def pelvis_relative_joint_positions_np(

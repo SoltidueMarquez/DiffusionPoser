@@ -22,3 +22,26 @@ def test_old_mean_std_normalizer_fails_fast(tmp_path):
     torch.save(torch.ones(214), tmp_path / "std.pt")
     with pytest.raises(FileNotFoundError):
         RealtimePoseNormalizer(tmp_path)
+
+
+def test_pose_scale_and_saved_eps_are_the_single_pose_conversion_contract(tmp_path):
+    writer = RealtimePoseNormalizer(tmp_path, eps=0.25, disable=True)
+    writer.save(
+        pose_mean=torch.ones(144),
+        pose_scale=torch.full((144,), 2.0),
+        tracker_mean=torch.zeros(6, 9),
+        tracker_std=torch.ones(6, 9),
+        head_path_xz_mean=torch.zeros(2),
+        head_path_xz_std=torch.ones(2),
+        head_height_mean=torch.tensor(0.0),
+        head_height_std=torch.tensor(1.0),
+        metadata={"eps": 99.0},
+    )
+
+    normalizer = RealtimePoseNormalizer(tmp_path, eps=1e-8)
+    assert normalizer.eps == pytest.approx(0.25)
+    torch.testing.assert_close(normalizer.pose_scale, torch.full((144,), 2.0))
+    raw = torch.full((2, 144), 5.0)
+    normalized = normalizer.normalize_pose(raw)
+    torch.testing.assert_close(normalized, torch.full((2, 144), 2.0))
+    torch.testing.assert_close(normalizer.inverse_pose(normalized), raw)

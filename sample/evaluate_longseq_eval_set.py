@@ -28,6 +28,7 @@ from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     TRACKER_PATTERN_CATEGORIES,
 )
 from data_loaders.tracker_timeline import (
@@ -164,7 +165,6 @@ def rollout_long_sequence_source(
             "d_on",
             "hard_rotation_state",
             "history_length",
-            "current_trajectory",
             "contact_target",
             "contact_logits",
             "future_leg_prediction",
@@ -234,7 +234,6 @@ def rollout_long_sequence_source(
         values["d_on"].append(runtime.previous_d_on.copy())
         values["hard_rotation_state"].append(step.hard_rotation_state)
         values["history_length"].append(history_length)
-        values["current_trajectory"].append(runtime.trajectory_history[-1])
         values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
         values["contact_logits"].append(
             np.full(2, np.nan, dtype=np.float32)
@@ -366,6 +365,7 @@ def rollout_long_sequence_sources(
                 else torch.stack(
                     [
                         torch.randn(
+                            REALTIME_POSE_WINDOW_LENGTH,
                             REALTIME_POSE_TARGET_DIM,
                             generator=noise_generators[index],
                             device=device,
@@ -430,7 +430,6 @@ def _new_rollout_values() -> dict[str, list]:
             "d_on",
             "hard_rotation_state",
             "history_length",
-            "current_trajectory",
             "contact_target",
             "contact_logits",
             "future_leg_prediction",
@@ -486,7 +485,6 @@ def _append_rollout_frame(
     values["d_on"].append(runtime.previous_d_on.copy())
     values["hard_rotation_state"].append(step.hard_rotation_state)
     values["history_length"].append(history_length)
-    values["current_trajectory"].append(runtime.trajectory_history[-1])
     values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
     values["contact_logits"].append(
         np.full(2, np.nan, dtype=np.float32)

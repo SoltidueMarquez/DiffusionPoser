@@ -8,6 +8,7 @@ import torch
 from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.realtime_pose_geometry import (
     assemble_tracker_features_np,
+    build_head_path_window_np,
     build_pose_target_np,
     build_tracker_measurements_np,
     decode_target_head_rotations_np,
@@ -18,14 +19,19 @@ from data_loaders.realtime_pose_geometry import (
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
+    REALTIME_POSE_FRAME_OFFSETS,
+    REALTIME_POSE_HISTORY_ANCHOR_COUNT,
+    REALTIME_POSE_HISTORY_ANCHOR_INDICES,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_TO_JOINT,
 )
 from data_loaders.tracker_reliability import (
     compute_hard_rotation_state_np,
+    compute_region_coverage_np,
     compute_tracker_reliability_np,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
@@ -97,7 +103,6 @@ class _PreparedRuntimeStep:
     hard_rotation_state: np.ndarray
     head_yaw: float
     floor_y: float
-    current_trajectory: np.ndarray
     current_tracker_raw: np.ndarray
     conditioning: dict[str, torch.Tensor]
 
@@ -113,7 +118,6 @@ class RealtimePoseRuntime:
         joint_offsets_parent: np.ndarray,
         joint_rest_local_rotations_6d: np.ndarray,
         normalizer=None,
-        reliability_config: TrackerReliabilityConfig | None = None,
         projected_ddim_mode: str = "all_steps",
         projected_ddim_late_steps: int = 5,
     ):
@@ -121,7 +125,10 @@ class RealtimePoseRuntime:
         self.diffusion = diffusion
         self.device = device
         self.normalizer = normalizer
-        self.reliability_config = (reliability_config or TrackerReliabilityConfig()).validate()
+        reliability_config = getattr(model, "reliability_config", None)
+        if not isinstance(reliability_config, TrackerReliabilityConfig):
+            raise TypeError("RealtimePoseRuntime 要求模型公开 TrackerReliabilityConfig。")
+        self.reliability_config = reliability_config.validate()
         self.projected_ddim_mode = str(projected_ddim_mode)
         self.projected_ddim_late_steps = int(projected_ddim_late_steps)
         self.joint_offsets_parent = np.asarray(joint_offsets_parent, dtype=np.float32).reshape(24, 3)
@@ -130,11 +137,9 @@ class RealtimePoseRuntime:
         ).reshape(24, 6)
         self.pose_history: list[WorldPoseState] = []
         self.tracker_history: list[_TrackerFrameState] = []
-        self.trajectory_history: list[np.ndarray] = []
         self.previous_d_off = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_head_yaw: float | None = None
-        self.previous_head_position: np.ndarray | None = None
 
     def step(
         self,
@@ -144,152 +149,14 @@ class RealtimePoseRuntime:
         measured_valid: np.ndarray,
         floor_y: float,
     ) -> RuntimeStepResult:
-        position = np.asarray(tracker_pos_world, dtype=np.float32).reshape(TRACKER_COUNT, 3)
-        rotation_6d = np.asarray(tracker_rot_world_6d, dtype=np.float32).reshape(TRACKER_COUNT, 6)
-        configured = np.asarray(configured, dtype=bool).reshape(TRACKER_COUNT)
-        measured = np.asarray(measured_valid, dtype=bool).reshape(TRACKER_COUNT)
-        if np.any(measured & ~configured):
-            raise ValueError("measured_valid 必须是 configured 子集。")
-        if not configured[HEAD_TRACKER_INDEX] or not measured[HEAD_TRACKER_INDEX]:
-            raise ValueError("Head 必须始终 configured 且 measured_valid。")
-
-        head_rotation = rotation_6d_to_matrix_np(rotation_6d[HEAD_TRACKER_INDEX : HEAD_TRACKER_INDEX + 1])
-        head_yaw = float(
-            extract_forward_yaw_np(
-                head_rotation,
-                initial_yaw=0.0 if self.previous_head_yaw is None else self.previous_head_yaw,
-            )[0]
-        )
-        d_off, d_on = _advance_durations(
-            self.previous_d_off,
-            self.previous_d_on,
-            configured,
-            measured,
-            self.reliability_config.duration_cap,
-        )
-        kappa_pos, kappa_rot = compute_tracker_reliability_np(
-            configured,
-            measured,
-            d_on,
-            config=self.reliability_config,
-        )
-        hard = compute_hard_rotation_state_np(
-            configured,
-            measured,
-            d_on,
-            self.reliability_config,
-        )
-        current_trajectory = self._build_current_trajectory(position[HEAD_TRACKER_INDEX], head_yaw, floor_y)
-        conditioning, current_tracker_raw = self._build_conditioning(
-            position,
-            rotation_6d,
-            configured,
-            measured,
-            d_off,
-            d_on,
-            head_yaw,
-            float(floor_y),
-            current_trajectory,
-        )
-        model_impl = getattr(self.model, "module", self.model)
-        # 历史条件在同一帧的全部 DDIM step 间复用；在线推理不保留其计算图。
-        with torch.no_grad():
-            prepared = model_impl.prepare_conditioning(
-                conditioning["pose_history"],
-                conditioning["tracker_history"],
-                conditioning["current_tracker"],
-                conditioning["trajectory_history"],
-                conditioning["current_trajectory"],
-                conditioning["valid_frame_mask"],
-            )
-        model_kwargs = {"prepared_conditioning": prepared}
-        current_tracker_tensor = torch.as_tensor(
-            current_tracker_raw, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
-        hard_tensor = torch.as_tensor(hard, device=self.device, dtype=torch.bool).unsqueeze(0)
-        mean, std = self._normalizer_pose_stats()
-        result = self.diffusion.projected_ddim_sample_loop(
-            self.model,
-            shape=(1, REALTIME_POSE_TARGET_DIM),
-            projection_fn=lambda value: project_realtime_pose_xstart(
-                value,
-                current_tracker_tensor,
-                hard_tensor,
-                mean,
-                std,
-            ),
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            device=self.device,
-            projection_mode=self.projected_ddim_mode,
-            late_steps=self.projected_ddim_late_steps,
-        )
-        raw_target = self._inverse_pose(result["raw_pred_xstart"])[0]
-        deployed_target = self._inverse_pose(result["deployed_pred_xstart"])[0]
-        resolved = decode_and_resolve_pose(
-            deployed_target,
-            current_tracker_raw,
-            hard,
-            head_yaw,
-            position[HEAD_TRACKER_INDEX],
-            float(floor_y),
-            self.joint_offsets_parent,
-            self.joint_rest_local_rotations_6d,
-        )
-        frame_state = _TrackerFrameState(
-            position.copy(),
-            rotation_6d.copy(),
-            configured.copy(),
-            measured.copy(),
-            d_off.copy(),
-            d_on.copy(),
-            head_yaw,
-            float(floor_y),
-        )
-        self.pose_history.append(resolved.as_world_state())
-        self.tracker_history.append(frame_state)
-        self.trajectory_history.append(current_trajectory.copy())
-        self.pose_history = self.pose_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.tracker_history = self.tracker_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.trajectory_history = self.trajectory_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.previous_d_off, self.previous_d_on = d_off, d_on
-        self.previous_head_yaw = head_yaw
-        self.previous_head_position = position[HEAD_TRACKER_INDEX].copy()
-        auxiliary = result.get("auxiliary_outputs", {})
-        future_leg = auxiliary.get("future_leg")
-        contact_logits = auxiliary.get("contact_logits")
-        return RuntimeStepResult(
-            resolved,
-            raw_target,
-            deployed_target,
-            kappa_pos,
-            kappa_rot,
-            hard.copy(),
-            current_tracker_raw.copy(),
-            None if future_leg is None else np.asarray(future_leg.detach().cpu()[0], dtype=np.float32),
-            None if contact_logits is None else np.asarray(contact_logits.detach().cpu()[0], dtype=np.float32),
-        )
-
-    def _build_current_trajectory(
-        self,
-        head_position: np.ndarray,
-        head_yaw: float,
-        floor_y: float,
-    ) -> np.ndarray:
-        delta_world = np.zeros(3, dtype=np.float64)
-        delta_yaw = 0.0
-        if self.previous_head_position is not None and self.previous_head_yaw is not None:
-            delta_world = head_position.astype(np.float64) - self.previous_head_position.astype(np.float64)
-            delta_yaw = (head_yaw - self.previous_head_yaw + np.pi) % (2.0 * np.pi) - np.pi
-            reference_yaw = self.previous_head_yaw
-        else:
-            reference_yaw = head_yaw
-        yaw_inv = make_yaw_rotation_np(np.asarray([reference_yaw], dtype=np.float64))[0].T
-        delta_ref = yaw_inv @ delta_world
-        return np.asarray(
-            [delta_ref[0], delta_ref[2], head_position[1] - float(floor_y), np.sin(delta_yaw), np.cos(delta_yaw)],
-            dtype=np.float32,
-        )
+        return step_realtime_pose_batch(
+            [self],
+            np.asarray(tracker_pos_world, dtype=np.float32)[None],
+            np.asarray(tracker_rot_world_6d, dtype=np.float32)[None],
+            np.asarray(configured, dtype=bool)[None],
+            np.asarray(measured_valid, dtype=bool)[None],
+            np.asarray([floor_y], dtype=np.float32),
+        )[0]
 
     def _build_conditioning(
         self,
@@ -301,85 +168,141 @@ class RealtimePoseRuntime:
         d_on: np.ndarray,
         head_yaw: float,
         floor_y: float,
-        current_trajectory: np.ndarray,
     ) -> tuple[dict[str, torch.Tensor], np.ndarray]:
-        history_count = len(self.pose_history)
-        if history_count:
-            reference = self.tracker_history[-1]
-            pose_raw = build_pose_target_np(
-                np.stack([state.joint_rotations_world for state in self.pose_history], axis=0),
-                reference.head_yaw_world,
-            )
-            tracker_measurement = build_tracker_measurements_np(
-                np.stack([state.tracker_pos_world for state in self.tracker_history], axis=0),
-                np.stack([state.tracker_rot_world_6d for state in self.tracker_history], axis=0),
-                reference.tracker_pos_world[HEAD_TRACKER_INDEX],
-                reference.floor_y,
-                reference.head_yaw_world,
-            )
-            tracker_raw = assemble_tracker_features_np(
-                tracker_measurement,
-                np.stack([state.configured for state in self.tracker_history]),
-                np.stack([state.measured_valid for state in self.tracker_history]),
-                np.stack([state.d_off for state in self.tracker_history]),
-                np.stack([state.d_on for state in self.tracker_history]),
-                duration_cap=self.reliability_config.duration_cap,
-            )
-            trajectory_raw = np.stack(self.trajectory_history, axis=0)
-        else:
-            pose_raw = np.empty((0, REALTIME_POSE_TARGET_DIM), dtype=np.float32)
-            tracker_raw = np.empty((0, TRACKER_COUNT, TRACKER_FEATURE_DIM), dtype=np.float32)
-            trajectory_raw = np.empty((0, 5), dtype=np.float32)
+        history_count = min(len(self.pose_history), REALTIME_POSE_HISTORY_LENGTH)
+        if len(self.tracker_history) != len(self.pose_history):
+            raise RuntimeError("Pose 与 Tracker 密集历史长度不一致。")
+        session_start = REALTIME_POSE_HISTORY_LENGTH - history_count
+        anchor_indices = np.asarray(REALTIME_POSE_HISTORY_ANCHOR_INDICES, dtype=np.int64)
+        history_valid = anchor_indices >= session_start
+        window_valid = np.concatenate([history_valid, np.asarray([True])])
 
-        current_measurement = build_tracker_measurements_np(
-            position[None],
-            rotation_6d[None],
+        pose_raw = np.zeros(
+            (REALTIME_POSE_HISTORY_ANCHOR_COUNT, REALTIME_POSE_TARGET_DIM),
+            dtype=np.float32,
+        )
+        tracker_positions = np.zeros(
+            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, 3), dtype=np.float32
+        )
+        tracker_rotations = np.zeros(
+            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, 6), dtype=np.float32
+        )
+        configured_window = np.zeros(
+            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT), dtype=bool
+        )
+        measured_window = np.zeros_like(configured_window)
+        d_off_window = np.zeros_like(configured_window, dtype=np.int64)
+        d_on_window = np.zeros_like(configured_window, dtype=np.int64)
+        head_positions = np.zeros((REALTIME_POSE_WINDOW_LENGTH, 3), dtype=np.float32)
+        head_yaws = np.zeros(REALTIME_POSE_WINDOW_LENGTH, dtype=np.float32)
+
+        selected_pose_rotations: list[np.ndarray] = []
+        selected_pose_slots: list[int] = []
+        for slot, dense_index in enumerate(anchor_indices.tolist()):
+            if dense_index < session_start:
+                continue
+            history_index = dense_index - session_start
+            pose_state = self.pose_history[history_index]
+            tracker_state = self.tracker_history[history_index]
+            selected_pose_slots.append(slot)
+            selected_pose_rotations.append(pose_state.joint_rotations_world)
+            tracker_positions[slot] = tracker_state.tracker_pos_world
+            tracker_rotations[slot] = tracker_state.tracker_rot_world_6d
+            configured_window[slot] = tracker_state.configured
+            measured_window[slot] = tracker_state.measured_valid
+            d_off_window[slot] = tracker_state.d_off
+            d_on_window[slot] = tracker_state.d_on
+            head_positions[slot] = tracker_state.tracker_pos_world[HEAD_TRACKER_INDEX]
+            head_yaws[slot] = tracker_state.head_yaw_world
+        if selected_pose_rotations:
+            pose_raw[np.asarray(selected_pose_slots, dtype=np.int64)] = build_pose_target_np(
+                np.stack(selected_pose_rotations, axis=0), head_yaw
+            )
+
+        tracker_positions[-1] = position
+        tracker_rotations[-1] = rotation_6d
+        configured_window[-1] = configured
+        measured_window[-1] = measured
+        d_off_window[-1] = d_off
+        d_on_window[-1] = d_on
+        head_positions[-1] = position[HEAD_TRACKER_INDEX]
+        head_yaws[-1] = head_yaw
+        tracker_measurements = build_tracker_measurements_np(
+            tracker_positions,
+            tracker_rotations,
             position[HEAD_TRACKER_INDEX],
             floor_y,
             head_yaw,
         )
-        current_tracker_raw = assemble_tracker_features_np(
-            current_measurement,
-            configured[None],
-            measured[None],
-            d_off[None],
-            d_on[None],
+        tracker_raw = np.zeros(
+            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+            dtype=np.float32,
+        )
+        tracker_raw[window_valid] = assemble_tracker_features_np(
+            tracker_measurements[window_valid],
+            configured_window[window_valid],
+            measured_window[window_valid],
+            d_off_window[window_valid],
+            d_on_window[window_valid],
             duration_cap=self.reliability_config.duration_cap,
-        )[0]
+        )
+        head_path_raw = build_head_path_window_np(
+            head_positions,
+            head_yaws,
+            position[HEAD_TRACKER_INDEX],
+            floor_y,
+            head_yaw,
+        )
         pose = self._normalize_pose_numpy(pose_raw)
-        tracker = self._normalize_tracker_numpy(tracker_raw)
-        current_tracker = self._normalize_tracker_numpy(current_tracker_raw)
-        trajectory = self._normalize_trajectory_numpy(trajectory_raw)
-        current_traj = self._normalize_trajectory_numpy(current_trajectory[None])
-        valid = np.zeros(REALTIME_POSE_HISTORY_LENGTH, dtype=bool)
-        valid[-history_count:] = True if history_count else False
-        return {
-            "pose_history": torch.as_tensor(
-                _left_pad(pose, (REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM)),
-                device=self.device,
-                dtype=torch.float32,
+        tracker_window = self._normalize_tracker_numpy(tracker_raw)
+        head_path = (
+            head_path_raw
+            if self.normalizer is None
+            else np.asarray(
+                self.normalizer.normalize_head_path(head_path_raw), dtype=np.float32
+            )
+        )
+        pose[~history_valid] = 0.0
+        tracker_window[~window_valid] = 0.0
+        head_path[~window_valid] = 0.0
+        kappa_position, kappa_rotation = compute_tracker_reliability_np(
+            configured_window[:-1], measured_window[:-1], d_on_window[:-1],
+            config=self.reliability_config,
+        )
+        rho_position, rho_rotation = compute_region_coverage_np(
+            kappa_position, kappa_rotation
+        )
+        history_confidence = 0.5 * (rho_position + rho_rotation)
+        history_confidence *= history_valid[:, None]
+        conditioning = {
+            "history_pose_observation": torch.as_tensor(
+                pose, device=self.device, dtype=torch.float32
             ).unsqueeze(0),
-            "tracker_history": torch.as_tensor(
-                _left_pad(tracker, (REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM)),
-                device=self.device,
-                dtype=torch.float32,
+            "tracker_window": torch.as_tensor(
+                tracker_window, device=self.device, dtype=torch.float32
             ).unsqueeze(0),
-            "current_tracker": torch.as_tensor(current_tracker, device=self.device, dtype=torch.float32).unsqueeze(0),
-            "trajectory_history": torch.as_tensor(
-                _left_pad(trajectory, (REALTIME_POSE_HISTORY_LENGTH, 5)),
-                device=self.device,
-                dtype=torch.float32,
+            "head_path_window": torch.as_tensor(
+                head_path, device=self.device, dtype=torch.float32
             ).unsqueeze(0),
-            "current_trajectory": torch.as_tensor(current_traj, device=self.device, dtype=torch.float32).unsqueeze(0),
-            "valid_frame_mask": torch.as_tensor(valid, device=self.device, dtype=torch.bool).unsqueeze(0),
-        }, current_tracker_raw
+            "history_region_confidence": torch.as_tensor(
+                history_confidence, device=self.device, dtype=torch.float32
+            ).unsqueeze(0),
+            "window_valid_mask": torch.as_tensor(
+                window_valid, device=self.device, dtype=torch.bool
+            ).unsqueeze(0),
+            "frame_offsets": torch.tensor(
+                REALTIME_POSE_FRAME_OFFSETS, device=self.device, dtype=torch.long
+            ).unsqueeze(0),
+        }
+        return conditioning, tracker_raw[-1]
+
 
     def _normalizer_pose_stats(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.normalizer is None:
             return None, None
         return (
             self.normalizer.pose_mean.to(self.device),
-            self.normalizer.pose_std.to(self.device),
+            self.normalizer.pose_scale.to(self.device),
         )
 
     def _normalize_pose_numpy(self, value: np.ndarray) -> np.ndarray:
@@ -388,11 +311,6 @@ class RealtimePoseRuntime:
     def _normalize_tracker_numpy(self, value: np.ndarray) -> np.ndarray:
         return value if self.normalizer is None else np.asarray(self.normalizer.normalize_tracker(value), dtype=np.float32)
 
-    def _normalize_trajectory_numpy(self, value: np.ndarray) -> np.ndarray:
-        result = np.asarray(value, dtype=np.float32).copy()
-        if self.normalizer is not None and result.size:
-            result[..., 2] = self.normalizer.normalize_head_height(result[..., 2])
-        return result
 
     def _inverse_pose(self, value: torch.Tensor) -> np.ndarray:
         cpu = value.detach().cpu()
@@ -400,7 +318,7 @@ class RealtimePoseRuntime:
             cpu = self.normalizer.inverse_pose(cpu)
         return np.asarray(cpu, dtype=np.float32)
 
-    def _prepare_batch_step(
+    def _prepare_step(
         self,
         tracker_pos_world: np.ndarray,
         tracker_rot_world_6d: np.ndarray,
@@ -447,11 +365,6 @@ class RealtimePoseRuntime:
             d_on,
             self.reliability_config,
         )
-        current_trajectory = self._build_current_trajectory(
-            position[HEAD_TRACKER_INDEX],
-            head_yaw,
-            float(floor_y),
-        )
         conditioning, current_tracker_raw = self._build_conditioning(
             position,
             rotation_6d,
@@ -461,7 +374,6 @@ class RealtimePoseRuntime:
             d_on,
             head_yaw,
             float(floor_y),
-            current_trajectory,
         )
         return _PreparedRuntimeStep(
             position=position,
@@ -475,12 +387,11 @@ class RealtimePoseRuntime:
             hard_rotation_state=hard,
             head_yaw=head_yaw,
             floor_y=float(floor_y),
-            current_trajectory=current_trajectory,
             current_tracker_raw=current_tracker_raw,
             conditioning=conditioning,
         )
 
-    def _finish_batch_step(
+    def _finish_step(
         self,
         prepared: _PreparedRuntimeStep,
         raw_target: np.ndarray,
@@ -512,14 +423,11 @@ class RealtimePoseRuntime:
         )
         self.pose_history.append(resolved.as_world_state())
         self.tracker_history.append(frame_state)
-        self.trajectory_history.append(prepared.current_trajectory.copy())
         self.pose_history = self.pose_history[-REALTIME_POSE_HISTORY_LENGTH:]
         self.tracker_history = self.tracker_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.trajectory_history = self.trajectory_history[-REALTIME_POSE_HISTORY_LENGTH:]
         self.previous_d_off = prepared.d_off.copy()
         self.previous_d_on = prepared.d_on.copy()
         self.previous_head_yaw = prepared.head_yaw
-        self.previous_head_position = prepared.position[HEAD_TRACKER_INDEX].copy()
         return RuntimeStepResult(
             resolved_pose=resolved,
             raw_pred_xstart=np.asarray(raw_target, dtype=np.float32),
@@ -577,7 +485,7 @@ def step_realtime_pose_batch(
     measured_batch = np.asarray(measured_valid, dtype=bool).reshape(batch_size, TRACKER_COUNT)
     floor_batch = np.asarray(floor_y, dtype=np.float32).reshape(batch_size)
     prepared_steps = [
-        runtime._prepare_batch_step(
+        runtime._prepare_step(
             positions[index],
             rotations[index],
             configured_batch[index],
@@ -594,12 +502,12 @@ def step_realtime_pose_batch(
     # 历史编码在整个 DDIM 采样中复用，且评测时不保留计算图。
     with torch.no_grad():
         prepared_conditioning = model_impl.prepare_conditioning(
-            conditioning["pose_history"],
-            conditioning["tracker_history"],
-            conditioning["current_tracker"],
-            conditioning["trajectory_history"],
-            conditioning["current_trajectory"],
-            conditioning["valid_frame_mask"],
+            conditioning["history_pose_observation"],
+            conditioning["tracker_window"],
+            conditioning["head_path_window"],
+            conditioning["history_region_confidence"],
+            conditioning["window_valid_mask"],
+            conditioning["frame_offsets"],
         )
     current_tracker_tensor = torch.as_tensor(
         np.stack([step.current_tracker_raw for step in prepared_steps]),
@@ -612,21 +520,26 @@ def step_realtime_pose_batch(
         dtype=torch.bool,
     )
     if noise is not None:
-        if tuple(noise.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+        if tuple(noise.shape) != (
+            batch_size,
+            REALTIME_POSE_WINDOW_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ):
             raise ValueError(
                 f"noise 应为 [{batch_size},{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(noise.shape)}"
             )
         noise = noise.to(device=first.device, dtype=torch.float32)
-    mean, std = first._normalizer_pose_stats()
+    mean, scale = first._normalizer_pose_stats()
     sample = first.diffusion.projected_ddim_sample_loop(
         first.model,
-        shape=(batch_size, REALTIME_POSE_TARGET_DIM),
+        shape=(batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
         projection_fn=lambda value: project_realtime_pose_xstart(
             value,
             current_tracker_tensor,
             hard_tensor,
             mean,
-            std,
+            scale,
+            conditioning["window_valid_mask"],
         ),
         clip_denoised=False,
         model_kwargs={"prepared_conditioning": prepared_conditioning},
@@ -635,13 +548,13 @@ def step_realtime_pose_batch(
         projection_mode=first.projected_ddim_mode,
         late_steps=first.projected_ddim_late_steps,
     )
-    raw_targets = first._inverse_pose(sample["raw_pred_xstart"])
-    deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])
+    raw_targets = first._inverse_pose(sample["raw_pred_xstart"])[:, -1]
+    deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])[:, -1]
     auxiliary = sample.get("auxiliary_outputs", {})
     future_leg = _batch_auxiliary_numpy(auxiliary.get("future_leg"), batch_size)
     contact_logits = _batch_auxiliary_numpy(auxiliary.get("contact_logits"), batch_size)
     return [
-        runtime._finish_batch_step(
+        runtime._finish_step(
             prepared_steps[index],
             raw_targets[index],
             deployed_targets[index],

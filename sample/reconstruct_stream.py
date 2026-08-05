@@ -13,7 +13,7 @@ from data_loaders.realtime_pose_geometry import (
     global_head_rotations_to_local_delta_6d_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_WINDOW_LENGTH
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
 from sample.utils import load_checkpoint_model
@@ -45,23 +45,23 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
     values = {
         name: batch[name].to(device)
         for name in (
-            "pose_history",
-            "tracker_history",
-            "current_tracker",
-            "trajectory_history",
-            "current_trajectory",
-            "valid_frame_mask",
+            "history_pose_observation",
+            "tracker_window",
+            "head_path_window",
+            "history_region_confidence",
+            "window_valid_mask",
+            "frame_offsets",
         )
     }
     model_impl = getattr(model, "module", model)
     with torch.no_grad():
         prepared = model_impl.prepare_conditioning(
-            values["pose_history"],
-            values["tracker_history"],
-            values["current_tracker"],
-            values["trajectory_history"],
-            values["current_trajectory"],
-            values["valid_frame_mask"].bool(),
+            values["history_pose_observation"],
+            values["tracker_window"],
+            values["head_path_window"],
+            values["history_region_confidence"],
+            values["window_valid_mask"].bool(),
+            values["frame_offsets"],
         )
     return {"prepared_conditioning": prepared}
 
@@ -73,19 +73,21 @@ def build_projection_fn(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     current_tracker_raw = batch["current_tracker_raw"].to(device)
     hard_rotation_state = batch["hard_rotation_state"].to(device).bool()
+    window_valid_mask = batch["window_valid_mask"].to(device).bool()
     if normalizer is None:
-        mean = std = None
+        mean = scale = None
     else:
-        if normalizer.pose_mean is None or normalizer.pose_std is None:
+        if normalizer.pose_mean is None or normalizer.pose_scale is None:
             normalizer.load()
         mean = normalizer.pose_mean.to(device)
-        std = normalizer.pose_std.to(device)
+        scale = normalizer.pose_scale.to(device)
     return lambda value: project_realtime_pose_xstart(
         value,
         current_tracker_raw,
         hard_rotation_state,
         mean,
-        std,
+        scale,
+        window_valid_mask,
     )
 
 
@@ -99,8 +101,11 @@ def reconstruct_batch(
     late_steps: int = 5,
 ) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
-    if reference.ndim != 2 or reference.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError(f"sample 应为 [B,144]，实际为 {tuple(reference.shape)}")
+    if reference.ndim != 3 or tuple(reference.shape[1:]) != (
+        REALTIME_POSE_WINDOW_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+    ):
+        raise ValueError(f"sample 应为 [B,11,144]，实际为 {tuple(reference.shape)}")
     model_kwargs = build_sampling_model_kwargs(model, batch, device)
     projection_fn = build_projection_fn(batch, device, normalizer)
     with torch.no_grad():
@@ -115,9 +120,9 @@ def reconstruct_batch(
             late_steps=late_steps,
         )
     output = {
-        "sample": result["sample"],
-        "raw_pred_xstart": result["raw_pred_xstart"],
-        "deployed_pred_xstart": result["deployed_pred_xstart"],
+        "sample": result["sample"][:, -1],
+        "raw_pred_xstart": result["raw_pred_xstart"][:, -1],
+        "deployed_pred_xstart": result["deployed_pred_xstart"][:, -1],
     }
     if "auxiliary_outputs" in result:
         output.update(result["auxiliary_outputs"])
@@ -139,6 +144,8 @@ def save_reconstruction(
     normalizer=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if reference.ndim == 3:
+        reference = reference[:, -1]
     reference_raw = inverse_normalized_target(reference, normalizer)
     raw_prediction = inverse_normalized_target(reconstruction["raw_pred_xstart"], normalizer)
     deployed_prediction = inverse_normalized_target(
@@ -241,7 +248,6 @@ def save_reconstruction(
         d_off=add_time(batch["d_off"][:, -1].detach().cpu().numpy()),
         d_on=add_time(batch["d_on"][:, -1].detach().cpu().numpy()),
         hard_rotation_state=add_time(batch["hard_rotation_state"].detach().cpu().numpy()),
-        current_trajectory=add_time(batch["current_trajectory"].detach().cpu().numpy()[:, 0]),
         contact_target=add_time(batch["contact_target"].detach().cpu().numpy()),
         contact_logits=add_time(
             reconstruction.get(

@@ -86,7 +86,6 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
         d_off=np.zeros((1, steps, 6), dtype=np.int64),
         d_on=np.tile(np.arange(1, steps + 1)[None, :, None], (1, 1, 6)),
         hard_rotation_state=hard,
-        current_trajectory=np.zeros((1, steps, 5), dtype=np.float32),
         contact_target=contact_target,
         contact_logits=contact_logits,
         future_leg_target=np.tile(IDENTITY_6D, (1, steps, 3, 8, 1)),

@@ -143,6 +143,10 @@ def source_global_rotations_to_body_fbx_local_delta_6d(
     source_local[:, 0] = heading_inv @ global_rot[:, 0]
     basis = SOURCE_FK_TO_BODY_FBX_BASIS
     body_delta = basis[None, None] @ source_local @ basis.T[None, None]
+    # 普通关节的父、子两侧都是骨骼局部坐标系，因此需要做完整的共轭变换。
+    # pelvis/root 的左侧却是已经转换好的 heading/world 坐标系；这里只能转换右侧的
+    # source 骨骼局部基，否则会把世界坐标再次旋转，导致整个人体额外倾斜约 90 度。
+    body_delta[:, 0] = source_local[:, 0] @ basis.T
     return rotation_6d_forward_up_np(body_delta).reshape(global_rot.shape[0], -1).astype(np.float32)
 
 

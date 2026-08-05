@@ -58,7 +58,9 @@ def compute_raw_deployed_losses(
     )
     target_joints = batch["target_joints_head_ref"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     fk_loss = torch.square(deployed_joints - target_joints).flatten(1).mean(dim=1)
-    world_joint_loss = torch.linalg.norm(deployed_joints - target_joints, dim=-1).mean(dim=1)
+    head_ref_joint_distance_loss = torch.linalg.norm(
+        deployed_joints - target_joints, dim=-1
+    ).mean(dim=1)
 
     non_head_trackers = torch.as_tensor(NON_HEAD_TRACKER_INDICES, device=raw_pred.device, dtype=torch.long)
     non_head_joints = tracker_joints.index_select(0, non_head_trackers)
@@ -107,36 +109,19 @@ def compute_raw_deployed_losses(
         "fk_loss": fk_loss,
         "tracker_position_loss": tracker_position_loss,
         "root_loss": root_loss,
-        "world_joint_loss": world_joint_loss,
+        "head_ref_joint_distance_loss": head_ref_joint_distance_loss,
         "head_to_root_xz_loss": head_to_root_xz_loss,
         "future_leg_loss": future_leg_loss,
         "contact_loss": contact_loss,
     }
 
 
-def compute_foot_slide_loss(
-    previous_joints: torch.Tensor,
-    current_joints: torch.Tensor,
-    previous_contact: torch.Tensor,
-    current_contact: torch.Tensor,
-) -> torch.Tensor:
-    """相邻两帧都接触时才惩罚左右脚 deployed 世界位移。"""
-
-    foot_indices = torch.as_tensor([10, 11], device=current_joints.device, dtype=torch.long)
-    displacement = torch.linalg.norm(
-        current_joints.index_select(1, foot_indices) - previous_joints.index_select(1, foot_indices),
-        dim=-1,
-    )
-    active = (previous_contact >= 0.5) & (current_contact >= 0.5)
-    return _masked_mean(displacement, active)
-
-
 def _to_raw_pose(value: torch.Tensor, batch: dict) -> torch.Tensor:
-    mean = batch.get("normalizer_mean")
-    std = batch.get("normalizer_std")
-    if mean is None or std is None:
+    mean = batch.get("pose_mean")
+    scale = batch.get("pose_scale")
+    if mean is None or scale is None:
         return value
-    return value * std.to(device=value.device, dtype=value.dtype) + mean.to(
+    return value * scale.to(device=value.device, dtype=value.dtype) + mean.to(
         device=value.device, dtype=value.dtype
     )
 

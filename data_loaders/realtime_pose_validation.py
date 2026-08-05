@@ -10,10 +10,12 @@ from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_FPS,
     REALTIME_POSE_HISTORY_LENGTH,
+    REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
+    REALTIME_POSE_WINDOW_LENGTH,
     TRACKER_CONFIGURED_OFFSET,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
@@ -28,8 +30,6 @@ SOURCE_FRAME_SHAPES = {
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY: (144,),
     "root_pos_world": (3,),
     "root_yaw": (),
-    "root_heading_delta_sincos": (2,),
-    "root_delta_xz_ref": (2,),
     "pelvis_height": (1,),
     "tracker_pos_world": (TRACKER_COUNT, 3),
     "tracker_rot_world_6d": (TRACKER_COUNT, 6),
@@ -43,25 +43,24 @@ SOURCE_STATIC_SHAPES = {
 }
 
 TASK_SHAPES = {
-    "pose_history": (REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM),
-    "tracker_history": (REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
-    "current_tracker": (TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "x": (REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
+    "history_pose_observation": (REALTIME_POSE_HISTORY_ANCHOR_COUNT, REALTIME_POSE_TARGET_DIM),
+    "tracker_window": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+    "head_path_window": (REALTIME_POSE_WINDOW_LENGTH, 5),
+    "history_region_confidence": (REALTIME_POSE_HISTORY_ANCHOR_COUNT, 5),
+    "window_valid_mask": (REALTIME_POSE_WINDOW_LENGTH,),
+    "frame_offsets": (REALTIME_POSE_WINDOW_LENGTH,),
     "current_tracker_raw": (TRACKER_COUNT, TRACKER_FEATURE_DIM),
-    "trajectory_history": (REALTIME_POSE_HISTORY_LENGTH, 5),
-    "current_trajectory": (1, 5),
-    "current_target": (REALTIME_POSE_TARGET_DIM,),
-    "valid_frame_mask": (REALTIME_POSE_HISTORY_LENGTH,),
     "hard_rotation_state": (TRACKER_COUNT,),
     "target_joints_head_ref": (24, 3),
-    "prev_joints_head_ref": (24, 3),
     "target_root_position_head_ref": (3,),
     "current_head_position_world": (3,),
     "joint_offsets_parent": (24, 3),
     "joint_rest_local_rotations_6d": (24, 6),
-    "configured": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
-    "measured_valid": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
-    "d_off": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
-    "d_on": (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT),
+    "configured": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
+    "measured_valid": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
+    "d_off": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
+    "d_on": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
     "future_leg_target": (3, 8, 6),
     "contact_target": (2,),
 }
@@ -69,7 +68,6 @@ TASK_SHAPES = {
 TASK_SCALAR_FIELDS = (
     "target_root_yaw_world",
     "target_hip_height",
-    "history_head_yaw_world",
     "current_head_yaw_world",
     "floor_y",
     "scenario",
@@ -159,11 +157,11 @@ def validate_realtime_task_arrays(
 
     configured = np.asarray(task["configured"], dtype=bool)
     measured_valid = np.asarray(task["measured_valid"], dtype=bool)
-    validate_tracker_states(configured, measured_valid)
-    tracker = np.concatenate(
-        [np.asarray(task["tracker_history"]), np.asarray(task["current_tracker"])[None]],
-        axis=0,
-    )
+    window_valid = np.asarray(task["window_valid_mask"], dtype=bool)
+    validate_tracker_states(configured[window_valid], measured_valid[window_valid])
+    if np.any(configured[~window_valid]) or np.any(measured_valid[~window_valid]):
+        raise ValueError(f"{label}padding Tracker 状态必须清零。")
+    tracker = np.asarray(task["tracker_window"])
     if not np.array_equal(tracker[..., TRACKER_CONFIGURED_OFFSET] > 0.5, configured):
         raise ValueError(f"{label}Tracker configured 与 task.configured 不一致")
     if not np.array_equal(tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5, measured_valid):

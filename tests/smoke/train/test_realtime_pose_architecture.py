@@ -1,44 +1,61 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import math
 
+import pytest
 import torch
 
 from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS
-from model.realtime_pose_target_dit import RealtimePoseTargetDiT
+from data_loaders.realtime_pose_history_noise import (
+    HistoryPoseNoiseConfig,
+    corrupt_history_pose_observation,
+)
+from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_torch
+from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
+from train.training_loop import (
+    TRAIN_DEVICE_FIELDS,
+    TrainLoop,
+    move_training_batch_to_device,
+)
 
 
-def _conditioning(batch_size: int = 2):
-    pose_history = torch.randn(batch_size, 60, 144)
-    tracker_history = torch.zeros(batch_size, 60, 6, 13)
-    current_tracker = torch.zeros(batch_size, 6, 13)
-    tracker_history[..., 9] = 1.0
-    tracker_history[..., 10] = 1.0
-    tracker_history[..., 12] = 1.0
-    current_tracker[..., 9] = 1.0
-    current_tracker[..., 10] = 1.0
-    current_tracker[..., 12] = 1.0
-    trajectory_history = torch.randn(batch_size, 60, 5)
-    current_trajectory = torch.randn(batch_size, 1, 5)
-    valid_frame_mask = torch.ones(batch_size, 60, dtype=torch.bool)
-    return (
-        pose_history,
-        tracker_history,
-        current_tracker,
-        trajectory_history,
-        current_trajectory,
-        valid_frame_mask,
-    )
+FRAME_OFFSETS = torch.tensor([-60, -53, -47, -40, -34, -27, -21, -14, -8, -1, 0])
 
 
-def _model() -> RealtimePoseTargetDiT:
-    return RealtimePoseTargetDiT(
+def _model() -> RealtimePoseSpatioTemporalDiT:
+    return RealtimePoseSpatioTemporalDiT(
         latent_dim=64,
         num_layers=1,
         num_heads=8,
-        motion_layers=1,
         dropout=0.0,
+        max_seq_len=11,
     ).eval()
+
+
+def _conditioning(batch_size: int = 2, cold_start: bool = False) -> dict[str, torch.Tensor]:
+    valid = torch.ones(batch_size, 11, dtype=torch.bool)
+    if cold_start:
+        valid[:, :-1] = False
+    tracker = torch.zeros(batch_size, 11, 6, 13)
+    tracker[..., 9:11] = 1.0
+    tracker[..., 12] = 1.0
+    tracker[~valid] = 0.0
+    history = torch.randn(batch_size, 10, 144)
+    history[~valid[:, :-1]] = 0.0
+    head_path = torch.randn(batch_size, 11, 5)
+    head_path[:, -1, :2] = 0.0
+    head_path[:, -1, 3:] = torch.tensor([0.0, 1.0])
+    head_path[~valid] = 0.0
+    confidence = torch.ones(batch_size, 10, 5)
+    confidence[~valid[:, :-1]] = 0.0
+    return {
+        "history_pose_observation": history,
+        "tracker_window": tracker,
+        "head_path_window": head_path,
+        "history_region_confidence": confidence,
+        "window_valid_mask": valid,
+        "frame_offsets": FRAME_OFFSETS,
+    }
 
 
 def test_target_regions_cover_each_joint_once():
@@ -46,255 +63,177 @@ def test_target_regions_cover_each_joint_once():
     assert set(TARGET_JOINT_REGIONS.tolist()) == {0, 1, 2, 3, 4}
 
 
-def test_self_attention_and_mlp_use_independent_six_parameter_adaln():
+def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite():
     model = _model()
-    block = model.blocks[0]
-    projection = block.adaln_modulation[-1]
-    assert projection.out_features == model.latent_dim * 6
-    assert not block.self_attention_norm.elementwise_affine
-    assert not block.mlp_norm.elementwise_affine
-    assert isinstance(block.mlp[0], torch.nn.Linear)
-    assert torch.count_nonzero(projection.weight) == 0
-    assert torch.count_nonzero(projection.bias) == 0
-
-    # gate 保持零，使两个分支读取同一 residual state；不同 shift 应分别到达 MSA 和 MLP。
-    with torch.no_grad():
-        projection.bias[: model.latent_dim].fill_(0.25)
-        projection.bias[3 * model.latent_dim : 4 * model.latent_dim].fill_(-0.5)
-    captured: dict[str, torch.Tensor] = {}
-
-    def capture_self_attention(_module, inputs) -> None:
-        captured["self_attention"] = inputs[0].detach()
-
-    def capture_mlp(_module, inputs) -> None:
-        captured["mlp"] = inputs[0].detach()
-
-    handles = [
-        block.self_attention.register_forward_pre_hook(capture_self_attention),
-        block.mlp.register_forward_pre_hook(capture_mlp),
-    ]
-    values = _conditioning(batch_size=1)
-    try:
-        with torch.no_grad():
-            model(torch.randn(1, 144), torch.ones(1, dtype=torch.long), *values)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    torch.testing.assert_close(
-        captured["self_attention"].mean(dim=-1),
-        torch.full((1, 24), 0.25),
-        atol=1e-5,
-        rtol=0.0,
-    )
-    torch.testing.assert_close(
-        captured["mlp"].mean(dim=-1),
-        torch.full((1, 24), -0.5),
-        atol=1e-5,
-        rtol=0.0,
-    )
-
-
-def test_condition_branches_share_the_same_initial_query():
-    torch.manual_seed(0)
-    model = _model()
-    block = model.blocks[0]
-    values = _conditioning(batch_size=1)
-    prepared = model.prepare_conditioning(*values)
-    hidden = torch.randn(1, 144)
-
-    joint_values = hidden.reshape(1, 24, 6)
-    joint_ids = torch.arange(24)
-    initial_target = (
-        model.joint_input(joint_values)
-        + model.joint_identity(joint_ids)[None]
-        + model.region_identity(model.joint_regions)[None]
-    )
-    expected_query = block.conditioning_norm(initial_target)
-    captured_queries: dict[str, torch.Tensor] = {}
-    normalization_outputs: list[torch.Tensor] = []
-
-    def capture_normalization(_module, _inputs, output) -> None:
-        normalization_outputs.append(output.detach().clone())
-
-    def capture_query(name: str):
-        def hook(_module, inputs) -> None:
-            captured_queries[name] = inputs[0].detach().clone()
-
-        return hook
-
-    handles = [
-        block.conditioning_norm.register_forward_hook(capture_normalization),
-        block.context_attention.register_forward_pre_hook(capture_query("state")),
-        block.position_attention.register_forward_pre_hook(capture_query("position")),
-        block.rotation_attention.register_forward_pre_hook(capture_query("rotation")),
-        block.prior_attention.register_forward_pre_hook(capture_query("prior")),
-    ]
-    try:
-        with torch.no_grad():
-            model(
-                hidden,
-                torch.ones(1, dtype=torch.long),
-                prepared_conditioning=prepared,
-            )
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    # 条件融合阶段只允许从 block 初始 residual state 计算一次公共 query。
-    assert len(normalization_outputs) == 1
-    torch.testing.assert_close(normalization_outputs[0], expected_query)
-    assert set(captured_queries) == {"state", "position", "rotation", "prior"}
-    for query in captured_queries.values():
-        torch.testing.assert_close(query, expected_query)
-
-
-def test_dit_context_attention_reads_only_current_state_tokens():
-    model = _model()
-    values = _conditioning(batch_size=1)
-    prepared = model.prepare_conditioning(*values)
-    captured: dict[str, torch.Tensor] = {}
-
-    def capture_context(_module, inputs) -> None:
-        captured["key"] = inputs[1].detach().clone()
-        captured["value"] = inputs[2].detach().clone()
-
-    handle = model.blocks[0].context_attention.register_forward_pre_hook(capture_context)
-    try:
-        with torch.no_grad():
-            model(
-                torch.randn(1, 144),
-                torch.ones(1, dtype=torch.long),
-                prepared_conditioning=prepared,
-            )
-    finally:
-        handle.remove()
-
-    assert captured["key"].shape == (1, 6, model.latent_dim)
-    torch.testing.assert_close(captured["key"], prepared.observation.state_tokens)
-    torch.testing.assert_close(captured["value"], prepared.observation.state_tokens)
-
-
-def test_history_summary_reaches_dit_only_through_motion_prior():
-    torch.manual_seed(0)
-    model = _model()
-    values = list(_conditioning(batch_size=1))
-    prepared = model.prepare_conditioning(*values)
-
-    # 固定 Motion Encoder 输出后，单独篡改 U 不应再改变 DiT；这可排除 U 到 context 的直连。
-    changed_observation = replace(
-        prepared.observation,
-        history_summary=prepared.observation.history_summary + 100.0,
-    )
-    changed_prepared = replace(prepared, observation=changed_observation)
-    hidden = torch.randn(1, 144)
-    timestep = torch.ones(1, dtype=torch.long)
-    with torch.no_grad():
-        original_output = model(hidden, timestep, prepared_conditioning=prepared)
-        changed_output = model(hidden, timestep, prepared_conditioning=changed_prepared)
-    torch.testing.assert_close(original_output, changed_output)
-
-    # 从原始 Tracker history 重新编码时，U 仍须改变 Motion Encoder 生成的结构化先验。
-    changed_values = list(values)
-    changed_values[1] = values[1].clone()
-    changed_values[1][:, :, 1, :9] += 5.0
-    history_changed = model.prepare_conditioning(*changed_values)
-    assert not torch.allclose(
-        prepared.observation.history_summary,
-        history_changed.observation.history_summary,
-    )
-    assert not torch.allclose(
-        prepared.motion.temporal_tokens,
-        history_changed.motion.temporal_tokens,
-    )
-    assert not torch.allclose(prepared.motion.latents, history_changed.motion.latents)
-
-
-def test_observation_encoder_excludes_head_position_branch():
-    model = _model()
-    values = list(_conditioning())
-    first = model.observation_encoder(values[1], values[2], values[5])
-    changed_current = values[2].clone()
-    changed_current[:, 0, :3] = 1000.0
-    second = model.observation_encoder(values[1], changed_current, values[5])
-    torch.testing.assert_close(first.position_tokens, second.position_tokens)
-
-
-def test_prepared_conditioning_matches_direct_forward_and_all_invalid_is_finite():
-    model = _model()
-    values = list(_conditioning())
-    # Head 当前测量保持有效，但 60 帧历史全部处于冷启动 padding 状态。
-    values[5].zero_()
-    values[2][:, 1:, :9] = 0.0
-    values[2][:, 1:, 10] = 0.0
-    values[2][:, 1:, 12] = 0.0
-    hidden = torch.randn(2, 144)
+    values = _conditioning(cold_start=True)
+    hidden = torch.randn(2, 11, 144)
     timestep = torch.tensor([1, 2])
-    prepared = model.prepare_conditioning(*values)
-    direct, direct_aux = model(hidden, timestep, *values, return_aux_outputs=True)
+    prepared = model.prepare_conditioning(**values)
+    direct, direct_aux = model(hidden, timestep, **values, return_aux_outputs=True)
     cached, cached_aux = model(
         hidden,
         timestep,
         prepared_conditioning=prepared,
         return_aux_outputs=True,
     )
-    torch.testing.assert_close(direct, cached, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(direct, cached)
     torch.testing.assert_close(direct_aux["future_leg"], cached_aux["future_leg"])
-    assert torch.isfinite(cached).all()
-    assert cached.shape == (2, 144)
-    assert cached_aux["future_leg"].shape == (2, 3, 8, 6)
-    assert cached_aux["contact_logits"].shape == (2, 2)
+    assert direct.shape == (2, 11, 144)
+    assert direct_aux["future_leg"].shape == (2, 3, 8, 6)
+    assert direct_aux["contact_logits"].shape == (2, 2)
+    assert torch.isfinite(direct).all()
+    assert torch.count_nonzero(direct[:, :-1]) == 0
 
 
-def test_motion_prior_does_not_read_current_tracker_or_current_trajectory():
+def test_tracker_history_is_encoded_per_frame_without_gru_summary():
     model = _model()
-    values = list(_conditioning())
-    first = model.prepare_conditioning(*values).motion
-    values[2] = values[2].clone()
-    values[2][..., :9] = values[2][..., :9] + torch.randn_like(values[2][..., :9]) * 10.0
-    values[4] = values[4] + torch.randn_like(values[4]) * 10.0
-    second = model.prepare_conditioning(*values).motion
-    torch.testing.assert_close(first.temporal_tokens, second.temporal_tokens, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(first.latents, second.latents, atol=1e-6, rtol=1e-6)
+    values = _conditioning(batch_size=1)
+    first = model.prepare_conditioning(**values)
+    changed = {name: value.clone() for name, value in values.items()}
+    changed["tracker_window"][:, 3, 1, :9] += 5.0
+    second = model.prepare_conditioning(**changed)
+    assert not torch.allclose(
+        first.observation.rotation_tokens[:, 3],
+        second.observation.rotation_tokens[:, 3],
+    )
+    torch.testing.assert_close(
+        first.observation.rotation_tokens[:, 2],
+        second.observation.rotation_tokens[:, 2],
+    )
+    assert not hasattr(model.observation_encoder, "history_gru")
 
 
-def test_zero_length_cold_start_motion_prior_is_finite_and_zero():
+def test_head_path_and_history_pose_are_independent_conditions():
     model = _model()
-    values = list(_conditioning(batch_size=1))
-    values[5].zero_()
-    prepared = model.prepare_conditioning(*values)
-    assert torch.isfinite(prepared.motion.temporal_tokens).all()
-    assert torch.count_nonzero(prepared.motion.temporal_tokens) == 0
-    assert torch.count_nonzero(prepared.motion.latents) == 0
+    values = _conditioning(batch_size=1)
+    first = model.prepare_conditioning(**values)
+    changed = {name: value.clone() for name, value in values.items()}
+    changed["head_path_window"][:, 4, 0] += 10.0
+    second = model.prepare_conditioning(**changed)
+    assert not torch.allclose(
+        first.static_pose_condition[:, 4], second.static_pose_condition[:, 4]
+    )
+    torch.testing.assert_close(
+        values["history_pose_observation"], changed["history_pose_observation"]
+    )
 
 
-def test_left_padding_uses_last_valid_history_frame():
+def test_temporal_mask_is_causal_and_ignores_left_padding_keys():
     model = _model()
-    values = list(_conditioning(batch_size=1))
-    values[5].zero_()
-    values[5][:, -2:] = True
-    first = model.prepare_conditioning(*values)
-
-    changed_padding = list(values)
-    changed_padding[0] = values[0].clone()
-    changed_padding[1] = values[1].clone()
-    changed_padding[3] = values[3].clone()
-    changed_padding[0][:, :-2] = torch.randn_like(changed_padding[0][:, :-2]) * 100.0
-    changed_padding[1][:, :-2] = torch.randn_like(changed_padding[1][:, :-2]) * 100.0
-    changed_padding[3][:, :-2] = torch.randn_like(changed_padding[3][:, :-2]) * 100.0
-    second = model.prepare_conditioning(*changed_padding)
-    torch.testing.assert_close(first.observation.history_summary, second.observation.history_summary)
-    torch.testing.assert_close(first.motion.latents, second.motion.latents, atol=1e-6, rtol=1e-6)
+    valid = torch.tensor([[False, False, True, True, True, True, True, True, True, True, True]])
+    mask = model._temporal_mask(valid, joint_count=24).reshape(1, 24, 8, 11, 11)
+    # 当前帧能读取全部有效历史，但历史第 5 帧不能读取第 6 帧。
+    assert not mask[0, 0, 0, -1, 2:].any()
+    assert mask[0, 0, 0, 5, 6]
+    assert mask[0, 0, 0, -1, :2].all()
 
 
-def test_left_leg_history_does_not_enter_right_leg_specific_tokens():
+def test_history_noise_only_changes_valid_history_in_so3_space():
+    identity = torch.eye(3).expand(2, 10, 24, 3, 3)
+    clean = rotation_6d_forward_up_torch(identity).reshape(2, 10, 144)
+    valid = torch.tensor(
+        [[False, False, True, True, True, True, True, True, True, True], [True] * 10]
+    )
+    clean[~valid] = 0.0
+    torch.manual_seed(0)
+    noisy = corrupt_history_pose_observation(
+        clean,
+        history_region_confidence=torch.full((2, 10, 5), 0.5),
+        history_valid_mask=valid,
+        pose_mean=None,
+        pose_scale=None,
+        config=HistoryPoseNoiseConfig(probability=1.0),
+    )
+    assert torch.isfinite(noisy).all()
+    assert torch.count_nonzero(noisy[~valid]) == 0
+    assert not torch.allclose(noisy[valid], clean[valid])
+
+
+def test_clean_history_probability_zero_is_exact_identity():
+    clean = torch.randn(2, 10, 144)
+    valid = torch.ones(2, 10, dtype=torch.bool)
+    result = corrupt_history_pose_observation(
+        clean,
+        torch.ones(2, 10, 5),
+        valid,
+        None,
+        None,
+        HistoryPoseNoiseConfig(probability=0.0),
+    )
+    torch.testing.assert_close(result, clean)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (field, value)
+        for field in (
+            "probability",
+            "min_degrees",
+            "max_degrees",
+            "temporal_rho",
+            "region_ratio",
+            "joint_ratio",
+        )
+        for value in (math.nan, math.inf, -math.inf)
+    ],
+)
+def test_history_noise_config_rejects_nonfinite_values(field: str, value: float):
+    with pytest.raises(ValueError, match=field):
+        HistoryPoseNoiseConfig(**{field: value}).validate()
+
+
+def test_model_rejects_unknown_constructor_and_forward_arguments():
+    with pytest.raises(TypeError):
+        RealtimePoseSpatioTemporalDiT(latent_dmi=64)
+
     model = _model()
-    values = list(_conditioning(batch_size=1))
-    first = model.prepare_conditioning(*values).motion
-    changed = list(values)
-    changed[0] = values[0].clone().reshape(1, 60, 24, 6)
-    changed[0][:, :, [1, 4, 7, 10]] += 10.0
-    changed[0] = changed[0].reshape(1, 60, 144)
-    second = model.prepare_conditioning(*changed).motion
-    torch.testing.assert_close(first.temporal_tokens[:, 3], second.temporal_tokens[:, 3])
-    assert not torch.allclose(first.temporal_tokens[:, 0], second.temporal_tokens[:, 0])
+    with pytest.raises(TypeError):
+        model(torch.randn(1, 11, 144), torch.ones(1), obsolete_argument=True)
+
+
+def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
+    assert "configured" not in TRAIN_DEVICE_FIELDS
+    assert "joint_rest_local_rotations_6d" not in TRAIN_DEVICE_FIELDS
+    batch = {
+        "x": torch.zeros(1),
+        "configured": torch.ones(1, dtype=torch.bool),
+        "joint_rest_local_rotations_6d": torch.zeros(24, 6),
+    }
+
+    moved = move_training_batch_to_device(batch, torch.device("meta"))
+
+    assert moved["x"].device.type == "meta"
+    assert moved["configured"].device.type == "cpu"
+    assert moved["joint_rest_local_rotations_6d"].device.type == "cpu"
+
+
+def test_training_model_kwargs_use_y_as_the_only_condition_source():
+    loop = object.__new__(TrainLoop)
+    loop.model = torch.nn.Identity().eval()
+    loop.pose_mean = None
+    loop.pose_scale = None
+    sample = torch.zeros(1, 11, 144)
+    batch = {
+        "history_pose_observation": torch.zeros(1, 10, 144),
+        "tracker_window": torch.zeros(1, 11, 6, 13),
+        "head_path_window": torch.zeros(1, 11, 5),
+        "history_region_confidence": torch.zeros(1, 10, 5),
+        "window_valid_mask": torch.ones(1, 11, dtype=torch.bool),
+        "frame_offsets": torch.zeros(1, 11, dtype=torch.long),
+        "current_tracker_raw": torch.zeros(1, 6, 13),
+        "hard_rotation_state": torch.zeros(1, 6, dtype=torch.bool),
+        "target_joints_head_ref": torch.zeros(1, 24, 3),
+        "joint_offsets_parent": torch.zeros(1, 24, 3),
+        "target_root_position_head_ref": torch.zeros(1, 3),
+        "target_root_yaw_world": torch.zeros(1),
+        "current_head_yaw_world": torch.zeros(1),
+        "future_leg_target": torch.zeros(1, 3, 8, 6),
+        "contact_target": torch.zeros(1, 2),
+    }
+
+    model_kwargs = loop.mask_manager(batch, sample)
+
+    assert set(model_kwargs) == {"y"}
+    assert model_kwargs["y"]["tracker_window"] is batch["tracker_window"]
+    assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]

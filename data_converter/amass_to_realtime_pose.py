@@ -38,9 +38,7 @@ from data_loaders.body_fbx_kinematics import (
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
     derive_stationary_prob_5,
-    encode_root_delta_xz_ref,
     rotation_6d_forward_up_np,
-    wrap_radians,
 )
 from data_loaders.realtime_pose_validation import (
     load_realtime_metadata,
@@ -57,8 +55,6 @@ REUSABLE_SOURCE_FIELDS = {
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     "root_pos_world",
     "root_yaw",
-    "root_heading_delta_sincos",
-    "root_delta_xz_ref",
     "pelvis_height",
     "tracker_pos_world",
     "tracker_rot_world_6d",
@@ -203,16 +199,10 @@ def build_realtime_pose_features(
     joint_rest_local_rotations_6d = rotation_6d_forward_up_np(
         body_fbx_rest.rest_local_rotations,
     ).astype(np.float32)
-    yaw_delta = np.zeros_like(root_yaw, dtype=np.float32)
-    if root_yaw.shape[0] > 1:
-        yaw_delta[1:] = wrap_radians(root_yaw[1:].astype(np.float64) - root_yaw[:-1].astype(np.float64)).astype(np.float32)
-    root_heading_delta_sincos = np.stack([np.sin(yaw_delta), np.cos(yaw_delta)], axis=-1).astype(np.float32)
-
     features = {
         BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY: body_pose_6d,
         "root_pos_world": root_pos_world.astype(np.float32),
         "root_yaw": root_yaw.astype(np.float32),
-        "root_heading_delta_sincos": root_heading_delta_sincos,
         "tracker_pos_world": tracker_pos_world,
         "tracker_rot_world_6d": tracker_rot_world_6d,
         "joints_world": joints_world,
@@ -223,10 +213,6 @@ def build_realtime_pose_features(
         features["body_fbx_rest_json"] = np.asarray(str(body_fbx_rest.source_path))
     # source 是可复用的世界运动缓存，不等同于 144 维扩散 target。Root 轨迹、
     # Pelvis 高度和 stationary 标签继续离线保存，但主 task 不会读取这些目标通道。
-    features["root_delta_xz_ref"] = encode_root_delta_xz_ref(
-        root_pos_world=root_pos_world.astype(np.float32),
-        root_yaw=root_yaw.astype(np.float32),
-    )
     features["pelvis_height"] = pelvis_world[:, 1:2].astype(np.float32)
     features["stationary_prob_5"] = derive_stationary_prob_5(
         joints_world=joints_world,

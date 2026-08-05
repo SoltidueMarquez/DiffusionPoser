@@ -1,24 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     SMPL_JOINT_COUNT,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_TO_JOINT,
 )
-
-
-@dataclass
-class ProjectedDDIMResult:
-    sample: torch.Tensor
-    raw_pred_xstart: torch.Tensor
-    deployed_pred_xstart: torch.Tensor
 
 
 def project_rotation_6d_to_so3(rotation_6d: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -59,47 +51,71 @@ def project_realtime_pose_xstart(
     pred_xstart: torch.Tensor,
     current_tracker_raw: torch.Tensor,
     hard_rotation_state: torch.Tensor,
-    normalizer_mean: torch.Tensor | None = None,
-    normalizer_std: torch.Tensor | None = None,
+    pose_mean: torch.Tensor | None = None,
+    pose_scale: torch.Tensor | None = None,
+    window_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SO(3) 投影全部关节，并只替换当前 hard Tracker 对应旋转。"""
 
-    if pred_xstart.ndim != 2 or pred_xstart.shape[1] != REALTIME_POSE_TARGET_DIM:
-        raise ValueError("pred_xstart 必须为 [B,144]。")
+    if pred_xstart.ndim != 3 or tuple(pred_xstart.shape[1:]) != (
+        REALTIME_POSE_WINDOW_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+    ):
+        raise ValueError("pred_xstart 必须为 [B,11,144]。")
     batch_size = pred_xstart.shape[0]
     if tuple(current_tracker_raw.shape) != (batch_size, TRACKER_COUNT, TRACKER_FEATURE_DIM):
         raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
     if tuple(hard_rotation_state.shape) != (batch_size, TRACKER_COUNT):
         raise ValueError("hard_rotation_state 必须为 [B,6]。")
-    raw = _inverse_pose(pred_xstart, normalizer_mean, normalizer_std)
-    rotations = project_rotation_6d_to_so3(raw.reshape(batch_size, SMPL_JOINT_COUNT, 6))
+    raw = _inverse_pose(pred_xstart, pose_mean, pose_scale)
+    rotations = project_rotation_6d_to_so3(
+        raw.reshape(batch_size, REALTIME_POSE_WINDOW_LENGTH, SMPL_JOINT_COUNT, 6)
+    )
     tracker_rotations = project_rotation_6d_to_so3(current_tracker_raw[..., 3:9])
     joint_indices = torch.as_tensor(TRACKER_TO_JOINT, device=pred_xstart.device, dtype=torch.long)
     deployed = rotations.clone()
-    for tracker_index in range(TRACKER_COUNT):
-        joint_index = int(joint_indices[tracker_index])
-        mask = hard_rotation_state[:, tracker_index, None]
-        deployed[:, joint_index] = torch.where(mask, tracker_rotations[:, tracker_index], deployed[:, joint_index])
-    return _normalize_pose(deployed.reshape(batch_size, REALTIME_POSE_TARGET_DIM), normalizer_mean, normalizer_std)
+    # 一次更新全部 Tracker 关节，避免逐个把 CUDA 索引转成 Python int 而触发设备同步。
+    current_rotations = deployed[:, -1].index_select(1, joint_indices)
+    replacement = torch.where(
+        hard_rotation_state[..., None],
+        tracker_rotations,
+        current_rotations,
+    )
+    deployed[:, -1].index_copy_(1, joint_indices, replacement)
+    result = _normalize_pose(
+        deployed.reshape(
+            batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM
+        ),
+        pose_mean,
+        pose_scale,
+    )
+    if window_valid_mask is not None:
+        if tuple(window_valid_mask.shape) != (
+            batch_size,
+            REALTIME_POSE_WINDOW_LENGTH,
+        ):
+            raise ValueError("window_valid_mask 必须为 [B,11]。")
+        result = result.masked_fill(~window_valid_mask.bool()[..., None], 0.0)
+    return result
 
 
 def _inverse_pose(
     value: torch.Tensor,
     mean: torch.Tensor | None,
-    std: torch.Tensor | None,
+    scale: torch.Tensor | None,
 ) -> torch.Tensor:
-    if mean is None or std is None:
+    if mean is None or scale is None:
         return value
-    return value * std.to(device=value.device, dtype=value.dtype) + mean.to(device=value.device, dtype=value.dtype)
+    return value * scale.to(device=value.device, dtype=value.dtype) + mean.to(device=value.device, dtype=value.dtype)
 
 
 def _normalize_pose(
     value: torch.Tensor,
     mean: torch.Tensor | None,
-    std: torch.Tensor | None,
+    scale: torch.Tensor | None,
 ) -> torch.Tensor:
-    if mean is None or std is None:
+    if mean is None or scale is None:
         return value
-    return (value - mean.to(device=value.device, dtype=value.dtype)) / std.to(
+    return (value - mean.to(device=value.device, dtype=value.dtype)) / scale.to(
         device=value.device, dtype=value.dtype
-    ).clamp_min(1e-8)
+    )

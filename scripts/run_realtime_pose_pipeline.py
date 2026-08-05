@@ -48,7 +48,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
     )
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
-    paths.add_argument("--save_dir", default="runs/realtime_pose_144d_target_dit", type=str)
+    paths.add_argument("--save_dir", required=True, type=str)
 
     pipeline = parser.add_argument_group("pipeline")
     pipeline.add_argument("--start_at", default="convert", choices=PIPELINE_STAGES)
@@ -91,14 +91,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tasks.add_argument("--skip_tasks", action="store_true")
     tasks.add_argument("--splits", nargs="+", default=["train", "test"])
     tasks.add_argument("--base_windows_per_source", default=20, type=int)
-    tasks.add_argument("--max_rollout_steps", default=4, type=int)
     tasks.add_argument("--shard_size", default=4096, type=int)
     tasks.add_argument("--short_source_policy", default="skip", choices=["skip", "error"])
 
     train = parser.add_argument_group("train")
     train.add_argument("--skip_train", action="store_true")
     train.add_argument("--resume_latest", action="store_true")
-    train.add_argument("--model_arch", default="target_dit", choices=["target_dit"])
+    train.add_argument(
+        "--model_arch",
+        default="spatiotemporal_dit",
+        choices=["spatiotemporal_dit"],
+    )
     train.add_argument("--cuda", default=True, type=str2bool)
     train.add_argument("--device", default=0, type=int)
     train.add_argument("--train_batch_size", default=64, type=int)
@@ -112,29 +115,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--layers", default=8, type=int)
     train.add_argument("--heads", default=8, type=int)
     train.add_argument("--latent_dim", default=512, type=int)
-    train.add_argument("--motion_layers", default=4, type=int)
     train.add_argument("--diffusion_steps", default=50, type=int)
     train.add_argument("--ts_respace", default="", type=str)
     train.add_argument("--model_ema", action=BooleanOptionalAction, default=True)
     train.add_argument("--gradient_clip", action=BooleanOptionalAction, default=True)
-    train.add_argument("--rollout_loss_weight", default=1.0, type=float)
-    train.add_argument("--rollout_steps", default=4, type=int)
-    train.add_argument("--rollout_prob", default=0.5, type=float)
     train.add_argument("--scenario_weights", nargs=5, default=[0.2] * 5, type=float)
-    train.add_argument("--detach_rollout_history", default=True, type=str2bool)
-    train.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)
-    train.add_argument("--rollout_rot_vel_loss_weight", default=0.02, type=float)
+    train.add_argument("--history_noise_prob", default=0.8, type=float)
+    train.add_argument("--history_noise_min_deg", default=2.0, type=float)
+    train.add_argument("--history_noise_max_deg", default=10.0, type=float)
+    train.add_argument("--history_noise_temporal_rho", default=0.95, type=float)
+    train.add_argument("--history_noise_region_ratio", default=0.75, type=float)
+    train.add_argument("--history_noise_joint_ratio", default=0.25, type=float)
     train.add_argument("--rotation_loss_weight", default=1.0, type=float)
     train.add_argument("--local_rot_loss_weight", default=1.0, type=float)
     train.add_argument("--fk_loss_weight", default=2.0, type=float)
     train.add_argument("--tracker_pos_loss_weight", default=10.0, type=float)
     train.add_argument("--tracker_rot_loss_weight", default=1.0, type=float)
     train.add_argument("--root_loss_weight", default=1.0, type=float)
-    train.add_argument("--world_joint_loss_weight", default=1.0, type=float)
+    train.add_argument(
+        "--head_ref_joint_distance_loss_weight", default=1.0, type=float
+    )
     train.add_argument("--head_to_root_xz_loss_weight", default=1.0, type=float)
     train.add_argument("--future_leg_loss_weight", default=0.5, type=float)
     train.add_argument("--contact_loss_weight", default=0.1, type=float)
-    train.add_argument("--foot_slide_loss_weight", default=0.5, type=float)
     return parser
 
 
@@ -293,9 +296,11 @@ def has_task_stores(task_dir: Path, splits: list[str]) -> bool:
 def has_normalizer_artifact(normalizer_dir: Path) -> bool:
     required = (
         "pose_mean.pt",
-        "pose_std.pt",
+        "pose_scale.pt",
         "tracker_mean.pt",
         "tracker_std.pt",
+        "head_path_xz_mean.pt",
+        "head_path_xz_std.pt",
         "head_height_mean.pt",
         "head_height_std.pt",
         "normalizer_meta.json",
@@ -354,7 +359,6 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--split_dir", normalize_path(args.split_dir),
         "--splits", *[str(split) for split in args.splits],
         "--base_windows_per_source", str(args.base_windows_per_source),
-        "--max_rollout_steps", str(args.max_rollout_steps),
         "--shard_size", str(args.shard_size),
         "--short_source_policy", args.short_source_policy,
         "--run_name", args.run_name,
@@ -382,26 +386,25 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--layers", str(args.layers),
         "--heads", str(args.heads),
         "--latent_dim", str(args.latent_dim),
-        "--motion_layers", str(args.motion_layers),
         "--diffusion_steps", str(args.diffusion_steps),
-        "--rollout_steps", str(args.rollout_steps),
-        "--rollout_loss_weight", str(args.rollout_loss_weight),
-        "--rollout_prob", str(args.rollout_prob),
         "--scenario_weights", *[str(value) for value in args.scenario_weights],
-        "--detach_rollout_history", "true" if args.detach_rollout_history else "false",
-        "--rollout_joint_vel_loss_weight", str(args.rollout_joint_vel_loss_weight),
-        "--rollout_rot_vel_loss_weight", str(args.rollout_rot_vel_loss_weight),
+        "--history_noise_prob", str(args.history_noise_prob),
+        "--history_noise_min_deg", str(args.history_noise_min_deg),
+        "--history_noise_max_deg", str(args.history_noise_max_deg),
+        "--history_noise_temporal_rho", str(args.history_noise_temporal_rho),
+        "--history_noise_region_ratio", str(args.history_noise_region_ratio),
+        "--history_noise_joint_ratio", str(args.history_noise_joint_ratio),
         "--rotation_loss_weight", str(args.rotation_loss_weight),
         "--local_rot_loss_weight", str(args.local_rot_loss_weight),
         "--fk_loss_weight", str(args.fk_loss_weight),
         "--tracker_pos_loss_weight", str(args.tracker_pos_loss_weight),
         "--tracker_rot_loss_weight", str(args.tracker_rot_loss_weight),
         "--root_loss_weight", str(args.root_loss_weight),
-        "--world_joint_loss_weight", str(args.world_joint_loss_weight),
+        "--head_ref_joint_distance_loss_weight",
+        str(args.head_ref_joint_distance_loss_weight),
         "--head_to_root_xz_loss_weight", str(args.head_to_root_xz_loss_weight),
         "--future_leg_loss_weight", str(args.future_leg_loss_weight),
         "--contact_loss_weight", str(args.contact_loss_weight),
-        "--foot_slide_loss_weight", str(args.foot_slide_loss_weight),
     ]
     add_bool_value(command, "--cuda", bool(args.cuda))
     command.extend(["--device", str(args.device)])

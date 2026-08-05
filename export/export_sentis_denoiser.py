@@ -1,3 +1,9 @@
+"""旧 Unity/Sentis 导出入口，当前不属于受支持的 Python 主链路。
+
+该实现仍绑定旧 feature schema 与旧运行时接口，暂时保留仅供后续迁移参考。
+在完成当前 spatiotemporal_dit 契约迁移前，不要把它作为可运行 CLI 或回归契约。
+"""
+
 from __future__ import annotations
 
 import argparse

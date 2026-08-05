@@ -10,32 +10,40 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
-from data_loaders.realtime_pose_geometry import advance_rollout_pose_history_torch
+from data_loaders.realtime_pose_history_noise import (
+    HistoryPoseNoiseConfig,
+    corrupt_history_pose_observation,
+)
 
 from data_loaders.sensor_masking import (
-    REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     TASK_MODE_REALTIME_POSE,
 )
 from diffusion import logger
-from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 from utils import dist_util
 
 
-def zero_invalid_pose_history(
-    pose_history: torch.Tensor,
-    valid_frame_mask: torch.Tensor,
-) -> torch.Tensor:
-    """把 `[B,60,144]` 中无效历史恢复为模型输入空间的字面量零。"""
-
-    if pose_history.ndim != 3 or pose_history.shape[1:] != (
-        REALTIME_POSE_HISTORY_LENGTH,
-        REALTIME_POSE_TARGET_DIM,
-    ):
-        raise ValueError("pose_history 必须为 [B,60,144]。")
-    if tuple(valid_frame_mask.shape) != tuple(pose_history.shape[:2]):
-        raise ValueError("valid_frame_mask 必须与 pose_history 的前两维一致。")
-    return pose_history.masked_fill(~valid_frame_mask.bool()[..., None], 0.0)
+TRAIN_DEVICE_FIELDS = frozenset(
+    {
+        "x",
+        "history_pose_observation",
+        "tracker_window",
+        "head_path_window",
+        "history_region_confidence",
+        "window_valid_mask",
+        "frame_offsets",
+        "current_tracker_raw",
+        "hard_rotation_state",
+        "target_joints_head_ref",
+        "joint_offsets_parent",
+        "target_root_position_head_ref",
+        "target_root_yaw_world",
+        "current_head_yaw_world",
+        "future_leg_target",
+        "contact_target",
+    }
+)
 
 
 class TrainLoop:
@@ -62,29 +70,14 @@ class TrainLoop:
         self.use_l1 = args.l1_loss
         self.task_mode = getattr(args, "task_mode", TASK_MODE_REALTIME_POSE)
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
-        self.rollout_steps = int(getattr(args, "rollout_steps", 1))
-        self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
-        self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
-        self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
-        self.rollout_joint_vel_loss_weight = float(
-            getattr(args, "rollout_joint_vel_loss_weight", 0.05)
-        )
-        self.rollout_rot_vel_loss_weight = float(
-            getattr(args, "rollout_rot_vel_loss_weight", 0.02)
-        )
-        if self.rollout_steps < 1:
-            raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
-        if self.rollout_steps > 4:
-            raise ValueError("当前快速迭代版本只支持 rollout_steps<=4。")
-        if self.rollout_loss_weight < 0.0:
-            raise ValueError(f"rollout_loss_weight must be >= 0, got {self.rollout_loss_weight}")
-        if self.rollout_joint_vel_loss_weight < 0.0:
-            raise ValueError("rollout_joint_vel_loss_weight 必须大于等于 0。")
-        if self.rollout_rot_vel_loss_weight < 0.0:
-            raise ValueError("rollout_rot_vel_loss_weight 必须大于等于 0。")
-        if not 0.0 <= self.rollout_prob <= 1.0:
-            raise ValueError(f"rollout_prob must be in [0, 1], got {self.rollout_prob}")
-
+        self.history_noise_config = HistoryPoseNoiseConfig(
+            probability=float(getattr(args, "history_noise_prob", 0.8)),
+            min_degrees=float(getattr(args, "history_noise_min_deg", 2.0)),
+            max_degrees=float(getattr(args, "history_noise_max_deg", 10.0)),
+            temporal_rho=float(getattr(args, "history_noise_temporal_rho", 0.95)),
+            region_ratio=float(getattr(args, "history_noise_region_ratio", 0.75)),
+            joint_ratio=float(getattr(args, "history_noise_joint_ratio", 0.25)),
+        ).validate()
         self.save_dir = Path(args.save_dir)
         self.step = 0
         self.resume_step = 0
@@ -109,10 +102,11 @@ class TrainLoop:
         logger.log(f"training device: {self.device}")
         logger.log(f"task mode: {self.task_mode}")
         logger.log(
-            f"rollout: steps={self.rollout_steps}, prob={self.rollout_prob}, "
-            f"weight={self.rollout_loss_weight}, detach_history={self.detach_rollout_history}, "
-            f"joint_vel_weight={self.rollout_joint_vel_loss_weight}, "
-            f"rot_vel_weight={self.rollout_rot_vel_loss_weight}"
+            "history pose noise: "
+            f"prob={self.history_noise_config.probability}, "
+            f"degrees=[{self.history_noise_config.min_degrees},"
+            f"{self.history_noise_config.max_degrees}], "
+            f"temporal_rho={self.history_noise_config.temporal_rho}"
         )
         if self.task_mode != TASK_MODE_REALTIME_POSE:
             raise ValueError(f"当前训练链路只支持 {TASK_MODE_REALTIME_POSE}，实际为 {self.task_mode}")
@@ -120,7 +114,7 @@ class TrainLoop:
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
 
         self.feature_w = self._load_feature_weights(args)
-        self.normalizer_mean, self.normalizer_std = self._read_dataset_normalizer_stats(data)
+        self.pose_mean, self.pose_scale = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
 
         self.amp_dtype = self._select_amp_dtype()
@@ -170,11 +164,11 @@ class TrainLoop:
         normalizer = getattr(dataset, "normalizer", None)
         if normalizer is None or getattr(normalizer, "disable", False):
             return None, None
-        mean = getattr(normalizer, "mean", None)
-        std = getattr(normalizer, "std", None)
-        if mean is None or std is None:
+        mean = getattr(normalizer, "pose_mean", None)
+        scale = getattr(normalizer, "pose_scale", None)
+        if mean is None or scale is None:
             return None, None
-        return mean.detach().float().clone(), std.detach().float().clone()
+        return mean.detach().float().clone(), scale.detach().float().clone()
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint(
@@ -260,7 +254,7 @@ class TrainLoop:
                             f"mean={sum(self.data_wait_times) / 100.0:.4f}s, "
                             f"max={max(self.data_wait_times):.4f}s"
                         )
-                batch = move_batch_to_device(batch, self.device)
+                batch = move_training_batch_to_device(batch, self.device)
                 train_start_time = time.perf_counter()
                 self.run_step(batch)
                 self.step += 1
@@ -318,7 +312,7 @@ class TrainLoop:
             for batch_index, batch in enumerate(self.eval_data):
                 if batch_index >= max_batches:
                     break
-                batch = move_batch_to_device(batch, self.device)
+                batch = move_training_batch_to_device(batch, self.device)
                 sample = batch["x"]
                 batch_size = sample.shape[0]
                 # eval 使用固定时间步轮转，避免验证 loss 随随机 timestep 抖动太大。
@@ -393,186 +387,27 @@ class TrainLoop:
                 self.scaler.scale(loss).backward()
 
     def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
-        sample = batch["x"]  # [B,144]
-        if sample.ndim != 2 or sample.shape[1] != REALTIME_POSE_TARGET_DIM:
-            raise ValueError(f"训练输入应为 [B,{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(sample.shape)}")
-        batch_size = sample.shape[0]
-        feature_w = self._feature_weights_for_batch(batch_size)
-        do_rollout = self.should_compute_rollout_loss(batch)
-        model_kwargs = self.mask_manager(batch, sample)
-        losses = self.diffusion.training_losses(
+        sample = batch["x"]  # [B,11,144]
+        if sample.ndim != 3 or tuple(sample.shape[1:]) != (
+            REALTIME_POSE_WINDOW_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ):
+            raise ValueError(
+                f"训练输入应为 [B,11,{REALTIME_POSE_TARGET_DIM}]，"
+                f"实际为 {tuple(sample.shape)}"
+            )
+        feature_w = self._feature_weights_for_batch(sample.shape[0])
+        return self.diffusion.training_losses(
             self.model,
             sample,
             timesteps,
-            model_kwargs=model_kwargs,
+            model_kwargs=self.mask_manager(batch, sample),
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
-            return_pred_xstart=do_rollout,
+            return_pred_xstart=False,
         )
-        pred_xstart = losses.pop("pred_xstart", None)
-        losses.pop("raw_pred_xstart", None)
-        losses.pop("deployed_pred_xstart", None)
-        if not do_rollout:
-            return losses
 
-        rollout_losses = self.compute_rollout_losses(
-            batch=batch,
-            pred_xstart=pred_xstart,
-            timesteps=timesteps,
-        )
-        base_loss = losses["loss"]
-        rollout_frame_loss = rollout_losses.pop("loss")
-        joint_vel_loss = rollout_losses.pop("joint_vel_loss")
-        rotation_vel_loss = rollout_losses.pop("rotation_vel_loss")
-        foot_slide_loss = rollout_losses.pop("foot_slide_loss")
-        rollout_loss_weighted = rollout_frame_loss * self.rollout_loss_weight
-        joint_vel_loss_weighted = joint_vel_loss * self.rollout_joint_vel_loss_weight
-        rotation_vel_loss_weighted = rotation_vel_loss * self.rollout_rot_vel_loss_weight
-        foot_slide_loss_weighted = foot_slide_loss * float(self.diffusion.foot_slide_loss_weight)
-        losses["base_loss"] = base_loss
-        losses["rollout_loss"] = rollout_frame_loss
-        losses["rollout_loss_weighted"] = rollout_loss_weighted
-        losses["rollout_joint_vel_loss"] = joint_vel_loss
-        losses["rollout_joint_vel_loss_weighted"] = joint_vel_loss_weighted
-        losses["rollout_rotation_vel_loss"] = rotation_vel_loss
-        losses["rollout_rotation_vel_loss_weighted"] = rotation_vel_loss_weighted
-        losses["rollout_foot_slide_loss"] = foot_slide_loss
-        losses["rollout_foot_slide_loss_weighted"] = foot_slide_loss_weighted
-        losses["loss"] = (
-            base_loss
-            + rollout_loss_weighted
-            + joint_vel_loss_weighted
-            + rotation_vel_loss_weighted
-            + foot_slide_loss_weighted
-        )
-        for key, value in rollout_losses.items():
-            losses[f"rollout_{key}"] = value
-        return losses
-
-    def should_compute_rollout_loss(self, batch: dict) -> bool:
-        rollout_weight_enabled = (
-            self.rollout_loss_weight > 0.0
-            or self.rollout_joint_vel_loss_weight > 0.0
-            or self.rollout_rot_vel_loss_weight > 0.0
-            or float(self.diffusion.foot_slide_loss_weight) > 0.0
-        )
-        if self.rollout_steps <= 1 or not rollout_weight_enabled:
-            return False
-        if not self.model.training or not torch.is_grad_enabled():
-            return False
-        rollout = batch.get("rollout")
-        if rollout is None:
-            return False
-        if not isinstance(rollout, (list, tuple)) or len(rollout) < self.rollout_steps - 1:
-            raise ValueError(f"batch rollout 不足以提供 rollout_steps={self.rollout_steps}。")
-        return True
-
-    def compute_rollout_losses(
-        self,
-        batch: dict,
-        pred_xstart: torch.Tensor,
-        timesteps: torch.Tensor,
-    ) -> dict:
-        if pred_xstart is None:
-            raise ValueError("rollout loss 需要第一步 training_losses 返回 pred_xstart。")
-
-        predictions = [pred_xstart]
-        step_batches = [batch]
-        rollout_terms: list[dict] = []
-        pose_history = batch["pose_history"]
-        current_batch = batch
-
-        for rollout_index, materialized_batch in enumerate(
-            batch["rollout"][: self.rollout_steps - 1],
-            start=1,
-        ):
-            next_batch = dict(materialized_batch)
-            next_sample = next_batch["x"]
-            if next_sample.shape != batch["x"].shape:
-                raise ValueError(
-                    f"rollout[{rollout_index - 1}]['x'] 应为 {tuple(batch['x'].shape)}，"
-                    f"实际为 {tuple(next_sample.shape)}"
-                )
-
-            # 持续滚动同一份历史，防止第三步以后较早的模型预测被离线 GT 历史重新覆盖。
-            pose_history = self.build_next_rollout_pose_history(
-                pose_history=pose_history,
-                source_head_yaw_world=current_batch["history_head_yaw_world"],
-                destination_head_yaw_world=next_batch["history_head_yaw_world"],
-                pred_xstart=predictions[-1],
-            )
-            # reference 变换会改变归一化 padding 的数值；下一步送入模型前必须再次严格清零。
-            pose_history = zero_invalid_pose_history(
-                pose_history,
-                next_batch["valid_frame_mask"],
-            )
-            next_batch["pose_history"] = pose_history
-
-            feature_w = self._feature_weights_for_batch(next_sample.shape[0])
-            next_terms = self.diffusion.training_losses(
-                self.model,
-                next_sample,
-                timesteps,
-                model_kwargs=self.mask_manager(next_batch, next_sample),
-                feature_w=feature_w,
-                snr_gamma=self.snr_gamma,
-                use_l1=self.use_l1,
-                return_pred_xstart=True,
-            )
-            next_prediction = next_terms.pop("pred_xstart", None)
-            next_terms.pop("raw_pred_xstart", None)
-            next_terms.pop("deployed_pred_xstart", None)
-            if next_prediction is None:
-                raise ValueError(f"rollout step {rollout_index} 没有返回 pred_xstart。")
-            predictions.append(next_prediction)
-            step_batches.append(next_batch)
-            rollout_terms.append(next_terms)
-            current_batch = next_batch
-
-        if not rollout_terms:
-            raise ValueError("rollout_steps>1 时至少应产生一个后续预测。")
-
-        result: dict[str, torch.Tensor] = {
-            "loss": torch.stack([terms["loss"] for terms in rollout_terms], dim=0).mean(dim=0),
-        }
-        for step_index, terms in enumerate(rollout_terms, start=1):
-            result[f"step_{step_index}_loss"] = terms["loss"]
-
-        common_keys = set.intersection(*(set(terms.keys()) for terms in rollout_terms))
-        for key in sorted(common_keys - {"loss"}):
-            values = [terms[key] for terms in rollout_terms]
-            if all(torch.is_tensor(value) and value.shape == values[0].shape for value in values):
-                result[key] = torch.stack(values, dim=0).mean(dim=0)
-
-        result.update(
-            compute_rollout_temporal_losses(
-                predictions=predictions,
-                step_batches=step_batches,
-                normalizer_mean=self.normalizer_mean,
-                normalizer_std=self.normalizer_std,
-            )
-        )
-        return result
-
-    def build_next_rollout_pose_history(
-        self,
-        pose_history: torch.Tensor,
-        source_head_yaw_world: torch.Tensor,
-        destination_head_yaw_world: torch.Tensor,
-        pred_xstart: torch.Tensor,
-    ) -> torch.Tensor:
-        """把当前历史整体换到下一帧参考系，并追加当前模型预测。"""
-
-        return advance_rollout_pose_history_torch(
-            pose_history=pose_history,
-            prediction=pred_xstart,
-            source_head_yaw_world=source_head_yaw_world,
-            destination_head_yaw_world=destination_head_yaw_world,
-            normalizer_mean=self.normalizer_mean,
-            normalizer_std=self.normalizer_std,
-            detach_prediction=self.detach_rollout_history,
-        )
 
     def _anneal_lr(self):
         if self.lr_anneal_steps <= 0:
@@ -589,53 +424,51 @@ class TrainLoop:
         return self.feature_w.to(self.device)[None].repeat(batch_size, 1)
 
     def mask_manager(self, batch, sample):
-        """构造新动态观测条件；扩散状态始终对完整 144D 加噪。"""
-
-        batch_size = sample.shape[0]
-        valid_frame_mask = batch.get("valid_frame_mask")
-        if valid_frame_mask is None:
-            valid_frame_mask = torch.ones(batch_size, 60, dtype=torch.bool, device=sample.device)
-        valid_frame_mask = valid_frame_mask.bool()
-        if valid_frame_mask.shape != (batch_size, 60):
-            raise ValueError(f"valid_frame_mask 应为 [B,60]，实际为 {tuple(valid_frame_mask.shape)}")
-
+        window_valid_mask = batch["window_valid_mask"].bool()
+        if tuple(window_valid_mask.shape) != tuple(sample.shape[:2]):
+            raise ValueError("window_valid_mask 必须为 [B,11]。")
+        history_observation = batch["history_pose_observation"]
+        if self.model.training and torch.is_grad_enabled():
+            # SO(3) 扰动始终使用 float32，避免 AMP 降低小角度指数映射精度。
+            with autocast(device_type=self.device.type, enabled=False):
+                history_observation = corrupt_history_pose_observation(
+                    history_pose_clean=history_observation.float(),
+                    history_region_confidence=batch["history_region_confidence"].float(),
+                    history_valid_mask=window_valid_mask[:, :-1],
+                    pose_mean=self.pose_mean,
+                    pose_scale=self.pose_scale,
+                    config=self.history_noise_config,
+                )
+        conditions = {
+            "history_pose_observation": history_observation,
+            "tracker_window": batch["tracker_window"],
+            "head_path_window": batch["head_path_window"],
+            "history_region_confidence": batch["history_region_confidence"],
+            "window_valid_mask": window_valid_mask,
+            "frame_offsets": batch["frame_offsets"],
+        }
         y = {
-            "pose_history": batch["pose_history"],
-            "tracker_history": batch["tracker_history"],
-            "current_tracker": batch["current_tracker"],
+            **conditions,
             "current_tracker_raw": batch["current_tracker_raw"],
-            "trajectory_history": batch["trajectory_history"],
-            "current_trajectory": batch["current_trajectory"],
-            "valid_frame_mask": valid_frame_mask,
             "hard_rotation_state": batch["hard_rotation_state"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
-            "prev_joints_head_ref": batch["prev_joints_head_ref"],
-            "current_tracker_pos_head_ref": batch["current_tracker_pos_head_ref"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
-            "joint_rest_local_rotations_6d": batch["joint_rest_local_rotations_6d"],
-            "configured": batch["configured"],
-            "measured_valid": batch["measured_valid"],
-            "d_off": batch["d_off"],
-            "d_on": batch["d_on"],
             "target_root_position_head_ref": batch["target_root_position_head_ref"],
             "target_root_yaw_world": batch["target_root_yaw_world"],
             "current_head_yaw_world": batch["current_head_yaw_world"],
             "future_leg_target": batch["future_leg_target"],
             "contact_target": batch["contact_target"],
         }
-        if self.normalizer_mean is not None and self.normalizer_std is not None:
-            y["normalizer_mean"] = self.normalizer_mean.to(device=sample.device, dtype=sample.dtype)
-            y["normalizer_std"] = self.normalizer_std.to(device=sample.device, dtype=sample.dtype)
+        if self.pose_mean is not None and self.pose_scale is not None:
+            y["pose_mean"] = self.pose_mean.to(
+                device=sample.device, dtype=sample.dtype
+            )
+            y["pose_scale"] = self.pose_scale.to(
+                device=sample.device, dtype=sample.dtype
+            )
+        # 模型、Loss 和 hard projection 共用同一个 y，避免条件在两层字典中静默分叉。
+        return {"y": y}
 
-        return {
-            "pose_history": batch["pose_history"],
-            "tracker_history": batch["tracker_history"],
-            "current_tracker": batch["current_tracker"],
-            "trajectory_history": batch["trajectory_history"],
-            "current_trajectory": batch["current_trajectory"],
-            "valid_frame_mask": valid_frame_mask,
-            "y": y,
-        }
 
     # endregion
 
@@ -724,6 +557,15 @@ def move_batch_to_device(batch, device):
     if isinstance(batch, tuple):
         return tuple(move_batch_to_device(value, device) for value in batch)
     return batch
+
+
+def move_training_batch_to_device(batch: dict, device: torch.device) -> dict:
+    """只搬运训练和 loss 实际读取的张量，重建专用字段继续留在 CPU。"""
+
+    return {
+        key: move_batch_to_device(value, device) if key in TRAIN_DEVICE_FIELDS else value
+        for key, value in batch.items()
+    }
 
 
 def parse_resume_step_from_filename(filename):

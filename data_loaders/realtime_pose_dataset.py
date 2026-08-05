@@ -13,14 +13,21 @@ from data_loaders.manifest_utils import filter_entries_by_folder_path
 from data_loaders.realtime_pose_geometry import assemble_tracker_features_np
 from data_loaders.realtime_pose_task_store import ShardReader, read_store_metadata
 from data_loaders.sensor_masking import (
+    REALTIME_POSE_FRAME_OFFSETS,
+    REALTIME_POSE_HISTORY_ANCHOR_INDICES,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_WINDOW_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_PATTERN_CATEGORIES,
     validate_realtime_seq_len,
 )
-from data_loaders.tracker_reliability import compute_hard_rotation_state_np
+from data_loaders.tracker_reliability import (
+    compute_hard_rotation_state_np,
+    compute_region_coverage_np,
+    compute_tracker_reliability_np,
+)
 from data_loaders.tracker_timeline import compute_tracker_durations, stable_context_seed
 from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self
@@ -30,23 +37,11 @@ from utils.run_dirs import resolve_latest_or_self
 class TaskRequest:
     task_index: int
     config_index: int
-    rollout_steps: int
     history_length: int = REALTIME_POSE_HISTORY_LENGTH
 
 
-@dataclass(frozen=True)
-class _RequestTrackerTimeline:
-    """一个请求从基础历史到 rollout 末尾的 Tracker 状态线，形状均为 `[60+K,6]`。"""
-
-    configured: np.ndarray
-    measured_valid: np.ndarray
-    d_off: np.ndarray
-    d_on: np.ndarray
-    hard_rotation_state: np.ndarray
-
-
 class RealtimePoseTaskDataset(Dataset):
-    """按请求从 mmap shard 读取一个基础窗口及实际需要的 rollout step。"""
+    """从 mmap task store 读取同步的 10 帧历史和 1 帧当前目标。"""
 
     def __init__(
         self,
@@ -64,12 +59,11 @@ class RealtimePoseTaskDataset(Dataset):
         self.metadata = read_store_metadata(self.split_dir)
         if int(self.metadata.get("tracker_feature_dim", -1)) != TRACKER_FEATURE_DIM:
             raise ValueError(
-                f"task store Tracker 维度不是当前要求的 {TRACKER_FEATURE_DIM}；旧 task 不可复用。"
+                f"task store 的 Tracker 特征维度必须为 {TRACKER_FEATURE_DIM}，请重建 task。"
             )
         if tuple(self.metadata.get("config_names", ())) != TRACKER_PATTERN_CATEGORIES:
-            raise ValueError("task store 五类场景名称与当前契约不一致；请重新生成 task。")
+            raise ValueError("task store 的 Tracker 场景配置与当前代码不兼容，请重建 task。")
         self.plan_hash = str(self.metadata["generation_plan_hash"])
-        self.max_rollout_steps = int(self.metadata["max_rollout_steps"])
         self.shards = list(self.metadata["shards"])
         self.normalizer = create_normalizer(normalizer_dir, bool(normalize_input))
         if self.normalizer is not None:
@@ -83,10 +77,14 @@ class RealtimePoseTaskDataset(Dataset):
         self.sources = read_jsonl(self.split_dir / "sources.jsonl")
         self.sources.sort(key=lambda value: int(value["source_index"]))
         self.joint_offsets_parent = np.load(
-            self.split_dir / "source_joint_offsets_parent.npy", mmap_mode="r", allow_pickle=False
+            self.split_dir / "source_joint_offsets_parent.npy",
+            mmap_mode="r",
+            allow_pickle=False,
         )
         self.joint_rest_local_rotations_6d = np.load(
-            self.split_dir / "source_joint_rest_local_rotations_6d.npy", mmap_mode="r", allow_pickle=False
+            self.split_dir / "source_joint_rest_local_rotations_6d.npy",
+            mmap_mode="r",
+            allow_pickle=False,
         )
         allowed_sources = set(range(len(self.sources)))
         if folder_path:
@@ -134,274 +132,187 @@ class RealtimePoseTaskDataset(Dataset):
         if isinstance(request, TaskRequest):
             task_index = int(request.task_index)
             config_index = int(request.config_index)
-            rollout_steps = int(request.rollout_steps)
             initial_history_length = int(request.history_length)
         else:
             task_index = int(request)
             config_index = 0
-            rollout_steps = 1
             initial_history_length = REALTIME_POSE_HISTORY_LENGTH
-        if not 0 <= config_index < 5:
-            raise IndexError(f"config_index 必须在 [0,4]，实际为 {config_index}")
-        if not 1 <= rollout_steps <= self.max_rollout_steps:
-            raise ValueError(
-                f"rollout_steps 必须在 [1,{self.max_rollout_steps}]，实际为 {rollout_steps}"
-            )
+        if not 0 <= config_index < len(TRACKER_PATTERN_CATEGORIES):
+            raise IndexError(f"config_index 必须位于 [0,4]，得到 {config_index}。")
         if not 0 <= initial_history_length <= REALTIME_POSE_HISTORY_LENGTH:
             raise ValueError(
-                f"history_length 必须在 [0,{REALTIME_POSE_HISTORY_LENGTH}]，"
-                f"实际为 {initial_history_length}"
+                f"history_length 必须位于 [0,{REALTIME_POSE_HISTORY_LENGTH}]，"
+                f"得到 {initial_history_length}。"
             )
-
         shard_index, row_index = self.locations[task_index]
-        shard = self.reader.get(shard_index)
-        tracker_timeline = self._build_request_tracker_timeline(
-            shard=shard,
+        return self._window_item(
+            shard=self.reader.get(shard_index),
             row_index=row_index,
             config_index=config_index,
-            rollout_steps=rollout_steps,
             initial_history_length=initial_history_length,
         )
-        base = self._step_to_item(
-            shard,
-            row_index,
-            config_index,
-            step=0,
-            include_history=True,
-            initial_history_length=initial_history_length,
-            tracker_timeline=tracker_timeline,
-        )
-        if rollout_steps > 1:
-            base["rollout"] = [
-                self._step_to_item(
-                    shard,
-                    row_index,
-                    config_index,
-                    step=step,
-                    include_history=False,
-                    initial_history_length=initial_history_length,
-                    tracker_timeline=tracker_timeline,
-                )
-                for step in range(1, rollout_steps)
-            ]
-        return base
 
-    def _build_request_tracker_timeline(
+    def _window_item(
         self,
         shard: dict[str, np.ndarray],
         row_index: int,
         config_index: int,
-        rollout_steps: int,
         initial_history_length: int,
-    ) -> _RequestTrackerTimeline:
-        """按虚拟会话起点一次性重放状态，避免 rollout 每一步独立重置 duration。"""
+    ) -> dict[str, Any]:
+        """先重放 61 帧密集 Tracker 状态，再同步抽取 10+1 个锚点。"""
 
-        state_length = REALTIME_POSE_HISTORY_LENGTH + int(rollout_steps)
-        original = {
-            "configured": np.asarray(
-                shard["configured"][row_index, config_index, :state_length], dtype=bool
-            ).copy(),
-            "measured_valid": np.asarray(
-                shard["measured_valid"][row_index, config_index, :state_length], dtype=bool
-            ).copy(),
-            "d_off": np.asarray(
-                shard["d_off"][row_index, config_index, :state_length], dtype=np.uint8
-            ).copy(),
-            "d_on": np.asarray(
-                shard["d_on"][row_index, config_index, :state_length], dtype=np.uint8
-            ).copy(),
-            "hard_rotation_state": np.asarray(
-                shard["hard_rotation_state"][row_index, config_index, :state_length], dtype=bool
-            ).copy(),
-        }
-        _validate_tracker_state_features(**original)
-        if initial_history_length == REALTIME_POSE_HISTORY_LENGTH:
-            return _RequestTrackerTimeline(**original)
+        configured_source = np.asarray(
+            shard["configured"][row_index, config_index], dtype=bool
+        ).copy()
+        measured_source = np.asarray(
+            shard["measured_valid"][row_index, config_index], dtype=bool
+        ).copy()
+        expected_dense_shape = (REALTIME_POSE_SEQ_LEN, TRACKER_COUNT)
+        if configured_source.shape != expected_dense_shape:
+            raise ValueError(f"configured 必须是 {expected_dense_shape}，得到 {configured_source.shape}。")
 
+        # 冷启动发生在虚拟会话起点，持续时间和 hard state 必须从该点重新累计。
         session_start = REALTIME_POSE_HISTORY_LENGTH - int(initial_history_length)
-        configured_visible = original["configured"][session_start:]
-        measured_visible = original["measured_valid"][session_start:]
+        configured_dense = np.zeros_like(configured_source)
+        measured_dense = np.zeros_like(measured_source)
+        d_off_dense = np.zeros_like(configured_source, dtype=np.uint8)
+        d_on_dense = np.zeros_like(configured_source, dtype=np.uint8)
+        hard_dense = np.zeros_like(configured_source)
+        configured_visible = configured_source[session_start:]
+        measured_visible = measured_source[session_start:]
         d_off_visible, d_on_visible = compute_tracker_durations(
-            configured_visible,
-            measured_visible,
+            configured_visible, measured_visible
         )
         hard_visible = compute_hard_rotation_state_np(
-            configured_visible,
-            measured_visible,
-            d_on_visible,
+            configured_visible, measured_visible, d_on_visible
         )
+        configured_dense[session_start:] = configured_visible
+        measured_dense[session_start:] = measured_visible
+        d_off_dense[session_start:] = d_off_visible
+        d_on_dense[session_start:] = d_on_visible
+        hard_dense[session_start:] = hard_visible
 
-        # 补零区域表示会话尚未开始，不能保留离线 source 在这些帧积累的可靠度状态。
-        configured = np.zeros_like(original["configured"], dtype=bool)
-        measured_valid = np.zeros_like(original["measured_valid"], dtype=bool)
-        d_off = np.zeros_like(original["d_off"], dtype=np.uint8)
-        d_on = np.zeros_like(original["d_on"], dtype=np.uint8)
-        hard_rotation_state = np.zeros_like(original["hard_rotation_state"], dtype=bool)
-        configured[session_start:] = configured_visible
-        measured_valid[session_start:] = measured_visible
-        d_off[session_start:] = d_off_visible
-        d_on[session_start:] = d_on_visible
-        hard_rotation_state[session_start:] = hard_visible
-        return _RequestTrackerTimeline(
-            configured=configured,
-            measured_valid=measured_valid,
-            d_off=d_off,
-            d_on=d_on,
-            hard_rotation_state=hard_rotation_state,
+        dense_indices = np.asarray(
+            (*REALTIME_POSE_HISTORY_ANCHOR_INDICES, REALTIME_POSE_HISTORY_LENGTH),
+            dtype=np.int64,
         )
+        window_valid = dense_indices >= session_start
+        configured = configured_dense[dense_indices]
+        measured_valid = measured_dense[dense_indices]
+        d_off = d_off_dense[dense_indices]
+        d_on = d_on_dense[dense_indices]
+        hard_rotation = hard_dense[dense_indices]
+
+        tracker_continuous = np.asarray(
+            shard["tracker_window_continuous"][row_index], dtype=np.float32
+        ).copy()
+        tracker_raw = np.zeros(
+            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+            dtype=np.float32,
+        )
+        tracker_raw[window_valid] = assemble_tracker_features_np(
+            tracker_continuous[window_valid],
+            configured[window_valid],
+            measured_valid[window_valid],
+            d_off[window_valid],
+            d_on[window_valid],
+        )
+        pose_window_raw = np.asarray(
+            shard["pose_window_clean"][row_index], dtype=np.float32
+        ).copy()
+        head_path_raw = np.asarray(
+            shard["head_path_window"][row_index], dtype=np.float32
+        ).copy()
+        if self.normalizer is None:
+            pose_window = pose_window_raw
+            tracker_window = tracker_raw
+            head_path_window = head_path_raw
+        else:
+            pose_window = self.normalizer.normalize_pose(pose_window_raw)
+            tracker_window = self.normalizer.normalize_tracker(tracker_raw)
+            head_path_window = self.normalizer.normalize_head_path(head_path_raw)
+
+        # 归一化后再清零，确保 padding 在模型输入中仍是字面零。
+        pose_window[~window_valid] = 0.0
+        tracker_window[~window_valid] = 0.0
+        head_path_window[~window_valid] = 0.0
+        kappa_pos, kappa_rot = compute_tracker_reliability_np(
+            configured[:-1], measured_valid[:-1], d_on[:-1]
+        )
+        rho_pos, rho_rot = compute_region_coverage_np(kappa_pos, kappa_rot)
+        history_confidence = 0.5 * (rho_pos + rho_rot)
+        history_confidence *= window_valid[:-1, None]
+
+        source_index = int(shard["source_index"][row_index])
+        source = self.sources[source_index]
+        start_frame = int(shard["start_frame"][row_index])
+        current_tracker_raw = tracker_raw[-1]
+        result: dict[str, Any] = {
+            "x": torch.from_numpy(pose_window).float(),
+            "history_pose_observation": torch.from_numpy(pose_window[:-1].copy()).float(),
+            "tracker_window": torch.from_numpy(tracker_window).float(),
+            "head_path_window": torch.from_numpy(head_path_window).float(),
+            "history_region_confidence": torch.from_numpy(history_confidence).float(),
+            "window_valid_mask": torch.from_numpy(window_valid).bool(),
+            "frame_offsets": torch.tensor(REALTIME_POSE_FRAME_OFFSETS, dtype=torch.long),
+            "history_length": torch.tensor(initial_history_length, dtype=torch.long),
+            "configured": torch.from_numpy(configured).bool(),
+            "measured_valid": torch.from_numpy(measured_valid).bool(),
+            "d_off": torch.from_numpy(d_off.astype(np.int64)).long(),
+            "d_on": torch.from_numpy(d_on.astype(np.int64)).long(),
+            "hard_rotation_state": torch.from_numpy(hard_rotation[-1]).bool(),
+            "current_tracker_raw": torch.from_numpy(current_tracker_raw).float(),
+            "target_joints_head_ref": torch.from_numpy(
+                np.asarray(shard["target_joints_head_ref"][row_index], dtype=np.float32).copy()
+            ).float(),
+            "target_root_position_head_ref": torch.from_numpy(
+                np.asarray(
+                    shard["target_root_position_head_ref"][row_index], dtype=np.float32
+                ).copy()
+            ).float(),
+            "target_root_yaw_world": torch.tensor(
+                float(shard["target_root_yaw_world"][row_index]), dtype=torch.float32
+            ),
+            "target_hip_height": torch.tensor(
+                float(shard["target_hip_height"][row_index]), dtype=torch.float32
+            ),
+            "current_head_yaw_world": torch.tensor(
+                float(shard["current_head_yaw_world"][row_index]), dtype=torch.float32
+            ),
+            "current_head_position_world": torch.from_numpy(
+                np.asarray(
+                    shard["current_head_position_world"][row_index], dtype=np.float32
+                ).copy()
+            ).float(),
+            "floor_y": torch.tensor(float(shard["floor_y"][row_index]), dtype=torch.float32),
+            "future_leg_target": torch.from_numpy(
+                np.asarray(shard["future_leg_target"][row_index], dtype=np.float32).copy()
+            ).float(),
+            "contact_target": torch.from_numpy(
+                np.asarray(shard["contact_target"][row_index], dtype=np.float32).copy()
+            ).float(),
+            "joint_offsets_parent": torch.from_numpy(
+                np.asarray(self.joint_offsets_parent[source_index], dtype=np.float32).copy()
+            ).float(),
+            "joint_rest_local_rotations_6d": torch.from_numpy(
+                np.asarray(
+                    self.joint_rest_local_rotations_6d[source_index], dtype=np.float32
+                ).copy()
+            ).float(),
+            "scenario_id": torch.tensor(config_index, dtype=torch.long),
+            "scenario": str(self.metadata["config_names"][config_index]),
+            "start_frame": torch.tensor(start_frame, dtype=torch.long),
+            "task_id": self.task_id_from_values(source, start_frame),
+            "source_path": str(source["source_path"]),
+        }
+        return result
 
     def task_id_at(self, task_index: int) -> str:
         shard_index, row_index = self.locations[int(task_index)]
         shard = self.reader.get(shard_index)
         source = self.sources[int(shard["source_index"][row_index])]
         start_frame = int(shard["start_frame"][row_index])
-        from data_loaders.generate_realtime_pose_tasks import make_task_id
-
-        return make_task_id(self.split, str(source["source_id"]), start_frame)
-
-    def _step_to_item(
-        self,
-        shard: dict[str, np.ndarray],
-        row_index: int,
-        config_index: int,
-        step: int,
-        include_history: bool,
-        initial_history_length: int,
-        tracker_timeline: _RequestTrackerTimeline,
-    ) -> dict[str, Any]:
-        source_index = int(shard["source_index"][row_index])
-        source = self.sources[source_index]
-        state_slice = slice(step, step + REALTIME_POSE_SEQ_LEN)
-        configured = tracker_timeline.configured[state_slice].copy()
-        measured_valid = tracker_timeline.measured_valid[state_slice].copy()
-        d_off = tracker_timeline.d_off[state_slice].copy()
-        d_on = tracker_timeline.d_on[state_slice].copy()
-        hard_rotation = tracker_timeline.hard_rotation_state[state_slice].copy()
-        history_length = min(
-            REALTIME_POSE_HISTORY_LENGTH,
-            int(initial_history_length) + int(step),
-        )
-        invalid_history_length = REALTIME_POSE_HISTORY_LENGTH - history_length
-
-        tracker_history_raw = np.zeros(
-            (REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
-            dtype=np.float32,
-        )
-        if history_length:
-            tracker_history_raw[-history_length:] = assemble_tracker_features_np(
-                np.asarray(
-                    shard["tracker_history_continuous"][row_index, step, -history_length:],
-                    dtype=np.float32,
-                ).copy(),
-                configured[invalid_history_length:-1],
-                measured_valid[invalid_history_length:-1],
-                d_off[invalid_history_length:-1],
-                d_on[invalid_history_length:-1],
-            )
-        current_tracker_raw = assemble_tracker_features_np(
-            np.asarray(shard["current_tracker_continuous"][row_index, step], dtype=np.float32)[None].copy(),
-            configured[-1:], measured_valid[-1:], d_off[-1:], d_on[-1:],
-        )[0]
-
-        current_target_raw = np.asarray(shard["current_target"][row_index, step], dtype=np.float32).copy()
-        trajectory_history = np.asarray(shard["trajectory_history"][row_index, step], dtype=np.float32).copy()
-        current_trajectory = np.asarray(shard["current_trajectory"][row_index, step], dtype=np.float32).copy()
-        session_start_in_history = (
-            REALTIME_POSE_HISTORY_LENGTH - int(initial_history_length) - int(step)
-        )
-        if 0 <= session_start_in_history < REALTIME_POSE_HISTORY_LENGTH:
-            trajectory_history[session_start_in_history, :2] = 0.0
-            trajectory_history[session_start_in_history, 3:] = (0.0, 1.0)
-        elif initial_history_length == 0 and step == 0:
-            current_trajectory[0, :2] = 0.0
-            current_trajectory[0, 3:] = (0.0, 1.0)
-        if self.normalizer is None:
-            current_target = current_target_raw
-            tracker_history = tracker_history_raw
-            current_tracker = current_tracker_raw
-        else:
-            current_target = self.normalizer.normalize_pose(current_target_raw)
-            tracker_history = self.normalizer.normalize_tracker(tracker_history_raw)
-            current_tracker = self.normalizer.normalize_tracker(current_tracker_raw)
-            trajectory_history[:, 2] = self.normalizer.normalize_head_height(trajectory_history[:, 2])
-            current_trajectory[:, 2] = self.normalizer.normalize_head_height(current_trajectory[:, 2])
-        # padding 是模型输入空间中的字面量零；不能把零高度再送入 normalizer。
-        trajectory_history[:invalid_history_length] = 0.0
-        start_frame = int(shard["start_frame"][row_index]) + int(step)
-        task_id = self.task_id_from_values(source, int(shard["start_frame"][row_index]))
-        valid_frame_mask = np.zeros(REALTIME_POSE_HISTORY_LENGTH, dtype=bool)
-        if history_length:
-            valid_frame_mask[-history_length:] = True
-        item: dict[str, Any] = {
-            "x": torch.from_numpy(current_target).float(),
-            "current_target": torch.from_numpy(current_target).float(),
-            "tracker_history": torch.from_numpy(tracker_history).float(),
-            "current_tracker": torch.from_numpy(current_tracker).float(),
-            "current_tracker_raw": torch.from_numpy(current_tracker_raw).float(),
-            "trajectory_history": torch.from_numpy(trajectory_history).float(),
-            "current_trajectory": torch.from_numpy(current_trajectory).float(),
-            "valid_frame_mask": torch.from_numpy(valid_frame_mask).bool(),
-            "history_length": torch.tensor(history_length, dtype=torch.long),
-            "configured": torch.from_numpy(configured).bool(),
-            "measured_valid": torch.from_numpy(measured_valid).bool(),
-            "d_off": torch.from_numpy(d_off.astype(np.int64)).long(),
-            "d_on": torch.from_numpy(d_on.astype(np.int64)).long(),
-            "hard_rotation_state": torch.from_numpy(hard_rotation[-1]).bool(),
-            "current_tracker_pos_head_ref": torch.from_numpy(current_tracker_raw[:, :3]).float(),
-            "current_tracker_rot_head_ref_6d": torch.from_numpy(current_tracker_raw[:, 3:9]).float(),
-            "target_joints_head_ref": torch.from_numpy(
-                np.asarray(shard["target_joints_head_ref"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "prev_joints_head_ref": torch.from_numpy(
-                np.asarray(shard["prev_joints_head_ref"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "target_root_position_head_ref": torch.from_numpy(
-                np.asarray(shard["target_root_position_head_ref"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "target_root_yaw_world": torch.tensor(
-                float(shard["target_root_yaw_world"][row_index, step]), dtype=torch.float32
-            ),
-            "target_hip_height": torch.tensor(
-                float(shard["target_hip_height"][row_index, step]), dtype=torch.float32
-            ),
-            "history_head_yaw_world": torch.tensor(
-                float(shard["history_head_yaw_world"][row_index, step]), dtype=torch.float32
-            ),
-            "current_head_yaw_world": torch.tensor(
-                float(shard["current_head_yaw_world"][row_index, step]), dtype=torch.float32
-            ),
-            "current_head_position_world": torch.from_numpy(
-                np.asarray(shard["current_head_position_world"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "floor_y": torch.tensor(float(shard["floor_y"][row_index, step]), dtype=torch.float32),
-            "future_leg_target": torch.from_numpy(
-                np.asarray(shard["future_leg_target"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "contact_target": torch.from_numpy(
-                np.asarray(shard["contact_target"][row_index, step], dtype=np.float32).copy()
-            ).float(),
-            "joint_offsets_parent": torch.from_numpy(
-                np.asarray(self.joint_offsets_parent[source_index], dtype=np.float32).copy()
-            ).float(),
-            "joint_rest_local_rotations_6d": torch.from_numpy(
-                np.asarray(self.joint_rest_local_rotations_6d[source_index], dtype=np.float32).copy()
-            ).float(),
-            "scenario_id": torch.tensor(config_index, dtype=torch.long),
-            "scenario": str(self.metadata["config_names"][config_index]),
-            "start_frame": torch.tensor(start_frame, dtype=torch.long),
-            "task_id": task_id,
-            "source_path": str(source["source_path"]),
-        }
-        if include_history:
-            pose_history_raw = np.asarray(shard["pose_history"][row_index], dtype=np.float32).copy()
-            pose_history = (
-                pose_history_raw
-                if self.normalizer is None
-                else self.normalizer.normalize_pose(pose_history_raw)
-            )
-            pose_history[:invalid_history_length] = 0.0
-            item["pose_history"] = torch.from_numpy(pose_history).float()
-        return item
+        return self.task_id_from_values(source, start_frame)
 
     def task_id_from_values(self, source: dict[str, Any], start_frame: int) -> str:
         from data_loaders.generate_realtime_pose_tasks import make_task_id
@@ -410,7 +321,7 @@ class RealtimePoseTaskDataset(Dataset):
 
 
 class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
-    """先打乱 shard/窗口，再为每个 batch 决定统一 rollout 长度。"""
+    """按 shard 打乱任务，并确定每个样本的场景与冷启动历史长度。"""
 
     def __init__(
         self,
@@ -418,8 +329,6 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         batch_size: int,
         seed: int,
         scenario_weights: list[float] | tuple[float, ...],
-        rollout_steps: int,
-        rollout_prob: float,
         cold_start_prob: float,
         shuffle: bool,
         drop_last: bool,
@@ -427,8 +336,6 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.seed = int(seed)
-        self.rollout_steps = int(rollout_steps)
-        self.rollout_prob = float(rollout_prob)
         self.cold_start_prob = float(cold_start_prob)
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
@@ -437,19 +344,19 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         if weights.shape != (5,) or np.any(weights < 0.0) or not np.any(weights > 0.0):
             raise ValueError("scenario_weights 必须是五个非负数，且至少一项大于零。")
         self.scenario_weights = weights / weights.sum()
-        if not 1 <= self.rollout_steps <= dataset.max_rollout_steps:
-            raise ValueError("rollout_steps 超出 task store 可用范围。")
-        if not 0.0 <= self.rollout_prob <= 1.0:
-            raise ValueError("rollout_prob 必须在 [0,1]。")
         if not 0.0 <= self.cold_start_prob <= 1.0:
-            raise ValueError("cold_start_prob 必须在 [0,1]。")
+            raise ValueError("cold_start_prob 必须位于 [0,1]。")
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self) -> Iterator[list[TaskRequest]]:
-        shard_order = [index for index, values in enumerate(self.dataset.indices_by_shard) if values]
-        rng = np.random.Generator(np.random.PCG64(stable_context_seed(self.seed, self.epoch, "shards")))
+        shard_order = [
+            index for index, values in enumerate(self.dataset.indices_by_shard) if values
+        ]
+        rng = np.random.Generator(
+            np.random.PCG64(stable_context_seed(self.seed, self.epoch, "shards"))
+        )
         if self.shuffle:
             rng.shuffle(shard_order)
         ordered_indices: list[int] = []
@@ -457,33 +364,36 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
             values = np.asarray(self.dataset.indices_by_shard[shard_index], dtype=np.int64)
             if self.shuffle:
                 local_rng = np.random.Generator(
-                    np.random.PCG64(stable_context_seed(self.seed, self.epoch, shard_index, "rows"))
+                    np.random.PCG64(
+                        stable_context_seed(self.seed, self.epoch, shard_index, "rows")
+                    )
                 )
                 local_rng.shuffle(values)
             ordered_indices.extend(int(value) for value in values.tolist())
 
-        weight_token = ",".join(f"{value:.17g}" for value in self.scenario_weights.tolist())
-        for batch_index, first in enumerate(range(0, len(ordered_indices), self.batch_size)):
+        weight_token = ",".join(
+            f"{value:.17g}" for value in self.scenario_weights.tolist()
+        )
+        for first in range(0, len(ordered_indices), self.batch_size):
             indices = ordered_indices[first : first + self.batch_size]
             if len(indices) < self.batch_size and self.drop_last:
                 break
-            rollout_rng = np.random.Generator(
-                np.random.PCG64(stable_context_seed(self.seed, self.epoch, batch_index, "rollout"))
-            )
-            use_rollout = self.rollout_steps > 1 and float(rollout_rng.random()) < self.rollout_prob
-            batch_rollout_steps = self.rollout_steps if use_rollout else 1
             requests: list[TaskRequest] = []
             for task_index in indices:
                 task_id = self.dataset.task_id_at(task_index)
                 config_rng = np.random.Generator(
                     np.random.PCG64(
-                        stable_context_seed(task_id, self.epoch, self.seed, weight_token, "scenario")
+                        stable_context_seed(
+                            task_id, self.epoch, self.seed, weight_token, "scenario"
+                        )
                     )
                 )
                 config_index = int(config_rng.choice(5, p=self.scenario_weights))
                 history_rng = np.random.Generator(
                     np.random.PCG64(
-                        stable_context_seed(task_id, self.epoch, self.seed, "cold_start")
+                        stable_context_seed(
+                            task_id, self.epoch, self.seed, "cold_start"
+                        )
                     )
                 )
                 use_cold_start = float(history_rng.random()) < self.cold_start_prob
@@ -496,7 +406,6 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
                     TaskRequest(
                         task_index=task_index,
                         config_index=config_index,
-                        rollout_steps=batch_rollout_steps,
                         history_length=history_length,
                     )
                 )
@@ -506,29 +415,6 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         if self.drop_last:
             return len(self.dataset) // self.batch_size
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
-
-
-def _validate_tracker_state_features(
-    configured: np.ndarray,
-    measured_valid: np.ndarray,
-    d_off: np.ndarray,
-    d_on: np.ndarray,
-    hard_rotation_state: np.ndarray,
-) -> None:
-    if np.any(measured_valid & ~configured):
-        raise ValueError("measured_valid 必须是 configured 的子集。")
-    if not configured[:, 0].all() or not measured_valid[:, 0].all():
-        raise ValueError("Head 必须始终 configured 且 measured_valid。")
-    if any(value.shape != configured.shape for value in (d_off, d_on, hard_rotation_state)):
-        raise ValueError("Tracker state arrays 必须同为 [T,6]。")
-    if np.any((d_off < 0) | (d_off > 60)) or np.any((d_on < 0) | (d_on > 60)):
-        raise ValueError("d_off/d_on 必须位于 [0,60]。")
-    if not np.all(d_off[~configured | measured_valid] == 0):
-        raise ValueError("未配置或有效 Tracker 的 d_off 必须为零。")
-    if not np.all(d_on[~configured | ~measured_valid] == 0):
-        raise ValueError("未配置或掉线 Tracker 的 d_on 必须为零。")
-    if not hard_rotation_state[:, 0].all():
-        raise ValueError("Head rotation 必须始终 hard。")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:

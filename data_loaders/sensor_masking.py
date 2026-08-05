@@ -16,13 +16,22 @@ REALTIME_POSE_TARGET_START = 60
 REALTIME_POSE_TARGET_LENGTH = 1
 REALTIME_POSE_FPS = 60.0
 
+# 模型仍从 60 帧密集运行时历史中取样，但真正进入时空 DiT 的只有 10 个
+# 同步锚点和 1 个当前帧。固定索引能保证训练、离线采样和在线运行时使用
+# 完全相同的时间语义，避免动态重采样造成不可复现的条件分布。
+REALTIME_POSE_HISTORY_ANCHOR_INDICES = (0, 7, 13, 20, 26, 33, 39, 46, 52, 59)
+REALTIME_POSE_HISTORY_FRAME_OFFSETS = (-60, -53, -47, -40, -34, -27, -21, -14, -8, -1)
+REALTIME_POSE_HISTORY_ANCHOR_COUNT = len(REALTIME_POSE_HISTORY_ANCHOR_INDICES)
+REALTIME_POSE_WINDOW_LENGTH = REALTIME_POSE_HISTORY_ANCHOR_COUNT + 1
+REALTIME_POSE_FRAME_OFFSETS = (*REALTIME_POSE_HISTORY_FRAME_OFFSETS, 0)
+
 SMPL_JOINT_COUNT = 24
 ROTATION_6D_DIM = 6
 BODY_POSE_DIM = SMPL_JOINT_COUNT * ROTATION_6D_DIM  # source local pose: 144
 JOINT_GLOBAL_ROTATION_DIM = BODY_POSE_DIM  # target: 24 个 Head-yaw 参考系全局旋转
 ROOT_DELTA_XZ_DIM = 2  # 仅供读取现有 source；不进入新 task。
 ROOT_HEIGHT_DIM = 1  # 仅供读取现有 source；不进入新 target。
-STATIONARY_PROB_DIM = 5  # 只保留在 source，主任务不读取。
+STATIONARY_PROB_DIM = 5  # 保存在 Source；task 生成时取左右脚通道作为 contact supervision。
 STATIONARY_JOINT_INDICES = (0, 10, 11, 22, 23)
 STATIONARY_JOINT_NAMES = ("pelvis", "left_foot", "right_foot", "left_hand", "right_hand")
 

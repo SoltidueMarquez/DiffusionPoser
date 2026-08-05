@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 
 from data_loaders.body_fbx_kinematics import BodyFbxRest, fk_body_fbx_local_delta_root_y0
 from data_loaders.realtime_pose_geometry import (
-    build_head_trajectory_np,
+    build_head_path_window_np,
     build_pose_target_np,
     build_tracker_measurements_np,
     extract_forward_yaw_np,
@@ -36,10 +36,12 @@ from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.realtime_pose_validation import load_realtime_metadata, validate_realtime_source_arrays
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
+    REALTIME_POSE_HISTORY_ANCHOR_INDICES,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
+    REALTIME_POSE_WINDOW_LENGTH,
     SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
     TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
@@ -96,7 +98,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     task.add_argument("--splits", nargs="+", default=["train"])
     task.add_argument("--seq_len", default=REALTIME_POSE_SEQ_LEN, type=int)
     task.add_argument("--base_windows_per_source", default=20, type=int)
-    task.add_argument("--max_rollout_steps", default=4, type=int)
     task.add_argument("--shard_size", default=4096, type=int)
     task.add_argument("--short_source_policy", default=SHORT_SOURCE_POLICY_SKIP, choices=SHORT_SOURCE_POLICIES)
     task.add_argument("--limit", default=0, type=int)
@@ -121,7 +122,6 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
             output_dir=plan.output_dir,
             plan_hash=plan_hash,
             shard_size=int(args.shard_size),
-            max_rollout_steps=int(args.max_rollout_steps),
         )
     write_latest_pointer(
         root_dir=plan.output_root,
@@ -135,8 +135,6 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
 def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerationPlan:
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"当前任务固定 seq_len={REALTIME_POSE_SEQ_LEN}。")
-    if not 1 <= int(args.max_rollout_steps) <= 4:
-        raise ValueError("max_rollout_steps 必须在 [1,4]。")
     if int(args.base_windows_per_source) < 1:
         raise ValueError("base_windows_per_source 必须大于等于 1。")
     if int(args.shard_size) < 1:
@@ -158,7 +156,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     split_plans: list[SplitTaskPlan] = []
     # future-leg 固定监督当前帧之后 3 帧，因此 source 末尾必须额外留出 3 帧。
-    required_frames = REALTIME_POSE_HISTORY_LENGTH + int(args.max_rollout_steps) + 3
+    required_frames = REALTIME_POSE_HISTORY_LENGTH + 1 + 3
     for raw_split in args.splits:
         split = str(raw_split)
         split_entries = filter_entries_by_split(entries, read_split_keys(split_dir, split))
@@ -180,7 +178,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
             starts = select_window_starts(
                 frame_count=source_frames,
                 count=int(args.base_windows_per_source),
-                max_rollout_steps=int(args.max_rollout_steps),
+                max_rollout_steps=1,
                 global_seed=int(args.seed),
                 split=split,
                 source_id=str(entry["stablemotion_split_key"]),
@@ -200,7 +198,7 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
                         "configs": build_task_config_plan(
                             task_id=task_id,
                             global_seed=int(args.seed),
-                            max_rollout_steps=int(args.max_rollout_steps),
+                            max_rollout_steps=1,
                             source_id=str(entry["stablemotion_split_key"]),
                             start_frame=int(start_frame),
                             source_frame_count=source_frames,
@@ -329,7 +327,6 @@ def materialize_split(
     output_dir: Path,
     plan_hash: str,
     shard_size: int,
-    max_rollout_steps: int,
 ) -> int:
     split_dir = output_dir / split_plan.split
     split_dir.mkdir(parents=True, exist_ok=False)
@@ -341,7 +338,7 @@ def materialize_split(
     recorded_sources: set[str] = set()
 
     shards: list[dict] = []
-    fields = shard_fields(max_rollout_steps)
+    fields = shard_fields()
     for shard_index, first in enumerate(range(0, len(split_plan.tasks), int(shard_size))):
         shard_tasks = split_plan.tasks[first : first + int(shard_size)]
         relative_dir = Path("shards") / f"shard_{shard_index:05d}"
@@ -352,6 +349,9 @@ def materialize_split(
         tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
         tracker_sumsq = np.zeros_like(tracker_sum)
         tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
+        head_path_xz_sum = np.zeros(2, dtype=np.float64)
+        head_path_xz_sumsq = np.zeros(2, dtype=np.float64)
+        head_path_xz_count = 0
         head_height_sum = np.float64(0.0)
         head_height_sumsq = np.float64(0.0)
         head_height_count = 0
@@ -394,24 +394,21 @@ def materialize_split(
                 start_frame=int(task["start_frame"]),
                 source_index=int(task["source_index"]),
                 config_plans=task["configs"],
-                max_rollout_steps=max_rollout_steps,
             )
             writer.write_row(row_index, row)
-            pose = np.concatenate([row["pose_history"], row["current_target"][0:1]], axis=0).astype(np.float64)
+            pose = np.asarray(row["pose_window_clean"], dtype=np.float64)
             pose_sum += pose.sum(axis=0)
             pose_sumsq += np.square(pose).sum(axis=0)
             pose_count += pose.shape[0]
-            tracker = np.concatenate(
-                [row["tracker_history_continuous"][0], row["current_tracker_continuous"][0:1]],
-                axis=0,
-            ).astype(np.float64)
+            tracker = np.asarray(row["tracker_window_continuous"], dtype=np.float64)
             tracker_sum += tracker.sum(axis=0)
             tracker_sumsq += np.square(tracker).sum(axis=0)
             tracker_count += tracker.shape[0]
-            head_height = np.concatenate(
-                [row["trajectory_history"][0, :, 2], row["current_trajectory"][0, :, 2]],
-                axis=0,
-            ).astype(np.float64)
+            head_path = np.asarray(row["head_path_window"], dtype=np.float64)
+            head_path_xz_sum += head_path[:, :2].sum(axis=0)
+            head_path_xz_sumsq += np.square(head_path[:, :2]).sum(axis=0)
+            head_path_xz_count += int(head_path.shape[0])
+            head_height = head_path[:, 2]
             head_height_sum += head_height.sum()
             head_height_sumsq += np.square(head_height).sum()
             head_height_count += int(head_height.shape[0])
@@ -425,6 +422,9 @@ def materialize_split(
             tracker_sum=tracker_sum,
             tracker_sumsq=tracker_sumsq,
             tracker_count=tracker_count,
+            head_path_xz_sum=head_path_xz_sum,
+            head_path_xz_sumsq=head_path_xz_sumsq,
+            head_path_xz_count=np.int64(head_path_xz_count),
             head_height_sum=head_height_sum,
             head_height_sumsq=head_height_sumsq,
             head_height_count=np.int64(head_height_count),
@@ -444,42 +444,42 @@ def materialize_split(
             "split": split_plan.split,
             "sample_count": len(split_plan.tasks),
             "source_count": len(split_plan.sources),
-            "max_rollout_steps": max_rollout_steps,
             "two_point_phase_counts": split_plan.two_point_phase_counts,
             "config_names": list(TRACKER_PATTERN_CATEGORIES),
             "tracker_feature_dim": TRACKER_FEATURE_DIM,
-            "schema_fields": sorted(shard_fields(max_rollout_steps)),
+            "schema_fields": sorted(shard_fields()),
             "shards": shards,
         },
     )
     return len(split_plan.tasks)
 
 
-def shard_fields(max_rollout_steps: int) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
-    steps = int(max_rollout_steps)
+def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
     return {
-        "pose_history": ((REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM), np.dtype("float32")),
-        "current_target": ((steps, REALTIME_POSE_TARGET_DIM), np.dtype("float32")),
-        "tracker_history_continuous": ((steps, REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), np.dtype("float32")),
-        "current_tracker_continuous": ((steps, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), np.dtype("float32")),
-        "trajectory_history": ((steps, REALTIME_POSE_HISTORY_LENGTH, 5), np.dtype("float32")),
-        "current_trajectory": ((steps, 1, 5), np.dtype("float32")),
-        "configured": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "measured_valid": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "d_off": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "d_on": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "hard_rotation_state": ((5, REALTIME_POSE_HISTORY_LENGTH + steps, TRACKER_COUNT), np.dtype("uint8")),
-        "target_joints_head_ref": ((steps, 24, 3), np.dtype("float32")),
-        "prev_joints_head_ref": ((steps, 24, 3), np.dtype("float32")),
-        "target_root_position_head_ref": ((steps, 3), np.dtype("float32")),
-        "target_root_yaw_world": ((steps,), np.dtype("float32")),
-        "target_hip_height": ((steps,), np.dtype("float32")),
-        "history_head_yaw_world": ((steps,), np.dtype("float32")),
-        "current_head_yaw_world": ((steps,), np.dtype("float32")),
-        "current_head_position_world": ((steps, 3), np.dtype("float32")),
-        "floor_y": ((steps,), np.dtype("float32")),
-        "future_leg_target": ((steps, 3, 8, 6), np.dtype("float32")),
-        "contact_target": ((steps, 2), np.dtype("float32")),
+        "pose_window_clean": (
+            (REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
+            np.dtype("float32"),
+        ),
+        "tracker_window_continuous": (
+            (
+                REALTIME_POSE_WINDOW_LENGTH,
+                TRACKER_COUNT,
+                TRACKER_CONTINUOUS_DIM,
+            ),
+            np.dtype("float32"),
+        ),
+        "head_path_window": ((REALTIME_POSE_WINDOW_LENGTH, 5), np.dtype("float32")),
+        "configured": ((5, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT), np.dtype("uint8")),
+        "measured_valid": ((5, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT), np.dtype("uint8")),
+        "target_joints_head_ref": ((24, 3), np.dtype("float32")),
+        "target_root_position_head_ref": ((3,), np.dtype("float32")),
+        "target_root_yaw_world": ((), np.dtype("float32")),
+        "target_hip_height": ((), np.dtype("float32")),
+        "current_head_yaw_world": ((), np.dtype("float32")),
+        "current_head_position_world": ((3,), np.dtype("float32")),
+        "floor_y": ((), np.dtype("float32")),
+        "future_leg_target": ((3, 8, 6), np.dtype("float32")),
+        "contact_target": ((2,), np.dtype("float32")),
         "source_index": ((), np.dtype("int32")),
         "start_frame": ((), np.dtype("int32")),
     }
@@ -492,115 +492,99 @@ def build_task_bundle_row(
     start_frame: int,
     source_index: int,
     config_plans: list[dict],
-    max_rollout_steps: int,
-) -> dict[str, np.ndarray | int]:
-    steps = int(max_rollout_steps)
+) -> dict[str, np.ndarray | int | float]:
+    """物化一个 10 帧历史锚点加当前帧的同步时空窗口。"""
+
     states = materialize_task_configurations(
         config_plans,
-        frame_count=REALTIME_POSE_HISTORY_LENGTH + steps,
+        frame_count=REALTIME_POSE_SEQ_LEN,
         absolute_start_frame=int(start_frame),
     )
-    row: dict[str, np.ndarray | int] = {
-        "pose_history": np.empty((REALTIME_POSE_HISTORY_LENGTH, REALTIME_POSE_TARGET_DIM), dtype=np.float32),
-        "current_target": np.empty((steps, REALTIME_POSE_TARGET_DIM), dtype=np.float32),
-        "tracker_history_continuous": np.empty((steps, REALTIME_POSE_HISTORY_LENGTH, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float32),
-        "current_tracker_continuous": np.empty((steps, TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float32),
-        "trajectory_history": np.empty((steps, REALTIME_POSE_HISTORY_LENGTH, 5), dtype=np.float32),
-        "current_trajectory": np.empty((steps, 1, 5), dtype=np.float32),
+    current_absolute = int(start_frame) + REALTIME_POSE_TARGET_START
+    anchor_absolute = int(start_frame) + np.asarray(
+        REALTIME_POSE_HISTORY_ANCHOR_INDICES, dtype=np.int64
+    )
+    window_absolute = np.concatenate(
+        [anchor_absolute, np.asarray([current_absolute], dtype=np.int64)]
+    )
+
+    current_head_yaw = float(head_yaws[current_absolute])
+    current_head_position = source["tracker_pos_world"][current_absolute, 0].astype(
+        np.float32
+    )
+    floor_y = float(source["root_pos_world"][current_absolute, 1])
+    pose_window = build_pose_target_np(
+        joint_rotations_world[window_absolute],
+        current_head_yaw,
+    )
+    tracker_window = build_tracker_measurements_np(
+        source["tracker_pos_world"][window_absolute],
+        source["tracker_rot_world_6d"][window_absolute],
+        current_head_position,
+        floor_y,
+        current_head_yaw,
+    )
+    head_path_window = build_head_path_window_np(
+        source["tracker_pos_world"][window_absolute, 0],
+        head_yaws[window_absolute],
+        current_head_position,
+        floor_y,
+        current_head_yaw,
+    )
+
+    cos_yaw = np.cos(current_head_yaw)
+    sin_yaw = np.sin(current_head_yaw)
+    yaw_inv = np.asarray(
+        [
+            [cos_yaw, 0.0, -sin_yaw],
+            [0.0, 1.0, 0.0],
+            [sin_yaw, 0.0, cos_yaw],
+        ],
+        dtype=np.float64,
+    )
+    origin = np.asarray(
+        [current_head_position[0], floor_y, current_head_position[2]],
+        dtype=np.float64,
+    )
+    target_joints_head = np.einsum(
+        "ij,aj->ai",
+        yaw_inv,
+        source["joints_world"][current_absolute].astype(np.float64) - origin[None],
+    ).astype(np.float32)
+    root_head = yaw_inv @ (
+        source["root_pos_world"][current_absolute].astype(np.float64) - origin
+    )
+    leg_joint_indices = np.asarray([1, 4, 7, 10, 2, 5, 8, 11], dtype=np.int64)
+    future_pose = build_pose_target_np(
+        joint_rotations_world[current_absolute + 1 : current_absolute + 4],
+        current_head_yaw,
+    ).reshape(3, 24, 6)
+
+    return {
+        "pose_window_clean": pose_window.astype(np.float32),
+        "tracker_window_continuous": tracker_window.astype(np.float32),
+        "head_path_window": head_path_window.astype(np.float32),
         "configured": states.configured.astype(np.uint8),
         "measured_valid": states.measured_valid.astype(np.uint8),
-        "d_off": states.d_off,
-        "d_on": states.d_on,
-        "hard_rotation_state": states.hard_rotation_state.astype(np.uint8),
-        "target_joints_head_ref": np.empty((steps, 24, 3), dtype=np.float32),
-        "prev_joints_head_ref": np.empty((steps, 24, 3), dtype=np.float32),
-        "target_root_position_head_ref": np.empty((steps, 3), dtype=np.float32),
-        "target_root_yaw_world": np.empty(steps, dtype=np.float32),
-        "target_hip_height": np.empty(steps, dtype=np.float32),
-        "history_head_yaw_world": np.empty(steps, dtype=np.float32),
-        "current_head_yaw_world": np.empty(steps, dtype=np.float32),
-        "current_head_position_world": np.empty((steps, 3), dtype=np.float32),
-        "floor_y": np.empty(steps, dtype=np.float32),
-        "future_leg_target": np.empty((steps, 3, 8, 6), dtype=np.float32),
-        "contact_target": np.empty((steps, 2), dtype=np.float32),
+        "target_joints_head_ref": target_joints_head,
+        "target_root_position_head_ref": root_head.astype(np.float32),
+        # 评估比较 pelvis forward 朝向；source root_yaw 是 actor heading，语义不同。
+        "target_root_yaw_world": np.float32(
+            extract_rotation_heading_np(joint_rotations_world[current_absolute, 0])
+        ),
+        "target_hip_height": np.float32(
+            source["pelvis_height"][current_absolute, 0]
+        ),
+        "current_head_yaw_world": np.float32(current_head_yaw),
+        "current_head_position_world": current_head_position,
+        "floor_y": np.float32(floor_y),
+        "future_leg_target": future_pose[:, leg_joint_indices].astype(np.float32),
+        "contact_target": source["stationary_prob_5"][
+            current_absolute, 1:3
+        ].astype(np.float32),
         "source_index": int(source_index),
         "start_frame": int(start_frame),
     }
-    trajectory = build_head_trajectory_np(
-        source["tracker_pos_world"][:, 0],
-        head_yaws,
-        source["root_pos_world"][:, 1],
-    )
-    leg_joint_indices = np.asarray([1, 4, 7, 10, 2, 5, 8, 11], dtype=np.int64)
-    for step in range(steps):
-        current_absolute = int(start_frame) + REALTIME_POSE_TARGET_START + step
-        history_slice = slice(current_absolute - REALTIME_POSE_HISTORY_LENGTH, current_absolute)
-        previous_absolute = current_absolute - 1
-        current_head_yaw = float(head_yaws[current_absolute])
-        current_head_position = source["tracker_pos_world"][current_absolute, 0].astype(np.float32)
-        floor_y = float(source["root_pos_world"][current_absolute, 1])
-        pose_history = build_pose_target_np(
-            joint_rotations_world[history_slice],
-            float(head_yaws[previous_absolute]),
-        )
-        current_target = build_pose_target_np(
-            joint_rotations_world[current_absolute : current_absolute + 1],
-            current_head_yaw,
-        )[0]
-        tracker_history = build_tracker_measurements_np(
-            source["tracker_pos_world"][history_slice],
-            source["tracker_rot_world_6d"][history_slice],
-            source["tracker_pos_world"][previous_absolute, 0],
-            float(source["root_pos_world"][previous_absolute, 1]),
-            float(head_yaws[previous_absolute]),
-        )
-        current_tracker = build_tracker_measurements_np(
-            source["tracker_pos_world"][current_absolute : current_absolute + 1],
-            source["tracker_rot_world_6d"][current_absolute : current_absolute + 1],
-            current_head_position,
-            floor_y,
-            current_head_yaw,
-        )[0]
-        cos_yaw = np.cos(current_head_yaw)
-        sin_yaw = np.sin(current_head_yaw)
-        yaw_inv = np.asarray(
-            [[cos_yaw, 0.0, -sin_yaw], [0.0, 1.0, 0.0], [sin_yaw, 0.0, cos_yaw]],
-            dtype=np.float64,
-        )
-        origin = np.asarray([current_head_position[0], floor_y, current_head_position[2]], dtype=np.float64)
-        joints_head = np.einsum(
-            "ij,taj->tai",
-            yaw_inv,
-            source["joints_world"][previous_absolute : current_absolute + 1].astype(np.float64) - origin[None, None],
-        ).astype(np.float32)
-        root_head = yaw_inv @ (source["root_pos_world"][current_absolute].astype(np.float64) - origin)
-        if step == 0:
-            row["pose_history"][:] = pose_history
-        row["current_target"][step] = current_target
-        row["tracker_history_continuous"][step] = tracker_history
-        row["current_tracker_continuous"][step] = current_tracker
-        row["trajectory_history"][step] = trajectory[history_slice]
-        row["current_trajectory"][step, 0] = trajectory[current_absolute]
-        row["target_joints_head_ref"][step] = joints_head[1]
-        row["prev_joints_head_ref"][step] = joints_head[0]
-        row["target_root_position_head_ref"][step] = root_head.astype(np.float32)
-        # 评估比较的是 pelvis forward 朝向；source root_yaw 是 actor heading，二者语义不同。
-        row["target_root_yaw_world"][step] = extract_rotation_heading_np(
-            joint_rotations_world[current_absolute, 0]
-        )
-        row["target_hip_height"][step] = source["pelvis_height"][current_absolute, 0]
-        row["history_head_yaw_world"][step] = head_yaws[previous_absolute]
-        row["current_head_yaw_world"][step] = current_head_yaw
-        row["current_head_position_world"][step] = current_head_position
-        row["floor_y"][step] = floor_y
-        future_pose = build_pose_target_np(
-            joint_rotations_world[current_absolute + 1 : current_absolute + 4],
-            current_head_yaw,
-        ).reshape(3, 24, 6)
-        row["future_leg_target"][step] = future_pose[:, leg_joint_indices]
-        row["contact_target"][step] = source["stationary_prob_5"][current_absolute, 1:3]
-    return row
-
 
 def compute_source_joint_rotations_world(source: dict[str, np.ndarray]) -> np.ndarray:
     rest_rotations = rotation_6d_to_matrix_np(source["joint_rest_local_rotations_6d"])

@@ -7,7 +7,7 @@ import numpy as np
 
 from data_loaders.realtime_pose_task_store import load_shard_stats, read_store_metadata
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, TRACKER_CONTINUOUS_DIM, TRACKER_COUNT
-from utils.normalizer import RealtimePoseNormalizer
+from utils.normalizer import RealtimePoseNormalizer, build_pose_scale
 from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
 
 
@@ -41,6 +41,9 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     tracker_sum = np.zeros((TRACKER_COUNT, TRACKER_CONTINUOUS_DIM), dtype=np.float64)
     tracker_sumsq = np.zeros_like(tracker_sum)
     tracker_count = np.zeros((TRACKER_COUNT, 1), dtype=np.float64)
+    head_path_xz_sum = np.zeros(2, dtype=np.float64)
+    head_path_xz_sumsq = np.zeros(2, dtype=np.float64)
+    head_path_xz_count = 0
     head_height_sum = np.float64(0.0)
     head_height_sumsq = np.float64(0.0)
     head_height_count = 0
@@ -52,13 +55,20 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         tracker_sum += stats["tracker_sum"]
         tracker_sumsq += stats["tracker_sumsq"]
         tracker_count += stats["tracker_count"]
+        head_path_xz_sum += stats["head_path_xz_sum"]
+        head_path_xz_sumsq += stats["head_path_xz_sumsq"]
+        head_path_xz_count += int(stats["head_path_xz_count"])
         head_height_sum += np.float64(stats["head_height_sum"])
         head_height_sumsq += np.float64(stats["head_height_sumsq"])
         head_height_count += int(stats["head_height_count"])
 
     pose_mean, pose_std = finalize_mean_std(pose_sum, pose_sumsq, pose_count, float(args.eps))
+    pose_scale = build_pose_scale(pose_std, float(args.eps))
     tracker_mean, tracker_std = finalize_mean_std(
         tracker_sum, tracker_sumsq, tracker_count, float(args.eps)
+    )
+    head_path_xz_mean, head_path_xz_std = finalize_mean_std(
+        head_path_xz_sum, head_path_xz_sumsq, head_path_xz_count, float(args.eps)
     )
     head_height_mean, head_height_std = finalize_mean_std(
         head_height_sum, head_height_sumsq, head_height_count, float(args.eps)
@@ -75,12 +85,15 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
         "pose_observation_count": int(pose_count),
         "tracker_observation_counts": tracker_count[:, 0].astype(int).tolist(),
         "std_definition": "population",
+        "pose_scale_definition": "stabilized_pose_std_plus_eps",
     }
     normalizer.save(
         pose_mean,
-        pose_std,
+        pose_scale,
         tracker_mean,
         tracker_std,
+        head_path_xz_mean,
+        head_path_xz_std,
         head_height_mean,
         head_height_std,
         metadata=normalizer_metadata,

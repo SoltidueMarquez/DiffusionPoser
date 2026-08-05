@@ -19,6 +19,29 @@ from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, com
 from diffusion.realtime_pose_losses import compute_raw_deployed_losses
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
+
+REALTIME_HISTORY_RECONSTRUCTION_WEIGHT = 0.1
+
+
+def _realtime_pose_reconstruction_loss(
+    elementwise_loss: th.Tensor,
+    window_valid_mask: th.Tensor,
+) -> th.Tensor:
+    """当前帧为主；全部有效历史帧的平均误差合计只占 0.1 权重。"""
+
+    frame_loss = elementwise_loss.mean(dim=-1)  # [B,11]
+    current_loss = frame_loss[:, -1]
+    history_valid = window_valid_mask[:, :-1].to(frame_loss.dtype)
+    history_count = history_valid.sum(dim=-1)
+    history_loss = (frame_loss[:, :-1] * history_valid).sum(dim=-1)
+    history_loss = history_loss / history_count.clamp_min(1.0)
+
+    # 冷启动没有有效历史时不引入空历史项，也不缩小当前帧 loss。
+    history_available = (history_count > 0).to(frame_loss.dtype)
+    history_weight = REALTIME_HISTORY_RECONSTRUCTION_WEIGHT * history_available
+    return (current_loss + history_weight * history_loss) / (1.0 + history_weight)
+
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -133,11 +156,10 @@ class GaussianDiffusion:
         diffusion_loss_weight=1.0,
         tracker_rot_loss_weight=1.0,
         root_loss_weight=1.0,
-        world_joint_loss_weight=1.0,
+        head_ref_joint_distance_loss_weight=1.0,
         head_to_root_xz_loss_weight=1.0,
         future_leg_loss_weight=0.5,
         contact_loss_weight=0.1,
-        foot_slide_loss_weight=0.5,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -154,11 +176,12 @@ class GaussianDiffusion:
         self.diffusion_loss_weight = float(diffusion_loss_weight)
         self.tracker_rot_loss_weight = float(tracker_rot_loss_weight)
         self.root_loss_weight = float(root_loss_weight)
-        self.world_joint_loss_weight = float(world_joint_loss_weight)
+        self.head_ref_joint_distance_loss_weight = float(
+            head_ref_joint_distance_loss_weight
+        )
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
         self.future_leg_loss_weight = float(future_leg_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
-        self.foot_slide_loss_weight = float(foot_slide_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -863,9 +886,13 @@ class GaussianDiffusion:
             projection_mode=projection_mode,
             late_steps=late_steps,
         )
-        projected = projection_fn(raw_pred_xstart)
-        selector = should_project.view(-1, *([1] * (x.ndim - 1)))
-        deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
+        if bool(should_project.any()):
+            projected = projection_fn(raw_pred_xstart)
+            selector = should_project.view(-1, *([1] * (x.ndim - 1)))
+            deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
+        else:
+            # late/final 模式的早期步骤保持 raw x0，避免支付无效的 SO(3) 与 hard projection 开销。
+            deployed_pred_xstart = raw_pred_xstart
         eps = self._predict_eps_from_xstart(x, t, deployed_pred_xstart)
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
@@ -1439,7 +1466,7 @@ class GaussianDiffusion:
         if model_kwargs is None:
             raise ValueError("RealtimePose 训练必须提供动态 Tracker 条件。")
         batch = model_kwargs.get("y", model_kwargs)
-        if "current_tracker" not in model_kwargs and "current_tracker" not in batch:
+        if "tracker_window" not in model_kwargs and "tracker_window" not in batch:
             raise ValueError(
                 "GaussianDiffusion 已不兼容旧 mask/inpainting 训练路径；"
                 "请传入当前动态 Tracker batch。"
@@ -1473,6 +1500,12 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
+        batch = model_kwargs.get("y", model_kwargs)
+        window_valid_mask = batch["window_valid_mask"].bool()
+        if tuple(window_valid_mask.shape) != tuple(x_start.shape[:2]):
+            raise ValueError("window_valid_mask 必须与扩散窗口前两维一致。")
+        # q_sample 会给 padding 位置写入随机噪声，送入模型前必须再次清零。
+        x_t = x_t.masked_fill(~window_valid_mask[..., None], 0.0)
         call_kwargs = dict(model_kwargs)
         call_kwargs["return_aux_outputs"] = True
         model_result = model(x_t, self._scale_timesteps(t), **call_kwargs)
@@ -1487,13 +1520,13 @@ class GaussianDiffusion:
             if self.model_mean_type == ModelMeanType.START_X
             else self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
         )
-        batch = model_kwargs.get("y", model_kwargs)
         deployed_pred_xstart = project_realtime_pose_xstart(
             raw_pred_xstart,
             batch["current_tracker_raw"],
             batch["hard_rotation_state"].bool(),
-            batch.get("normalizer_mean"),
-            batch.get("normalizer_std"),
+            batch.get("pose_mean"),
+            batch.get("pose_scale"),
+            batch.get("window_valid_mask"),
         )
         # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。
@@ -1508,14 +1541,22 @@ class GaussianDiffusion:
                 dtype=elementwise_loss.dtype,
             )
             if feature_weight.ndim == 1:
-                feature_weight = feature_weight.unsqueeze(0).expand(elementwise_loss.shape[0], -1)
-            if feature_weight.shape != elementwise_loss.shape:
+                feature_weight = feature_weight[None, None]
+            elif feature_weight.ndim == 2:
+                feature_weight = feature_weight[:, None]
+            if (
+                feature_weight.shape[-1] != elementwise_loss.shape[-1]
+                or feature_weight.shape[0] not in (1, elementwise_loss.shape[0])
+            ):
                 raise ValueError(
                     "动态 RealtimePose feature_w 必须为 [144] 或 [B,144]，"
                     f"实际为 {tuple(feature_weight.shape)}"
                 )
             elementwise_loss = elementwise_loss * feature_weight
-        simple_loss = mean_flat(elementwise_loss)
+        simple_loss = _realtime_pose_reconstruction_loss(
+            elementwise_loss,
+            window_valid_mask,
+        )
         if snr_gamma:
             snr = compute_snr(self, t)
             weight = torch.minimum(snr, torch.full_like(snr, float(snr_gamma)))
@@ -1525,9 +1566,9 @@ class GaussianDiffusion:
         terms = {"simple_loss": simple_loss}
         terms.update(
             compute_raw_deployed_losses(
-                raw_pred_xstart,
-                deployed_pred_xstart,
-                x_start,
+                raw_pred_xstart[:, -1],
+                deployed_pred_xstart[:, -1],
+                x_start[:, -1],
                 batch,
                 auxiliary_outputs,
                 tracker_pos_huber_beta=self.tracker_pos_huber_beta,
@@ -1540,7 +1581,8 @@ class GaussianDiffusion:
             + self.fk_loss_weight * terms["fk_loss"]
             + self.tracker_pos_loss_weight * terms["tracker_position_loss"]
             + self.root_loss_weight * terms["root_loss"]
-            + self.world_joint_loss_weight * terms["world_joint_loss"]
+            + self.head_ref_joint_distance_loss_weight
+            * terms["head_ref_joint_distance_loss"]
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
             + self.future_leg_loss_weight * terms["future_leg_loss"]
             + self.contact_loss_weight * terms["contact_loss"]

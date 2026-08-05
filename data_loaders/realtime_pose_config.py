@@ -41,19 +41,16 @@ class TrackerReliabilityConfig:
 
 @dataclass(frozen=True)
 class RealtimePoseLossWeights:
-    diffusion: float = 1.0
     global_rotation: float = 1.0
     local_rotation: float = 1.0
     fk: float = 2.0
     tracker_position: float = 10.0
     tracker_rotation: float = 1.0
     root: float = 1.0
-    world_joint: float = 1.0
+    head_ref_joint_distance: float = 1.0
     head_to_root_xz: float = 1.0
-    rollout: float = 1.0
     future_leg: float = 0.5
     contact: float = 0.1
-    foot_slide: float = 0.5
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)
@@ -73,7 +70,7 @@ def build_target_joint_regions() -> np.ndarray:
     for region_index, names in enumerate(groups):
         result[[JOINT_INDEX[name] for name in names]] = region_index
     if np.any(result < 0):
-        raise RuntimeError("24 个关节必须恰好映射到一个 TargetDiT 区域。")
+        raise RuntimeError("24 个关节必须恰好映射到一个时空 DiT 目标区域。")
     return result
 
 

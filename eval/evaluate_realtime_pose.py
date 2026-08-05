@@ -42,7 +42,6 @@ REQUIRED_RESULT_FIELDS = {
     "d_off",
     "d_on",
     "hard_rotation_state",
-    "current_trajectory",
     "contact_target",
     "contact_logits",
     "future_leg_target",

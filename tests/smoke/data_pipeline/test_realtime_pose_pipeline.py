@@ -32,6 +32,8 @@ def parse_pipeline_args(tmp_path: Path, *extra: str):
             str(tmp_path / "normalizer"),
             "--split_dir",
             "",
+            "--save_dir",
+            str(tmp_path / "runs"),
             "--splits",
             "train",
             *extra,
@@ -60,11 +62,10 @@ def write_latest_task_artifact(task_root: Path, split: str = "train") -> Path:
                 "split": split,
                 "sample_count": 1,
                 "source_count": 1,
-                "max_rollout_steps": 4,
                 "two_point_phase_counts": {"dropout": 1, "reconnect": 0},
                 "config_names": list(TRACKER_PATTERN_CATEGORIES),
                 "tracker_feature_dim": TRACKER_FEATURE_DIM,
-                "schema_fields": sorted(shard_fields(4)),
+                "schema_fields": sorted(shard_fields()),
                 "shards": [],
             }
         )
@@ -84,9 +85,11 @@ def write_latest_normalizer_artifact(normalizer_root: Path) -> Path:
     normalizer_dir = normalizer_root / "20260101_000000_normalizer"
     normalizer_dir.mkdir(parents=True, exist_ok=True)
     (normalizer_dir / "pose_mean.pt").write_bytes(b"mean")
-    (normalizer_dir / "pose_std.pt").write_bytes(b"std")
+    (normalizer_dir / "pose_scale.pt").write_bytes(b"scale")
     (normalizer_dir / "tracker_mean.pt").write_bytes(b"mean")
     (normalizer_dir / "tracker_std.pt").write_bytes(b"std")
+    (normalizer_dir / "head_path_xz_mean.pt").write_bytes(b"mean")
+    (normalizer_dir / "head_path_xz_std.pt").write_bytes(b"std")
     (normalizer_dir / "head_height_mean.pt").write_bytes(b"mean")
     (normalizer_dir / "head_height_std.pt").write_bytes(b"std")
     (normalizer_dir / "normalizer_meta.json").write_text("{}\n", encoding="utf-8")
@@ -170,12 +173,10 @@ def test_pipeline_passes_new_task_store_and_training_sampling_args(tmp_path):
         tmp_path,
         "--base_windows_per_source",
         "7",
-        "--max_rollout_steps",
-        "4",
         "--shard_size",
         "128",
-        "--rollout_steps",
-        "3",
+        "--history_noise_prob",
+        "0.7",
         "--scenario_weights",
         "5",
         "4",
@@ -186,10 +187,10 @@ def test_pipeline_passes_new_task_store_and_training_sampling_args(tmp_path):
     task_args = pipeline.build_task_args(args)
     train_args = pipeline.build_train_args(args)
     assert task_args[task_args.index("--base_windows_per_source") + 1] == "7"
-    assert task_args[task_args.index("--max_rollout_steps") + 1] == "4"
     assert task_args[task_args.index("--shard_size") + 1] == "128"
     assert "--samples_per_file" not in task_args
-    assert train_args[train_args.index("--rollout_steps") + 1] == "3"
+    assert train_args[train_args.index("--history_noise_prob") + 1] == "0.7"
+    assert "--rollout_steps" not in train_args
     weights = train_args.index("--scenario_weights")
     assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]
     invalid_reliability_options = {

@@ -150,6 +150,7 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     assert payload["current_tracker_raw"].shape == (1, 5, 6, 13)
     assert payload["raw_pred_target_raw"].shape == (1, 5, 144)
     assert payload["deployed_pred_target_raw"].shape == (1, 5, 144)
+    assert "current_trajectory" not in payload
     reference_pelvis_yaw = longseq.extract_rotation_heading_np(
         longseq.compute_source_joint_rotations_world(source)[:, 0]
     )
@@ -191,6 +192,8 @@ def test_longseq_cross_sequence_batch_supports_different_lengths_and_matches_sin
     assert batch_model.batch_sizes == [2, 2, 1, 1]
     assert payloads[0]["deployed_pred_target_raw"].shape == (1, 4, 144)
     assert payloads[1]["deployed_pred_target_raw"].shape == (1, 2, 144)
+    assert "current_trajectory" not in payloads[0]
+    assert "current_trajectory" not in payloads[1]
     np.testing.assert_array_equal(payloads[0]["history_length"], [[0, 1, 2, 3]])
     np.testing.assert_array_equal(payloads[1]["history_length"], [[0, 1]])
 
