@@ -13,6 +13,8 @@ from data_loaders.realtime_pose_kinematics import SMPL_PARENTS, rotation_6d_to_m
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_WINDOW_LENGTH,
     SMPL_JOINT_COUNT,
     TRACKER_TO_JOINT,
 )
@@ -41,7 +43,9 @@ def compute_raw_deployed_losses(
     target_local = target_global[:, parents].transpose(-1, -2) @ target_global[:, 1:]
     local_rotation_loss = _rotation_angle(raw_local, target_local).square().mean(dim=1)
 
-    current_tracker = batch["current_tracker_raw"].to(device=raw_pred.device, dtype=raw_pred.dtype)
+    current_tracker = batch["tracker_window_raw"][:, -1].to(
+        device=raw_pred.device, dtype=raw_pred.dtype
+    )
     tracker_rot = rotation_6d_to_matrix_torch(current_tracker[..., 3:9])
     measured = current_tracker[..., 10] > 0.5
     tracker_joints = torch.as_tensor(TRACKER_TO_JOINT, device=raw_pred.device, dtype=torch.long)
@@ -114,6 +118,40 @@ def compute_raw_deployed_losses(
         "future_leg_loss": future_leg_loss,
         "contact_loss": contact_loss,
     }
+
+
+def compute_temporal_rotation_loss(
+    deployed_pred_xstart: torch.Tensor,
+    target_xstart: torch.Tensor,
+    window_valid_mask: torch.Tensor,
+    batch: dict,
+) -> torch.Tensor:
+    """比较 `[-1,0]` 两帧的全局旋转增量，返回逐样本 `[B]` loss。"""
+
+    expected_shape = (REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM)
+    if deployed_pred_xstart.ndim != 3 or deployed_pred_xstart.shape[-2:] != expected_shape:
+        raise ValueError("deployed_pred_xstart 必须为 [B,11,144]。")
+    if target_xstart.shape != deployed_pred_xstart.shape:
+        raise ValueError("target_xstart 必须与 deployed_pred_xstart 同形。")
+    if tuple(window_valid_mask.shape) != tuple(deployed_pred_xstart.shape[:2]):
+        raise ValueError("window_valid_mask 必须为 [B,11]。")
+
+    batch_size = deployed_pred_xstart.shape[0]
+    deployed = _to_raw_pose(deployed_pred_xstart[:, -2:], batch)
+    target = _to_raw_pose(target_xstart[:, -2:], batch)
+    deployed_rotations, _ = decode_target_head_rotations_torch(
+        deployed.reshape(batch_size * 2, -1)
+    )
+    target_rotations, _ = decode_target_head_rotations_torch(
+        target.reshape(batch_size * 2, -1)
+    )
+    deployed_rotations = deployed_rotations.reshape(batch_size, 2, SMPL_JOINT_COUNT, 3, 3)
+    target_rotations = target_rotations.reshape(batch_size, 2, SMPL_JOINT_COUNT, 3, 3)
+    deployed_delta = deployed_rotations[:, 0].transpose(-1, -2) @ deployed_rotations[:, 1]
+    target_delta = target_rotations[:, 0].transpose(-1, -2) @ target_rotations[:, 1]
+    loss = _rotation_angle(deployed_delta, target_delta).square().mean(dim=1)
+    pair_valid = window_valid_mask[:, -2:].all(dim=-1).to(loss.dtype)
+    return loss * pair_valid
 
 
 def _to_raw_pose(value: torch.Tensor, batch: dict) -> torch.Tensor:

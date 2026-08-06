@@ -71,8 +71,8 @@ def build_projection_fn(
     device: torch.device,
     normalizer=None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    current_tracker_raw = batch["current_tracker_raw"].to(device)
-    hard_rotation_state = batch["hard_rotation_state"].to(device).bool()
+    tracker_window_raw = batch["tracker_window_raw"].to(device)
+    hard_rotation_state_window = batch["hard_rotation_state_window"].to(device).bool()
     window_valid_mask = batch["window_valid_mask"].to(device).bool()
     if normalizer is None:
         mean = scale = None
@@ -83,8 +83,8 @@ def build_projection_fn(
         scale = normalizer.pose_scale.to(device)
     return lambda value: project_realtime_pose_xstart(
         value,
-        current_tracker_raw,
-        hard_rotation_state,
+        tracker_window_raw,
+        hard_rotation_state_window,
         mean,
         scale,
         window_valid_mask,
@@ -157,8 +157,8 @@ def save_reconstruction(
     reference_root_world = []
     tracker_positions_world = []
     for batch_index in range(deployed_prediction.shape[0]):
-        current_tracker_raw = batch["current_tracker_raw"][batch_index].detach().cpu().numpy()
-        hard_rotation = batch["hard_rotation_state"][batch_index].detach().cpu().numpy()
+        current_tracker_raw = batch["tracker_window_raw"][batch_index, -1].detach().cpu().numpy()
+        hard_rotation = batch["hard_rotation_state_window"][batch_index, -1].detach().cpu().numpy()
         value = decode_and_resolve_pose(
             deployed_prediction[batch_index],
             current_tracker_raw,
@@ -242,12 +242,14 @@ def save_reconstruction(
             np.asarray([value.hip_height for value in resolved], dtype=np.float32)
         ),
         tracker_pos_world=add_time(np.asarray(tracker_positions_world, dtype=np.float32)),
-        current_tracker_raw=add_time(batch["current_tracker_raw"].detach().cpu().numpy()),
+        current_tracker_raw=add_time(batch["tracker_window_raw"][:, -1].detach().cpu().numpy()),
         configured=add_time(batch["configured"][:, -1].detach().cpu().numpy()),
         measured_valid=add_time(batch["measured_valid"][:, -1].detach().cpu().numpy()),
         d_off=add_time(batch["d_off"][:, -1].detach().cpu().numpy()),
         d_on=add_time(batch["d_on"][:, -1].detach().cpu().numpy()),
-        hard_rotation_state=add_time(batch["hard_rotation_state"].detach().cpu().numpy()),
+        hard_rotation_state=add_time(
+            batch["hard_rotation_state_window"][:, -1].detach().cpu().numpy()
+        ),
         contact_target=add_time(batch["contact_target"].detach().cpu().numpy()),
         contact_logits=add_time(
             reconstruction.get(

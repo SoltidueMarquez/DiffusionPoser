@@ -22,7 +22,7 @@ IDENTITY_6D = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
 
 
 def _tracker(batch_size: int = 2) -> torch.Tensor:
-    tracker = torch.zeros(batch_size, 6, 13)
+    tracker = torch.zeros(batch_size, 11, 6, 13)
     tracker[..., 3:9] = IDENTITY_6D
     tracker[..., 9:11] = 1.0
     tracker[..., 12] = 1.0
@@ -33,9 +33,9 @@ def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
     torch.manual_seed(1)
     raw = torch.randn(2, 11, 144)
     tracker = _tracker()
-    hard = torch.zeros(2, 6, dtype=torch.bool)
-    hard[:, 0] = True
-    hard[:, 3] = True
+    hard = torch.zeros(2, 11, 6, dtype=torch.bool)
+    hard[:, :, 0] = True
+    hard[:, :, 3] = True
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     repeated = project_realtime_pose_xstart(deployed, tracker, hard)
     torch.testing.assert_close(deployed, repeated, atol=1e-5, rtol=1e-5)
@@ -47,22 +47,50 @@ def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
         joint_index = TRACKER_TO_JOINT[tracker_index]
         torch.testing.assert_close(
             deployed[:, -1, joint_index * 6 : joint_index * 6 + 6],
-            tracker[:, tracker_index, 3:9],
+            tracker[:, -1, tracker_index, 3:9],
         )
+    head_joint = TRACKER_TO_JOINT[0]
+    torch.testing.assert_close(
+        deployed[:, :, head_joint * 6 : head_joint * 6 + 6],
+        tracker[:, :, 0, 3:9],
+    )
 
 
 def test_soft_tracker_is_not_replaced():
     raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
     tracker = _tracker(batch_size=1)
-    tracker[:, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-    hard = torch.zeros(1, 6, dtype=torch.bool)
-    hard[:, 0] = True
+    tracker[:, :, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    hard = torch.zeros(1, 11, 6, dtype=torch.bool)
+    hard[:, :, 0] = True
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     wrist = TRACKER_TO_JOINT[1]
     torch.testing.assert_close(
         deployed[:, -1, wrist * 6 : wrist * 6 + 6],
         raw[:, -1, wrist * 6 : wrist * 6 + 6],
     )
+
+
+def test_window_projection_uses_each_anchor_and_keeps_padding_zero():
+    raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
+    tracker = _tracker(batch_size=1)
+    tracker[:, 3, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    hard = torch.zeros(1, 11, 6, dtype=torch.bool)
+    hard[:, 3, 1] = True
+    hard[:, -1, 1] = True
+    valid = torch.ones(1, 11, dtype=torch.bool)
+    valid[:, :2] = False
+
+    deployed = project_realtime_pose_xstart(raw, tracker, hard, window_valid_mask=valid)
+    wrist = TRACKER_TO_JOINT[1]
+    torch.testing.assert_close(
+        deployed[:, 3, wrist * 6 : wrist * 6 + 6],
+        tracker[:, 3, 1, 3:9],
+    )
+    torch.testing.assert_close(
+        deployed[:, -1, wrist * 6 : wrist * 6 + 6],
+        tracker[:, -1, 1, 3:9],
+    )
+    assert torch.count_nonzero(deployed[:, :2]) == 0
 
 
 class _ConstantXStart(nn.Module):

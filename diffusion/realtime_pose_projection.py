@@ -49,13 +49,13 @@ def project_rotation_6d_to_so3(rotation_6d: torch.Tensor, eps: float = 1e-8) -> 
 
 def project_realtime_pose_xstart(
     pred_xstart: torch.Tensor,
-    current_tracker_raw: torch.Tensor,
-    hard_rotation_state: torch.Tensor,
+    tracker_window_raw: torch.Tensor,
+    hard_rotation_state_window: torch.Tensor,
     pose_mean: torch.Tensor | None = None,
     pose_scale: torch.Tensor | None = None,
     window_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """SO(3) 投影全部关节，并只替换当前 hard Tracker 对应旋转。"""
+    """SO(3) 投影全部关节，并逐锚点替换当时的 hard Tracker 旋转。"""
 
     if pred_xstart.ndim != 3 or tuple(pred_xstart.shape[1:]) != (
         REALTIME_POSE_WINDOW_LENGTH,
@@ -63,25 +63,35 @@ def project_realtime_pose_xstart(
     ):
         raise ValueError("pred_xstart 必须为 [B,11,144]。")
     batch_size = pred_xstart.shape[0]
-    if tuple(current_tracker_raw.shape) != (batch_size, TRACKER_COUNT, TRACKER_FEATURE_DIM):
-        raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
-    if tuple(hard_rotation_state.shape) != (batch_size, TRACKER_COUNT):
-        raise ValueError("hard_rotation_state 必须为 [B,6]。")
+    window_shape = (batch_size, REALTIME_POSE_WINDOW_LENGTH)
+    if tuple(tracker_window_raw.shape) != (*window_shape, TRACKER_COUNT, TRACKER_FEATURE_DIM):
+        raise ValueError("tracker_window_raw 必须为 [B,11,6,13]。")
+    if tuple(hard_rotation_state_window.shape) != (*window_shape, TRACKER_COUNT):
+        raise ValueError("hard_rotation_state_window 必须为 [B,11,6]。")
+    if window_valid_mask is None:
+        valid_window = torch.ones(window_shape, dtype=torch.bool, device=pred_xstart.device)
+    else:
+        if tuple(window_valid_mask.shape) != window_shape:
+            raise ValueError("window_valid_mask 必须为 [B,11]。")
+        valid_window = window_valid_mask.to(device=pred_xstart.device, dtype=torch.bool)
     raw = _inverse_pose(pred_xstart, pose_mean, pose_scale)
     rotations = project_rotation_6d_to_so3(
         raw.reshape(batch_size, REALTIME_POSE_WINDOW_LENGTH, SMPL_JOINT_COUNT, 6)
     )
-    tracker_rotations = project_rotation_6d_to_so3(current_tracker_raw[..., 3:9])
+    tracker_rotations = project_rotation_6d_to_so3(tracker_window_raw[..., 3:9])
     joint_indices = torch.as_tensor(TRACKER_TO_JOINT, device=pred_xstart.device, dtype=torch.long)
     deployed = rotations.clone()
-    # 一次更新全部 Tracker 关节，避免逐个把 CUDA 索引转成 Python int 而触发设备同步。
-    current_rotations = deployed[:, -1].index_select(1, joint_indices)
+    # 一次更新全部锚点和 Tracker 关节，避免逐帧 Python 循环触发设备同步。
+    current_rotations = deployed.index_select(2, joint_indices)
+    hard_window = hard_rotation_state_window.to(
+        device=pred_xstart.device, dtype=torch.bool
+    ) & valid_window[..., None]
     replacement = torch.where(
-        hard_rotation_state[..., None],
+        hard_window[..., None],
         tracker_rotations,
         current_rotations,
     )
-    deployed[:, -1].index_copy_(1, joint_indices, replacement)
+    deployed.index_copy_(2, joint_indices, replacement)
     result = _normalize_pose(
         deployed.reshape(
             batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM
@@ -89,13 +99,7 @@ def project_realtime_pose_xstart(
         pose_mean,
         pose_scale,
     )
-    if window_valid_mask is not None:
-        if tuple(window_valid_mask.shape) != (
-            batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
-        ):
-            raise ValueError("window_valid_mask 必须为 [B,11]。")
-        result = result.masked_fill(~window_valid_mask.bool()[..., None], 0.0)
+    result = result.masked_fill(~valid_window[..., None], 0.0)
     return result
 
 

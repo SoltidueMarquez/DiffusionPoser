@@ -190,6 +190,7 @@ def test_pipeline_passes_new_task_store_and_training_sampling_args(tmp_path):
     assert task_args[task_args.index("--shard_size") + 1] == "128"
     assert "--samples_per_file" not in task_args
     assert train_args[train_args.index("--history_noise_prob") + 1] == "0.7"
+    assert train_args[train_args.index("--temporal_rotation_loss_weight") + 1] == "0.5"
     assert "--rollout_steps" not in train_args
     weights = train_args.index("--scenario_weights")
     assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]

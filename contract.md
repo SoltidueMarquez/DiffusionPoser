@@ -82,8 +82,8 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `frame_offsets` | `[B,11]` | 固定真实帧偏移 |
 | `configured` / `measured_valid` | `[B,11,6]` | 所选场景在同步锚点上的 Tracker 状态 |
 | `d_off` / `d_on` | `[B,11,6]` | 从虚拟会话起点重新累计的掉线与在线帧数 |
-| `current_tracker_raw` | `[B,6,13]` | 当前几何 Loss 与 hard projection 使用的未归一化 Tracker |
-| `hard_rotation_state` | `[B,6]` | 当前帧 hard rotation 集合 |
+| `tracker_window_raw` | `[B,11,6,13]` | 几何 Loss 与全窗口 hard projection 使用的未归一化 Tracker；每个锚点使用自身时刻的测量 |
+| `hard_rotation_state_window` | `[B,11,6]` | 逐锚点 hard rotation 集合；padding 和未稳定测量恒为 `False` |
 | `joint_offsets_parent` | `[B,24,3]` | 目标骨架父子偏移 |
 | `joint_rest_local_rotations_6d` | `[B,24,6]` | 目标骨架 rest local rotation6D |
 | `target_joints_head_ref` | `[B,24,3]` | 当前帧关节位置监督 |

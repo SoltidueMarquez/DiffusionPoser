@@ -108,6 +108,12 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert "pose_window_clean" not in item
     assert item["history_pose_observation"].shape == (10, 144)
     assert item["tracker_window"].shape == (11, 6, 13)
+    assert item["tracker_window_raw"].shape == (11, 6, 13)
+    assert item["hard_rotation_state_window"].shape == (11, 6)
+    assert not (
+        item["hard_rotation_state_window"]
+        & ~(item["configured"] & item["measured_valid"])
+    ).any()
     assert item["head_path_window"].shape == (11, 5)
     assert item["history_region_confidence"].shape == (10, 5)
     assert item["window_valid_mask"].all()
@@ -123,13 +129,16 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert np.count_nonzero(cold["tracker_window"].numpy()[:-1]) == 0
     assert np.count_nonzero(cold["head_path_window"].numpy()[:-1]) == 0
     np.testing.assert_array_equal(cold["d_on"].numpy()[-1], np.ones(6, dtype=np.int64))
-    assert cold["hard_rotation_state"].tolist() == [True, False, False, False, False, False]
+    assert not cold["hard_rotation_state_window"][:-1].any()
+    assert cold["hard_rotation_state_window"][-1].tolist() == [True, False, False, False, False, False]
 
     almost_full = dataset[TaskRequest(0, 0, history_length=59)]
     assert almost_full["window_valid_mask"].sum().item() == 10
     assert not almost_full["window_valid_mask"][0]
     worker_batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
     assert worker_batch["tracker_window"].shape == (1, 11, 6, 13)
+    assert worker_batch["tracker_window_raw"].shape == (1, 11, 6, 13)
+    assert worker_batch["hard_rotation_state_window"].shape == (1, 11, 6)
     dataset.close()
 
 

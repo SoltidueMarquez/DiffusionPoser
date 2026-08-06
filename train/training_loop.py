@@ -33,8 +33,8 @@ TRAIN_DEVICE_FIELDS = frozenset(
         "history_region_confidence",
         "window_valid_mask",
         "frame_offsets",
-        "current_tracker_raw",
-        "hard_rotation_state",
+        "tracker_window_raw",
+        "hard_rotation_state_window",
         "target_joints_head_ref",
         "joint_offsets_parent",
         "target_root_position_head_ref",
@@ -449,8 +449,8 @@ class TrainLoop:
         }
         y = {
             **conditions,
-            "current_tracker_raw": batch["current_tracker_raw"],
-            "hard_rotation_state": batch["hard_rotation_state"],
+            "tracker_window_raw": batch["tracker_window_raw"],
+            "hard_rotation_state_window": batch["hard_rotation_state_window"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
             "target_root_position_head_ref": batch["target_root_position_head_ref"],

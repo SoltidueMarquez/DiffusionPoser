@@ -31,7 +31,11 @@ from diffusion.gaussian_diffusion import (
     ModelVarType,
     _realtime_pose_reconstruction_loss,
 )
-from diffusion.realtime_pose_losses import _radial_huber_loss, _rotation_angle
+from diffusion.realtime_pose_losses import (
+    _radial_huber_loss,
+    _rotation_angle,
+    compute_temporal_rotation_loss,
+)
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
@@ -122,9 +126,9 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "history_region_confidence": confidence,
         "window_valid_mask": np.ones(11, dtype=bool),
         "frame_offsets": np.asarray(REALTIME_POSE_FRAME_OFFSETS),
-        "current_tracker_raw": tracker[-1],
-        "hard_rotation_state": compute_hard_rotation_state_np(
-            configured[-1], measured[-1], d_on[-1]
+        "tracker_window_raw": tracker,
+        "hard_rotation_state_window": compute_hard_rotation_state_np(
+            configured, measured, d_on
         ),
         "target_joints_head_ref": row["target_joints_head_ref"],
         "joint_offsets_parent": source["joint_offsets_parent"],
@@ -182,17 +186,37 @@ def test_window_training_keeps_raw_hard_joint_gradient_and_current_constraint():
     raw.retain_grad()
     terms["loss"].mean().backward()
     hard_channels = []
-    for tracker_index in torch.nonzero(batch["hard_rotation_state"][0]).flatten().tolist():
+    for tracker_index in torch.nonzero(
+        batch["hard_rotation_state_window"][0, -1]
+    ).flatten().tolist():
         joint_index = TRACKER_TO_JOINT[tracker_index]
         start = joint_index * 6
         torch.testing.assert_close(
             deployed[0, -1, start : start + 6],
-            batch["current_tracker_raw"][0, tracker_index, 3:9],
+            batch["tracker_window_raw"][0, -1, tracker_index, 3:9],
             atol=1e-5,
             rtol=1e-5,
         )
         hard_channels.extend(range(start, start + 6))
     assert torch.linalg.norm(raw.grad[0, -1, hard_channels]) > 0.0
+
+
+def test_temporal_rotation_loss_matches_deployed_motion_and_masks_cold_start():
+    identity = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+    target = identity.repeat(3, 11, 24).reshape(3, 11, 144)
+    prediction = target.clone()
+    valid = torch.ones(3, 11, dtype=torch.bool)
+    valid[2, -2] = False
+
+    prediction[1:, -1, :6] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    prediction.requires_grad_(True)
+    loss = compute_temporal_rotation_loss(prediction, target, valid, batch={})
+
+    torch.testing.assert_close(loss[0], torch.zeros_like(loss[0]))
+    assert loss[1] > 0.0
+    torch.testing.assert_close(loss[2], torch.zeros_like(loss[2]))
+    loss.sum().backward()
+    assert torch.isfinite(prediction.grad).all()
 
 
 def test_window_training_uses_tracker_position_huber_beta():

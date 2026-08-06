@@ -100,10 +100,10 @@ class _PreparedRuntimeStep:
     d_on: np.ndarray
     kappa_position: np.ndarray
     kappa_rotation: np.ndarray
-    hard_rotation_state: np.ndarray
     head_yaw: float
     floor_y: float
-    current_tracker_raw: np.ndarray
+    tracker_window_raw: np.ndarray
+    hard_rotation_state_window: np.ndarray
     conditioning: dict[str, torch.Tensor]
 
 
@@ -168,7 +168,7 @@ class RealtimePoseRuntime:
         d_on: np.ndarray,
         head_yaw: float,
         floor_y: float,
-    ) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+    ) -> tuple[dict[str, torch.Tensor], np.ndarray, np.ndarray]:
         history_count = min(len(self.pose_history), REALTIME_POSE_HISTORY_LENGTH)
         if len(self.tracker_history) != len(self.pose_history):
             raise RuntimeError("Pose 与 Tracker 密集历史长度不一致。")
@@ -246,6 +246,13 @@ class RealtimePoseRuntime:
             d_on_window[window_valid],
             duration_cap=self.reliability_config.duration_cap,
         )
+        hard_rotation_window = np.zeros_like(configured_window)
+        hard_rotation_window[window_valid] = compute_hard_rotation_state_np(
+            configured_window[window_valid],
+            measured_window[window_valid],
+            d_on_window[window_valid],
+            self.reliability_config,
+        )
         head_path_raw = build_head_path_window_np(
             head_positions,
             head_yaws,
@@ -294,7 +301,7 @@ class RealtimePoseRuntime:
                 REALTIME_POSE_FRAME_OFFSETS, device=self.device, dtype=torch.long
             ).unsqueeze(0),
         }
-        return conditioning, tracker_raw[-1]
+        return conditioning, tracker_raw, hard_rotation_window
 
 
     def _normalizer_pose_stats(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -359,13 +366,7 @@ class RealtimePoseRuntime:
             d_on,
             config=self.reliability_config,
         )
-        hard = compute_hard_rotation_state_np(
-            configured,
-            measured,
-            d_on,
-            self.reliability_config,
-        )
-        conditioning, current_tracker_raw = self._build_conditioning(
+        conditioning, tracker_window_raw, hard_rotation_state_window = self._build_conditioning(
             position,
             rotation_6d,
             configured,
@@ -384,10 +385,10 @@ class RealtimePoseRuntime:
             d_on=d_on,
             kappa_position=kappa_pos,
             kappa_rotation=kappa_rot,
-            hard_rotation_state=hard,
             head_yaw=head_yaw,
             floor_y=float(floor_y),
-            current_tracker_raw=current_tracker_raw,
+            tracker_window_raw=tracker_window_raw,
+            hard_rotation_state_window=hard_rotation_state_window,
             conditioning=conditioning,
         )
 
@@ -403,8 +404,8 @@ class RealtimePoseRuntime:
 
         resolved = decode_and_resolve_pose(
             deployed_target,
-            prepared.current_tracker_raw,
-            prepared.hard_rotation_state,
+            prepared.tracker_window_raw[-1],
+            prepared.hard_rotation_state_window[-1],
             prepared.head_yaw,
             prepared.position[HEAD_TRACKER_INDEX],
             prepared.floor_y,
@@ -434,8 +435,8 @@ class RealtimePoseRuntime:
             deployed_pred_xstart=np.asarray(deployed_target, dtype=np.float32),
             kappa_position=prepared.kappa_position.copy(),
             kappa_rotation=prepared.kappa_rotation.copy(),
-            hard_rotation_state=prepared.hard_rotation_state.copy(),
-            current_tracker_raw=prepared.current_tracker_raw.copy(),
+            hard_rotation_state=prepared.hard_rotation_state_window[-1].copy(),
+            current_tracker_raw=prepared.tracker_window_raw[-1].copy(),
             future_leg_prediction=(
                 None if future_leg is None else np.asarray(future_leg, dtype=np.float32)
             ),
@@ -509,13 +510,13 @@ def step_realtime_pose_batch(
             conditioning["window_valid_mask"],
             conditioning["frame_offsets"],
         )
-    current_tracker_tensor = torch.as_tensor(
-        np.stack([step.current_tracker_raw for step in prepared_steps]),
+    tracker_window_tensor = torch.as_tensor(
+        np.stack([step.tracker_window_raw for step in prepared_steps]),
         device=first.device,
         dtype=torch.float32,
     )
-    hard_tensor = torch.as_tensor(
-        np.stack([step.hard_rotation_state for step in prepared_steps]),
+    hard_window_tensor = torch.as_tensor(
+        np.stack([step.hard_rotation_state_window for step in prepared_steps]),
         device=first.device,
         dtype=torch.bool,
     )
@@ -535,8 +536,8 @@ def step_realtime_pose_batch(
         shape=(batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
         projection_fn=lambda value: project_realtime_pose_xstart(
             value,
-            current_tracker_tensor,
-            hard_tensor,
+            tracker_window_tensor,
+            hard_window_tensor,
             mean,
             scale,
             conditioning["window_valid_mask"],

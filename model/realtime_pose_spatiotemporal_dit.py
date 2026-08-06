@@ -37,6 +37,7 @@ class PreparedSpatioTemporalConditioning:
     position_attention_bias: torch.Tensor
     rotation_attention_bias: torch.Tensor
     temporal_attention_mask: torch.Tensor
+    prior_gate_joint: torch.Tensor
 
 
 def _modulate(
@@ -181,6 +182,9 @@ class SpatioTemporalDiTBlock(nn.Module):
         temporal_gate_bj = temporal_gate[:, None].expand(-1, joint_count, -1).reshape(
             batch_size * joint_count, latent_dim
         )
+        prior_gate_bjt = prepared.prior_gate_joint.permute(0, 2, 1).reshape(
+            batch_size * joint_count, time_count, 1
+        )
         temporal_query = _modulate(
             self.temporal_norm(temporal), temporal_shift_bj, temporal_scale_bj
         )
@@ -191,7 +195,10 @@ class SpatioTemporalDiTBlock(nn.Module):
             attn_mask=prepared.temporal_attention_mask,
             need_weights=False,
         )[0]
-        temporal = temporal + temporal_gate_bj[:, None] * temporal_value
+        # 当前区域 Tracker 越可靠，历史时序残差越弱；最低保留 0.1 维持全身协调。
+        temporal = temporal + (
+            prior_gate_bjt * temporal_gate_bj[:, None] * temporal_value
+        )
         target = temporal.reshape(
             batch_size, joint_count, time_count, latent_dim
         ).permute(0, 2, 1, 3)
@@ -360,6 +367,11 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             window_valid_mask.bool(),
             joint_count=SMPL_JOINT_COUNT,
         )
+        prior_gate_region = torch.clamp(
+            1.0 - 0.5 * (observation.rho_position + observation.rho_rotation),
+            min=0.1,
+        )
+        prior_gate_joint = prior_gate_region.index_select(2, self.joint_regions)
         return PreparedSpatioTemporalConditioning(
             observation=observation,
             static_pose_condition=static_condition,
@@ -367,6 +379,7 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             position_attention_bias=position_attention_bias,
             rotation_attention_bias=rotation_attention_bias,
             temporal_attention_mask=temporal_attention_mask,
+            prior_gate_joint=prior_gate_joint,
         )
 
     def forward(

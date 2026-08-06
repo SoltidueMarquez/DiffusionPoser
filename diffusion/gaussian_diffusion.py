@@ -16,7 +16,10 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from diffusion.realtime_pose_losses import compute_raw_deployed_losses
+from diffusion.realtime_pose_losses import (
+    compute_raw_deployed_losses,
+    compute_temporal_rotation_loss,
+)
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
 
@@ -160,6 +163,7 @@ class GaussianDiffusion:
         head_to_root_xz_loss_weight=1.0,
         future_leg_loss_weight=0.5,
         contact_loss_weight=0.1,
+        temporal_rotation_loss_weight=0.5,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -182,6 +186,9 @@ class GaussianDiffusion:
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
         self.future_leg_loss_weight = float(future_leg_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
+        self.temporal_rotation_loss_weight = float(temporal_rotation_loss_weight)
+        if not np.isfinite(self.temporal_rotation_loss_weight) or self.temporal_rotation_loss_weight < 0.0:
+            raise ValueError("temporal_rotation_loss_weight 必须是有限非负数。")
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1522,8 +1529,8 @@ class GaussianDiffusion:
         )
         deployed_pred_xstart = project_realtime_pose_xstart(
             raw_pred_xstart,
-            batch["current_tracker_raw"],
-            batch["hard_rotation_state"].bool(),
+            batch["tracker_window_raw"],
+            batch["hard_rotation_state_window"].bool(),
             batch.get("pose_mean"),
             batch.get("pose_scale"),
             batch.get("window_valid_mask"),
@@ -1574,6 +1581,12 @@ class GaussianDiffusion:
                 tracker_pos_huber_beta=self.tracker_pos_huber_beta,
             )
         )
+        terms["temporal_rotation_loss"] = compute_temporal_rotation_loss(
+            deployed_pred_xstart,
+            x_start,
+            window_valid_mask,
+            batch,
+        )
         auxiliary_loss = (
             self.rotation_loss_weight * terms["global_rotation_loss"]
             + self.local_rot_loss_weight * terms["local_rotation_loss"]
@@ -1586,6 +1599,7 @@ class GaussianDiffusion:
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
             + self.future_leg_loss_weight * terms["future_leg_loss"]
             + self.contact_loss_weight * terms["contact_loss"]
+            + self.temporal_rotation_loss_weight * terms["temporal_rotation_loss"]
         )
         terms["aux_loss"] = auxiliary_loss
         terms["loss"] = self.diffusion_loss_weight * simple_loss + self.aux_loss_weight * auxiliary_loss

@@ -246,7 +246,6 @@ class RealtimePoseTaskDataset(Dataset):
         source_index = int(shard["source_index"][row_index])
         source = self.sources[source_index]
         start_frame = int(shard["start_frame"][row_index])
-        current_tracker_raw = tracker_raw[-1]
         result: dict[str, Any] = {
             "x": torch.from_numpy(pose_window).float(),
             "history_pose_observation": torch.from_numpy(pose_window[:-1].copy()).float(),
@@ -260,8 +259,8 @@ class RealtimePoseTaskDataset(Dataset):
             "measured_valid": torch.from_numpy(measured_valid).bool(),
             "d_off": torch.from_numpy(d_off.astype(np.int64)).long(),
             "d_on": torch.from_numpy(d_on.astype(np.int64)).long(),
-            "hard_rotation_state": torch.from_numpy(hard_rotation[-1]).bool(),
-            "current_tracker_raw": torch.from_numpy(current_tracker_raw).float(),
+            "tracker_window_raw": torch.from_numpy(tracker_raw).float(),
+            "hard_rotation_state_window": torch.from_numpy(hard_rotation).bool(),
             "target_joints_head_ref": torch.from_numpy(
                 np.asarray(shard["target_joints_head_ref"][row_index], dtype=np.float32).copy()
             ).float(),

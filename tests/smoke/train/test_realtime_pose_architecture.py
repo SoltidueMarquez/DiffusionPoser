@@ -128,6 +128,31 @@ def test_temporal_mask_is_causal_and_ignores_left_padding_keys():
     assert mask[0, 0, 0, -1, :2].all()
 
 
+def test_prior_gate_is_complementary_and_region_specific():
+    model = _model()
+    stable = _conditioning(batch_size=1)
+    stable_prepared = model.prepare_conditioning(**stable)
+    torch.testing.assert_close(
+        stable_prepared.prior_gate_joint,
+        torch.full_like(stable_prepared.prior_gate_joint, 0.1),
+    )
+
+    missing = {name: value.clone() for name, value in stable.items()}
+    missing["tracker_window"][:, :, 1, 10] = 0.0
+    missing["tracker_window"][:, :, 1, 12] = 0.0
+    missing_prepared = model.prepare_conditioning(**missing)
+    left_arm_joint = int(torch.nonzero(model.joint_regions == 1)[0])
+    right_arm_joint = int(torch.nonzero(model.joint_regions == 2)[0])
+    torch.testing.assert_close(
+        missing_prepared.prior_gate_joint[:, :, left_arm_joint],
+        torch.ones(1, 11),
+    )
+    torch.testing.assert_close(
+        missing_prepared.prior_gate_joint[:, :, right_arm_joint],
+        torch.full((1, 11), 0.1),
+    )
+
+
 def test_history_noise_only_changes_valid_history_in_so3_space():
     identity = torch.eye(3).expand(2, 10, 24, 3, 3)
     clean = rotation_6d_forward_up_torch(identity).reshape(2, 10, 144)
@@ -221,8 +246,8 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "history_region_confidence": torch.zeros(1, 10, 5),
         "window_valid_mask": torch.ones(1, 11, dtype=torch.bool),
         "frame_offsets": torch.zeros(1, 11, dtype=torch.long),
-        "current_tracker_raw": torch.zeros(1, 6, 13),
-        "hard_rotation_state": torch.zeros(1, 6, dtype=torch.bool),
+        "tracker_window_raw": torch.zeros(1, 11, 6, 13),
+        "hard_rotation_state_window": torch.zeros(1, 11, 6, dtype=torch.bool),
         "target_joints_head_ref": torch.zeros(1, 24, 3),
         "joint_offsets_parent": torch.zeros(1, 24, 3),
         "target_root_position_head_ref": torch.zeros(1, 3),
