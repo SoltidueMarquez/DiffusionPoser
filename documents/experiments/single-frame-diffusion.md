@@ -27,3 +27,12 @@
 - Run 目录: 不适用。
 - 结果指标: 不适用。
 - 结论: 单帧改动已与原 `codex/dynamic-topology-inpainting-v2` 分支建立清晰边界。
+
+### 002 - 单帧长序列抖动来源诊断
+
+- 改动摘要: 增加同条件重复采样诊断，并为长序列评估增加预测历史/GT 历史切换，用于隔离扩散随机噪声和历史误差反馈。
+- 关键文件: `sample/diagnose_realtime_pose_sampling_variance.py`、`sample/evaluate_longseq_eval_set.py`。
+- 检查命令: `conda run -n diffusionposer5070 python -m py_compile sample/evaluate_longseq_eval_set.py sample/diagnose_realtime_pose_sampling_variance.py`。
+- Run 目录: `D:\dp\single_frame_jitter_diagnostics_90k_20260807`。
+- 结果指标: 固定噪声使 MPJVE 下降 81.78%、jitter 下降 93.73%，但 MPJPE 上升 55.50%；GT 历史使 MPJPE 下降 77.66%、Root yaw 下降 89.41%，但 jitter 上升 67.22%。
+- 结论: 逐帧独立扩散噪声是高频抖动的主要来源；预测历史误差是绝对姿态和 root 长程漂移的主要来源，同时预测历史也提供了明显的时间低通作用。

@@ -42,6 +42,7 @@ from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize
 from sample.realtime_pose_runtime import (
     RealtimePoseRuntime,
     RuntimeStepResult,
+    WorldPoseState,
     step_realtime_pose_batch,
 )
 from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
@@ -101,6 +102,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("per_frame", "fixed_sequence", "correlated"),
     )
     longseq.add_argument("--diffusion_noise_rho", default=0.95, type=float)
+    longseq.add_argument(
+        "--pose_history_mode",
+        default="predicted",
+        choices=("predicted", "ground_truth"),
+        help="控制下一帧读取预测历史还是GT历史；ground_truth仅用于诊断历史误差反馈。",
+    )
     longseq.add_argument("--inference_steps", default=5, type=int)
     longseq.add_argument("--latency_warmup_frames", default=20, type=int)
     longseq.add_argument("--require_cuda", default=True, action=BooleanOptionalAction)
@@ -299,6 +306,7 @@ def rollout_long_sequence_sources(
     diffusion_seeds: list[int] | None = None,
     diffusion_noise_mode: str = "per_frame",
     diffusion_noise_rho: float = 0.95,
+    pose_history_mode: str = "predicted",
 ) -> list[dict[str, np.ndarray]]:
     """跨序列逐帧批处理，序列结束后仅保留其余活跃 runtime。"""
 
@@ -310,6 +318,8 @@ def rollout_long_sequence_sources(
         raise ValueError("diffusion_noise_mode 必须为 per_frame/fixed_sequence/correlated。")
     if not -1.0 <= float(diffusion_noise_rho) <= 1.0:
         raise ValueError("diffusion_noise_rho 必须位于 [-1,1]。")
+    if pose_history_mode not in {"predicted", "ground_truth"}:
+        raise ValueError("pose_history_mode 必须为 predicted/ground_truth。")
     frame_counts = [
         int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]) for source in sources
     ]
@@ -425,6 +435,17 @@ def rollout_long_sequence_sources(
                 sampling_latency_ms=sampling_elapsed,
                 e2e_latency_ms=e2e_elapsed,
             )
+            if pose_history_mode == "ground_truth":
+                # 当前输出仍按模型预测评估；这里只替换下一帧将读取的 pose history，
+                # 从而单独测量自回归历史误差对后续预测与抖动的贡献。
+                source = sources[sequence_index]
+                rotations = joint_rotations[sequence_index][frame_index]
+                runtimes[sequence_index].pose_history[-1] = WorldPoseState(
+                    joint_rotations_world=rotations.copy(),
+                    root_yaw_world=float(extract_rotation_heading_np(rotations[0])),
+                    hip_height=float(source["pelvis_height"][frame_index, 0]),
+                    root_position_world=source["root_pos_world"][frame_index].copy(),
+                )
         if progress is not None:
             progress.update(len(active_indices))
     if progress is not None:
@@ -627,6 +648,7 @@ def evaluate_longseq_entries(
     timeline_seed: int = 10,
     diffusion_noise_mode: str = "per_frame",
     diffusion_noise_rho: float = 0.95,
+    pose_history_mode: str = "predicted",
     render_mp4: bool = False,
     render_fps: int = 30,
     render_stride: int = 1,
@@ -702,6 +724,7 @@ def evaluate_longseq_entries(
             diffusion_seeds=batch_diffusion_seeds,
             diffusion_noise_mode=diffusion_noise_mode,
             diffusion_noise_rho=diffusion_noise_rho,
+            pose_history_mode=pose_history_mode,
         )
 
         for (entry, condition), source, payload, eval_mask in zip(
@@ -786,6 +809,7 @@ def evaluate_longseq_entries(
     metadata["shared_diffusion_noise_across_conditions"] = True
     metadata["diffusion_noise_mode"] = str(diffusion_noise_mode)
     metadata["diffusion_noise_rho"] = float(diffusion_noise_rho)
+    metadata["pose_history_mode"] = str(pose_history_mode)
     if device.type == "cuda":
         metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
     summary_payload = {
@@ -936,6 +960,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         timeline_seed=int(args.timeline_seed),
         diffusion_noise_mode=str(args.diffusion_noise_mode),
         diffusion_noise_rho=float(args.diffusion_noise_rho),
+        pose_history_mode=str(args.pose_history_mode),
         render_mp4=bool(args.render_mp4),
         render_fps=int(args.render_fps),
         render_stride=int(args.render_stride),
@@ -955,6 +980,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "diffusion_seed": int(args.seed),
             "diffusion_noise_mode": str(args.diffusion_noise_mode),
             "diffusion_noise_rho": float(args.diffusion_noise_rho),
+            "pose_history_mode": str(args.pose_history_mode),
             "projected_ddim_mode": str(args.projected_ddim_mode),
             "projected_ddim_late_steps": int(args.projected_ddim_late_steps),
             "latency_warmup_frames": int(args.latency_warmup_frames),
