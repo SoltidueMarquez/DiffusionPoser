@@ -24,7 +24,7 @@ def create_model_and_diffusion(args):
 
 
 def create_gaussian_diffusion(args):
-    """创建直接作用于 11 帧、每帧 144 维 Pose 窗口的扩散过程。"""
+    """创建只作用于当前 144D Pose、以 10 帧历史为条件的扩散过程。"""
 
     steps = int(args.diffusion_steps)
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
@@ -50,5 +50,4 @@ def create_gaussian_diffusion(args):
         head_to_root_xz_loss_weight=getattr(args, "head_to_root_xz_loss_weight", 1.0),
         future_leg_loss_weight=getattr(args, "future_leg_loss_weight", 0.5),
         contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
-        temporal_rotation_loss_weight=getattr(args, "temporal_rotation_loss_weight", 0.5),
     )

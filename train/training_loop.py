@@ -387,21 +387,23 @@ class TrainLoop:
                 self.scaler.scale(loss).backward()
 
     def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
-        sample = batch["x"]  # [B,11,144]
-        if sample.ndim != 3 or tuple(sample.shape[1:]) != (
+        sample_window = batch["x"]  # [B,11,144]，Dataset 仍保留干净监督窗口。
+        if sample_window.ndim != 3 or tuple(sample_window.shape[1:]) != (
             REALTIME_POSE_WINDOW_LENGTH,
             REALTIME_POSE_TARGET_DIM,
         ):
             raise ValueError(
                 f"训练输入应为 [B,11,{REALTIME_POSE_TARGET_DIM}]，"
-                f"实际为 {tuple(sample.shape)}"
+                f"实际为 {tuple(sample_window.shape)}"
             )
-        feature_w = self._feature_weights_for_batch(sample.shape[0])
+        # 历史帧只通过 condition 进入模型，不属于 diffusion Markov chain。
+        x_start = sample_window[:, -1]
+        feature_w = self._feature_weights_for_batch(x_start.shape[0])
         return self.diffusion.training_losses(
             self.model,
-            sample,
+            x_start,
             timesteps,
-            model_kwargs=self.mask_manager(batch, sample),
+            model_kwargs=self.mask_manager(batch, sample_window),
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,

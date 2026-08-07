@@ -179,11 +179,6 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
     group.add_argument("--future_leg_loss_weight", default=_LOSS_DEFAULTS.future_leg, type=float)
     group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
-    group.add_argument(
-        "--temporal_rotation_loss_weight",
-        default=_LOSS_DEFAULTS.temporal_rotation,
-        type=float,
-    )
     group.add_argument("--history_noise_prob", default=0.8, type=float)
     group.add_argument("--history_noise_min_deg", default=2.0, type=float)
     group.add_argument("--history_noise_max_deg", default=10.0, type=float)

@@ -91,6 +91,22 @@ def _metric(stats: dict[str, float | int]) -> float | None:
     return float(stats["sum"]) / int(stats["count"]) if int(stats["count"]) else None
 
 
+def compute_predicted_joint_jitter(
+    predicted_joints: np.ndarray,
+    fps: float,
+) -> np.ndarray:
+    """计算预测关节位置三阶差分；每条序列前三帧没有完整差分，记为 NaN。"""
+
+    joints = np.asarray(predicted_joints, dtype=np.float64)
+    if joints.ndim != 4 or joints.shape[-1] != 3:
+        raise ValueError("predicted_joints 必须为 [N,T,J,3]。")
+    jitter = np.full(joints.shape[:2], np.nan, dtype=np.float64)
+    if joints.shape[1] >= 4:
+        third_difference = np.diff(joints, n=3, axis=1) * float(fps) ** 3
+        jitter[:, 3:] = np.linalg.norm(third_difference, axis=-1).mean(axis=-1)
+    return jitter
+
+
 def _group_metrics(
     frame_mask: np.ndarray,
     metric_values: dict[str, np.ndarray],
@@ -157,6 +173,10 @@ def evaluate_file(path: Path) -> dict[str, object]:
         mpjae[:, 2:] = np.linalg.norm(
             predicted_acceleration - reference_acceleration, axis=-1
         ).mean(axis=-1)
+    jitter = compute_predicted_joint_jitter(
+        predicted_joints[:, :, PAPER_JOINT_SLICE],
+        fps,
+    )
 
     tracker_raw = values["current_tracker_raw"].reshape(
         sequence_count,
@@ -242,6 +262,7 @@ def evaluate_file(path: Path) -> dict[str, object]:
         "mpjpe_cm": mpjpe,
         "mpjve_cm_s": mpjve,
         "mpjae_cm_s2": mpjae,
+        "jitter_m_s3": jitter,
         "raw_hard_tracker_rotation_deg": raw_hard_rotation,
         "deployed_hard_tracker_rotation_deg": deployed_hard_rotation,
         "soft_tracker_rotation_deg": soft_rotation,

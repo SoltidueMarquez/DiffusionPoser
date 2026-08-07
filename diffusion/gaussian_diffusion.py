@@ -14,35 +14,11 @@ import numpy as np
 import torch
 import torch as th
 from copy import deepcopy
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
-from diffusion.realtime_pose_losses import (
-    compute_raw_deployed_losses,
-    compute_temporal_rotation_loss,
-)
+from diffusion.realtime_pose_losses import compute_raw_deployed_losses
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
-
-
-REALTIME_HISTORY_RECONSTRUCTION_WEIGHT = 0.1
-
-
-def _realtime_pose_reconstruction_loss(
-    elementwise_loss: th.Tensor,
-    window_valid_mask: th.Tensor,
-) -> th.Tensor:
-    """当前帧为主；全部有效历史帧的平均误差合计只占 0.1 权重。"""
-
-    frame_loss = elementwise_loss.mean(dim=-1)  # [B,11]
-    current_loss = frame_loss[:, -1]
-    history_valid = window_valid_mask[:, :-1].to(frame_loss.dtype)
-    history_count = history_valid.sum(dim=-1)
-    history_loss = (frame_loss[:, :-1] * history_valid).sum(dim=-1)
-    history_loss = history_loss / history_count.clamp_min(1.0)
-
-    # 冷启动没有有效历史时不引入空历史项，也不缩小当前帧 loss。
-    history_available = (history_count > 0).to(frame_loss.dtype)
-    history_weight = REALTIME_HISTORY_RECONSTRUCTION_WEIGHT * history_available
-    return (current_loss + history_weight * history_loss) / (1.0 + history_weight)
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
@@ -163,7 +139,6 @@ class GaussianDiffusion:
         head_to_root_xz_loss_weight=1.0,
         future_leg_loss_weight=0.5,
         contact_loss_weight=0.1,
-        temporal_rotation_loss_weight=0.5,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -186,9 +161,6 @@ class GaussianDiffusion:
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
         self.future_leg_loss_weight = float(future_leg_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
-        self.temporal_rotation_loss_weight = float(temporal_rotation_loss_weight)
-        if not np.isfinite(self.temporal_rotation_loss_weight) or self.temporal_rotation_loss_weight < 0.0:
-            raise ValueError("temporal_rotation_loss_weight 必须是有限非负数。")
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1502,17 +1474,17 @@ class GaussianDiffusion:
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """完整 144D 加噪，并显式分离 raw/deployed x0 的训练路径。"""
+        """只对当前 144D 姿态加噪，并显式分离 raw/deployed x0 路径。"""
 
+        if x_start.ndim != 2 or x_start.shape[-1] != REALTIME_POSE_TARGET_DIM:
+            raise ValueError(
+                f"RealtimePose diffusion target 必须为当前帧 "
+                f"[B,{REALTIME_POSE_TARGET_DIM}]。"
+            )
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
         batch = model_kwargs.get("y", model_kwargs)
-        window_valid_mask = batch["window_valid_mask"].bool()
-        if tuple(window_valid_mask.shape) != tuple(x_start.shape[:2]):
-            raise ValueError("window_valid_mask 必须与扩散窗口前两维一致。")
-        # q_sample 会给 padding 位置写入随机噪声，送入模型前必须再次清零。
-        x_t = x_t.masked_fill(~window_valid_mask[..., None], 0.0)
         call_kwargs = dict(model_kwargs)
         call_kwargs["return_aux_outputs"] = True
         model_result = model(x_t, self._scale_timesteps(t), **call_kwargs)
@@ -1529,11 +1501,10 @@ class GaussianDiffusion:
         )
         deployed_pred_xstart = project_realtime_pose_xstart(
             raw_pred_xstart,
-            batch["tracker_window_raw"],
-            batch["hard_rotation_state_window"].bool(),
+            batch["tracker_window_raw"][:, -1],
+            batch["hard_rotation_state_window"][:, -1].bool(),
             batch.get("pose_mean"),
             batch.get("pose_scale"),
-            batch.get("window_valid_mask"),
         )
         # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。
@@ -1548,9 +1519,7 @@ class GaussianDiffusion:
                 dtype=elementwise_loss.dtype,
             )
             if feature_weight.ndim == 1:
-                feature_weight = feature_weight[None, None]
-            elif feature_weight.ndim == 2:
-                feature_weight = feature_weight[:, None]
+                feature_weight = feature_weight[None]
             if (
                 feature_weight.shape[-1] != elementwise_loss.shape[-1]
                 or feature_weight.shape[0] not in (1, elementwise_loss.shape[0])
@@ -1560,10 +1529,7 @@ class GaussianDiffusion:
                     f"实际为 {tuple(feature_weight.shape)}"
                 )
             elementwise_loss = elementwise_loss * feature_weight
-        simple_loss = _realtime_pose_reconstruction_loss(
-            elementwise_loss,
-            window_valid_mask,
-        )
+        simple_loss = elementwise_loss.mean(dim=-1)
         if snr_gamma:
             snr = compute_snr(self, t)
             weight = torch.minimum(snr, torch.full_like(snr, float(snr_gamma)))
@@ -1573,19 +1539,13 @@ class GaussianDiffusion:
         terms = {"simple_loss": simple_loss}
         terms.update(
             compute_raw_deployed_losses(
-                raw_pred_xstart[:, -1],
-                deployed_pred_xstart[:, -1],
-                x_start[:, -1],
+                raw_pred_xstart,
+                deployed_pred_xstart,
+                x_start,
                 batch,
                 auxiliary_outputs,
                 tracker_pos_huber_beta=self.tracker_pos_huber_beta,
             )
-        )
-        terms["temporal_rotation_loss"] = compute_temporal_rotation_loss(
-            deployed_pred_xstart,
-            x_start,
-            window_valid_mask,
-            batch,
         )
         auxiliary_loss = (
             self.rotation_loss_weight * terms["global_rotation_loss"]
@@ -1599,7 +1559,6 @@ class GaussianDiffusion:
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
             + self.future_leg_loss_weight * terms["future_leg_loss"]
             + self.contact_loss_weight * terms["contact_loss"]
-            + self.temporal_rotation_loss_weight * terms["temporal_rotation_loss"]
         )
         terms["aux_loss"] = auxiliary_loss
         terms["loss"] = self.diffusion_loss_weight * simple_loss + self.aux_loss_weight * auxiliary_loss

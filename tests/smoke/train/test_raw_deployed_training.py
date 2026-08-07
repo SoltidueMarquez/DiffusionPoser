@@ -29,12 +29,10 @@ from diffusion.gaussian_diffusion import (
     LossType,
     ModelMeanType,
     ModelVarType,
-    _realtime_pose_reconstruction_loss,
 )
 from diffusion.realtime_pose_losses import (
     _radial_huber_loss,
     _rotation_angle,
-    compute_temporal_rotation_loss,
 )
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
@@ -159,7 +157,7 @@ def _model_and_kwargs(batch):
     return model, kwargs
 
 
-def test_window_training_keeps_raw_hard_joint_gradient_and_current_constraint():
+def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint():
     torch.manual_seed(7)
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
@@ -172,10 +170,10 @@ def test_window_training_keeps_raw_hard_joint_gradient_and_current_constraint():
     )
     terms = diffusion.training_losses(
         model,
-        batch["x"].float(),
+        batch["x"][:, -1].float(),
         torch.ones(1, dtype=torch.long),
         model_kwargs=model_kwargs,
-        noise=torch.zeros_like(batch["x"], dtype=torch.float32),
+        noise=torch.zeros_like(batch["x"][:, -1], dtype=torch.float32),
         return_pred_xstart=True,
     )
     assert all(torch.isfinite(value).all() for value in terms.values())
@@ -192,34 +190,16 @@ def test_window_training_keeps_raw_hard_joint_gradient_and_current_constraint():
         joint_index = TRACKER_TO_JOINT[tracker_index]
         start = joint_index * 6
         torch.testing.assert_close(
-            deployed[0, -1, start : start + 6],
+            deployed[0, start : start + 6],
             batch["tracker_window_raw"][0, -1, tracker_index, 3:9],
             atol=1e-5,
             rtol=1e-5,
         )
         hard_channels.extend(range(start, start + 6))
-    assert torch.linalg.norm(raw.grad[0, -1, hard_channels]) > 0.0
+    assert torch.linalg.norm(raw.grad[0, hard_channels]) > 0.0
 
 
-def test_temporal_rotation_loss_matches_deployed_motion_and_masks_cold_start():
-    identity = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
-    target = identity.repeat(3, 11, 24).reshape(3, 11, 144)
-    prediction = target.clone()
-    valid = torch.ones(3, 11, dtype=torch.bool)
-    valid[2, -2] = False
-
-    prediction[1:, -1, :6] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-    prediction.requires_grad_(True)
-    loss = compute_temporal_rotation_loss(prediction, target, valid, batch={})
-
-    torch.testing.assert_close(loss[0], torch.zeros_like(loss[0]))
-    assert loss[1] > 0.0
-    torch.testing.assert_close(loss[2], torch.zeros_like(loss[2]))
-    loss.sum().backward()
-    assert torch.isfinite(prediction.grad).all()
-
-
-def test_window_training_uses_tracker_position_huber_beta():
+def test_current_training_uses_tracker_position_huber_beta():
     torch.manual_seed(9)
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
@@ -237,16 +217,16 @@ def test_window_training_uses_tracker_position_huber_beta():
             losses.append(
                 diffusion.training_losses(
                     model,
-                    batch["x"].float(),
+                    batch["x"][:, -1].float(),
                     torch.ones(1, dtype=torch.long),
                     model_kwargs=model_kwargs,
-                    noise=torch.zeros_like(batch["x"]),
+                    noise=torch.zeros_like(batch["x"][:, -1]),
                 )["tracker_position_loss"]
             )
     assert not torch.allclose(losses[0], losses[1])
 
 
-def test_window_training_respects_l1_and_feature_weights():
+def test_current_training_respects_l1_and_feature_weights():
     torch.manual_seed(11)
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
@@ -259,10 +239,10 @@ def test_window_training_respects_l1_and_feature_weights():
     )
     common = dict(
         model=model,
-        x_start=batch["x"].float(),
+        x_start=batch["x"][:, -1].float(),
         t=torch.ones(1, dtype=torch.long),
         model_kwargs=model_kwargs,
-        noise=torch.zeros_like(batch["x"]),
+        noise=torch.zeros_like(batch["x"][:, -1]),
     )
     with torch.no_grad():
         mse = diffusion.training_losses(**common, feature_w=torch.ones(1, 144))
@@ -272,33 +252,3 @@ def test_window_training_respects_l1_and_feature_weights():
         zero = diffusion.training_losses(**common, feature_w=torch.zeros(1, 144))
     assert not torch.allclose(mse["simple_loss"], l1["simple_loss"])
     torch.testing.assert_close(zero["simple_loss"], torch.zeros_like(zero["simple_loss"]))
-
-
-def test_history_reconstruction_has_one_tenth_total_weight_and_handles_cold_start():
-    elementwise = torch.zeros(3, 11, 2)
-    valid = torch.zeros(3, 11, dtype=torch.bool)
-    valid[:, -1] = True
-
-    # 完整历史无论有 10 帧还是更少，都先按有效帧平均，再作为一个 0.1 权重项。
-    elementwise[0, :-1] = 4.0
-    elementwise[0, -1] = 1.0
-    valid[0, :-1] = True
-    elementwise[1, 7:9] = torch.tensor([2.0, 6.0])[:, None]
-    elementwise[1, :7] = 1000.0  # 无效 padding 不得进入 loss。
-    elementwise[1, -1] = 1.0
-    valid[1, 7:9] = True
-
-    # 完全冷启动时只有当前帧，不能仍除以 1.1。
-    elementwise[2, :-1] = 1000.0
-    elementwise[2, -1] = 2.0
-
-    result = _realtime_pose_reconstruction_loss(elementwise, valid)
-
-    expected = torch.tensor(
-        [
-            (1.0 + 0.1 * 4.0) / 1.1,
-            (1.0 + 0.1 * 4.0) / 1.1,
-            2.0,
-        ]
-    )
-    torch.testing.assert_close(result, expected)

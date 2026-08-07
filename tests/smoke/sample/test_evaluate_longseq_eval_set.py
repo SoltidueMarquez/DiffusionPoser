@@ -244,7 +244,69 @@ def test_isolated_conditions_share_framewise_diffusion_noise_for_fair_comparison
 
     assert len(diffusion.noises) == 3
     for noise in diffusion.noises:
+        assert noise.shape == (2, 144)
         np.testing.assert_array_equal(noise[0], noise[1])
+
+
+def test_fixed_sequence_noise_reuses_current_frame_noise():
+    class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
+        def __init__(self) -> None:
+            self.noises: list[torch.Tensor] = []
+
+        def projected_ddim_sample_loop(self, *args, **kwargs):
+            self.noises.append(kwargs["noise"].detach().cpu().clone())
+            return super().projected_ddim_sample_loop(*args, **kwargs)
+
+    source = build_toy_realtime_source(frame_count=3)
+    timeline = longseq.build_isolated_condition_timeline("fixed", 3, "fixed_six")
+    diffusion = NoiseRecordingDiffusion()
+    longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        diffusion,
+        [source],
+        [timeline],
+        torch.device("cpu"),
+        normalizer=None,
+        diffusion_seeds=[17],
+        diffusion_noise_mode="fixed_sequence",
+    )
+
+    assert all(noise.shape == (1, 144) for noise in diffusion.noises)
+    torch.testing.assert_close(diffusion.noises[0], diffusion.noises[1])
+    torch.testing.assert_close(diffusion.noises[0], diffusion.noises[2])
+
+
+def test_correlated_noise_uses_current_only_ar1_formula():
+    class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
+        def __init__(self) -> None:
+            self.noises: list[torch.Tensor] = []
+
+        def projected_ddim_sample_loop(self, *args, **kwargs):
+            self.noises.append(kwargs["noise"].detach().cpu().clone())
+            return super().projected_ddim_sample_loop(*args, **kwargs)
+
+    rho = 0.6
+    source = build_toy_realtime_source(frame_count=2)
+    timeline = longseq.build_isolated_condition_timeline("correlated", 2, "fixed_six")
+    diffusion = NoiseRecordingDiffusion()
+    longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        diffusion,
+        [source],
+        [timeline],
+        torch.device("cpu"),
+        normalizer=None,
+        diffusion_seeds=[23],
+        diffusion_noise_mode="correlated",
+        diffusion_noise_rho=rho,
+    )
+
+    generator = torch.Generator(device="cpu").manual_seed(23)
+    first = torch.randn(144, generator=generator)
+    innovation = torch.randn(144, generator=generator)
+    expected_second = rho * first + np.sqrt(1.0 - rho**2) * innovation
+    torch.testing.assert_close(diffusion.noises[0][0], first)
+    torch.testing.assert_close(diffusion.noises[1][0], expected_second)
 
 
 def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp_path):

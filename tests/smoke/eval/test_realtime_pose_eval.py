@@ -1,6 +1,10 @@
 import numpy as np
 
-from eval.evaluate_realtime_pose import evaluate_file, summarize
+from eval.evaluate_realtime_pose import (
+    compute_predicted_joint_jitter,
+    evaluate_file,
+    summarize,
+)
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D
 
 
@@ -9,6 +13,7 @@ METRIC_KEYS = (
     "mpjpe_cm",
     "mpjve_cm_s",
     "mpjae_cm_s2",
+    "jitter_m_s3",
     "unknown_rotation_deg",
     "root_yaw_error_deg",
     "root_xz_error_m",
@@ -22,6 +27,7 @@ def _result(samples: int, mpjpe_sum: float, mpjpe_count: int, known_max: float) 
     stats["mpjpe_cm"] = {"sum": mpjpe_sum, "count": mpjpe_count}
     stats["mpjve_cm_s"] = {"sum": 0.0, "count": 0}
     stats["mpjae_cm_s2"] = {"sum": 0.0, "count": 0}
+    stats["jitter_m_s3"] = {"sum": 0.0, "count": 0}
     return {
         "sequences": 1,
         "samples": samples,
@@ -44,6 +50,7 @@ def test_eval_summary_uses_weighted_metric_counts_and_global_max():
     assert summary["samples"] == 4
     assert summary["mpjpe_cm"] == 2.5
     assert summary["mpjve_cm_s"] is None
+    assert summary["jitter_m_s3"] is None
     assert summary["known_tracker_rotation_max_error_deg"] == 0.3
 
 
@@ -104,3 +111,15 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
     assert result["by_reconnect_d_on"]["1"]["samples"] == 1
     assert result["by_history_phase"]["cold_start_0_59"]["samples"] == 2
     assert result["by_history_phase"]["steady_state_60_plus"]["samples"] == 1
+
+
+def test_predicted_joint_jitter_uses_third_difference_and_marks_warmup_nan():
+    fps = 2.0
+    positions = np.zeros((1, 5, 22, 3), dtype=np.float64)
+    frame = np.arange(5, dtype=np.float64)
+    positions[0, :, 0, 0] = frame**3
+
+    jitter = compute_predicted_joint_jitter(positions, fps)
+
+    assert np.isnan(jitter[0, :3]).all()
+    np.testing.assert_allclose(jitter[0, 3:], 6.0 * fps**3 / 22.0)

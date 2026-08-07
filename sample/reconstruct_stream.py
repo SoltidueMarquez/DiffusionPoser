@@ -71,9 +71,8 @@ def build_projection_fn(
     device: torch.device,
     normalizer=None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    tracker_window_raw = batch["tracker_window_raw"].to(device)
-    hard_rotation_state_window = batch["hard_rotation_state_window"].to(device).bool()
-    window_valid_mask = batch["window_valid_mask"].to(device).bool()
+    current_tracker_raw = batch["tracker_window_raw"][:, -1].to(device)
+    hard_rotation_state = batch["hard_rotation_state_window"][:, -1].to(device).bool()
     if normalizer is None:
         mean = scale = None
     else:
@@ -83,11 +82,10 @@ def build_projection_fn(
         scale = normalizer.pose_scale.to(device)
     return lambda value: project_realtime_pose_xstart(
         value,
-        tracker_window_raw,
-        hard_rotation_state_window,
+        current_tracker_raw,
+        hard_rotation_state,
         mean,
         scale,
-        window_valid_mask,
     )
 
 
@@ -111,7 +109,7 @@ def reconstruct_batch(
     with torch.no_grad():
         result = diffusion.projected_ddim_sample_loop(
             model,
-            shape=tuple(reference.shape),
+            shape=(reference.shape[0], REALTIME_POSE_TARGET_DIM),
             projection_fn=projection_fn,
             clip_denoised=False,
             model_kwargs=model_kwargs,
@@ -120,9 +118,9 @@ def reconstruct_batch(
             late_steps=late_steps,
         )
     output = {
-        "sample": result["sample"][:, -1],
-        "raw_pred_xstart": result["raw_pred_xstart"][:, -1],
-        "deployed_pred_xstart": result["deployed_pred_xstart"][:, -1],
+        "sample": result["sample"],
+        "raw_pred_xstart": result["raw_pred_xstart"],
+        "deployed_pred_xstart": result["deployed_pred_xstart"],
     }
     if "auxiliary_outputs" in result:
         output.update(result["auxiliary_outputs"])

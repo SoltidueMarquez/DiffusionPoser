@@ -98,7 +98,9 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
         self.assertEqual(args.head_ref_joint_distance_loss_weight, 1.0)
-        self.assertEqual(args.temporal_rotation_loss_weight, 0.5)
+        self.assertNotIn(
+            "--temporal_rotation_loss_weight", parser._option_string_actions
+        )
         self.assertEqual(args.history_noise_prob, 0.8)
         self.assertNotIn("--world_joint_loss_weight", parser._option_string_actions)
         self.assertNotIn("--rollout_prob", parser._option_string_actions)

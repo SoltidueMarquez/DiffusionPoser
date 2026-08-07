@@ -1,6 +1,6 @@
 # RealPose Python Contract
 
-本文档是当前 Python 主链路的数据契约。旧 task、旧 normalizer 和旧 checkpoint 与本契约不兼容，读取时直接报错，不提供兼容分支。
+本文档是当前 Python 主链路的数据契约。本次 current-only diffusion 不改变 Task Store、Dataset 或 normalizer 字段，现有符合下述契约的数据可以直接复用；旧的整窗扩散 checkpoint 与新模型结构不兼容，不提供迁移分支。
 
 ## 时间窗口与共同参考系
 
@@ -36,7 +36,7 @@ Pose、Tracker 和 Head 路径必须使用同一组锚点。11 帧全部表达�
 - `joint_rest_local_rotations_6d: [24,6]`
 - `stationary_prob_5: [T,5]`
 
-Source 可以复用；task、normalizer 和 checkpoint 必须重建。
+Source、Task Store 和 normalizer 可以复用；模型 checkpoint 必须按新结构重新训练。
 
 ## Task Store
 
@@ -73,7 +73,7 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 
 | 字段 | 形状 | 语义 |
 |---|---:|---|
-| `x` | `[B,11,144]` | 干净的 10 帧历史 Pose 与当前 GT，完整参与扩散；Dataset 不重复返回 Task Store 的 `pose_window_clean` 名称 |
+| `x` | `[B,11,144]` | 干净监督窗口；只有 `x[:, -1]` 是 diffusion target，Dataset 不重复返回 Task Store 的 `pose_window_clean` 名称 |
 | `history_pose_observation` | `[B,10,144]` | 历史 Pose 条件；训练时可扰动，部署时为真实历史预测 |
 | `tracker_window` | `[B,11,6,13]` | 同步锚点的完整 Tracker 历史与当前 Tracker |
 | `head_path_window` | `[B,11,5]` | 同步锚点在 `C_n` 下的 Head 路径 |
@@ -82,7 +82,7 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `frame_offsets` | `[B,11]` | 固定真实帧偏移 |
 | `configured` / `measured_valid` | `[B,11,6]` | 所选场景在同步锚点上的 Tracker 状态 |
 | `d_off` / `d_on` | `[B,11,6]` | 从虚拟会话起点重新累计的掉线与在线帧数 |
-| `tracker_window_raw` | `[B,11,6,13]` | 几何 Loss 与全窗口 hard projection 使用的未归一化 Tracker；每个锚点使用自身时刻的测量 |
+| `tracker_window_raw` | `[B,11,6,13]` | 几何 Loss 使用的未归一化 Tracker 窗口；current-only projection 只读取 `[:, -1]` |
 | `hard_rotation_state_window` | `[B,11,6]` | 逐锚点 hard rotation 集合；padding 和未稳定测量恒为 `False` |
 | `joint_offsets_parent` | `[B,24,3]` | 目标骨架父子偏移 |
 | `joint_rest_local_rotations_6d` | `[B,24,6]` | 目标骨架 rest local rotation6D |
@@ -99,13 +99,13 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `scenario_id` / `scenario` | `[B]` | 所选 Tracker 场景的索引与名称 |
 | `start_frame` / `task_id` / `source_path` | `[B]` | 样本定位与追踪信息 |
 
-模型内部及扩散采样输出为 `[B,11,144]`；外部 `reconstruct_batch` 和 `RuntimeStepResult` 只返回当前帧 `[B,144]`。
+模型 diffusion state、模型输出和扩散采样结果均为当前帧 `[B,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain；`reconstruct_batch` 和 `RuntimeStepResult` 的外部契约仍为当前帧 `[B,144]`。
 
 ## 144D Pose 与历史扰动
 
-每帧 Pose 由 24 个关节的全局 rotation6D 拼接而成。标准扩散作用于完整 `[B,11,144]` 窗口，但历史 Pose 只是可能含误差的参考信息，部署时只使用当前帧输出。因此 diffusion reconstruction loss 先对全部有效历史帧取平均，再令该历史平均项的总权重为 `0.1`、当前帧权重为 `1.0`；存在有效历史时二者除以 `1.1` 保持 loss 尺度稳定，冷启动没有有效历史时只计算当前帧。无效历史帧不参与 loss。
+每帧 Pose 由 24 个关节的全局 rotation6D 拼接而成。训练入口令 `x_start = x[:, -1]`，只对这个完整 144D 当前姿态执行 `q_sample()`，noise、diffusion target、raw/deployed `pred_xstart` 和 reconstruction loss 都是 `[B,144]`。历史帧不加噪、不执行 DDIM 更新、不产生重建输出，也没有历史 reconstruction 项或 temporal rotation loss。
 
-历史 Pose 扰动只修改独立条件 `history_pose_observation`，干净窗口仍作为扩散监督。扰动在反归一化后的 SO(3) 空间执行：
+历史 Pose 扰动只修改独立条件 `history_pose_observation`，不会改变当前 diffusion target `x[:, -1]`。扰动在反归一化后的 SO(3) 空间执行：
 
 ```text
 history_noise_prob = 0.8
@@ -156,9 +156,12 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 
 - `WindowObservationEncoder` 逐帧输出 Tracker state、position、rotation token，保留 11 帧时间轴，不使用历史 GRU summary；
 - 每层依次执行 Tracker cross-attention、24 关节 Spatial Self-Attention、同关节 11 帧 Temporal Self-Attention；
-- Temporal Attention 使用 causal mask，当前帧能读取全部历史，历史帧不能读取未来；
+- Temporal Attention 使用固定历史前缀 mask：有效历史 query 可双向读取全部有效历史 key，但不能读取当前 key；当前 query 可读取全部有效历史和自己；padding 永远不能作为 key；
 - 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测、Loss 和 hard projection 从同一份条件与监督数据读取，不在顶层重复条件字段；
 - 历史 Pose、Tracker 窗口、Head 路径和置信度由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
-- future-leg 与 contact head 只读取最后当前帧 token；
-- 所有 11 帧执行 rotation6D 到 SO(3) 投影，hard Tracker rotation 只替换最后当前帧；
+- 历史和当前使用独立输入投影，历史姿态不会同时经过当前 diffusion 输入投影；11 帧仍形成 `[B,11,24,D]` token 网格；
+- 共享 diffusion timestep AdaLN 仍调制全部 11 帧；有效历史 temporal residual 可靠度 gate 为 1，当前 gate 由当前区域 Tracker coverage 决定，padding gate 为 0；
+- 只解码当前 token；current loss 可经 Temporal Attention 反向训练历史编码路径，future-leg 与 contact head 也只读取当前 token；
+- current-only projection 对 `[B,144]` 的 24 个关节执行 rotation6D 到 SO(3) 投影，并只用 `tracker_window_raw[:, -1]` 与 `hard_rotation_state_window[:, -1]` 替换当前 hard Tracker 旋转；
+- Projected DDIM 的 state、初始 noise 和每步更新均为 `[B,144]`。长序列评估的 `per_frame`、`fixed_sequence` 和 `correlated` noise 也只描述当前帧；correlated 模式使用 `epsilon_n = rho * epsilon_(n-1) + sqrt(1-rho^2) * eta_n`；
 - 训练阶段不执行模型 rollout；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。

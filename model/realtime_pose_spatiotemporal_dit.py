@@ -195,7 +195,8 @@ class SpatioTemporalDiTBlock(nn.Module):
             attn_mask=prepared.temporal_attention_mask,
             need_weights=False,
         )[0]
-        # 当前区域 Tracker 越可靠，历史时序残差越弱；最低保留 0.1 维持全身协调。
+        # 历史 query 的可靠度 gate 恒为 1；当前区域 Tracker 越可靠，
+        # 当前 query 的历史时序残差越弱，最低保留 0.1 维持全身协调。
         temporal = temporal + (
             prior_gate_bjt * temporal_gate_bj[:, None] * temporal_value
         )
@@ -211,7 +212,7 @@ class SpatioTemporalDiTBlock(nn.Module):
 
 
 class RealtimePoseSpatioTemporalDiT(nn.Module):
-    """对 10 个历史锚点和当前帧联合扩散的因子化时空 DiT。"""
+    """以 10 个固定历史锚点为前缀、只恢复当前帧的因子化时空 DiT。"""
 
     def __init__(
         self,
@@ -326,8 +327,10 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             SMPL_JOINT_COUNT,
             ROTATION_6D_DIM,
         )
-        confidence = history_region_confidence.index_select(2, self.joint_regions)
-        history_tokens = self.history_pose_input(history) * confidence[..., None]
+        # 临时消融：Tracker 覆盖度只控制当前观测与当前 query 的先验门控，
+        # 不再把缺少 Tracker 的区域历史姿态直接清零。历史槽位是否存在仍由
+        # 下方的 window_valid_mask 统一控制，避免冷启动 padding 泄漏进模型。
+        history_tokens = self.history_pose_input(history)
         history_tokens = torch.cat(
             [
                 history_tokens,
@@ -367,9 +370,21 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             window_valid_mask.bool(),
             joint_count=SMPL_JOINT_COUNT,
         )
-        prior_gate_region = torch.clamp(
-            1.0 - 0.5 * (observation.rho_position + observation.rho_rotation),
+        current_prior_gate = torch.clamp(
+            1.0
+            - 0.5
+            * (
+                observation.rho_position[:, -1]
+                + observation.rho_rotation[:, -1]
+            ),
             min=0.1,
+        )
+        # 历史 token 之间始终完整建模；只有当前 query 依据当前 Tracker 覆盖度
+        # 调整时序残差强度，避免可靠观测反向削弱历史表示本身。
+        prior_gate_region = torch.ones_like(observation.rho_position)
+        prior_gate_region[:, -1] = current_prior_gate
+        prior_gate_region = prior_gate_region * window_valid_mask[..., None].to(
+            prior_gate_region.dtype
         )
         prior_gate_joint = prior_gate_region.index_select(2, self.joint_regions)
         return PreparedSpatioTemporalConditioning(
@@ -397,12 +412,8 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         return_aux_outputs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch_size = hidden_states.shape[0]
-        if tuple(hidden_states.shape) != (
-            batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
-            REALTIME_POSE_TARGET_DIM,
-        ):
-            raise ValueError("hidden_states 必须为 [B,11,144]。")
+        if tuple(hidden_states.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+            raise ValueError("hidden_states 必须为当前扩散状态 [B,144]。")
         values = y or {}
         if prepared_conditioning is None:
             history_pose_observation = (
@@ -445,13 +456,29 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
 
         joint_values = hidden_states.reshape(
             batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
             SMPL_JOINT_COUNT,
             ROTATION_6D_DIM,
         )
         joint_ids = torch.arange(SMPL_JOINT_COUNT, device=hidden_states.device)
+        current_tokens = self.joint_input(joint_values)[:, None]
+        # 历史槽位只读取独立历史条件 W_z z；只有最后当前槽位读取带噪状态 W_x x_k。
+        # 这样 11 帧仍形成同一时空 token 网格，但历史不再属于 diffusion state。
+        diffusion_tokens = torch.cat(
+            [
+                current_tokens.new_zeros(
+                    (
+                        batch_size,
+                        REALTIME_POSE_HISTORY_ANCHOR_COUNT,
+                        SMPL_JOINT_COUNT,
+                        self.latent_dim,
+                    )
+                ),
+                current_tokens,
+            ],
+            dim=1,
+        )
         target = (
-            self.joint_input(joint_values)
+            diffusion_tokens
             + self.joint_identity(joint_ids)[None, None]
             + self.region_identity(self.joint_regions)[None, None]
             + prepared_conditioning.static_pose_condition
@@ -468,16 +495,13 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
                 self.joint_regions,
             )
         target = self.output_norm(target)
-        raw_xstart = self.joint_output(target).reshape(
-            batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM
-        )
-        raw_xstart = raw_xstart * prepared_conditioning.window_valid_mask[..., None].to(
-            raw_xstart.dtype
+        current_tokens = target[:, -1]
+        raw_xstart = self.joint_output(current_tokens).reshape(
+            batch_size, REALTIME_POSE_TARGET_DIM
         )
         if not return_aux_outputs:
             return raw_xstart
 
-        current_tokens = target[:, -1]
         leg_indices = torch.as_tensor(
             [1, 4, 7, 10, 2, 5, 8, 11], device=target.device
         )
@@ -518,12 +542,20 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         self, window_valid_mask: torch.Tensor, joint_count: int
     ) -> torch.Tensor:
         batch_size, time_count = window_valid_mask.shape
-        causal = torch.ones(
+        if time_count != REALTIME_POSE_WINDOW_LENGTH:
+            raise ValueError("Temporal Attention 固定使用 10 个历史锚点和 1 个当前帧。")
+        # 行为 query、列为 key：历史内部双向可见，当前可读历史与自身，
+        # 但任何历史 query 都不能读取最后的当前带噪 token。
+        role_allowed = torch.ones(
             time_count, time_count, device=window_valid_mask.device, dtype=torch.bool
-        ).tril()
-        allowed = causal[None] & window_valid_mask[:, None, :].bool()
+        )
+        role_allowed[:-1, -1] = False
+        query_valid = window_valid_mask[:, :, None].bool()
+        key_valid = window_valid_mask[:, None, :].bool()
+        allowed = role_allowed[None] & query_valid & key_valid
         empty = ~allowed.any(dim=-1)
-        # 左侧 padding query 没有可读 key 时只允许读取自身，避免全屏蔽产生 NaN。
+        # padding query 没有合法 key，只临时开放自身防止 Softmax 全屏蔽；
+        # 其 residual state 会在 block 边界再次清零，不会写入任何有效 token。
         identity = torch.eye(
             time_count, device=window_valid_mask.device, dtype=torch.bool
         )

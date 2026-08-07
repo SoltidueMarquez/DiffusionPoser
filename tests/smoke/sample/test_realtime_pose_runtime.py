@@ -5,7 +5,7 @@ import torch
 from ema_pytorch import EMA
 
 from data_loaders.realtime_pose_config import TrackerReliabilityConfig
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_WINDOW_LENGTH
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
 from sample.realtime_pose_runtime import RealtimePoseRuntime, step_realtime_pose_batch
 from sample.utils import load_checkpoint_model
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, build_toy_realtime_source
@@ -65,11 +65,11 @@ class _OneStepProjectedDiffusion:
         **kwargs,
     ):
         del model, model_kwargs, kwargs
-        assert shape[1:] == (REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM)
+        assert shape[1:] == (REALTIME_POSE_TARGET_DIM,)
         frame = torch.as_tensor(
             np.tile(IDENTITY_6D, 24), device=device, dtype=torch.float32
         )
-        raw = frame.reshape(1, 1, REALTIME_POSE_TARGET_DIM).expand(*shape).clone()
+        raw = frame.reshape(1, REALTIME_POSE_TARGET_DIM).expand(*shape).clone()
         deployed = projection_fn(raw)
         return {
             "sample": deployed,

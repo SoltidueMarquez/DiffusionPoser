@@ -521,11 +521,7 @@ def step_realtime_pose_batch(
         dtype=torch.bool,
     )
     if noise is not None:
-        if tuple(noise.shape) != (
-            batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
-            REALTIME_POSE_TARGET_DIM,
-        ):
+        if tuple(noise.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
             raise ValueError(
                 f"noise 应为 [{batch_size},{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(noise.shape)}"
             )
@@ -533,14 +529,13 @@ def step_realtime_pose_batch(
     mean, scale = first._normalizer_pose_stats()
     sample = first.diffusion.projected_ddim_sample_loop(
         first.model,
-        shape=(batch_size, REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
+        shape=(batch_size, REALTIME_POSE_TARGET_DIM),
         projection_fn=lambda value: project_realtime_pose_xstart(
             value,
-            tracker_window_tensor,
-            hard_window_tensor,
+            tracker_window_tensor[:, -1],
+            hard_window_tensor[:, -1],
             mean,
             scale,
-            conditioning["window_valid_mask"],
         ),
         clip_denoised=False,
         model_kwargs={"prepared_conditioning": prepared_conditioning},
@@ -549,8 +544,8 @@ def step_realtime_pose_batch(
         projection_mode=first.projected_ddim_mode,
         late_steps=first.projected_ddim_late_steps,
     )
-    raw_targets = first._inverse_pose(sample["raw_pred_xstart"])[:, -1]
-    deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])[:, -1]
+    raw_targets = first._inverse_pose(sample["raw_pred_xstart"])
+    deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])
     auxiliary = sample.get("auxiliary_outputs", {})
     future_leg = _batch_auxiliary_numpy(auxiliary.get("future_leg"), batch_size)
     contact_logits = _batch_auxiliary_numpy(auxiliary.get("contact_logits"), batch_size)

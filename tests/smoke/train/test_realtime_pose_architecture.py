@@ -66,7 +66,7 @@ def test_target_regions_cover_each_joint_once():
 def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite():
     model = _model()
     values = _conditioning(cold_start=True)
-    hidden = torch.randn(2, 11, 144)
+    hidden = torch.randn(2, 144)
     timestep = torch.tensor([1, 2])
     prepared = model.prepare_conditioning(**values)
     direct, direct_aux = model(hidden, timestep, **values, return_aux_outputs=True)
@@ -78,11 +78,33 @@ def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite()
     )
     torch.testing.assert_close(direct, cached)
     torch.testing.assert_close(direct_aux["future_leg"], cached_aux["future_leg"])
-    assert direct.shape == (2, 11, 144)
+    assert direct.shape == (2, 144)
     assert direct_aux["future_leg"].shape == (2, 3, 8, 6)
     assert direct_aux["contact_logits"].shape == (2, 2)
     assert torch.isfinite(direct).all()
-    assert torch.count_nonzero(direct[:, :-1]) == 0
+
+
+def test_history_and_current_use_independent_input_projections_once():
+    model = _model()
+    values = _conditioning(batch_size=1)
+    inputs: dict[str, list[torch.Size]] = {"history": [], "current": []}
+    handles = [
+        model.history_pose_input.register_forward_pre_hook(
+            lambda _module, args: inputs["history"].append(args[0].shape)
+        ),
+        model.joint_input.register_forward_pre_hook(
+            lambda _module, args: inputs["current"].append(args[0].shape)
+        ),
+    ]
+    try:
+        model(torch.randn(1, 144), torch.ones(1), **values)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert inputs == {
+        "history": [torch.Size([1, 10, 24, 6])],
+        "current": [torch.Size([1, 24, 6])],
+    }
 
 
 def test_tracker_history_is_encoded_per_frame_without_gru_summary():
@@ -118,14 +140,51 @@ def test_head_path_and_history_pose_are_independent_conditions():
     )
 
 
-def test_temporal_mask_is_causal_and_ignores_left_padding_keys():
+def test_temporal_mask_is_prefix_bidirectional_and_ignores_padding_keys():
     model = _model()
     valid = torch.tensor([[False, False, True, True, True, True, True, True, True, True, True]])
     mask = model._temporal_mask(valid, joint_count=24).reshape(1, 24, 8, 11, 11)
-    # 当前帧能读取全部有效历史，但历史第 5 帧不能读取第 6 帧。
+    # 当前帧读取全部有效历史与自己；有效历史双向互读，但不能读取当前帧。
     assert not mask[0, 0, 0, -1, 2:].any()
-    assert mask[0, 0, 0, 5, 6]
+    assert not mask[0, 0, 0, 5, 6]
+    assert not mask[0, 0, 0, 6, 5]
+    assert mask[0, 0, 0, 5, -1]
     assert mask[0, 0, 0, -1, :2].all()
+    assert mask[0, 0, 0, 5, :2].all()
+
+
+def test_changing_current_token_does_not_change_history_block_rows():
+    model = _model()
+    values = _conditioning(batch_size=1)
+    with torch.no_grad():
+        block = model.blocks[0]
+        latent_dim = model.latent_dim
+        block.adaln_modulation[-1].bias[5 * latent_dim : 6 * latent_dim].fill_(1.0)
+    captured: list[torch.Tensor] = []
+    handle = model.blocks[0].register_forward_hook(
+        lambda _module, _args, output: captured.append(output.detach().clone())
+    )
+    try:
+        model(torch.zeros(1, 144), torch.ones(1), **values)
+        model(torch.full((1, 144), 10.0), torch.ones(1), **values)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(captured[0][:, :-1], captured[1][:, :-1])
+
+
+def test_current_loss_backpropagates_into_history_input_projection():
+    model = _model().train()
+    values = _conditioning(batch_size=1)
+    with torch.no_grad():
+        latent_dim = model.latent_dim
+        model.blocks[0].adaln_modulation[-1].bias[
+            5 * latent_dim : 6 * latent_dim
+        ].fill_(1.0)
+    output = model(torch.randn(1, 144), torch.ones(1), **values)
+    output.square().mean().backward()
+    gradient = model.history_pose_input.weight.grad
+    assert gradient is not None
+    assert torch.linalg.norm(gradient) > 0.0
 
 
 def test_prior_gate_is_complementary_and_region_specific():
@@ -133,8 +192,12 @@ def test_prior_gate_is_complementary_and_region_specific():
     stable = _conditioning(batch_size=1)
     stable_prepared = model.prepare_conditioning(**stable)
     torch.testing.assert_close(
-        stable_prepared.prior_gate_joint,
-        torch.full_like(stable_prepared.prior_gate_joint, 0.1),
+        stable_prepared.prior_gate_joint[:, :-1],
+        torch.ones_like(stable_prepared.prior_gate_joint[:, :-1]),
+    )
+    torch.testing.assert_close(
+        stable_prepared.prior_gate_joint[:, -1],
+        torch.full_like(stable_prepared.prior_gate_joint[:, -1], 0.1),
     )
 
     missing = {name: value.clone() for name, value in stable.items()}
@@ -144,12 +207,16 @@ def test_prior_gate_is_complementary_and_region_specific():
     left_arm_joint = int(torch.nonzero(model.joint_regions == 1)[0])
     right_arm_joint = int(torch.nonzero(model.joint_regions == 2)[0])
     torch.testing.assert_close(
-        missing_prepared.prior_gate_joint[:, :, left_arm_joint],
-        torch.ones(1, 11),
+        missing_prepared.prior_gate_joint[:, :-1, left_arm_joint],
+        torch.ones(1, 10),
     )
     torch.testing.assert_close(
-        missing_prepared.prior_gate_joint[:, :, right_arm_joint],
-        torch.full((1, 11), 0.1),
+        missing_prepared.prior_gate_joint[:, -1, left_arm_joint],
+        torch.ones(1),
+    )
+    torch.testing.assert_close(
+        missing_prepared.prior_gate_joint[:, -1, right_arm_joint],
+        torch.full((1,), 0.1),
     )
 
 
@@ -214,7 +281,7 @@ def test_model_rejects_unknown_constructor_and_forward_arguments():
 
     model = _model()
     with pytest.raises(TypeError):
-        model(torch.randn(1, 11, 144), torch.ones(1), obsolete_argument=True)
+        model(torch.randn(1, 144), torch.ones(1), obsolete_argument=True)
 
 
 def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
@@ -262,3 +329,35 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
     assert set(model_kwargs) == {"y"}
     assert model_kwargs["y"]["tracker_window"] is batch["tracker_window"]
     assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
+
+
+def test_training_boundary_only_passes_current_frame_to_diffusion():
+    class CapturingDiffusion:
+        def __init__(self) -> None:
+            self.targets: list[torch.Tensor] = []
+
+        def training_losses(self, _model, x_start, _timesteps, **_kwargs):
+            self.targets.append(x_start.detach().clone())
+            return {"loss": torch.zeros(x_start.shape[0])}
+
+    loop = object.__new__(TrainLoop)
+    loop.model = torch.nn.Identity()
+    loop.diffusion = CapturingDiffusion()
+    loop.feature_w = None
+    loop.snr_gamma = 0.0
+    loop.use_l1 = False
+    loop.mask_manager = lambda batch, sample: {
+        "y": {"history_pose_observation": batch["history_pose_observation"]}
+    }
+    sample_window = torch.randn(2, 11, 144)
+    batch = {
+        "x": sample_window.clone(),
+        "history_pose_observation": torch.randn(2, 10, 144),
+    }
+
+    loop.compute_losses(batch, torch.ones(2, dtype=torch.long))
+    batch["history_pose_observation"].add_(100.0)
+    loop.compute_losses(batch, torch.ones(2, dtype=torch.long))
+
+    torch.testing.assert_close(loop.diffusion.targets[0], sample_window[:, -1])
+    torch.testing.assert_close(loop.diffusion.targets[1], sample_window[:, -1])
