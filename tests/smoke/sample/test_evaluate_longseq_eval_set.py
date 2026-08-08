@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 import sample.evaluate_longseq_eval_set as longseq
+from data_loaders.realtime_pose_config import TaIDConfig
 from data_loaders.sensor_masking import (
     SCENARIO_FIXED_SIX,
     SCENARIO_THREE_TO_SIX,
@@ -13,6 +14,7 @@ from data_loaders.sensor_masking import (
 )
 from data_loaders.tracker_timeline import TrackerTimeline
 from eval.evaluate_realtime_pose import evaluate_file
+from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 from tests.smoke.sample.test_realtime_pose_runtime import (
     _OneStepProjectedDiffusion,
@@ -150,6 +152,8 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     assert payload["current_tracker_raw"].shape == (1, 5, 6, 13)
     assert payload["raw_pred_target_raw"].shape == (1, 5, 144)
     assert payload["deployed_pred_target_raw"].shape == (1, 5, 144)
+    assert np.isnan(payload["taid_prior_root_head"]).all()
+    assert np.isnan(payload["taid_prior_joints_head"]).all()
     reference_pelvis_yaw = longseq.extract_rotation_heading_np(
         longseq.compute_source_joint_rotations_world(source)[:, 0]
     )
@@ -166,6 +170,48 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     assert result["samples"] == 5
     assert result["by_history_phase"]["cold_start_0_59"]["samples"] == 5
     assert result["by_history_phase"]["steady_state_60_plus"]["samples"] == 0
+    assert result["by_startup_phase"]["frames_0_14"]["samples"] == 5
+    assert result["taid_prior_available_ratio"] == 0.0
+    assert result["taid_prior_root_xz_error_m"] is None
+    assert result["taid_prior_internal_mpjpe_cm"] is None
+
+
+def test_longseq_taid_prior_diagnostics_are_available_and_grouped(tmp_path):
+    source = build_toy_realtime_source(frame_count=2)
+    configured = np.ones((2, 6), dtype=bool)
+    model = RealtimePoseTargetDiT(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        motion_layers=1,
+        dropout=0.0,
+        taid_config=TaIDConfig(ablation="B1", innovation_dim=16),
+    ).eval()
+    payload = longseq.rollout_long_sequence_source(
+        model,
+        _OneStepProjectedDiffusion(),
+        source,
+        _timeline(configured, configured.copy()),
+        torch.device("cpu"),
+        normalizer=None,
+    )
+    assert payload["taid_prior_root_head"].shape == (1, 2, 4)
+    assert payload["taid_prior_joints_head"].shape == (1, 2, 24, 3)
+    assert np.isfinite(payload["taid_prior_root_head"]).all()
+    result_path = tmp_path / "taid_longseq.npz"
+    np.savez(result_path, **payload)
+    result = evaluate_file(result_path)
+    assert result["taid_prior_available_ratio"] == 1.0
+    assert result["taid_prior_root_xz_error_m"] is not None
+    assert result["taid_prior_root_y_error_m"] is not None
+    assert result["taid_prior_vs_deployed_root_gap_m"] is not None
+    assert result["taid_prior_vs_deployed_yaw_deg"] is not None
+    assert result["taid_prior_internal_mpjpe_cm"] is not None
+    assert result["taid_prior_vs_deployed_joint_gap_cm"] is not None
+    assert (
+        result["by_startup_phase"]["frames_0_14"]["taid_prior_available_ratio"]
+        == 1.0
+    )
 
 
 def test_longseq_cross_sequence_batch_supports_different_lengths_and_matches_single():
@@ -280,6 +326,11 @@ def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp
     assert summary["metadata"]["latency_scope"] == "active_batch_wall_time_per_stream"
     assert len(summary["files"]) == 4
     assert set(summary["summary"]["by_condition"]) == {"fixed_six", "fixed_three"}
+    assert (
+        summary["summary"]["by_condition"]["fixed_three"]["by_startup_phase"]
+        ["frames_0_14"]["samples"]
+        == 6
+    )
     assert all(
         (
             tmp_path

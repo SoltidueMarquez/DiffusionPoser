@@ -20,6 +20,8 @@ def get_dataset_loader(
     cold_start_prob: float = 0.1,
     scenario_weights: list[float] | tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2),
     seed: int = 10,
+    cold_start_history_weights: list[float] | tuple[float, ...] | None = None,
+    cold_start_scenario_weights: list[float] | tuple[float, ...] | None = None,
 ):
     """返回 mmap task store 的训练/评估 DataLoader。"""
 
@@ -52,6 +54,12 @@ def get_dataset_loader(
         rollout_steps=rollout_steps if is_train_split and enable_rollout else 1,
         rollout_prob=rollout_prob if is_train_split and enable_rollout else 0.0,
         cold_start_prob=cold_start_prob if is_train_split else 0.0,
+        cold_start_history_weights=(
+            cold_start_history_weights if is_train_split else None
+        ),
+        cold_start_scenario_weights=(
+            cold_start_scenario_weights if is_train_split else None
+        ),
         shuffle=is_train_split,
         drop_last=is_train_split,
     )

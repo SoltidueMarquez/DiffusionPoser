@@ -4,7 +4,11 @@ import json
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
-from data_loaders.realtime_pose_config import TAID_ABLATIONS, RealtimePoseLossWeights
+from data_loaders.realtime_pose_config import (
+    TAID_ABLATIONS,
+    TAID_PRIOR_TRACKER_AGGREGATIONS,
+    RealtimePoseLossWeights,
+)
 from data_loaders.sensor_masking import (
     DEFAULT_SCENARIO_WEIGHTS,
     REALTIME_POSE_SEQ_LEN,
@@ -94,6 +98,22 @@ def add_data_options(parser: ArgumentParser):
         help="训练时使用 0～59 帧部分历史的概率；其余样本保留完整 60 帧历史。",
     )
     group.add_argument(
+        "--cold_start_history_weights",
+        nargs=5,
+        default=None,
+        type=float,
+        metavar=("ZERO", "ONE_TO_FOUR", "FIVE_TO_FOURTEEN", "FIFTEEN_TO_TWENTY_NINE", "THIRTY_TO_FIFTY_NINE"),
+        help="可选冷启动历史桶权重；未提供时继续在 0～59 帧均匀采样。",
+    )
+    group.add_argument(
+        "--cold_start_scenario_weights",
+        nargs=5,
+        default=None,
+        type=float,
+        metavar=("SIX", "THREE", "3TO6", "6TO3", "TWO_DROP_RECONNECT"),
+        help="可选冷启动场景权重；只影响部分历史样本。",
+    )
+    group.add_argument(
         "--scenario_weights",
         nargs=5,
         default=list(DEFAULT_SCENARIO_WEIGHTS),
@@ -138,6 +158,12 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--model_arch", default="target_dit", choices=["target_dit"], type=str)
     group.add_argument("--motion_layers", default=4, type=int)
     group.add_argument("--taid_ablation", default="B0", choices=TAID_ABLATIONS, type=str)
+    group.add_argument(
+        "--taid_prior_tracker_aggregation",
+        default="fixed_slots",
+        choices=TAID_PRIOR_TRACKER_AGGREGATIONS,
+        help="Prior 跨 Tracker 固定六槽聚合契约；当前实现只允许 fixed_slots。",
+    )
     group.add_argument("--taid_anchor_ramp_start", default=5, type=int)
     group.add_argument("--taid_anchor_ramp_end", default=15, type=int)
     group.add_argument("--taid_innovation_ramp_frames", default=15, type=int)
@@ -209,6 +235,12 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
     group.add_argument("--foot_slide_loss_weight", default=_LOSS_DEFAULTS.foot_slide, type=float)
     group.add_argument("--rollout_loss_weight", default=_LOSS_DEFAULTS.rollout, type=float)
+    group.add_argument(
+        "--rollout_frame_weighting",
+        default="uniform",
+        choices=("uniform", "linear_late"),
+        help="rollout 后续帧 loss 的时间聚合策略；默认 uniform 保持原平均行为。",
+    )
     group.add_argument("--rollout_prob", default=0.5, type=float)
     group.add_argument("--detach_rollout_history", default=True, type=str2bool)
     group.add_argument("--rollout_joint_vel_loss_weight", default=0.05, type=float)

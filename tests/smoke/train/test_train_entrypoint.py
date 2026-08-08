@@ -59,9 +59,37 @@ class TrainEntrypointTest(unittest.TestCase):
 
         self.assertEqual(args.rollout_steps, 4)
         self.assertEqual(args.cold_start_prob, 0.1)
+        self.assertIsNone(args.cold_start_history_weights)
+        self.assertIsNone(args.cold_start_scenario_weights)
         self.assertNotIn("--history_pose_noise_std", parser._option_string_actions)
         self.assertNotIn("--tracker_latency_max_frames", parser._option_string_actions)
         self.assertNotIn("--tracker_mask_policy", parser._option_string_actions)
+
+    def test_data_options_parse_stratified_cold_start_weights(self):
+        parser = ArgumentParser()
+        add_data_options(parser)
+
+        args = parser.parse_args(
+            [
+                "--data_dir",
+                "dataset/tasks",
+                "--cold_start_history_weights",
+                "0.25",
+                "0.20",
+                "0.25",
+                "0.15",
+                "0.15",
+                "--cold_start_scenario_weights",
+                "0.10",
+                "0.60",
+                "0.10",
+                "0.10",
+                "0.10",
+            ]
+        )
+
+        self.assertEqual(args.cold_start_history_weights, [0.25, 0.2, 0.25, 0.15, 0.15])
+        self.assertEqual(args.cold_start_scenario_weights, [0.1, 0.6, 0.1, 0.1, 0.1])
 
     def test_training_options_default_to_protect_existing_save_dir(self):
         parser = ArgumentParser()
@@ -75,6 +103,7 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertTrue(args.model_ema)
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
+        self.assertEqual(args.rollout_frame_weighting, "uniform")
         removed_legacy_losses = (
             "--pelvis_fk_loss_weight",
             "--pelvis_offset_loss_weight",
@@ -83,6 +112,30 @@ class TrainEntrypointTest(unittest.TestCase):
         )
         for option in removed_legacy_losses:
             self.assertNotIn(option, parser._option_string_actions)
+
+    def test_training_options_parse_linear_late_rollout_weighting(self):
+        parser = ArgumentParser()
+        add_training_options(parser)
+
+        args = parser.parse_args(
+            [
+                "--save_dir",
+                "save/test_run",
+                "--rollout_frame_weighting",
+                "linear_late",
+            ]
+        )
+
+        self.assertEqual(args.rollout_frame_weighting, "linear_late")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--save_dir",
+                    "save/test_run",
+                    "--rollout_frame_weighting",
+                    "quadratic",
+                ]
+            )
 
     def test_training_options_can_disable_default_model_ema(self):
         parser = ArgumentParser()

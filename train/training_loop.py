@@ -15,12 +15,95 @@ from data_loaders.realtime_pose_config import TAID_ABLATIONS
 
 from data_loaders.sensor_masking import (
     REALTIME_POSE_HISTORY_LENGTH,
+    REALTIME_POSE_MAX_ROLLOUT_STEPS,
     REALTIME_POSE_TARGET_DIM,
     TASK_MODE_REALTIME_POSE,
 )
 from diffusion import logger
 from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 from utils import dist_util
+
+
+ROLLOUT_PRIOR_DIAGNOSTIC_NAMES = (
+    "prior_fk_loss",
+    "prior_internal_fk_loss",
+    "prior_root_pose_gap_m",
+    "prior_root_pose_gap_xz_m",
+    "prior_joint_resolver_gap_m",
+)
+ROLLOUT_FRAME_WEIGHTINGS = ("uniform", "linear_late")
+
+
+def build_rollout_frame_weights(
+    rollout_steps: int,
+    weighting: str,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """构造第 2～K 帧的归一化权重，第一帧主损失不包含在这里。"""
+
+    future_steps = int(rollout_steps) - 1
+    if future_steps < 1:
+        raise ValueError("rollout frame weighting 至少需要两个预测帧。")
+    if weighting not in ROLLOUT_FRAME_WEIGHTINGS:
+        raise ValueError(
+            f"rollout_frame_weighting 必须属于 {ROLLOUT_FRAME_WEIGHTINGS}，实际为 {weighting!r}。"
+        )
+    if weighting == "uniform":
+        weights = torch.ones(future_steps, device=device, dtype=dtype)
+    else:
+        weights = torch.arange(1, future_steps + 1, device=device, dtype=dtype)
+    return weights / weights.sum()
+
+
+def aggregate_rollout_frame_losses(
+    rollout_terms: list[dict[str, torch.Tensor]],
+    weighting: str,
+) -> dict[str, torch.Tensor]:
+    """只聚合逐帧主 loss；时序 loss 和其他诊断仍走原来的独立路径。"""
+
+    if not rollout_terms:
+        raise ValueError("rollout frame loss 聚合至少需要一个后续预测。")
+    step_losses = [terms["loss"] for terms in rollout_terms]
+    first_shape = step_losses[0].shape
+    if any(loss.shape != first_shape for loss in step_losses):
+        raise ValueError("rollout 各后续帧 loss 形状必须一致。")
+    stacked = torch.stack(step_losses, dim=0)
+    weights = build_rollout_frame_weights(
+        len(rollout_terms) + 1,
+        weighting,
+        device=stacked.device,
+        dtype=stacked.dtype,
+    )
+    broadcast_shape = (len(weights),) + (1,) * (stacked.ndim - 1)
+    uniform_frame_loss = stacked.mean(dim=0)
+    weighted_frame_loss = (
+        uniform_frame_loss
+        if weighting == "uniform"
+        else (stacked * weights.reshape(broadcast_shape)).sum(dim=0)
+    )
+    result = {
+        "loss": weighted_frame_loss,
+        "uniform_frame_loss": uniform_frame_loss,
+    }
+    for step_index, (step_loss, weight) in enumerate(zip(step_losses, weights), start=1):
+        result[f"step_{step_index}_loss"] = step_loss
+        result[f"step_{step_index}_weight"] = torch.ones_like(step_loss) * weight
+        result[f"step_{step_index}_weighted_loss"] = step_loss * weight
+    return result
+
+
+def add_rollout_step_diagnostics(
+    result: dict[str, torch.Tensor],
+    terms: dict[str, torch.Tensor],
+    step_index: int,
+) -> None:
+    """把第 2～15 帧的 Prior/FK 诊断写入稳定的 rollout 日志键。"""
+
+    for diagnostic_name in ROLLOUT_PRIOR_DIAGNOSTIC_NAMES:
+        if diagnostic_name in terms:
+            result[f"step_{step_index}_{diagnostic_name}"] = terms[diagnostic_name]
 
 
 def validate_taid_checkpoint_stage(
@@ -134,6 +217,9 @@ class TrainLoop:
         self.checkpoint_max_keep = max(0, int(args.checkpoint_max_keep))
         self.rollout_steps = int(getattr(args, "rollout_steps", 1))
         self.rollout_loss_weight = float(getattr(args, "rollout_loss_weight", 0.0))
+        self.rollout_frame_weighting = str(
+            getattr(args, "rollout_frame_weighting", "uniform")
+        )
         self.rollout_prob = float(getattr(args, "rollout_prob", 0.0))
         self.detach_rollout_history = bool(getattr(args, "detach_rollout_history", True))
         self.rollout_joint_vel_loss_weight = float(
@@ -144,10 +230,18 @@ class TrainLoop:
         )
         if self.rollout_steps < 1:
             raise ValueError(f"rollout_steps must be >= 1, got {self.rollout_steps}")
-        if self.rollout_steps > 4:
-            raise ValueError("当前快速迭代版本只支持 rollout_steps<=4。")
+        if self.rollout_steps > REALTIME_POSE_MAX_ROLLOUT_STEPS:
+            raise ValueError(
+                "rollout_steps 超过离线 task 可物化上限："
+                f"{REALTIME_POSE_MAX_ROLLOUT_STEPS}。"
+            )
         if self.rollout_loss_weight < 0.0:
             raise ValueError(f"rollout_loss_weight must be >= 0, got {self.rollout_loss_weight}")
+        if self.rollout_frame_weighting not in ROLLOUT_FRAME_WEIGHTINGS:
+            raise ValueError(
+                "rollout_frame_weighting 必须属于 "
+                f"{ROLLOUT_FRAME_WEIGHTINGS}，实际为 {self.rollout_frame_weighting!r}。"
+            )
         if self.rollout_joint_vel_loss_weight < 0.0:
             raise ValueError("rollout_joint_vel_loss_weight 必须大于等于 0。")
         if self.rollout_rot_vel_loss_weight < 0.0:
@@ -180,7 +274,8 @@ class TrainLoop:
         logger.log(f"task mode: {self.task_mode}")
         logger.log(
             f"rollout: steps={self.rollout_steps}, prob={self.rollout_prob}, "
-            f"weight={self.rollout_loss_weight}, detach_history={self.detach_rollout_history}, "
+            f"weight={self.rollout_loss_weight}, frame_weighting={self.rollout_frame_weighting}, "
+            f"detach_history={self.detach_rollout_history}, "
             f"joint_vel_weight={self.rollout_joint_vel_loss_weight}, "
             f"rot_vel_weight={self.rollout_rot_vel_loss_weight}"
         )
@@ -640,11 +735,12 @@ class TrainLoop:
         if not rollout_terms:
             raise ValueError("rollout_steps>1 时至少应产生一个后续预测。")
 
-        result: dict[str, torch.Tensor] = {
-            "loss": torch.stack([terms["loss"] for terms in rollout_terms], dim=0).mean(dim=0),
-        }
+        result = aggregate_rollout_frame_losses(
+            rollout_terms,
+            getattr(self, "rollout_frame_weighting", "uniform"),
+        )
         for step_index, terms in enumerate(rollout_terms, start=1):
-            result[f"step_{step_index}_loss"] = terms["loss"]
+            add_rollout_step_diagnostics(result, terms, step_index)
 
         common_keys = set.intersection(*(set(terms.keys()) for terms in rollout_terms))
         for key in sorted(common_keys - {"loss"}):

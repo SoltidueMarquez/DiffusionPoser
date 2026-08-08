@@ -37,6 +37,7 @@ from data_loaders.realtime_pose_validation import load_realtime_metadata, valida
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
+    REALTIME_POSE_MAX_ROLLOUT_STEPS,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_START,
@@ -61,6 +62,9 @@ SHORT_SOURCE_POLICY_SKIP = "skip"
 SHORT_SOURCE_POLICY_ERROR = "error"
 SHORT_SOURCE_POLICIES = (SHORT_SOURCE_POLICY_SKIP, SHORT_SOURCE_POLICY_ERROR)
 TASK_OUTPUT_MARKER = ".realtime_pose_tasks.json"
+LIMIT_SELECTION_PREFIX = "prefix"
+LIMIT_SELECTION_STRATIFIED = "stratified"
+LIMIT_SELECTION_MODES = (LIMIT_SELECTION_PREFIX, LIMIT_SELECTION_STRATIFIED)
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     task.add_argument("--shard_size", default=4096, type=int)
     task.add_argument("--short_source_policy", default=SHORT_SOURCE_POLICY_SKIP, choices=SHORT_SOURCE_POLICIES)
     task.add_argument("--limit", default=0, type=int)
+    task.add_argument(
+        "--limit_selection",
+        default=LIMIT_SELECTION_PREFIX,
+        choices=LIMIT_SELECTION_MODES,
+        help="limit 对 source 的选择方式；默认 prefix 严格保持旧行为。",
+    )
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--seed", default=10, type=int)
@@ -135,8 +145,10 @@ def generate_realtime_pose_tasks(args: argparse.Namespace) -> dict[str, int]:
 def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerationPlan:
     if int(args.seq_len) != REALTIME_POSE_SEQ_LEN:
         raise ValueError(f"当前任务固定 seq_len={REALTIME_POSE_SEQ_LEN}。")
-    if not 1 <= int(args.max_rollout_steps) <= 4:
-        raise ValueError("max_rollout_steps 必须在 [1,4]。")
+    if not 1 <= int(args.max_rollout_steps) <= REALTIME_POSE_MAX_ROLLOUT_STEPS:
+        raise ValueError(
+            f"max_rollout_steps 必须在 [1,{REALTIME_POSE_MAX_ROLLOUT_STEPS}]。"
+        )
     if int(args.base_windows_per_source) < 1:
         raise ValueError("base_windows_per_source 必须大于等于 1。")
     if int(args.shard_size) < 1:
@@ -162,8 +174,13 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
     for raw_split in args.splits:
         split = str(raw_split)
         split_entries = filter_entries_by_split(entries, read_split_keys(split_dir, split))
-        if int(args.limit) > 0:
-            split_entries = split_entries[: int(args.limit)]
+        split_entries = select_limited_source_entries(
+            split_entries,
+            limit=int(args.limit),
+            selection=str(getattr(args, "limit_selection", LIMIT_SELECTION_PREFIX)),
+            global_seed=int(args.seed),
+            split=split,
+        )
         sources: list[dict] = []
         tasks: list[dict] = []
         for entry in split_entries:
@@ -219,6 +236,37 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
             )
         )
     return TaskGenerationPlan(source_dir, output_root, output_dir, split_plans)
+
+
+def select_limited_source_entries(
+    entries: list[dict],
+    *,
+    limit: int,
+    selection: str,
+    global_seed: int,
+    split: str,
+) -> list[dict]:
+    """在已排序 split source 上执行可复现限量选择。"""
+
+    values = list(entries)
+    requested = int(limit)
+    mode = str(selection)
+    if mode not in LIMIT_SELECTION_MODES:
+        raise ValueError(f"未知 limit_selection：{mode}")
+    if requested <= 0 or len(values) <= requested:
+        return values
+    if mode == LIMIT_SELECTION_PREFIX:
+        return values[:requested]
+
+    rng = np.random.Generator(
+        np.random.PCG64(stable_context_seed(global_seed, split, "source_limit_stratified"))
+    )
+    selected: list[dict] = []
+    for interval_index in range(requested):
+        low = interval_index * len(values) // requested
+        high = (interval_index + 1) * len(values) // requested
+        selected.append(values[int(rng.integers(low, high))])
+    return selected
 
 
 def validate_two_point_phase_balance(tasks: list[dict], split: str) -> dict[str, int]:

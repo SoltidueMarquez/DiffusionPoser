@@ -19,6 +19,13 @@ from data_loaders.sensor_masking import (
 )
 
 
+def wrapped_angle_difference(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """返回 ``first-second`` 在 ``[-π,π]`` 上的连续有符号角差。"""
+
+    difference = first - second
+    return torch.atan2(torch.sin(difference), torch.cos(difference))
+
+
 def compute_raw_deployed_losses(
     raw_pred_xstart: torch.Tensor,
     deployed_pred_xstart: torch.Tensor,
@@ -92,10 +99,10 @@ def compute_raw_deployed_losses(
     target_root = batch["target_root_position_head_ref"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     current_head_yaw = batch["current_head_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     target_root_yaw = batch["target_root_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
-    root_yaw_error = torch.remainder(
-        deployed_root_yaw + current_head_yaw - target_root_yaw + math.pi,
-        2.0 * math.pi,
-    ) - math.pi
+    root_yaw_error = wrapped_angle_difference(
+        deployed_root_yaw + current_head_yaw,
+        target_root_yaw,
+    )
     # Actor Root 的 Y 固定在 floor；root_loss 只监督 yaw，避免与下面的
     # Head-to-Root 水平几何项重复惩罚同一个 XZ 偏移。
     root_loss = root_yaw_error.square()
@@ -133,10 +140,11 @@ def compute_raw_deployed_losses(
 
 def compute_anchor_prior_losses(
     target_xstart: torch.Tensor,
+    deployed_pred_xstart: torch.Tensor,
     batch: dict,
     auxiliary_outputs: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """计算 B1 Anchor Prior 的完整姿态、Root、速度与接触监督。"""
+    """计算 B1 Prior 监督；主 FK 严格复用部署 Resolver，内部 FK 仅诊断。"""
 
     target_raw = _to_raw_pose(target_xstart, batch)
     target_rotations, _ = decode_target_head_rotations_torch(target_raw)
@@ -172,14 +180,35 @@ def compute_anchor_prior_losses(
     rotation_error = _rotation_angle(prior_rotations, target_rotations)
     prior_rotation_loss = _weighted_mean(rotation_error, joint_weight)
 
-    prior_joints = auxiliary_outputs["taid_prior_joints_head"].to(
+    prior_internal_joints = auxiliary_outputs["taid_prior_joints_head"].to(
         device=target_raw.device, dtype=target_raw.dtype
     )
     target_joints = batch["target_joints_head_ref"].to(
         device=target_raw.device, dtype=target_raw.dtype
     )
-    joint_l1 = (prior_joints - target_joints).abs().mean(dim=-1)
-    prior_fk_loss = _weighted_mean(joint_l1, joint_weight)
+
+    # B1 的主 FK 必须与部署一致：先使用 hard rotation projection 后的 144D pose，
+    # 再由稳定的 Head-Anchored Resolver 恢复 Root 和关节。内部 Root MLP xyz 不参与此路径。
+    deployed_raw = _to_raw_pose(deployed_pred_xstart, batch)
+    deployed_rotations, deployed_root_yaw = decode_target_head_rotations_torch(
+        deployed_raw
+    )
+    current_tracker = batch["current_tracker_raw"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    joint_offsets = batch["joint_offsets_parent"].to(
+        device=target_raw.device, dtype=target_raw.dtype
+    )
+    deployed_root, _, deployed_joints = resolve_root_head_reference_torch(
+        deployed_rotations,
+        deployed_root_yaw,
+        joint_offsets,
+        observed_head_height=current_tracker[:, HEAD_TRACKER_INDEX, 1],
+    )
+    deployed_joint_l1 = (deployed_joints - target_joints).abs().mean(dim=-1)
+    prior_fk_loss = _weighted_mean(deployed_joint_l1, joint_weight)
+    internal_joint_l1 = (prior_internal_joints - target_joints).abs().mean(dim=-1)
+    prior_internal_fk_loss = _weighted_mean(internal_joint_l1, joint_weight)
 
     root_head = auxiliary_outputs["taid_prior_root_head"].to(
         device=target_raw.device, dtype=target_raw.dtype
@@ -193,13 +222,20 @@ def compute_anchor_prior_losses(
     current_head_yaw = batch["current_head_yaw_world"].to(
         device=target_raw.device, dtype=target_raw.dtype
     )
-    relative_target_yaw = torch.remainder(
-        target_root_yaw - current_head_yaw + math.pi, 2.0 * math.pi
-    ) - math.pi
-    yaw_error = torch.remainder(
-        root_head[:, 3] - relative_target_yaw + math.pi, 2.0 * math.pi
-    ) - math.pi
-    prior_root_loss = (root_head[:, :3] - target_root).abs().mean(dim=-1) + yaw_error.abs()
+    relative_target_yaw = wrapped_angle_difference(target_root_yaw, current_head_yaw)
+    # root_head[:,3] 已从 prior_pose_raw 的 Pelvis rotation 派生；该 circular
+    # 监督会直接回传到真正部署的 144D pose，而不是训练一个平行但未消费的 yaw。
+    yaw_error = wrapped_angle_difference(root_head[:, 3], relative_target_yaw)
+    prior_root_loss = (
+        (root_head[:, :3] - target_root).abs().mean(dim=-1) + yaw_error.abs()
+    )
+    root_gap = root_head[:, :3] - deployed_root
+    prior_root_pose_gap_m = torch.linalg.norm(root_gap, dim=-1)
+    prior_root_pose_gap_xz_m = torch.linalg.norm(root_gap[:, [0, 2]], dim=-1)
+    prior_joint_resolver_gap_m = torch.linalg.norm(
+        prior_internal_joints - deployed_joints,
+        dim=-1,
+    ).mean(dim=-1)
 
     previous_joints = batch["prev_joints_head_ref"].to(
         device=target_raw.device, dtype=target_raw.dtype
@@ -219,6 +255,10 @@ def compute_anchor_prior_losses(
     return {
         "prior_rotation_loss": prior_rotation_loss,
         "prior_fk_loss": prior_fk_loss,
+        "prior_internal_fk_loss": prior_internal_fk_loss,
+        "prior_root_pose_gap_m": prior_root_pose_gap_m,
+        "prior_root_pose_gap_xz_m": prior_root_pose_gap_xz_m,
+        "prior_joint_resolver_gap_m": prior_joint_resolver_gap_m,
         "prior_root_loss": prior_root_loss,
         "prior_velocity_loss": prior_velocity_loss,
         "prior_contact_loss": prior_contact_loss,

@@ -5,7 +5,12 @@ from dataclasses import dataclass, replace
 import torch
 import torch.nn as nn
 
-from data_loaders.realtime_pose_config import TAID_ABLATIONS, TARGET_JOINT_REGIONS, TaIDConfig
+from data_loaders.realtime_pose_config import (
+    TAID_ABLATIONS,
+    TAID_PRIOR_TRACKER_AGGREGATIONS,
+    TARGET_JOINT_REGIONS,
+    TaIDConfig,
+)
 from data_loaders.realtime_pose_geometry import (
     decode_target_head_rotations_torch,
     reexpress_previous_position_residual_torch,
@@ -66,6 +71,28 @@ class PreparedTaIDConditioning:
     joint_condition: torch.Tensor
 
 
+class FixedSlotAnchorProjection(nn.Module):
+    """按固定 Tracker 顺序把 `[B,6,D]` 槽位投影回 `[B,D]`。"""
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        # 不调用随机初始化：六个单位矩阵使初始输出严格等价于槽位求和，
+        # 也不会改变同 seed 下其余 Prior 参数的初始化随机序列。
+        initial_weight = torch.eye(self.latent_dim).repeat(1, TRACKER_COUNT)
+        self.weight = nn.Parameter(initial_weight)
+
+    def forward(self, normalized_anchor_slots: torch.Tensor) -> torch.Tensor:
+        expected = (TRACKER_COUNT, self.latent_dim)
+        if tuple(normalized_anchor_slots.shape[1:]) != expected:
+            raise ValueError(
+                "normalized_anchor_slots 应为 [B,6,D]，"
+                f"实际为 {tuple(normalized_anchor_slots.shape)}"
+            )
+        flattened = normalized_anchor_slots.reshape(normalized_anchor_slots.shape[0], -1)
+        return torch.matmul(flattened, self.weight.t())
+
+
 class AnchorPriorRegressor(nn.Module):
     """只融合 deployed pose history、Head 与乘过 alpha 的独立 Tracker token。"""
 
@@ -75,7 +102,7 @@ class AnchorPriorRegressor(nn.Module):
         self.history_frame_encoder = nn.Linear(REALTIME_POSE_TARGET_DIM, self.latent_dim)
         self.history_gru = nn.GRU(self.latent_dim, self.latent_dim, batch_first=True)
         self.tracker_fusion = nn.Sequential(
-            nn.Linear(self.latent_dim * 3, self.latent_dim),
+            nn.Linear(self.latent_dim * 4, self.latent_dim),
             nn.SiLU(),
             nn.Linear(self.latent_dim, self.latent_dim),
         )
@@ -97,7 +124,7 @@ class AnchorPriorRegressor(nn.Module):
         self.root_head = nn.Sequential(
             nn.Linear(self.latent_dim, max(32, self.latent_dim // 2)),
             nn.SiLU(),
-            nn.Linear(max(32, self.latent_dim // 2), 4),
+            nn.Linear(max(32, self.latent_dim // 2), 3),
         )
         self.contact_head = nn.Sequential(
             nn.Linear(self.latent_dim, max(32, self.latent_dim // 4)),
@@ -109,6 +136,7 @@ class AnchorPriorRegressor(nn.Module):
             nn.SiLU(),
             nn.Linear(self.latent_dim, SMPL_JOINT_COUNT * 3),
         )
+        self.anchor_slot_projection = FixedSlotAnchorProjection(self.latent_dim)
         # Prior 从上一 deployed pose 做残差预测；零初始化保证接入初期不会随机
         # 破坏历史中心，Root/contact 则从中性输出开始学习。
         nn.init.zeros_(self.pose_head[-1].weight)
@@ -149,13 +177,23 @@ class AnchorPriorRegressor(nn.Module):
         position_tokens[:, 1:] = observation.position_tokens
         tracker_tokens = self.tracker_fusion(
             torch.cat(
-                [observation.state_tokens, position_tokens, observation.rotation_tokens],
+                [
+                    observation.state_tokens,
+                    position_tokens,
+                    observation.rotation_tokens,
+                    observation.history_summary,
+                ],
                 dim=-1,
             )
         )
+        # 每个 Tracker 先独立融合当前观测与其60帧历史，再用连续 alpha 门控。
+        # 因此 U/M/未配置 Tracker 的 current/history 均不会泄漏进跨 Tracker 聚合。
         anchor_tokens = tracker_tokens * role_state.alpha[..., None].to(tracker_tokens.dtype)
         anchor_denominator = role_state.alpha.sum(dim=1, keepdim=True).clamp_min(1.0)
-        anchor_summary = anchor_tokens.sum(dim=1) / anchor_denominator
+        # 固定顺序为 Head/LHand/RHand/Hip/LFoot/RFoot。先按旧公式归一化，
+        # 再保留六个槽位进入可训练投影；初始化时与原加权平均逐元素相同。
+        normalized_anchor_slots = anchor_tokens / anchor_denominator[..., None]
+        anchor_summary = self.anchor_slot_projection(normalized_anchor_slots)
         coverage_token = self.coverage_encoder(role_state.region_coverage.to(pose_history.dtype))
         fused = self.fusion(
             torch.cat(
@@ -165,12 +203,16 @@ class AnchorPriorRegressor(nn.Module):
         )
         pose_model = last_pose_model + self.pose_head(fused)
         pose_raw = _inverse_pose(pose_model, pose_mean, pose_std)
-        root_head = self.root_head(fused)
+        root_xyz_head = self.root_head(fused)
         contact_logits = self.contact_head(fused)
         joint_velocity_head = self.joint_velocity_head(fused).reshape(
             batch_size, SMPL_JOINT_COUNT, 3
         )
-        rotations, _ = decode_target_head_rotations_torch(pose_raw)
+        rotations, pose_root_yaw_head = decode_target_head_rotations_torch(pose_raw)
+        # 144D pose 是 runtime 最终消费的唯一姿态输出，因此 Root yaw 必须由
+        # 其中的 Pelvis forward heading 派生。Root MLP 只预测 xyz，避免训练时
+        # 另一个独立 yaw head 看似准确、部署时 pose heading 却落入相反 π 模态。
+        root_head = torch.cat([root_xyz_head, pose_root_yaw_head[:, None]], dim=-1)
         base_root, _, joints = resolve_root_head_reference_torch(
             rotations,
             root_head[:, 3],
@@ -258,6 +300,9 @@ class TaIDConditioner(nn.Module):
                     self.config.hip_leg_secondary_weight,
                     self.config.hand_torso_weight,
                     self.config.foot_root_contact_weight,
+                    TAID_PRIOR_TRACKER_AGGREGATIONS.index(
+                        self.config.prior_tracker_aggregation
+                    ),
                 ],
                 dtype=torch.float64,
             ),

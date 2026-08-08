@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -74,6 +75,8 @@ class RuntimeStepResult:
     current_tracker_raw: np.ndarray
     future_leg_prediction: np.ndarray | None = None
     contact_logits: np.ndarray | None = None
+    taid_prior_root_head: np.ndarray | None = None
+    taid_prior_joints_head: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,63 @@ class RealtimePoseRuntime:
         self.previous_d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_head_yaw: float | None = None
         self.previous_head_position: np.ndarray | None = None
+
+    def replace_pose_history_for_diagnostic(
+        self,
+        states: Sequence[WorldPoseState],
+    ) -> None:
+        """只为离线诊断覆写完整 GT pose history，不触碰部署会话状态。
+
+        Teacher-forced 诊断仍让 Tracker、trajectory、duration 和 Head 状态沿
+        真实时间线连续推进；这里只替换模型会消费的过去 60 帧世界旋转。严格
+        要求另外两类历史已经填满，避免把 GT pose 注入误用于冷启动部署路径。
+        """
+
+        if len(states) != REALTIME_POSE_HISTORY_LENGTH:
+            raise ValueError(
+                "诊断 pose history 必须严格包含 "
+                f"{REALTIME_POSE_HISTORY_LENGTH} 帧，实际为 {len(states)}。"
+            )
+        if (
+            len(self.tracker_history) != REALTIME_POSE_HISTORY_LENGTH
+            or len(self.trajectory_history) != REALTIME_POSE_HISTORY_LENGTH
+        ):
+            raise RuntimeError(
+                "覆写 GT pose history 前，Tracker 与 trajectory history 必须已经填满 60 帧。"
+            )
+
+        copied: list[WorldPoseState] = []
+        for index, state in enumerate(states):
+            if not isinstance(state, WorldPoseState):
+                raise TypeError(f"states[{index}] 必须是 WorldPoseState。")
+            rotations = np.asarray(state.joint_rotations_world, dtype=np.float32)
+            root_position = np.asarray(state.root_position_world, dtype=np.float32)
+            if rotations.shape != (24, 3, 3):
+                raise ValueError(
+                    f"states[{index}].joint_rotations_world 必须为 [24,3,3]，"
+                    f"实际为 {rotations.shape}。"
+                )
+            if root_position.shape != (3,):
+                raise ValueError(
+                    f"states[{index}].root_position_world 必须为 [3]，"
+                    f"实际为 {root_position.shape}。"
+                )
+            if not (
+                np.isfinite(rotations).all()
+                and np.isfinite(root_position).all()
+                and np.isfinite(float(state.root_yaw_world))
+                and np.isfinite(float(state.hip_height))
+            ):
+                raise ValueError(f"states[{index}] 含非有限 GT pose 值。")
+            copied.append(
+                WorldPoseState(
+                    joint_rotations_world=rotations.copy(),
+                    root_yaw_world=float(state.root_yaw_world),
+                    hip_height=float(state.hip_height),
+                    root_position_world=root_position.copy(),
+                )
+            )
+        self.pose_history = copied
 
     def step(
         self,
@@ -208,6 +268,7 @@ class RealtimePoseRuntime:
                 conditioning["valid_frame_mask"],
                 **prepare_kwargs,
             )
+        taid_prior_root_head, taid_prior_joints_head = _prepared_taid_prior_numpy(prepared)
         model_kwargs = {"prepared_conditioning": prepared}
         current_tracker_tensor = torch.as_tensor(
             current_tracker_raw, device=self.device, dtype=torch.float32
@@ -274,6 +335,8 @@ class RealtimePoseRuntime:
             current_tracker_raw.copy(),
             None if future_leg is None else np.asarray(future_leg.detach().cpu()[0], dtype=np.float32),
             None if contact_logits is None else np.asarray(contact_logits.detach().cpu()[0], dtype=np.float32),
+            None if taid_prior_root_head is None else taid_prior_root_head[0],
+            None if taid_prior_joints_head is None else taid_prior_joints_head[0],
         )
 
     def _build_current_trajectory(
@@ -526,6 +589,8 @@ class RealtimePoseRuntime:
         deployed_target: np.ndarray,
         future_leg: np.ndarray | None,
         contact_logits: np.ndarray | None,
+        taid_prior_root_head: np.ndarray | None,
+        taid_prior_joints_head: np.ndarray | None,
     ) -> RuntimeStepResult:
         """用采样结果推进一条序列，不影响批内其他序列。"""
 
@@ -572,6 +637,16 @@ class RealtimePoseRuntime:
             ),
             contact_logits=(
                 None if contact_logits is None else np.asarray(contact_logits, dtype=np.float32)
+            ),
+            taid_prior_root_head=(
+                None
+                if taid_prior_root_head is None
+                else np.asarray(taid_prior_root_head, dtype=np.float32)
+            ),
+            taid_prior_joints_head=(
+                None
+                if taid_prior_joints_head is None
+                else np.asarray(taid_prior_joints_head, dtype=np.float32)
             ),
         )
 
@@ -655,6 +730,9 @@ def step_realtime_pose_batch(
             conditioning["valid_frame_mask"],
             **prepare_kwargs,
         )
+    taid_prior_root_head, taid_prior_joints_head = _prepared_taid_prior_numpy(
+        prepared_conditioning
+    )
     current_tracker_tensor = torch.as_tensor(
         current_tracker_raw_batch,
         device=first.device,
@@ -701,6 +779,8 @@ def step_realtime_pose_batch(
             deployed_targets[index],
             None if future_leg is None else future_leg[index],
             None if contact_logits is None else contact_logits[index],
+            None if taid_prior_root_head is None else taid_prior_root_head[index],
+            None if taid_prior_joints_head is None else taid_prior_joints_head[index],
         )
         for index, runtime in enumerate(runtimes)
     ]
@@ -716,6 +796,19 @@ def _batch_auxiliary_numpy(value, batch_size: int) -> np.ndarray | None:
     if result.shape[0] != batch_size:
         raise ValueError(f"辅助输出批维不匹配：{result.shape[0]} != {batch_size}")
     return np.asarray(result, dtype=np.float32)
+
+
+def _prepared_taid_prior_numpy(prepared) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """导出 TAID Prior 诊断；这些值绝不参与稳定的部署 Resolver。"""
+
+    taid = getattr(prepared, "taid", None)
+    if taid is None:
+        return None, None
+    prior = taid.prior
+    return (
+        np.asarray(prior.root_head.detach().cpu(), dtype=np.float32),
+        np.asarray(prior.joints_head.detach().cpu(), dtype=np.float32),
+    )
 
 
 def decode_and_resolve_pose(

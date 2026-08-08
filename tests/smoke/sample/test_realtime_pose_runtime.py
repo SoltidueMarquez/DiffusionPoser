@@ -117,6 +117,8 @@ def test_runtime_cold_start_cache_and_hard_recovery_gate() -> None:
     assert reconnected.raw_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,)
     assert reconnected.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,)
     assert reconnected.current_tracker_raw.shape == (6, 13)
+    assert reconnected.taid_prior_root_head is None
+    assert reconnected.taid_prior_joints_head is None
 
 
 def test_ema_checkpoint_returns_inner_model_and_runs_runtime(tmp_path) -> None:
@@ -174,6 +176,10 @@ def test_taid_single_and_batch_runtime_prepare_full_geometry_contract() -> None:
     )
     single = _step(first, source, 0, np.ones(6, dtype=bool))
     assert single.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,)
+    assert single.taid_prior_root_head is not None
+    assert single.taid_prior_root_head.shape == (4,)
+    assert single.taid_prior_joints_head is not None
+    assert single.taid_prior_joints_head.shape == (24, 3)
 
     second = RealtimePoseRuntime(
         model,
@@ -192,3 +198,13 @@ def test_taid_single_and_batch_runtime_prepare_full_geometry_contract() -> None:
     )
     assert len(results) == 2
     assert all(result.deployed_pred_xstart.shape == (REALTIME_POSE_TARGET_DIM,) for result in results)
+    np.testing.assert_allclose(
+        results[1].taid_prior_root_head,
+        single.taid_prior_root_head,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        results[1].taid_prior_joints_head,
+        single.taid_prior_joints_head,
+        atol=1e-6,
+    )

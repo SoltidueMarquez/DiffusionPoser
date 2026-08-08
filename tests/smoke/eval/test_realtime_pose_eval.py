@@ -1,6 +1,11 @@
 import numpy as np
 
-from eval.evaluate_realtime_pose import evaluate_file, summarize
+from eval.evaluate_realtime_pose import (
+    STARTUP_PHASE_BUCKETS,
+    _build_startup_phase_masks,
+    evaluate_file,
+    summarize,
+)
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D
 
 
@@ -76,7 +81,9 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
         reference_root_position_world=np.zeros((1, steps, 3), dtype=np.float32),
         predicted_root_position_world=np.zeros((1, steps, 3), dtype=np.float32),
         reference_root_yaw_world=np.zeros((1, steps), dtype=np.float32),
-        predicted_root_yaw_world=np.zeros((1, steps), dtype=np.float32),
+        predicted_root_yaw_world=np.radians(
+            np.asarray([[0.0, 100.0, 160.0]], dtype=np.float32)
+        ),
         reference_hip_height=np.ones((1, steps), dtype=np.float32),
         predicted_hip_height=np.ones((1, steps), dtype=np.float32),
         tracker_pos_world=np.zeros((1, steps, 6, 3), dtype=np.float32),
@@ -94,6 +101,7 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
         scenario=np.full((1, steps), "two_point_dropout_reconnect"),
         eval_frame_mask=np.ones((1, steps), dtype=bool),
         history_length=np.asarray([[0, 1, 60]], dtype=np.int64),
+        absolute_frame_index=np.asarray([10, 11, 12], dtype=np.int64),
         hard_rotation_max_error=np.zeros((1, steps), dtype=np.float32),
     )
     result = evaluate_file(path)
@@ -105,3 +113,34 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
     assert result["by_reconnect_d_on"]["1"]["samples"] == 1
     assert result["by_history_phase"]["cold_start_0_59"]["samples"] == 2
     assert result["by_history_phase"]["steady_state_60_plus"]["samples"] == 1
+    assert result["by_startup_phase"]["frames_0_14"]["samples"] == 3
+    yaw = result["root_yaw_diagnostics"]
+    assert np.isclose(yaw["median_deg"], 100.0)
+    assert np.isclose(yaw["p90_deg"], 148.0)
+    assert np.isclose(yaw["p95_deg"], 154.0)
+    assert np.isclose(yaw["error_over_90_ratio"], 2.0 / 3.0)
+    assert np.isclose(yaw["error_over_150_ratio"], 1.0 / 3.0)
+    assert yaw["earliest_error_over_150_frame"] == 12
+    assert yaw["pi_mode_entry_count"] == 1
+    assert yaw["pi_mode_exit_count"] == 0
+    assert yaw["pi_mode_transition_count"] == 1
+    assert yaw["pi_majority_sequence_count"] == 0
+    steady_yaw = result["by_history_phase"]["steady_state_60_plus"][
+        "root_yaw_diagnostics"
+    ]
+    assert steady_yaw["error_over_150_ratio"] == 1.0
+    assert steady_yaw["pi_majority_sequence_count"] == 1
+
+
+def test_startup_phase_masks_cover_every_boundary_once():
+    indices = np.asarray(
+        [[0, 14, 15, 29, 30, 59, 60, 119, 120, 299, 300, 999]],
+        dtype=np.int64,
+    )
+    masks = _build_startup_phase_masks(indices)
+    assert tuple(masks) == tuple(name for name, _, _ in STARTUP_PHASE_BUCKETS)
+    stacked = np.stack(list(masks.values()), axis=0)
+    np.testing.assert_array_equal(stacked.sum(axis=0), np.ones_like(indices))
+    for phase_index, mask in enumerate(masks.values()):
+        selected = np.flatnonzero(mask.reshape(-1))
+        np.testing.assert_array_equal(selected, [phase_index * 2, phase_index * 2 + 1])

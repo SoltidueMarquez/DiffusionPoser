@@ -136,6 +136,10 @@ def reconstruct_batch(
         "raw_pred_xstart": result["raw_pred_xstart"],
         "deployed_pred_xstart": result["deployed_pred_xstart"],
     }
+    prepared = model_kwargs["prepared_conditioning"]
+    if prepared.taid is not None:
+        output["taid_prior_root_head"] = prepared.taid.prior.root_head
+        output["taid_prior_joints_head"] = prepared.taid.prior.joints_head
     if "auxiliary_outputs" in result:
         output.update(result["auxiliary_outputs"])
     return output

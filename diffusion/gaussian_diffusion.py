@@ -1498,7 +1498,12 @@ class GaussianDiffusion:
             batch.get("normalizer_std"),
         )
         if bool(auxiliary_outputs.get("taid_prior_only", False)):
-            terms = compute_anchor_prior_losses(x_start, batch, auxiliary_outputs)
+            terms = compute_anchor_prior_losses(
+                x_start,
+                deployed_pred_xstart,
+                batch,
+                auxiliary_outputs,
+            )
             prior_loss = (
                 self.rotation_loss_weight * terms["prior_rotation_loss"]
                 + self.fk_loss_weight * terms["prior_fk_loss"]

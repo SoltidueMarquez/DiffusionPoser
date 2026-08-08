@@ -6,9 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
-from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
 from data_loaders.sensor_masking import (
     FOOT_TRACKER_INDICES,
+    HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
     REALTIME_POSE_TARGET_DIM,
     SMPL_JOINT_COUNT,
@@ -21,6 +22,14 @@ from data_loaders.sensor_masking import (
 PAPER_JOINT_SLICE = slice(0, 22)
 PAPER_BODY_ROTATION_SLICE = slice(1, 22)
 DURATION_BUCKETS = (("1-5", 1, 5), ("6-15", 6, 15), ("16-30", 16, 30), ("31-60", 31, 60))
+STARTUP_PHASE_BUCKETS = (
+    ("frames_0_14", 0, 14),
+    ("frames_15_29", 15, 29),
+    ("frames_30_59", 30, 59),
+    ("frames_60_119", 60, 119),
+    ("frames_120_299", 120, 299),
+    ("frames_300_plus", 300, None),
+)
 REQUIRED_RESULT_FIELDS = {
     "reference_target_raw",
     "raw_pred_target_raw",
@@ -74,6 +83,17 @@ def _load_result(path: Path) -> dict[str, np.ndarray]:
         values = {key: np.asarray(data[key]) for key in REQUIRED_RESULT_FIELDS}
         if "history_length" in data.files:
             values["history_length"] = np.asarray(data["history_length"], dtype=np.int64)
+        if "absolute_frame_index" in data.files:
+            values["absolute_frame_index"] = np.asarray(
+                data["absolute_frame_index"], dtype=np.int64
+            )
+        for name in (
+            "current_head_yaw_world",
+            "taid_prior_root_head",
+            "taid_prior_joints_head",
+        ):
+            if name in data.files:
+                values[name] = np.asarray(data[name])
         values["hard_rotation_max_error"] = np.asarray(
             data["hard_rotation_max_error"] if "hard_rotation_max_error" in data.files else 0.0,
             dtype=np.float64,
@@ -92,23 +112,128 @@ def _metric(stats: dict[str, float | int]) -> float | None:
     return float(stats["sum"]) / int(stats["count"]) if int(stats["count"]) else None
 
 
+def _build_startup_phase_masks(frame_indices: np.ndarray) -> dict[str, np.ndarray]:
+    """按每条序列的绝对帧号拆分启动、锁模和稳定阶段。"""
+
+    indices = np.asarray(frame_indices, dtype=np.int64)
+    return {
+        name: (
+            indices >= lower
+            if upper is None
+            else (indices >= lower) & (indices <= upper)
+        )
+        for name, lower, upper in STARTUP_PHASE_BUCKETS
+    }
+
+
+def _summarize_root_yaw_diagnostics(
+    samples: np.ndarray,
+    sequence_stats: list[dict[str, int | None]],
+) -> dict[str, float | int | None]:
+    """汇总 Root yaw 的 π 模态分布与时序进入/退出次数。"""
+
+    values = np.asarray(samples, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    first_frames = [
+        int(item["first_error_over_150_frame"])
+        for item in sequence_stats
+        if item.get("first_error_over_150_frame") is not None
+    ]
+    return {
+        "samples": int(values.size),
+        "median_deg": float(np.median(values)) if values.size else None,
+        "p90_deg": float(np.percentile(values, 90)) if values.size else None,
+        "p95_deg": float(np.percentile(values, 95)) if values.size else None,
+        "error_over_90_ratio": float(np.mean(values > 90.0)) if values.size else None,
+        "error_over_150_ratio": float(np.mean(values > 150.0)) if values.size else None,
+        "earliest_error_over_150_frame": min(first_frames) if first_frames else None,
+        "pi_mode_entry_count": sum(
+            int(item["pi_mode_entry_count"]) for item in sequence_stats
+        ),
+        "pi_mode_exit_count": sum(
+            int(item["pi_mode_exit_count"]) for item in sequence_stats
+        ),
+        "pi_mode_transition_count": sum(
+            int(item["pi_mode_transition_count"]) for item in sequence_stats
+        ),
+        "pi_majority_sequence_count": sum(
+            int(item["error_over_150_count"]) * 2 > int(item["sample_count"])
+            for item in sequence_stats
+            if int(item["sample_count"]) > 0
+        ),
+        "sequence_count": sum(int(item["sample_count"]) > 0 for item in sequence_stats),
+    }
+
+
+def _root_yaw_diagnostic_inputs(
+    root_yaw_error_deg: np.ndarray,
+    frame_mask: np.ndarray,
+    frame_indices: np.ndarray,
+) -> tuple[np.ndarray, list[dict[str, int | None]]]:
+    """保留可精确合并的逐帧误差和逐序列 π 模态时序统计。"""
+
+    values = np.asarray(root_yaw_error_deg, dtype=np.float64)
+    mask = np.broadcast_to(np.asarray(frame_mask, dtype=bool), values.shape)
+    indices = np.broadcast_to(np.asarray(frame_indices, dtype=np.int64), values.shape)
+    finite_mask = mask & np.isfinite(values)
+    samples = values[finite_mask]
+    sequence_stats: list[dict[str, int | None]] = []
+    for sequence_index in range(values.shape[0]):
+        valid = finite_mask[sequence_index]
+        bad = valid & (values[sequence_index] > 150.0)
+        first_positions = np.flatnonzero(bad)
+        adjacent = valid[1:] & valid[:-1]
+        entries = int(np.count_nonzero(adjacent & bad[1:] & ~bad[:-1]))
+        exits = int(np.count_nonzero(adjacent & ~bad[1:] & bad[:-1]))
+        sequence_stats.append(
+            {
+                "sample_count": int(valid.sum()),
+                "error_over_150_count": int(bad.sum()),
+                "first_error_over_150_frame": (
+                    int(indices[sequence_index, first_positions[0]])
+                    if first_positions.size
+                    else None
+                ),
+                "pi_mode_entry_count": entries,
+                "pi_mode_exit_count": exits,
+                "pi_mode_transition_count": entries + exits,
+            }
+        )
+    return samples, sequence_stats
+
+
 def _group_metrics(
     frame_mask: np.ndarray,
     metric_values: dict[str, np.ndarray],
     metric_scales: dict[str, float],
+    frame_indices: np.ndarray,
 ) -> dict[str, object]:
     stats = {
         name: _stats(values, frame_mask, metric_scales.get(name, 1.0))
         for name, values in metric_values.items()
     }
+    root_yaw_samples, root_yaw_sequence_stats = _root_yaw_diagnostic_inputs(
+        metric_values["root_yaw_error_deg"],
+        frame_mask,
+        frame_indices,
+    )
     return {
         "samples": int(np.asarray(frame_mask, dtype=bool).sum()),
         **{name: _metric(value) for name, value in stats.items()},
+        "root_yaw_diagnostics": _summarize_root_yaw_diagnostics(
+            root_yaw_samples,
+            root_yaw_sequence_stats,
+        ),
         "_metric_stats": stats,
+        "_root_yaw_samples": root_yaw_samples,
+        "_root_yaw_sequence_stats": root_yaw_sequence_stats,
     }
 
 
-def evaluate_file(path: Path) -> dict[str, object]:
+def evaluate_file(
+    path: Path,
+    eval_frame_mask_override: np.ndarray | None = None,
+) -> dict[str, object]:
     values = _load_result(path)
     reference = values["reference_target_raw"].astype(np.float64)
     raw = values["raw_pred_target_raw"].astype(np.float64)
@@ -120,6 +245,31 @@ def evaluate_file(path: Path) -> dict[str, object]:
     sequence_count, steps = reference.shape[:2]
     frame_shape = (sequence_count, steps)
     eval_mask = values["eval_frame_mask"].reshape(frame_shape).astype(bool)
+    if eval_frame_mask_override is not None:
+        override = np.asarray(eval_frame_mask_override, dtype=bool)
+        if override.shape == (steps,):
+            override = np.broadcast_to(override[None], frame_shape)
+        elif override.shape != frame_shape:
+            raise ValueError(
+                "eval_frame_mask_override 必须为 [T] 或 [N,T]，"
+                f"实际为 {override.shape}。"
+            )
+        # 诊断分组只能进一步收窄原评估范围，不能绕过 condition 自带的 eval mask。
+        eval_mask &= override
+    absolute_frame_index = values.get("absolute_frame_index")
+    if absolute_frame_index is None:
+        frame_indices = np.broadcast_to(np.arange(steps, dtype=np.int64), frame_shape)
+    else:
+        absolute_frame_index = np.asarray(absolute_frame_index, dtype=np.int64)
+        if absolute_frame_index.shape == (steps,):
+            frame_indices = np.broadcast_to(absolute_frame_index[None], frame_shape)
+        elif absolute_frame_index.shape == frame_shape:
+            frame_indices = absolute_frame_index
+        else:
+            raise ValueError(
+                "absolute_frame_index 必须为 [T] 或 [N,T]，"
+                f"实际为 {absolute_frame_index.shape}。"
+            )
     fps = float(np.asarray(values["fps"]).reshape(()))
 
     reference_global = rotation_6d_to_matrix_np(reference.reshape(sequence_count, steps, 24, 6))
@@ -208,6 +358,86 @@ def evaluate_file(path: Path) -> dict[str, object]:
             axis=-1,
         )
 
+    prior_root_head = np.asarray(
+        values.get(
+            "taid_prior_root_head",
+            np.full((*frame_shape, 4), np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    ).reshape(sequence_count, steps, 4)
+    prior_joints_head = np.asarray(
+        values.get(
+            "taid_prior_joints_head",
+            np.full((*frame_shape, SMPL_JOINT_COUNT, 3), np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    ).reshape(sequence_count, steps, SMPL_JOINT_COUNT, 3)
+    current_head_yaw = np.asarray(
+        values.get(
+            "current_head_yaw_world",
+            np.full(frame_shape, np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    ).reshape(frame_shape)
+    prior_available = (
+        np.isfinite(prior_root_head).all(axis=-1)
+        & np.isfinite(prior_joints_head).all(axis=(-1, -2))
+        & np.isfinite(current_head_yaw)
+    )
+    prior_origin_world = np.stack(
+        (
+            tracker_pos[:, :, HEAD_TRACKER_INDEX, 0],
+            reference_root[:, :, 1],
+            tracker_pos[:, :, HEAD_TRACKER_INDEX, 2],
+        ),
+        axis=-1,
+    )
+    head_yaw_rotation = make_yaw_rotation_np(current_head_yaw.reshape(-1)).reshape(
+        sequence_count, steps, 3, 3
+    )
+    prior_root_world = prior_origin_world + np.einsum(
+        "...ij,...j->...i", head_yaw_rotation, prior_root_head[..., :3]
+    )
+    prior_joints_world = prior_origin_world[..., None, :] + np.einsum(
+        "...ij,...aj->...ai", head_yaw_rotation, prior_joints_head
+    )
+    prior_root_yaw_world = current_head_yaw + prior_root_head[..., 3]
+
+    def _mask_unavailable(array: np.ndarray) -> np.ndarray:
+        return np.where(prior_available, array, np.nan)
+
+    taid_prior_root_xz = _mask_unavailable(
+        np.linalg.norm(
+            prior_root_world[..., [0, 2]] - reference_root[..., [0, 2]], axis=-1
+        )
+    )
+    taid_prior_root_y = _mask_unavailable(
+        np.abs(prior_root_world[..., 1] - reference_root[..., 1])
+    )
+    taid_prior_vs_deployed_root = _mask_unavailable(
+        np.linalg.norm(prior_root_world - predicted_root, axis=-1)
+    )
+    taid_prior_vs_deployed_yaw = _mask_unavailable(
+        np.degrees(
+            np.abs(
+                np.arctan2(
+                    np.sin(prior_root_yaw_world - root_yaw_pred),
+                    np.cos(prior_root_yaw_world - root_yaw_pred),
+                )
+            )
+        )
+    )
+    taid_prior_internal_mpjpe = _mask_unavailable(
+        np.linalg.norm(
+            prior_joints_world[:, :, PAPER_JOINT_SLICE]
+            - reference_joints[:, :, PAPER_JOINT_SLICE],
+            axis=-1,
+        ).mean(axis=-1)
+    )
+    taid_prior_vs_deployed_joint = _mask_unavailable(
+        np.linalg.norm(prior_joints_world - predicted_joints, axis=-1).mean(axis=-1)
+    )
+
     contact_target = values["contact_target"].reshape(sequence_count, steps, 2) >= 0.5
     contact_logits = values["contact_logits"].reshape(sequence_count, steps, 2).astype(np.float64)
     contact_accuracy = np.nanmean(
@@ -254,9 +484,22 @@ def evaluate_file(path: Path) -> dict[str, object]:
         "future_leg_rotation_deg": future_rotation,
         "contact_accuracy": contact_accuracy,
         "foot_slide_m_s": foot_slide,
+        "taid_prior_root_xz_error_m": taid_prior_root_xz,
+        "taid_prior_root_y_error_m": taid_prior_root_y,
+        "taid_prior_vs_deployed_root_gap_m": taid_prior_vs_deployed_root,
+        "taid_prior_vs_deployed_yaw_deg": taid_prior_vs_deployed_yaw,
+        "taid_prior_internal_mpjpe_cm": taid_prior_internal_mpjpe,
+        "taid_prior_vs_deployed_joint_gap_cm": taid_prior_vs_deployed_joint,
+        "taid_prior_available_ratio": prior_available.astype(np.float64),
     }
-    metric_scales = {"mpjpe_cm": 100.0, "mpjve_cm_s": 100.0, "mpjae_cm_s2": 100.0}
-    result = _group_metrics(eval_mask, metric_values, metric_scales)
+    metric_scales = {
+        "mpjpe_cm": 100.0,
+        "mpjve_cm_s": 100.0,
+        "mpjae_cm_s2": 100.0,
+        "taid_prior_internal_mpjpe_cm": 100.0,
+        "taid_prior_vs_deployed_joint_gap_cm": 100.0,
+    }
+    result = _group_metrics(eval_mask, metric_values, metric_scales, frame_indices)
     result.update(
         path=str(path),
         sequences=sequence_count,
@@ -266,13 +509,20 @@ def evaluate_file(path: Path) -> dict[str, object]:
     )
     scenarios = values["scenario"].reshape(frame_shape).astype(str)
     result["by_scenario"] = {
-        scenario: _group_metrics(eval_mask & (scenarios == scenario), metric_values, metric_scales)
+        scenario: _group_metrics(
+            eval_mask & (scenarios == scenario), metric_values, metric_scales, frame_indices
+        )
         for scenario in sorted(set(scenarios[eval_mask].tolist()))
     }
     d_off = values["d_off"].reshape(sequence_count, steps, TRACKER_COUNT)
     max_d_off = d_off[:, :, NON_HEAD_TRACKER_INDICES].max(axis=-1)
     result["by_d_off"] = {
-        name: _group_metrics(eval_mask & (max_d_off >= lower) & (max_d_off <= upper), metric_values, metric_scales)
+        name: _group_metrics(
+            eval_mask & (max_d_off >= lower) & (max_d_off <= upper),
+            metric_values,
+            metric_scales,
+            frame_indices,
+        )
         for name, lower, upper in DURATION_BUCKETS
     }
     d_on = values["d_on"].reshape(sequence_count, steps, TRACKER_COUNT)
@@ -284,22 +534,36 @@ def evaluate_file(path: Path) -> dict[str, object]:
             & np.any(d_on[:, :, NON_HEAD_TRACKER_INDICES] == duration, axis=-1),
             metric_values,
             metric_scales,
+            frame_indices,
         )
         for duration in range(1, 16)
     }
     hard_count = hard.sum(axis=-1)
     result["by_rotation_state"] = {
-        "head_only_hard": _group_metrics(eval_mask & (hard_count == 1), metric_values, metric_scales),
+        "head_only_hard": _group_metrics(
+            eval_mask & (hard_count == 1), metric_values, metric_scales, frame_indices
+        ),
         "mixed_hard_soft": _group_metrics(
             eval_mask & (hard_count > 1) & soft_rotation_mask.any(axis=-1),
             metric_values,
             metric_scales,
+            frame_indices,
         ),
         "all_configured_hard": _group_metrics(
             eval_mask & (hard_count == values["configured"].reshape(sequence_count, steps, 6).sum(axis=-1)),
             metric_values,
             metric_scales,
+            frame_indices,
         ),
+    }
+    result["by_startup_phase"] = {
+        name: _group_metrics(
+            eval_mask & phase_mask,
+            metric_values,
+            metric_scales,
+            frame_indices,
+        )
+        for name, phase_mask in _build_startup_phase_masks(frame_indices).items()
     }
     if "history_length" in values:
         history_length = values["history_length"].reshape(frame_shape)
@@ -310,11 +574,13 @@ def evaluate_file(path: Path) -> dict[str, object]:
                 eval_mask & (history_length < 60),
                 metric_values,
                 metric_scales,
+                frame_indices,
             ),
             "steady_state_60_plus": _group_metrics(
                 eval_mask & (history_length >= 60),
                 metric_values,
                 metric_scales,
+                frame_indices,
             ),
         }
     return result
@@ -350,9 +616,24 @@ def _summarize_metric_stats(results: list[dict[str, object]]) -> dict[str, objec
             "sum": sum(float(value["sum"]) for value in values),
             "count": sum(int(value["count"]) for value in values),
         }
+    root_yaw_samples = np.concatenate(
+        [
+            np.asarray(result.get("_root_yaw_samples", []), dtype=np.float64).reshape(-1)
+            for result in results
+        ]
+    )
+    root_yaw_sequence_stats = [
+        item
+        for result in results
+        for item in result.get("_root_yaw_sequence_stats", [])
+    ]
     return {
         "samples": sum(int(result.get("samples", 0)) for result in results),
         **{name: _metric(value) for name, value in stats.items()},
+        "root_yaw_diagnostics": _summarize_root_yaw_diagnostics(
+            root_yaw_samples,
+            root_yaw_sequence_stats,
+        ),
         "_metric_stats": stats,
     }
 
@@ -375,6 +656,7 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
         "by_reconnect_d_on",
         "by_rotation_state",
         "by_history_phase",
+        "by_startup_phase",
     ):
         summary[group_name] = _merge_groups(results, group_name)
     return summary

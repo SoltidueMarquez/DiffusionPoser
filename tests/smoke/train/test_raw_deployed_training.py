@@ -8,7 +8,14 @@ from data_loaders.generate_realtime_pose_tasks import (
     build_task_bundle_row,
     compute_source_joint_rotations_world,
 )
-from data_loaders.realtime_pose_geometry import assemble_tracker_features_np, extract_forward_yaw_np
+from data_loaders.realtime_pose_geometry import (
+    assemble_tracker_features_np,
+    decode_target_head_rotations_np,
+    decode_target_head_rotations_torch,
+    extract_forward_yaw_np,
+    resolve_root_head_reference_np,
+    resolve_root_head_reference_torch,
+)
 from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_np,
     rotation_6d_to_matrix_torch,
@@ -19,7 +26,13 @@ from diffusion.gaussian_diffusion import GaussianDiffusion, LossType, ModelMeanT
 from diffusion.realtime_pose_losses import _radial_huber_loss, _rotation_angle
 from model.realtime_pose_target_dit import RealtimePoseTargetDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
-from train.training_loop import zero_invalid_pose_history
+from train.training_loop import (
+    TrainLoop,
+    add_rollout_step_diagnostics,
+    aggregate_rollout_frame_losses,
+    build_rollout_frame_weights,
+    zero_invalid_pose_history,
+)
 
 
 def test_training_rejects_removed_legacy_inpainting_contract() -> None:
@@ -166,6 +179,31 @@ def _training_batch() -> dict[str, torch.Tensor]:
         name: torch.as_tensor(value).unsqueeze(0)
         for name, value in values.items()
     }
+
+
+def test_numpy_runtime_and_torch_training_resolvers_match() -> None:
+    batch = _training_batch()
+    target = batch["x"][0].numpy()
+    offsets = batch["joint_offsets_parent"][0].numpy()
+    observed_head_height = float(batch["current_tracker_raw"][0, 0, 1])
+    rotations_np, yaw_np = decode_target_head_rotations_np(target)
+    root_np, hip_np, joints_np = resolve_root_head_reference_np(
+        rotations_np,
+        yaw_np,
+        offsets,
+        observed_head_height=observed_head_height,
+    )
+    rotations_torch, yaw_torch = decode_target_head_rotations_torch(batch["x"].float())
+    root_torch, hip_torch, joints_torch = resolve_root_head_reference_torch(
+        rotations_torch,
+        yaw_torch,
+        batch["joint_offsets_parent"].float(),
+        observed_head_height=batch["current_tracker_raw"][:, 0, 1].float(),
+    )
+
+    np.testing.assert_allclose(root_torch[0].numpy(), root_np, atol=1e-5, rtol=0.0)
+    np.testing.assert_allclose(joints_torch[0].numpy(), joints_np, atol=1e-5, rtol=0.0)
+    assert abs(float(hip_torch[0]) - float(hip_np)) <= 1e-5
 
 
 def test_full_144d_training_keeps_raw_hard_joint_gradient_and_deployed_constraint() -> None:
@@ -367,14 +405,14 @@ def test_rollout_history_restores_invalid_padding_to_literal_zero() -> None:
     torch.testing.assert_close(masked[valid], history[valid])
 
 
-def test_four_step_rollout_temporal_losses_are_finite() -> None:
+def test_fifteen_step_rollout_temporal_losses_are_finite() -> None:
     from diffusion.realtime_pose_temporal_losses import compute_rollout_temporal_losses
 
-    source = build_toy_realtime_source(frame_count=4)
+    source = build_toy_realtime_source(frame_count=15)
     identity_pose = torch.as_tensor(np.tile([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], 24)).float()[None]
-    predictions = [identity_pose + 0.001 * step for step in range(4)]
+    predictions = [identity_pose + 0.001 * step for step in range(15)]
     batches = []
-    for step in range(4):
+    for step in range(15):
         batches.append(
             {
                 "x": identity_pose.clone(),
@@ -394,3 +432,105 @@ def test_four_step_rollout_temporal_losses_are_finite() -> None:
     losses = compute_rollout_temporal_losses(predictions, batches, None, None)
     assert set(losses) == {"joint_vel_loss", "rotation_vel_loss", "foot_slide_loss"}
     assert all(torch.isfinite(value).all() for value in losses.values())
+
+
+def test_fifteen_step_rollout_exports_each_prior_fk_diagnostic_step() -> None:
+    result: dict[str, torch.Tensor] = {}
+    for step_index in range(1, 15):
+        value = torch.tensor([float(step_index)])
+        add_rollout_step_diagnostics(
+            result,
+            {
+                "prior_fk_loss": value,
+                "prior_internal_fk_loss": value + 1.0,
+                "prior_root_pose_gap_m": value + 2.0,
+                "prior_root_pose_gap_xz_m": value + 3.0,
+                "prior_joint_resolver_gap_m": value + 4.0,
+            },
+            step_index,
+        )
+    assert len(result) == 70
+    for step_index in range(1, 15):
+        assert f"step_{step_index}_prior_fk_loss" in result
+        assert f"step_{step_index}_prior_internal_fk_loss" in result
+        assert f"step_{step_index}_prior_root_pose_gap_m" in result
+        assert f"step_{step_index}_prior_root_pose_gap_xz_m" in result
+        assert f"step_{step_index}_prior_joint_resolver_gap_m" in result
+
+
+@pytest.mark.parametrize("rollout_steps", [4, 15])
+def test_rollout_frame_weights_are_normalized_and_deterministic(rollout_steps: int) -> None:
+    uniform = build_rollout_frame_weights(rollout_steps, "uniform", dtype=torch.float64)
+    linear_late = build_rollout_frame_weights(
+        rollout_steps,
+        "linear_late",
+        dtype=torch.float64,
+    )
+    future_steps = rollout_steps - 1
+    expected_linear = torch.arange(1, future_steps + 1, dtype=torch.float64)
+    expected_linear /= expected_linear.sum()
+
+    torch.testing.assert_close(
+        uniform,
+        torch.full((future_steps,), 1.0 / future_steps, dtype=torch.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(linear_late, expected_linear, rtol=0.0, atol=0.0)
+    assert float(uniform.sum()) == 1.0
+    assert float(linear_late.sum()) == 1.0
+    assert linear_late[-1] > linear_late[0]
+
+
+def test_rollout_frame_weight_validation_rejects_k1_and_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="至少需要两个预测帧"):
+        build_rollout_frame_weights(1, "uniform")
+    with pytest.raises(ValueError, match="rollout_frame_weighting"):
+        build_rollout_frame_weights(15, "late_squared")
+
+
+def test_k1_and_batch_without_rollout_still_skip_rollout_loss() -> None:
+    loop = TrainLoop.__new__(TrainLoop)
+    loop.rollout_steps = 1
+    loop.rollout_loss_weight = 1.0
+    loop.rollout_joint_vel_loss_weight = 0.05
+    loop.rollout_rot_vel_loss_weight = 0.02
+    loop.diffusion = type("DiffusionStub", (), {"foot_slide_loss_weight": 0.05})()
+    loop.model = torch.nn.Linear(1, 1).train()
+
+    assert loop.should_compute_rollout_loss({"rollout": []}) is False
+    loop.rollout_steps = 15
+    assert loop.should_compute_rollout_loss({}) is False
+
+
+def test_uniform_rollout_aggregation_matches_old_mean_and_gradient_exactly() -> None:
+    losses = [torch.tensor([1.0, 2.0], requires_grad=True) for _ in range(14)]
+    terms = [{"loss": loss} for loss in losses]
+    result = aggregate_rollout_frame_losses(terms, "uniform")
+    old_mean = torch.stack(losses, dim=0).mean(dim=0)
+
+    torch.testing.assert_close(result["loss"], old_mean, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(result["uniform_frame_loss"], old_mean, rtol=0.0, atol=0.0)
+    old_grad = torch.autograd.grad(old_mean.sum(), losses, retain_graph=True)
+    new_grad = torch.autograd.grad(result["loss"].sum(), losses)
+    for expected, actual in zip(old_grad, new_grad):
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_linear_late_rollout_aggregation_matches_hand_calculation() -> None:
+    losses = [torch.tensor([float(step)]) for step in range(1, 15)]
+    result = aggregate_rollout_frame_losses(
+        [{"loss": loss} for loss in losses],
+        "linear_late",
+    )
+    weights = torch.arange(1, 15, dtype=torch.float32) / 105.0
+    expected = (torch.stack(losses, dim=0).squeeze(-1) * weights).sum()
+
+    torch.testing.assert_close(result["loss"].squeeze(), expected)
+    torch.testing.assert_close(result["uniform_frame_loss"], torch.tensor([7.5]))
+    torch.testing.assert_close(result["step_1_weight"], torch.tensor([1.0 / 105.0]))
+    torch.testing.assert_close(result["step_14_weight"], torch.tensor([14.0 / 105.0]))
+    torch.testing.assert_close(
+        result["step_14_weighted_loss"],
+        losses[-1] * (14.0 / 105.0),
+    )

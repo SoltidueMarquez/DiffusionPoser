@@ -10,7 +10,11 @@ from typing import Any, Iterable
 import numpy as np
 from numpy.lib.format import open_memmap
 
-from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_MAX_ROLLOUT_STEPS,
+    TRACKER_FEATURE_DIM,
+    TRACKER_PATTERN_CATEGORIES,
+)
 
 
 STORE_METADATA_FILE = "task_store.json"
@@ -89,6 +93,10 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
         raise ValueError(f"{path} 缺少新 task store 字段 {missing}；旧 task 不可复用。")
     if int(value["tracker_feature_dim"]) != TRACKER_FEATURE_DIM:
         raise ValueError(f"{path} Tracker 维度不是当前要求的 {TRACKER_FEATURE_DIM}。")
+    if not 1 <= int(value["max_rollout_steps"]) <= REALTIME_POSE_MAX_ROLLOUT_STEPS:
+        raise ValueError(
+            f"{path} max_rollout_steps 必须在 [1,{REALTIME_POSE_MAX_ROLLOUT_STEPS}]。"
+        )
     if int(value["sample_count"]) <= 0 or int(value["source_count"]) <= 0:
         raise ValueError(f"{path} sample_count/source_count 必须大于 0。")
     if tuple(value["config_names"]) != TRACKER_PATTERN_CATEGORIES:

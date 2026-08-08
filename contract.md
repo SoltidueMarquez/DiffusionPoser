@@ -7,7 +7,8 @@
 - 历史长度固定为 60 帧，当前目标为第 61 帧。
 - `pose_history` 与 `tracker_history` 统一表达在上一帧 Head-yaw/floor 参考系 \(C_{n-1}\)。
 - `current_target` 与 `current_tracker` 表达在当前参考系 \(C_n\)。
-- rollout 最多物化 4 个连续目标；下一步历史只能追加 `deployed_pred_xstart.detach()`，不得读取后续 GT pose history。
+- rollout 最多物化 15 个连续目标，默认仍为 4；下一步历史只能追加 `deployed_pred_xstart.detach()`，不得读取后续 GT pose history。
+- 后续 `K-1` 帧主 loss 默认以 `rollout_frame_weighting=uniform` 保持原算术平均；受控实验可用 `linear_late` 按 `1…K-1` 归一化加权。该参数不改变第一帧主 loss、joint/rotation velocity、foot-slide、时序状态或 task schema。
 - 冷启动时三类历史统一左侧补零，补零帧对应 `valid_frame_mask=False`；padding 是归一化后模型输入空间中的字面量零。
 - 虚拟会话首帧从零状态重新推进 `d_off/d_on` 与 hard hysteresis，不得继承被裁掉历史的持续时间。首帧 Head trajectory 的平移/yaw 增量为零，`cos(delta_yaw)=1`。
 - rollout 的有效历史长度按 `min(60,H+s)` 增长；同一 rollout 必须沿同一虚拟会话状态线连续推进，不能逐步重置 duration。
@@ -133,7 +134,7 @@ Head rotation 始终 hard。其他 Tracker 的 hard 状态直接定义为 `confi
 
 默认采样权重各 `0.2`，CLI 可覆盖。切换 target 位于事件后 0～14 帧。两点掉线持续 5～30 帧，掉线中与重连后 0～14 帧按 1:1 采样。可靠度只由配置、测量有效性和连续恢复时长决定。事件必须按 `global_seed + source_id` 在绝对时间线上确定，重叠窗口状态一致。
 
-训练默认以 `cold_start_prob=0.1` 把样本替换为部分历史冷启动；命中时 `H` 在 `[0,59]` 均匀采样，否则使用完整 60 帧历史。验证集保持完整历史，长序列评估另外报告 `cold_start_0_59`、`steady_state_60_plus` 和全帧指标。
+训练默认以 `cold_start_prob=0.1` 把样本替换为部分历史冷启动；命中时 `H` 在 `[0,59]` 均匀采样，否则使用完整 60 帧历史。训练实验可用 `cold_start_history_weights` 覆盖 `[0]`、`[1,4]`、`[5,14]`、`[15,29]`、`[30,59]` 五个历史桶的概率，并用 `cold_start_scenario_weights` 只覆盖部分历史样本的场景概率；未提供时必须保持上述默认分布。验证集保持完整历史，长序列评估另外报告 `cold_start_0_59`、`steady_state_60_plus`、`by_startup_phase` 和全帧指标。
 
 ## mmap task store
 
@@ -153,13 +154,15 @@ Head rotation 始终 hard。其他 Tracker 的 hard 状态直接定义为 `confi
 
 `task_store.json` 必须记录 `tracker_feature_dim=13`、五类 `config_names`、完整 `schema_fields` 以及 `two_point_phase_counts`。后者统计两点掉线与重连样本，数量必须与 `sample_count` 一致并满足近似 1:1。缺少任一新字段时直接拒绝读取。
 
+`K` 允许 `1…15`，但 `seq_len/max_seq_len` 始终为 61；K15 只表示离线 task 额外物化基础目标之后的14个连续目标和共75帧 Tracker 状态，不扩展 TargetDiT 输入长度。生成器的默认 `K=4` 保持旧行为。限量生成默认选择排序列表前缀；受控实验可使用 `limit_selection=stratified`，按 seed 从排序后的 source 等距区间确定性抽取。
+
 ## Normalizer
 
 - `pose_mean.pt`、`pose_std.pt`: `[144]`
 - `tracker_mean.pt`、`tracker_std.pt`: `[6,9]`
 - `head_height_mean.pt`、`head_height_std.pt`: 标量
 
-normalizer 元数据必须与 task generation-plan hash 一致。场景权重不参与 normalizer 统计。
+normalizer 元数据必须与 task generation-plan hash 一致。场景权重不参与 normalizer 统计。K15 配对实验允许逐字节复用正式 K4 的六个统计文件，但必须先证明两份 task 来自同一 source、均满足144D Pose/13D Tracker/五场景契约，并在新元数据中绑定 K15 generation-plan hash、记录原 metadata 与全部统计文件 SHA256；Dataset 仍执行严格 plan-hash 匹配，不提供 mismatch 绕过。
 
 ## 模型与扩散输出
 
@@ -184,15 +187,40 @@ Uncertain、Anchor 四种身份不合并。Head 强制为 Anchor。第一版固�
 - `beta=valid*(1-alpha)*min(1,d_on/KR)`；
 - `region_coverage=1-prod(1-alpha*coverage)`。
 
-Anchor Prior 只读 deployed pose history、Head trajectory、逐 Tracker 独立编码后
-乘过 `alpha` 的 token 和 region coverage；Uncertain 当前测量不得通过共享聚合
-旁路进入。Prior 输出：
+Anchor Prior 只读 deployed pose history、Head trajectory、region coverage，以及
+逐 Tracker 独立融合的 `[state_token, position_token, rotation_token,
+history_summary]`。其中 `history_summary:[B,6,D]` 来自已存在且冻结的
+DynamicObservationEncoder 60帧 Tracker history GRU；四类 token 先在每个 Tracker
+内部融合为 `[B,6,D]`，再乘 `alpha` 并除以现有 `sum(alpha)`。六个结果不再直接
+求和，而是按 Head、LeftHand、RightHand、Hip、LeftFoot、RightFoot 的固定顺序
+展平为 `[B,6D]`，经无 bias 的 `anchor_slot_projection:[D,6D]` 压回 `[B,D]`。
+该投影初始化为六个单位矩阵横向拼接，因此训练开始时与旧加权平均逐元素等价，
+随后才允许不同身体槽位学习不同作用。Uncertain/Missing/未配置 Tracker 的当前和
+历史观测都不得通过共享聚合旁路进入。Prior 输出：
 
 - `prior_pose_raw/model: [B,144]`；
 - `prior_root_head: [B,4]`，依次为 Head-relative Actor Root `xyz+yaw`；
 - `prior_contact_logits: [B,2]`；
 - `prior_joint_velocity_head: [B,24,3]`，仅用于 B1 训练期速度监督；
 - `region_coverage: [B,5]`。
+
+`prior_root_head.xyz` 是 TAID 内部辅助状态，只用于 Prior 内部 FK、FK innovation
+和 TargetDiT 条件，不得覆盖部署 Root。部署 Root 的唯一真值仍是 hard rotation
+projection 后的 144D pose，经 Head-Anchored World Resolver 解析得到的结果：Head
+位置严格对齐当前 Head Tracker，Actor Root 的 Y 位于 floor。`prior_root_head.yaw`
+仍严格由 `prior_pose_raw` 的 Pelvis heading 派生，不存在独立 yaw head。
+
+B1 的 `prior_fk_loss` 必须使用投影后的 `deployed_pred_xstart` 并调用与 runtime
+一致的 Torch Resolver；内部 `prior_root_head.xyz + prior_pose_raw` FK 只产生
+`prior_internal_fk_loss`、Root gap 和 joint gap 诊断，不进入总损失。这是当前实现
+相对“让 Prior Root xyz 辅助部署 Resolver”提案的受控差异，目的是保持既有
+144D/Unity 稳定接口和 Head/floor 世界解析契约。
+
+当前跨 Tracker 聚合固定为六槽投影，`args.json` 必须记录
+`taid_prior_tracker_aggregation=fixed_slots`。本轮只改变跨 Tracker 聚合容量，
+不改变 Tracker-history 编码、velocity监督或任何 loss 权重。29Z及更早 B1
+checkpoint 不含 `anchor_slot_projection`，禁止恢复或续训；正式 B0 仍可按缺失
+全部 TAID 参数的既有规则初始化 B1。
 
 Posterior innovation 固定为 `[B,6,6]`：位置使用米，旋转使用 SO(3) Log 的弧度。
 Head residual 恒为零；无效测量的 residual、`delta_e` 和 innovation token 必须严格
@@ -214,5 +242,8 @@ self-attention。
 
 B1 仅训练 Prior；B2～B6 冻结 Prior，并对用于 FK/条件的 Prior 输出
 stop-gradient。每个目标帧只执行一次 Prior/innovation，全部 DDIM step 复用。
+Python runtime 可只读导出 `taid_prior_root_head` 和 `taid_prior_joints_head`；B0
+必须报告不可用，不能以零误差代替。长序列评估按 condition、history phase 和
+startup phase 汇总 Prior Root/FK 与 deployed Resolver 的差距。
 `init_checkpoint` 只允许 B0→B1 或 B1→B2～B6；`resume_checkpoint` 必须与当前
 ablation 完全相同。

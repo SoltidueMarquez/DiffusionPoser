@@ -26,6 +26,46 @@ from utils.normalizer import RealtimePoseNormalizer
 from utils.run_dirs import resolve_latest_or_self
 
 
+COLD_START_HISTORY_BUCKETS = (
+    (0, 0),
+    (1, 4),
+    (5, 14),
+    (15, 29),
+    (30, REALTIME_POSE_HISTORY_LENGTH - 1),
+)
+
+
+def _normalize_optional_sampling_weights(
+    values: list[float] | tuple[float, ...] | None,
+    *,
+    name: str,
+) -> np.ndarray | None:
+    """校验并归一化可选的五分类采样权重。"""
+
+    if values is None:
+        return None
+    weights = np.asarray(values, dtype=np.float64)
+    if (
+        weights.shape != (5,)
+        or not np.isfinite(weights).all()
+        or np.any(weights < 0.0)
+        or not np.any(weights > 0.0)
+    ):
+        raise ValueError(f"{name} 必须是五个有限非负数，且至少一项大于零。")
+    return weights / weights.sum()
+
+
+def sample_cold_start_history_length(
+    rng: np.random.Generator,
+    bucket_weights: np.ndarray,
+) -> int:
+    """先选历史阶段桶，再在桶内均匀采样整数历史长度。"""
+
+    bucket_index = int(rng.choice(len(COLD_START_HISTORY_BUCKETS), p=bucket_weights))
+    lower, upper = COLD_START_HISTORY_BUCKETS[bucket_index]
+    return int(rng.integers(lower, upper + 1))
+
+
 @dataclass(frozen=True)
 class TaskRequest:
     task_index: int
@@ -423,6 +463,8 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         cold_start_prob: float,
         shuffle: bool,
         drop_last: bool,
+        cold_start_history_weights: list[float] | tuple[float, ...] | None = None,
+        cold_start_scenario_weights: list[float] | tuple[float, ...] | None = None,
     ):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -433,10 +475,19 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
         self.epoch = 0
-        weights = np.asarray(scenario_weights, dtype=np.float64)
-        if weights.shape != (5,) or np.any(weights < 0.0) or not np.any(weights > 0.0):
-            raise ValueError("scenario_weights 必须是五个非负数，且至少一项大于零。")
-        self.scenario_weights = weights / weights.sum()
+        self.scenario_weights = _normalize_optional_sampling_weights(
+            scenario_weights,
+            name="scenario_weights",
+        )
+        assert self.scenario_weights is not None
+        self.cold_start_history_weights = _normalize_optional_sampling_weights(
+            cold_start_history_weights,
+            name="cold_start_history_weights",
+        )
+        self.cold_start_scenario_weights = _normalize_optional_sampling_weights(
+            cold_start_scenario_weights,
+            name="cold_start_scenario_weights",
+        )
         if not 1 <= self.rollout_steps <= dataset.max_rollout_steps:
             raise ValueError("rollout_steps 超出 task store 可用范围。")
         if not 0.0 <= self.rollout_prob <= 1.0:
@@ -463,6 +514,21 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
             ordered_indices.extend(int(value) for value in values.tolist())
 
         weight_token = ",".join(f"{value:.17g}" for value in self.scenario_weights.tolist())
+        cold_scenario_token = (
+            ""
+            if self.cold_start_scenario_weights is None
+            else "|cold="
+            + ",".join(
+                f"{value:.17g}" for value in self.cold_start_scenario_weights.tolist()
+            )
+        )
+        history_weight_token = (
+            ""
+            if self.cold_start_history_weights is None
+            else ",".join(
+                f"{value:.17g}" for value in self.cold_start_history_weights.tolist()
+            )
+        )
         for batch_index, first in enumerate(range(0, len(ordered_indices), self.batch_size)):
             indices = ordered_indices[first : first + self.batch_size]
             if len(indices) < self.batch_size and self.drop_last:
@@ -475,23 +541,56 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
             requests: list[TaskRequest] = []
             for task_index in indices:
                 task_id = self.dataset.task_id_at(task_index)
-                config_rng = np.random.Generator(
-                    np.random.PCG64(
-                        stable_context_seed(task_id, self.epoch, self.seed, weight_token, "scenario")
+                history_seed_parts: tuple[object, ...] = (
+                    (task_id, self.epoch, self.seed, "cold_start")
+                    if self.cold_start_history_weights is None
+                    else (
+                        task_id,
+                        self.epoch,
+                        self.seed,
+                        history_weight_token,
+                        "cold_start_stratified",
                     )
                 )
-                config_index = int(config_rng.choice(5, p=self.scenario_weights))
                 history_rng = np.random.Generator(
-                    np.random.PCG64(
-                        stable_context_seed(task_id, self.epoch, self.seed, "cold_start")
-                    )
+                    np.random.PCG64(stable_context_seed(*history_seed_parts))
                 )
                 use_cold_start = float(history_rng.random()) < self.cold_start_prob
-                history_length = (
-                    int(history_rng.integers(0, REALTIME_POSE_HISTORY_LENGTH))
-                    if use_cold_start
-                    else REALTIME_POSE_HISTORY_LENGTH
+                if not use_cold_start:
+                    history_length = REALTIME_POSE_HISTORY_LENGTH
+                elif self.cold_start_history_weights is None:
+                    # 未启用分层配置时严格保留旧版 0～59 均匀采样行为。
+                    history_length = int(
+                        history_rng.integers(0, REALTIME_POSE_HISTORY_LENGTH)
+                    )
+                else:
+                    history_length = sample_cold_start_history_length(
+                        history_rng,
+                        self.cold_start_history_weights,
+                    )
+
+                active_scenario_weights = (
+                    self.cold_start_scenario_weights
+                    if use_cold_start and self.cold_start_scenario_weights is not None
+                    else self.scenario_weights
                 )
+                active_scenario_token = (
+                    weight_token + cold_scenario_token
+                    if use_cold_start and self.cold_start_scenario_weights is not None
+                    else weight_token
+                )
+                config_rng = np.random.Generator(
+                    np.random.PCG64(
+                        stable_context_seed(
+                            task_id,
+                            self.epoch,
+                            self.seed,
+                            active_scenario_token,
+                            "scenario",
+                        )
+                    )
+                )
+                config_index = int(config_rng.choice(5, p=active_scenario_weights))
                 requests.append(
                     TaskRequest(
                         task_index=task_index,

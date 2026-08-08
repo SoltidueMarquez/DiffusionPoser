@@ -9,6 +9,7 @@ from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
+    REALTIME_POSE_MAX_ROLLOUT_STEPS,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     SCENARIO_FIXED_SIX,
@@ -86,8 +87,10 @@ def build_task_config_plan(
     """为基础窗口生成五套场景；正式生成时事件来自 source 绝对时间线。"""
 
     rollout_steps = int(max_rollout_steps)
-    if not 1 <= rollout_steps <= 4:
-        raise ValueError("max_rollout_steps 必须在 [1,4]。")
+    if not 1 <= rollout_steps <= REALTIME_POSE_MAX_ROLLOUT_STEPS:
+        raise ValueError(
+            f"max_rollout_steps 必须在 [1,{REALTIME_POSE_MAX_ROLLOUT_STEPS}]。"
+        )
     absolute_mode = source_id is not None and start_frame is not None and source_frame_count is not None
     absolute_target = int(start_frame or 0) + REALTIME_POSE_TARGET_START
     source_events = (

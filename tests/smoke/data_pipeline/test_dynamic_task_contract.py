@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import numpy as np
+import pytest
 from torch.utils.data import DataLoader
 
 import data_loaders.get_data as get_data
@@ -11,6 +12,7 @@ from data_loaders.generate_realtime_pose_tasks import (
     shard_fields,
 )
 from data_loaders.realtime_pose_dataset import (
+    COLD_START_HISTORY_BUCKETS,
     RealtimePoseBatchSampler,
     RealtimePoseTaskDataset,
     TaskRequest,
@@ -22,7 +24,7 @@ from data_loaders.realtime_pose_geometry import (
     extract_rotation_heading_np,
 )
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np, wrap_radians
-from data_loaders.tracker_timeline import build_task_config_plan
+from data_loaders.tracker_timeline import build_task_config_plan, stable_context_seed
 from data_loaders.realtime_pose_task_store import ShardWriter, read_store_metadata, write_json
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
@@ -291,6 +293,159 @@ def test_cold_start_sampler_is_deterministic_and_only_samples_partial_history():
 
     assert first == second
     assert all(0 <= history_length < 60 for history_length in first)
+
+
+def test_default_cold_start_sampler_preserves_legacy_uniform_draws():
+    class FakeDataset:
+        max_rollout_steps = 4
+        indices_by_shard = [list(range(64))]
+
+        def __len__(self) -> int:
+            return 64
+
+        def task_id_at(self, task_index: int) -> str:
+            return f"legacy-{int(task_index)}"
+
+    probability = 0.4
+    sampler = RealtimePoseBatchSampler(
+        dataset=FakeDataset(),
+        batch_size=8,
+        seed=10,
+        scenario_weights=(0.2, 0.2, 0.2, 0.2, 0.2),
+        rollout_steps=1,
+        rollout_prob=0.0,
+        cold_start_prob=probability,
+        shuffle=False,
+        drop_last=False,
+    )
+    actual = [request.history_length for batch in sampler for request in batch]
+    expected = []
+    for task_index in range(64):
+        task_id = FakeDataset().task_id_at(task_index)
+        rng = np.random.Generator(
+            np.random.PCG64(stable_context_seed(task_id, 0, 10, "cold_start"))
+        )
+        use_cold_start = float(rng.random()) < probability
+        expected.append(int(rng.integers(0, 60)) if use_cold_start else 60)
+    assert actual == expected
+
+
+def test_stratified_cold_start_sampler_respects_all_bucket_boundaries():
+    class FakeDataset:
+        max_rollout_steps = 4
+        indices_by_shard = [list(range(256))]
+
+        def __len__(self) -> int:
+            return 256
+
+        def task_id_at(self, task_index: int) -> str:
+            return f"bucket-{int(task_index)}"
+
+    for bucket_index, (lower, upper) in enumerate(COLD_START_HISTORY_BUCKETS):
+        history_weights = [0.0] * len(COLD_START_HISTORY_BUCKETS)
+        history_weights[bucket_index] = 1.0
+        sampler = RealtimePoseBatchSampler(
+            dataset=FakeDataset(),
+            batch_size=32,
+            seed=10,
+            scenario_weights=(1.0, 0.0, 0.0, 0.0, 0.0),
+            cold_start_scenario_weights=(0.0, 1.0, 0.0, 0.0, 0.0),
+            cold_start_history_weights=history_weights,
+            rollout_steps=1,
+            rollout_prob=0.0,
+            cold_start_prob=1.0,
+            shuffle=False,
+            drop_last=False,
+        )
+        requests = [request for batch in sampler for request in batch]
+        lengths = [request.history_length for request in requests]
+        assert all(lower <= value <= upper for value in lengths)
+        assert all(request.config_index == 1 for request in requests)
+        assert min(lengths) == lower
+        assert max(lengths) == upper
+
+
+def test_cold_scenario_weights_do_not_change_full_history_scenarios():
+    class FakeDataset:
+        max_rollout_steps = 4
+        indices_by_shard = [list(range(64))]
+
+        def __len__(self) -> int:
+            return 64
+
+        def task_id_at(self, task_index: int) -> str:
+            return f"warm-{int(task_index)}"
+
+    common = dict(
+        dataset=FakeDataset(),
+        batch_size=8,
+        seed=10,
+        scenario_weights=(0.1, 0.2, 0.3, 0.2, 0.2),
+        rollout_steps=1,
+        rollout_prob=0.0,
+        cold_start_prob=0.0,
+        shuffle=False,
+        drop_last=False,
+    )
+    baseline = RealtimePoseBatchSampler(**common)
+    with_cold_override = RealtimePoseBatchSampler(
+        **common,
+        cold_start_history_weights=(1.0, 0.0, 0.0, 0.0, 0.0),
+        cold_start_scenario_weights=(0.0, 1.0, 0.0, 0.0, 0.0),
+    )
+    baseline_requests = [request for batch in baseline for request in batch]
+    override_requests = [request for batch in with_cold_override for request in batch]
+    assert baseline_requests == override_requests
+    assert all(request.history_length == 60 for request in override_requests)
+
+
+@pytest.mark.parametrize(
+    "history_weights",
+    [
+        (1.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0),
+        (1.0, -1.0, 0.0, 0.0, 0.0),
+        (1.0, np.nan, 0.0, 0.0, 0.0),
+    ],
+)
+def test_stratified_cold_start_sampler_rejects_invalid_weights(history_weights):
+    class FakeDataset:
+        max_rollout_steps = 4
+        indices_by_shard = [[0]]
+
+    with pytest.raises(ValueError, match="cold_start_history_weights"):
+        RealtimePoseBatchSampler(
+            dataset=FakeDataset(),
+            batch_size=1,
+            seed=10,
+            scenario_weights=(0.2, 0.2, 0.2, 0.2, 0.2),
+            cold_start_history_weights=history_weights,
+            rollout_steps=1,
+            rollout_prob=0.0,
+            cold_start_prob=1.0,
+            shuffle=False,
+            drop_last=False,
+        )
+
+
+def test_stratified_cold_start_sampler_rejects_invalid_scenario_weights():
+    class FakeDataset:
+        max_rollout_steps = 4
+        indices_by_shard = [[0]]
+
+    with pytest.raises(ValueError, match="cold_start_scenario_weights"):
+        RealtimePoseBatchSampler(
+            dataset=FakeDataset(),
+            batch_size=1,
+            seed=10,
+            scenario_weights=(0.2, 0.2, 0.2, 0.2, 0.2),
+            cold_start_scenario_weights=(0.0, 0.0, 0.0, 0.0, 0.0),
+            rollout_steps=1,
+            rollout_prob=0.0,
+            cold_start_prob=1.0,
+            shuffle=False,
+            drop_last=False,
+        )
 
 
 def test_old_task_metadata_is_rejected_explicitly(tmp_path):

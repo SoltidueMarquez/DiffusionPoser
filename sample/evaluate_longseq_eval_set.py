@@ -157,6 +157,9 @@ def rollout_long_sequence_source(
             "predicted_root_position_world",
             "reference_root_yaw_world",
             "predicted_root_yaw_world",
+            "current_head_yaw_world",
+            "taid_prior_root_head",
+            "taid_prior_joints_head",
             "reference_hip_height",
             "predicted_hip_height",
             "tracker_pos_world",
@@ -227,6 +230,17 @@ def rollout_long_sequence_source(
             float(decode_target_root_yaw_world_np(reference_target, runtime.previous_head_yaw))
         )
         values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
+        values["current_head_yaw_world"].append(float(runtime.previous_head_yaw))
+        values["taid_prior_root_head"].append(
+            np.full(4, np.nan, dtype=np.float32)
+            if step.taid_prior_root_head is None
+            else step.taid_prior_root_head
+        )
+        values["taid_prior_joints_head"].append(
+            np.full((24, 3), np.nan, dtype=np.float32)
+            if step.taid_prior_joints_head is None
+            else step.taid_prior_joints_head
+        )
         values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
         values["predicted_hip_height"].append(resolved.hip_height)
         for name in ("tracker_pos_world", "tracker_rot_world_6d"):
@@ -423,6 +437,9 @@ def _new_rollout_values() -> dict[str, list]:
             "predicted_root_position_world",
             "reference_root_yaw_world",
             "predicted_root_yaw_world",
+            "current_head_yaw_world",
+            "taid_prior_root_head",
+            "taid_prior_joints_head",
             "reference_hip_height",
             "predicted_hip_height",
             "tracker_pos_world",
@@ -479,6 +496,17 @@ def _append_rollout_frame(
         float(decode_target_root_yaw_world_np(reference_target, runtime.previous_head_yaw))
     )
     values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
+    values["current_head_yaw_world"].append(float(runtime.previous_head_yaw))
+    values["taid_prior_root_head"].append(
+        np.full(4, np.nan, dtype=np.float32)
+        if step.taid_prior_root_head is None
+        else step.taid_prior_root_head
+    )
+    values["taid_prior_joints_head"].append(
+        np.full((24, 3), np.nan, dtype=np.float32)
+        if step.taid_prior_joints_head is None
+        else step.taid_prior_joints_head
+    )
     values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
     values["predicted_hip_height"].append(resolved.hip_height)
     for name in ("tracker_pos_world", "tracker_rot_world_6d"):

@@ -10,6 +10,9 @@ def create_model_and_diffusion(args):
         raise ValueError("144 维动态 Tracker 路径只支持 target_dit；旧 full_feature_dit 不兼容。")
     taid_config = TaIDConfig(
         ablation=getattr(args, "taid_ablation", "B0"),
+        prior_tracker_aggregation=getattr(
+            args, "taid_prior_tracker_aggregation", "fixed_slots"
+        ),
         role=TrackerRoleConfig(
             anchor_ramp_start=getattr(args, "taid_anchor_ramp_start", 5),
             anchor_ramp_end=getattr(args, "taid_anchor_ramp_end", 15),

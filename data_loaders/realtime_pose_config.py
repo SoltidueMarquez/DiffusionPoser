@@ -20,6 +20,7 @@ TARGET_REGION_NAMES = ("torso", "left_arm", "right_arm", "left_leg", "right_leg"
 MOTION_REGION_NAMES = ("global", "pelvis", "left_leg", "right_leg")
 PROJECTED_DDIM_MODES = ("all_steps", "late_steps", "final_step")
 TAID_ABLATIONS = ("B0", "B1", "B2", "B3", "B4", "B5", "B6")
+TAID_PRIOR_TRACKER_AGGREGATIONS = ("fixed_slots",)
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class TaIDConfig:
     """TAID B0～B6 的结构、角色和确定性几何默认值。"""
 
     ablation: str = "B0"
+    prior_tracker_aggregation: str = "fixed_slots"
     role: TrackerRoleConfig = TrackerRoleConfig()
     innovation_dim: int = 64
     innovation_clip: float = 3.0
@@ -61,6 +63,11 @@ class TaIDConfig:
     def validate(self) -> "TaIDConfig":
         if self.ablation not in TAID_ABLATIONS:
             raise ValueError(f"TAID ablation 必须属于 {TAID_ABLATIONS}，实际为 {self.ablation}")
+        if self.prior_tracker_aggregation not in TAID_PRIOR_TRACKER_AGGREGATIONS:
+            raise ValueError(
+                "TAID Prior Tracker 聚合必须属于 "
+                f"{TAID_PRIOR_TRACKER_AGGREGATIONS}，实际为 {self.prior_tracker_aggregation}"
+            )
         self.role.validate()
         if self.innovation_dim <= 0 or self.innovation_clip <= 0.0:
             raise ValueError("innovation_dim/innovation_clip 必须大于 0。")

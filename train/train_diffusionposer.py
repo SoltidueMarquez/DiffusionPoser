@@ -64,6 +64,8 @@ def main():
             rollout_steps=args.rollout_steps,
             rollout_prob=args.rollout_prob,
             cold_start_prob=args.cold_start_prob,
+            cold_start_history_weights=args.cold_start_history_weights,
+            cold_start_scenario_weights=args.cold_start_scenario_weights,
             scenario_weights=args.scenario_weights,
             seed=args.seed,
         )
@@ -84,6 +86,8 @@ def main():
                 rollout_steps=1,
                 rollout_prob=0.0,
                 cold_start_prob=0.0,
+                cold_start_history_weights=None,
+                cold_start_scenario_weights=None,
                 scenario_weights=args.scenario_weights,
                 seed=args.seed,
             )
