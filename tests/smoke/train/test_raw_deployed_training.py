@@ -31,6 +31,7 @@ from diffusion.gaussian_diffusion import (
     ModelVarType,
 )
 from diffusion.realtime_pose_losses import (
+    _contact_slide_loss,
     _radial_huber_loss,
     _rotation_angle,
 )
@@ -84,6 +85,39 @@ def test_tracker_position_radial_huber_values_and_gradients():
     torch.testing.assert_close(distance.grad, torch.tensor([0.0, 1.0, 1.0]))
     with pytest.raises(ValueError):
         _radial_huber_loss(torch.tensor([0.1]), beta=0.0)
+
+
+def test_contact_slide_loss_uses_soft_contact_and_previous_valid_mask():
+    previous = torch.zeros(1, 2, 3)
+    predicted = previous.clone()
+    predicted[0, 0, 0] = 0.01
+    predicted.requires_grad_()
+    contact_weight = torch.tensor([[1.0, 0.0]])
+
+    loss = _contact_slide_loss(
+        predicted_feet=predicted,
+        previous_target_feet=previous,
+        contact_weight=contact_weight,
+        previous_frame_valid=torch.tensor([True]),
+        fps=60.0,
+        huber_beta_mps=0.1,
+    )
+    # 1 cm/frame 在 60 Hz 下是 0.6 m/s，Huber(beta=0.1) 得到 0.55。
+    torch.testing.assert_close(loss, torch.tensor([0.55]))
+    loss.sum().backward()
+    assert torch.isfinite(predicted.grad).all()
+    assert predicted.grad[0, 0, 0] > 0.0
+    torch.testing.assert_close(predicted.grad[0, 1], torch.zeros(3))
+
+    invalid_loss = _contact_slide_loss(
+        predicted_feet=predicted.detach(),
+        previous_target_feet=previous,
+        contact_weight=torch.ones(1, 2),
+        previous_frame_valid=torch.tensor([False]),
+        fps=60.0,
+        huber_beta_mps=0.1,
+    )
+    torch.testing.assert_close(invalid_loss, torch.zeros_like(invalid_loss))
 
 
 def _training_batch() -> dict[str, torch.Tensor]:
@@ -153,7 +187,10 @@ def _model_and_kwargs(batch):
         "frame_offsets",
     )
     kwargs = {name: batch[name] for name in condition_names}
-    kwargs["y"] = batch
+    kwargs["y"] = {
+        **batch,
+        "previous_pose_target": batch["x"][:, -2],
+    }
     return model, kwargs
 
 
@@ -178,6 +215,7 @@ def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint()
     )
     assert all(torch.isfinite(value).all() for value in terms.values())
     assert "head_ref_joint_distance_loss" in terms
+    assert "contact_slide_loss" in terms
     assert "world_joint_loss" not in terms
     raw = terms["raw_pred_xstart"]
     deployed = terms["deployed_pred_xstart"]

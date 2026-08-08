@@ -139,6 +139,7 @@ class GaussianDiffusion:
         head_to_root_xz_loss_weight=1.0,
         future_leg_loss_weight=0.5,
         contact_loss_weight=0.1,
+        contact_slide_loss_weight=0.1,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -161,6 +162,7 @@ class GaussianDiffusion:
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
         self.future_leg_loss_weight = float(future_leg_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
+        self.contact_slide_loss_weight = float(contact_slide_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -1559,6 +1561,7 @@ class GaussianDiffusion:
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
             + self.future_leg_loss_weight * terms["future_leg_loss"]
             + self.contact_loss_weight * terms["contact_loss"]
+            + self.contact_slide_loss_weight * terms["contact_slide_loss"]
         )
         terms["aux_loss"] = auxiliary_loss
         terms["loss"] = self.diffusion_loss_weight * simple_loss + self.aux_loss_weight * auxiliary_loss

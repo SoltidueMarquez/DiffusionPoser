@@ -451,6 +451,9 @@ class TrainLoop:
         }
         y = {
             **conditions,
+            # contact-slide 只读取未扰动的相邻 GT；带噪历史仍仅作为模型条件，
+            # 避免把人为历史噪声误当成需要保持的脚部锚点。
+            "previous_pose_target": sample[:, -2],
             "tracker_window_raw": batch["tracker_window_raw"],
             "hard_rotation_state_window": batch["hard_rotation_state_window"],
             "target_joints_head_ref": batch["target_joints_head_ref"],

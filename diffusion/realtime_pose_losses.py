@@ -9,12 +9,20 @@ from data_loaders.realtime_pose_geometry import (
     decode_target_head_rotations_torch,
     resolve_root_head_reference_torch,
 )
-from data_loaders.realtime_pose_kinematics import SMPL_PARENTS, rotation_6d_to_matrix_torch
+from data_loaders.realtime_pose_kinematics import (
+    JOINT_INDEX,
+    SMPL_PARENTS,
+    rotation_6d_to_matrix_torch,
+)
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
+    REALTIME_POSE_FPS,
     TRACKER_TO_JOINT,
 )
+
+
+CONTACT_SLIDE_HUBER_BETA_MPS = 0.1
 
 
 def compute_raw_deployed_losses(
@@ -94,15 +102,56 @@ def compute_raw_deployed_losses(
     if future_prediction.shape != future_target.shape:
         raise ValueError("future_leg 输出与监督必须同为 [B,3,8,6]。")
     future_leg_loss = torch.square(future_prediction - future_target).flatten(1).mean(dim=1)
-    contact_target = (
-        batch["contact_target"].to(device=raw_pred.device, dtype=raw_pred.dtype) >= 0.5
-    ).to(raw_pred.dtype)
+    contact_weight = batch["contact_target"].to(
+        device=raw_pred.device, dtype=raw_pred.dtype
+    ).clamp(0.0, 1.0)
+    contact_target = (contact_weight >= 0.5).to(raw_pred.dtype)
     contact_logits = auxiliary_outputs["contact_logits"].to(dtype=raw_pred.dtype)
     contact_loss = F.binary_cross_entropy_with_logits(
         contact_logits,
         contact_target,
         reduction="none",
     ).mean(dim=-1)
+
+    previous_pose = _to_raw_pose(
+        batch["previous_pose_target"].to(
+            device=raw_pred.device, dtype=raw_pred.dtype
+        ),
+        batch,
+    )
+    previous_global, previous_root_yaw = decode_target_head_rotations_torch(
+        previous_pose
+    )
+    previous_head_position = batch["tracker_window_raw"][:, -2, HEAD_TRACKER_INDEX, :3].to(
+        device=raw_pred.device, dtype=raw_pred.dtype
+    )
+    _, _, previous_joints = resolve_root_head_reference_torch(
+        previous_global,
+        previous_root_yaw,
+        offsets,
+        observed_head_height=previous_head_position[:, 1],
+    )
+    # FK resolver 会把每一帧的 Head XZ 放在原点；补回上一帧 Head 相对当前
+    # Head 的水平位移后，两帧脚点才位于同一个当前 Head-reference 坐标系。
+    previous_head_translation = torch.zeros_like(previous_head_position)
+    previous_head_translation[:, [0, 2]] = previous_head_position[:, [0, 2]]
+    previous_joints = previous_joints + previous_head_translation[:, None]
+
+    foot_indices = torch.as_tensor(
+        [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
+        device=raw_pred.device,
+        dtype=torch.long,
+    )
+    contact_slide_loss = _contact_slide_loss(
+        predicted_feet=deployed_joints.index_select(1, foot_indices),
+        previous_target_feet=previous_joints.index_select(1, foot_indices),
+        contact_weight=contact_weight,
+        previous_frame_valid=batch["window_valid_mask"][:, -2].to(
+            device=raw_pred.device
+        ),
+        fps=REALTIME_POSE_FPS,
+        huber_beta_mps=CONTACT_SLIDE_HUBER_BETA_MPS,
+    )
     return {
         "global_rotation_loss": global_rotation_loss,
         "local_rotation_loss": local_rotation_loss,
@@ -114,6 +163,7 @@ def compute_raw_deployed_losses(
         "head_to_root_xz_loss": head_to_root_xz_loss,
         "future_leg_loss": future_leg_loss,
         "contact_loss": contact_loss,
+        "contact_slide_loss": contact_slide_loss,
     }
 
 
@@ -171,3 +221,40 @@ def _radial_huber_loss(distance: torch.Tensor, beta: float) -> torch.Tensor:
         0.5 * distance.square() / beta_tensor,
         distance - 0.5 * beta_tensor,
     )
+
+
+def _contact_slide_loss(
+    predicted_feet: torch.Tensor,
+    previous_target_feet: torch.Tensor,
+    contact_weight: torch.Tensor,
+    previous_frame_valid: torch.Tensor,
+    *,
+    fps: float,
+    huber_beta_mps: float,
+) -> torch.Tensor:
+    """计算逐样本两脚接触滑动损失。
+
+    `predicted_feet` 与 `previous_target_feet` 均为同一当前 Head-reference
+    下的 `[B,2,3]`。这里只约束 XZ 水平速度，避免把 AMASS 中不可靠的
+    绝对地面高度解释成物理接触真值。
+    """
+
+    if predicted_feet.shape != previous_target_feet.shape or predicted_feet.ndim != 3:
+        raise ValueError("当前预测脚与前一帧目标脚必须同为 [B,2,3]。")
+    if tuple(predicted_feet.shape[1:]) != (2, 3):
+        raise ValueError("脚点张量必须包含左右脚两个三维位置。")
+    if tuple(contact_weight.shape) != tuple(predicted_feet.shape[:2]):
+        raise ValueError("contact_weight 必须为 [B,2]。")
+    if tuple(previous_frame_valid.shape) != (predicted_feet.shape[0],):
+        raise ValueError("previous_frame_valid 必须为 [B]。")
+    if not math.isfinite(float(fps)) or float(fps) <= 0.0:
+        raise ValueError("fps 必须是有限正数。")
+
+    horizontal_speed = torch.linalg.norm(
+        predicted_feet[..., [0, 2]] - previous_target_feet[..., [0, 2]],
+        dim=-1,
+    ) * float(fps)
+    penalty = _radial_huber_loss(horizontal_speed, beta=huber_beta_mps)
+    weight = contact_weight.to(penalty.dtype).clamp(0.0, 1.0)
+    weight = weight * previous_frame_valid.to(penalty.dtype)[:, None]
+    return (penalty * weight).sum(dim=-1) / weight.sum(dim=-1).clamp_min(1.0)

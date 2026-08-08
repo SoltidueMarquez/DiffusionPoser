@@ -50,4 +50,5 @@ def create_gaussian_diffusion(args):
         head_to_root_xz_loss_weight=getattr(args, "head_to_root_xz_loss_weight", 1.0),
         future_leg_loss_weight=getattr(args, "future_leg_loss_weight", 0.5),
         contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
+        contact_slide_loss_weight=getattr(args, "contact_slide_loss_weight", 0.1),
     )
