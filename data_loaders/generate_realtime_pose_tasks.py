@@ -479,6 +479,7 @@ def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "current_head_position_world": ((3,), np.dtype("float32")),
         "floor_y": ((), np.dtype("float32")),
         "future_leg_target": ((3, 8, 6), np.dtype("float32")),
+        "previous_contact_target": ((2,), np.dtype("float32")),
         "contact_target": ((2,), np.dtype("float32")),
         "source_index": ((), np.dtype("int32")),
         "start_frame": ((), np.dtype("int32")),
@@ -579,6 +580,9 @@ def build_task_bundle_row(
         "current_head_position_world": current_head_position,
         "floor_y": np.float32(floor_y),
         "future_leg_target": future_pose[:, leg_joint_indices].astype(np.float32),
+        "previous_contact_target": source["stationary_prob_5"][
+            current_absolute - 1, 1:3
+        ].astype(np.float32),
         "contact_target": source["stationary_prob_5"][
             current_absolute, 1:3
         ].astype(np.float32),

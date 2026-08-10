@@ -62,6 +62,7 @@ TASK_SHAPES = {
     "d_off": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
     "d_on": (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT),
     "future_leg_target": (3, 8, 6),
+    "previous_contact_target": (2,),
     "contact_target": (2,),
 }
 

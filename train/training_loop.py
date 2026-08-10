@@ -41,6 +41,7 @@ TRAIN_DEVICE_FIELDS = frozenset(
         "target_root_yaw_world",
         "current_head_yaw_world",
         "future_leg_target",
+        "previous_contact_target",
         "contact_target",
     }
 )
@@ -462,6 +463,7 @@ class TrainLoop:
             "target_root_yaw_world": batch["target_root_yaw_world"],
             "current_head_yaw_world": batch["current_head_yaw_world"],
             "future_leg_target": batch["future_leg_target"],
+            "previous_contact_target": batch["previous_contact_target"],
             "contact_target": batch["contact_target"],
         }
         if self.pose_mean is not None and self.pose_scale is not None:

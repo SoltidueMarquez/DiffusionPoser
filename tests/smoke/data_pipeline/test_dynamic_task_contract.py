@@ -49,7 +49,16 @@ def test_task_bundle_materializes_synchronized_spatiotemporal_window():
     assert row["configured"].shape == (5, 61, 6)
     assert row["measured_valid"].shape == (5, 61, 6)
     assert row["future_leg_target"].shape == (3, 8, 6)
+    assert row["previous_contact_target"].shape == (2,)
     assert row["contact_target"].shape == (2,)
+    np.testing.assert_allclose(
+        row["previous_contact_target"],
+        _source["stationary_prob_5"][59, 1:3],
+    )
+    np.testing.assert_allclose(
+        row["contact_target"],
+        _source["stationary_prob_5"][60, 1:3],
+    )
     np.testing.assert_allclose(row["head_path_window"][-1, :2], 0.0, atol=1e-7)
     np.testing.assert_allclose(row["head_path_window"][-1, 3:], [0.0, 1.0], atol=1e-7)
     # Head 路径和同一锚点的 Head Tracker 必须来自完全相同的参考系变换。
@@ -110,6 +119,8 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert item["tracker_window"].shape == (11, 6, 13)
     assert item["tracker_window_raw"].shape == (11, 6, 13)
     assert item["hard_rotation_state_window"].shape == (11, 6)
+    assert item["previous_contact_target"].shape == (2,)
+    assert item["contact_target"].shape == (2,)
     assert not (
         item["hard_rotation_state_window"]
         & ~(item["configured"] & item["measured_valid"])

@@ -287,6 +287,11 @@ class RealtimePoseTaskDataset(Dataset):
             "future_leg_target": torch.from_numpy(
                 np.asarray(shard["future_leg_target"][row_index], dtype=np.float32).copy()
             ).float(),
+            "previous_contact_target": torch.from_numpy(
+                np.asarray(
+                    shard["previous_contact_target"][row_index], dtype=np.float32
+                ).copy()
+            ).float(),
             "contact_target": torch.from_numpy(
                 np.asarray(shard["contact_target"][row_index], dtype=np.float32).copy()
             ).float(),

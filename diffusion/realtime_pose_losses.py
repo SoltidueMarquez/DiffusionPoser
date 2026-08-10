@@ -105,6 +105,15 @@ def compute_raw_deployed_losses(
     contact_weight = batch["contact_target"].to(
         device=raw_pred.device, dtype=raw_pred.dtype
     ).clamp(0.0, 1.0)
+    previous_contact_weight = batch["previous_contact_target"].to(
+        device=raw_pred.device, dtype=raw_pred.dtype
+    )
+    # 只有相邻两帧都保持接触时才约束脚底滑动，避免在落地和离地边沿
+    # 把上一帧仍在摆动的脚错误地当作世界空间锚点。
+    adjacent_contact_weight = _adjacent_contact_weight(
+        current_contact_weight=contact_weight,
+        previous_contact_weight=previous_contact_weight,
+    )
     contact_target = (contact_weight >= 0.5).to(raw_pred.dtype)
     contact_logits = auxiliary_outputs["contact_logits"].to(dtype=raw_pred.dtype)
     contact_loss = F.binary_cross_entropy_with_logits(
@@ -145,7 +154,7 @@ def compute_raw_deployed_losses(
     contact_slide_loss = _contact_slide_loss(
         predicted_feet=deployed_joints.index_select(1, foot_indices),
         previous_target_feet=previous_joints.index_select(1, foot_indices),
-        contact_weight=contact_weight,
+        contact_weight=adjacent_contact_weight,
         previous_frame_valid=batch["window_valid_mask"][:, -2].to(
             device=raw_pred.device
         ),
@@ -220,6 +229,22 @@ def _radial_huber_loss(distance: torch.Tensor, beta: float) -> torch.Tensor:
         distance < beta_tensor,
         0.5 * distance.square() / beta_tensor,
         distance - 0.5 * beta_tensor,
+    )
+
+
+def _adjacent_contact_weight(
+    current_contact_weight: torch.Tensor,
+    previous_contact_weight: torch.Tensor,
+) -> torch.Tensor:
+    """返回连续两帧都接触的逐脚 soft 权重 `[B,2]`。"""
+
+    if current_contact_weight.shape != previous_contact_weight.shape:
+        raise ValueError("previous_contact_target 与 contact_target 必须同为 [B,2]。")
+    if current_contact_weight.ndim != 2 or current_contact_weight.shape[-1] != 2:
+        raise ValueError("contact_target 必须为 [B,2]。")
+    return torch.minimum(
+        previous_contact_weight.clamp(0.0, 1.0),
+        current_contact_weight.clamp(0.0, 1.0),
     )
 
 

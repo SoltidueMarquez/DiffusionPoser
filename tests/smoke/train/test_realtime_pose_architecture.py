@@ -321,6 +321,7 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "target_root_yaw_world": torch.zeros(1),
         "current_head_yaw_world": torch.zeros(1),
         "future_leg_target": torch.zeros(1, 3, 8, 6),
+        "previous_contact_target": torch.zeros(1, 2),
         "contact_target": torch.zeros(1, 2),
     }
 

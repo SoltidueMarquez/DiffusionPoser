@@ -108,6 +108,8 @@ def read_store_metadata(split_dir: str | Path) -> dict[str, Any]:
         "configured",
         "measured_valid",
         "current_head_yaw_world",
+        "previous_contact_target",
+        "contact_target",
     }
     if not required_fields.issubset(set(value["schema_fields"])):
         raise ValueError(f"{path} 不满足当前 task schema；旧 task 不可复用。")

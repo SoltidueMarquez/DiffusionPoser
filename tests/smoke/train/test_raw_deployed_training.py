@@ -31,6 +31,7 @@ from diffusion.gaussian_diffusion import (
     ModelVarType,
 )
 from diffusion.realtime_pose_losses import (
+    _adjacent_contact_weight,
     _contact_slide_loss,
     _radial_huber_loss,
     _rotation_angle,
@@ -120,6 +121,21 @@ def test_contact_slide_loss_uses_soft_contact_and_previous_valid_mask():
     torch.testing.assert_close(invalid_loss, torch.zeros_like(invalid_loss))
 
 
+def test_adjacent_contact_weight_requires_contact_on_both_frames():
+    current = torch.tensor([[1.0, 0.4]])
+    previous = torch.tensor([[0.2, 0.8]])
+    torch.testing.assert_close(
+        _adjacent_contact_weight(current, previous),
+        torch.tensor([[0.2, 0.4]]),
+    )
+    torch.testing.assert_close(
+        _adjacent_contact_weight(current, torch.zeros_like(previous)),
+        torch.zeros_like(current),
+    )
+    with pytest.raises(ValueError, match=r"\[B,2\]"):
+        _adjacent_contact_weight(current, torch.ones(1, 3))
+
+
 def _training_batch() -> dict[str, torch.Tensor]:
     source = build_toy_realtime_source(frame_count=70)
     joint_rotations = compute_source_joint_rotations_world(source)
@@ -169,6 +185,7 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "target_root_yaw_world": row["target_root_yaw_world"],
         "current_head_yaw_world": row["current_head_yaw_world"],
         "future_leg_target": row["future_leg_target"],
+        "previous_contact_target": row["previous_contact_target"],
         "contact_target": row["contact_target"],
     }
     return {name: torch.as_tensor(value).unsqueeze(0) for name, value in values.items()}
