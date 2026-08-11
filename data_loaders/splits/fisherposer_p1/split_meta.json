@@ -1,0 +1,134 @@
+{
+  "counts": {
+    "by_subset": {
+      "BioMotionLab_NTroje": {
+        "eligible": 3034,
+        "test": 305,
+        "train": 2729
+      },
+      "CMU": {
+        "eligible": 2066,
+        "test": 206,
+        "train": 1852
+      },
+      "MPI_HDM05": {
+        "eligible": 214,
+        "test": 22,
+        "train": 192
+      }
+    },
+    "eligible": 5314,
+    "test": 533,
+    "train": 4773
+  },
+  "eligibility_exclusion_counts": {
+    "mirrored": 5358,
+    "missing_split_key": 0,
+    "outside_p1_subsets": 17476,
+    "target_fps_mismatch": 0,
+    "too_short": 44,
+    "unusable_status": 0
+  },
+  "local_split_policy": {
+    "ordering": "sha256(seed\\x1fsource_key)",
+    "test_count_rounding": "ceil",
+    "test_ratio": 0.1
+  },
+  "min_source_frames": 64,
+  "mirror_policy": "disabled",
+  "official_split": {
+    "eligibility_projection": "realtime_pose_task_compatible",
+    "exclusions": {
+      "eligible_not_listed": [
+        "CMU/06/06_08_poses.npy",
+        "CMU/06/06_09_poses.npy",
+        "CMU/06/06_10_poses.npy",
+        "CMU/06/06_11_poses.npy",
+        "CMU/06/06_12_poses.npy",
+        "CMU/06/06_13_poses.npy",
+        "CMU/06/06_14_poses.npy",
+        "CMU/06/06_15_poses.npy"
+      ],
+      "non_motion_shape_file": [
+        "CMU/18_19_Justin/shape.npy",
+        "CMU/18_19_rory/shape.npy",
+        "CMU/20_21_Justin1/shape.npy",
+        "CMU/20_21_rory1/shape.npy",
+        "CMU/22_23_Rory/shape.npy",
+        "CMU/22_23_justin/shape.npy"
+      ],
+      "too_short": [
+        "BioMotionLab_NTroje/rub005/0007_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub005/0023_scamper1_poses.npy",
+        "BioMotionLab_NTroje/rub008/0009_normal_jog1_poses.npy",
+        "BioMotionLab_NTroje/rub008/0010_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub008/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub008/0012_normal_jog4_poses.npy",
+        "BioMotionLab_NTroje/rub010/0010_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub010/0011_normal_jog4_poses.npy",
+        "BioMotionLab_NTroje/rub011/0009_normal_jog1_poses.npy",
+        "BioMotionLab_NTroje/rub011/0012_normal_jog4_poses.npy",
+        "BioMotionLab_NTroje/rub086/0010_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub086/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub088/0010_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub088/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub096/0009_normal_jog1_poses.npy",
+        "BioMotionLab_NTroje/rub101/0010_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub109/0006_normal_walk2_poses.npy",
+        "BioMotionLab_NTroje/rub112/0009_normal_jog1_poses.npy",
+        "BioMotionLab_NTroje/rub112/0010_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub112/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub112/0012_normal_jog4_poses.npy",
+        "BioMotionLab_NTroje/rub114/0009_normal_jog1_poses.npy",
+        "BioMotionLab_NTroje/rub114/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub114/0012_normal_jog4_poses.npy",
+        "BioMotionLab_NTroje/rub115/0010_normal_jog2_poses.npy",
+        "BioMotionLab_NTroje/rub115/0011_normal_jog3_poses.npy",
+        "BioMotionLab_NTroje/rub115/0012_normal_jog4_poses.npy",
+        "CMU/102/102_05_poses.npy",
+        "CMU/102/102_07_poses.npy",
+        "CMU/102/102_09_poses.npy",
+        "CMU/102/102_10_poses.npy",
+        "CMU/103/103_01_poses.npy",
+        "CMU/122/122_11_poses.npy",
+        "CMU/126/126_13_poses.npy",
+        "CMU/76/76_07_poses.npy",
+        "CMU/78/78_06_poses.npy",
+        "CMU/78/78_08_poses.npy",
+        "CMU/78/78_11_poses.npy",
+        "CMU/78/78_12_poses.npy",
+        "CMU/82/82_01_poses.npy",
+        "CMU/82/82_18_poses.npy",
+        "CMU/83/83_11_poses.npy",
+        "CMU/93/93_01_poses.npy",
+        "MPI_HDM05/dg/HDM_dg_06-03_04_120_poses.npy"
+      ]
+    },
+    "input_canonical_sha256": {
+      "BioMotionLab_NTroje/test_split.txt": "de689e94333d03c3ebaba8dcd041ad5c7c658a5a3ac8c62c9fd31abfad0ed3ea",
+      "BioMotionLab_NTroje/train_split.txt": "c5da0d2acf73bd1cab762a281247c2b39c251e585d68f46ad02c3a1790a8b8df",
+      "CMU/test_split.txt": "1a3896df346d2f362e8896eef1184c0589462a7ba5601790e6a1575f7cb60a40",
+      "CMU/train_split.txt": "d6777d812ea78f814e2d47f2afa762184259f55018e706f61afa3a41e78c8fc9",
+      "MPI_HDM05/test_split.txt": "449884812e119d2f897bc0112d42ed09a08a38707435422e262b648db656fe04",
+      "MPI_HDM05/train_split.txt": "33cf91ce635dc3ef740f4912b66ea9a78124deb6a20c0cb61127679b1695c3d3"
+    },
+    "listed_counts": {
+      "test": 537,
+      "train": 4819
+    }
+  },
+  "protocol": "fisherposer_p1",
+  "seed": 10,
+  "source_manifest_canonical_sha256": "ec9ba8e1dfe9693a7ae767058af84f4fa81abeb1c3ca0564c0788190982cb57a",
+  "split_origin": "avatarposer_official",
+  "split_sha256": {
+    "test.txt": "3a3d8344bab60049baa8f88a0caae97e5afd09fa7970853db8404bf9dfe043fa",
+    "train.txt": "62c30d68fa8053727601334ada1cd03e4698e3cb89e640f9f9759aca04ea2c95"
+  },
+  "subsets": [
+    "CMU",
+    "BioMotionLab_NTroje",
+    "MPI_HDM05"
+  ],
+  "target_fps": 60.0
+}
