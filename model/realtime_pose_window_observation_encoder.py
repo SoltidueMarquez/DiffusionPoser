@@ -15,10 +15,7 @@ from data_loaders.sensor_masking import (
     TRACKER_FEATURE_DIM,
     TRACKER_MEASURED_VALID_OFFSET,
 )
-from data_loaders.tracker_reliability import (
-    compute_region_coverage_torch,
-    compute_tracker_reliability_torch,
-)
+from data_loaders.tracker_reliability import compute_tracker_reliability_torch
 
 
 @dataclass
@@ -28,8 +25,6 @@ class WindowObservationEncoding:
     rotation_tokens: torch.Tensor
     kappa_position: torch.Tensor
     kappa_rotation: torch.Tensor
-    rho_position: torch.Tensor
-    rho_rotation: torch.Tensor
 
 
 class WindowObservationEncoder(nn.Module):
@@ -113,15 +108,10 @@ class WindowObservationEncoder(nn.Module):
         valid_scalar = window_valid_mask.to(kappa_position.dtype)[..., None]
         kappa_position = kappa_position * valid_scalar
         kappa_rotation = kappa_rotation * valid_scalar
-        rho_position, rho_rotation = compute_region_coverage_torch(
-            kappa_position, kappa_rotation
-        )
         return WindowObservationEncoding(
             state_tokens=state_tokens,
             position_tokens=position_tokens,
             rotation_tokens=rotation_tokens,
             kappa_position=kappa_position,
             kappa_rotation=kappa_rotation,
-            rho_position=rho_position,
-            rho_rotation=rho_rotation,
         )

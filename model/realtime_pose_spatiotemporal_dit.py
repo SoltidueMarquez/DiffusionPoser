@@ -36,8 +36,9 @@ class PreparedSpatioTemporalConditioning:
     window_valid_mask: torch.Tensor
     position_attention_bias: torch.Tensor
     rotation_attention_bias: torch.Tensor
+    position_measurement_valid: torch.Tensor
+    rotation_measurement_valid: torch.Tensor
     temporal_attention_mask: torch.Tensor
-    prior_gate_joint: torch.Tensor
 
 
 def _modulate(
@@ -90,7 +91,6 @@ class SpatioTemporalDiTBlock(nn.Module):
         target: torch.Tensor,
         diffusion_time: torch.Tensor,
         prepared: PreparedSpatioTemporalConditioning,
-        joint_regions: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, time_count, joint_count, latent_dim = target.shape
         observation = prepared.observation
@@ -125,16 +125,18 @@ class SpatioTemporalDiTBlock(nn.Module):
             attn_mask=prepared.rotation_attention_bias,
             need_weights=False,
         )[0]
-        rho_position = observation.rho_position.index_select(2, joint_regions).reshape(
-            batch_size * time_count, joint_count
+        # Attention 的连续作用强度由模型自行学习；这里只用二值有效性清除
+        # 全无合法 key 时为防止 softmax NaN 而临时开放的回退输出。
+        position_value = position_value * prepared.position_measurement_valid.to(
+            position_value.dtype
         )
-        rho_rotation = observation.rho_rotation.index_select(2, joint_regions).reshape(
-            batch_size * time_count, joint_count
+        rotation_value = rotation_value * prepared.rotation_measurement_valid.to(
+            rotation_value.dtype
         )
         target = target + (
             state_value
-            + rho_position[..., None] * position_value
-            + rho_rotation[..., None] * rotation_value
+            + position_value
+            + rotation_value
         ).reshape(batch_size, time_count, joint_count, latent_dim)
         target = target * frame_valid
 
@@ -182,9 +184,6 @@ class SpatioTemporalDiTBlock(nn.Module):
         temporal_gate_bj = temporal_gate[:, None].expand(-1, joint_count, -1).reshape(
             batch_size * joint_count, latent_dim
         )
-        prior_gate_bjt = prepared.prior_gate_joint.permute(0, 2, 1).reshape(
-            batch_size * joint_count, time_count, 1
-        )
         temporal_query = _modulate(
             self.temporal_norm(temporal), temporal_shift_bj, temporal_scale_bj
         )
@@ -195,11 +194,8 @@ class SpatioTemporalDiTBlock(nn.Module):
             attn_mask=prepared.temporal_attention_mask,
             need_weights=False,
         )[0]
-        # 历史 query 的可靠度 gate 恒为 1；当前区域 Tracker 越可靠，
-        # 当前 query 的历史时序残差越弱，最低保留 0.1 维持全身协调。
-        temporal = temporal + (
-            prior_gate_bjt * temporal_gate_bj[:, None] * temporal_value
-        )
+        # 不再根据 Tracker coverage 人工削弱历史，时序残差强度只由可学习 gate 决定。
+        temporal = temporal + temporal_gate_bj[:, None] * temporal_value
         target = temporal.reshape(
             batch_size, joint_count, time_count, latent_dim
         ).permute(0, 2, 1, 3)
@@ -358,11 +354,11 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             static_condition.dtype
         )
         # 这些 mask 只依赖输入窗口，在同一轮 DDIM 的所有去噪步之间保持不变。
-        position_attention_bias = self._measurement_bias(
+        position_attention_bias, position_measurement_valid = self._measurement_bias(
             observation.kappa_position[:, :, NON_HEAD_TRACKER_INDICES],
             self.position_coverage[:, NON_HEAD_TRACKER_INDICES],
         )
-        rotation_attention_bias = self._measurement_bias(
+        rotation_attention_bias, rotation_measurement_valid = self._measurement_bias(
             observation.kappa_rotation,
             self.rotation_coverage,
         )
@@ -370,31 +366,15 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             window_valid_mask.bool(),
             joint_count=SMPL_JOINT_COUNT,
         )
-        current_prior_gate = torch.clamp(
-            1.0
-            - 0.5
-            * (
-                observation.rho_position[:, -1]
-                + observation.rho_rotation[:, -1]
-            ),
-            min=0.1,
-        )
-        # 历史 token 之间始终完整建模；只有当前 query 依据当前 Tracker 覆盖度
-        # 调整时序残差强度，避免可靠观测反向削弱历史表示本身。
-        prior_gate_region = torch.ones_like(observation.rho_position)
-        prior_gate_region[:, -1] = current_prior_gate
-        prior_gate_region = prior_gate_region * window_valid_mask[..., None].to(
-            prior_gate_region.dtype
-        )
-        prior_gate_joint = prior_gate_region.index_select(2, self.joint_regions)
         return PreparedSpatioTemporalConditioning(
             observation=observation,
             static_pose_condition=static_condition,
             window_valid_mask=window_valid_mask.bool(),
             position_attention_bias=position_attention_bias,
             rotation_attention_bias=rotation_attention_bias,
+            position_measurement_valid=position_measurement_valid,
+            rotation_measurement_valid=rotation_measurement_valid,
             temporal_attention_mask=temporal_attention_mask,
-            prior_gate_joint=prior_gate_joint,
         )
 
     def forward(
@@ -492,7 +472,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
                 target,
                 diffusion_time,
                 prepared_conditioning,
-                self.joint_regions,
             )
         target = self.output_norm(target)
         current_tokens = target[:, -1]
@@ -520,7 +499,7 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
 
     def _measurement_bias(
         self, kappa: torch.Tensor, coverage: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, time_count, key_count = kappa.shape
         flat = kappa.reshape(batch_size * time_count, key_count)
         allowed = coverage.to(dtype=torch.bool).index_select(0, self.joint_regions)
@@ -529,14 +508,17 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         )
         bias = bias.masked_fill(~allowed[None], float("-inf"))
         bias = bias.masked_fill(flat[:, None] <= 0.0, float("-inf"))
-        empty = ~torch.isfinite(bias).any(dim=-1)
-        # 空行回退到第一个 key；保持为纯张量操作，避免 CUDA 到 CPU 的条件同步。
+        measurement_valid = torch.isfinite(bias).any(dim=-1)
+        empty = ~measurement_valid
+        # 空行临时回退到第一个 key 以避免 softmax NaN；调用方会用
+        # measurement_valid 将这部分输出严格清零，因此不会泄漏无效 Tracker 几何。
         bias[..., 0] = torch.where(empty, torch.zeros_like(bias[..., 0]), bias[..., 0])
-        return bias[:, None].expand(-1, self.num_heads, -1, -1).reshape(
+        attention_bias = bias[:, None].expand(-1, self.num_heads, -1, -1).reshape(
             batch_size * time_count * self.num_heads,
             SMPL_JOINT_COUNT,
             key_count,
         )
+        return attention_bias, measurement_valid[..., None]
 
     def _temporal_mask(
         self, window_valid_mask: torch.Tensor, joint_count: int

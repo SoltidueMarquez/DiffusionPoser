@@ -192,7 +192,8 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 - 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测、Loss 和 hard projection 从同一份条件与监督数据读取，不在顶层重复条件字段；
 - 历史 Pose、Tracker 窗口、Head 路径和置信度由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
 - 历史和当前使用独立输入投影，历史姿态不会同时经过当前 diffusion 输入投影；11 帧仍形成 `[B,11,24,D]` token 网格；
-- 共享 diffusion timestep AdaLN 仍调制全部 11 帧；有效历史 temporal residual 可靠度 gate 为 1，当前 gate 由当前区域 Tracker coverage 决定，padding gate 为 0；
+- Tracker cross-attention 使用 `kappa` 与 coverage 构造 attention bias 并屏蔽无效测量；position/rotation attention residual 直接参与 token 更新；没有合法 key 的 query 通过二值有效性将安全回退输出清零；
+- 共享 diffusion timestep AdaLN 调制全部 11 帧；Temporal Attention 的时序残差强度由可学习 AdaLN gate 决定，padding 由 `window_valid_mask` 屏蔽；
 - 只解码当前 token；current loss 可经 Temporal Attention 反向训练历史编码路径，future-leg 与 contact head 也只读取当前 token；
 - current-only projection 对 `[B,144]` 的 24 个关节执行 rotation6D 到 SO(3) 投影，并只用 `tracker_window_raw[:, -1]` 与 `hard_rotation_state_window[:, -1]` 替换当前 hard Tracker 旋转；
 - Projected DDIM 的 state、初始 noise 和每步更新均为 `[B,144]`。长序列评估的 `per_frame`、`fixed_sequence` 和 `correlated` noise 也只描述当前帧；correlated 模式使用 `epsilon_n = rho * epsilon_(n-1) + sqrt(1-rho^2) * eta_n`；
