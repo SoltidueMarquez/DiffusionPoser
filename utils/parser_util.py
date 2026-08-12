@@ -106,7 +106,6 @@ def add_sampling_options(parser: ArgumentParser):
     group = parser.add_argument_group("sampling")
     group.add_argument("--model_path", required=True, type=str)
     group.add_argument("--output_dir", default="", type=str)
-    group.add_argument("--folder_path", default="", type=str)
     group.add_argument("--visualize_num", default=0, type=int)
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--source_fps", default=60.0, type=float)

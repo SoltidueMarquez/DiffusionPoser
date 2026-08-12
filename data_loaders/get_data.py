@@ -13,7 +13,6 @@ def get_dataset_loader(
     normalize_input: bool = True,
     num_workers: int = 0,
     pin_memory: bool = False,
-    folder_path: str | None = None,
     cold_start_prob: float = 0.1,
     scenario_weights: list[float] | tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2),
     seed: int = 10,
@@ -29,7 +28,6 @@ def get_dataset_loader(
         seq_len=seq_len,
         normalizer_dir=normalizer_dir,
         normalize_input=normalize_input,
-        folder_path=folder_path,
     )
     worker_kwargs = {
         "num_workers": int(num_workers),

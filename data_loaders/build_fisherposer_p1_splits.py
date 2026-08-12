@@ -9,21 +9,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from data_loaders.generate_realtime_pose_tasks import (
-    USABLE_SOURCE_STATUSES,
     normalize_split_key,
     read_source_entries,
 )
-from data_loaders.sensor_masking import REALTIME_POSE_HISTORY_LENGTH
-
-
 FISHERPOSER_P1_SUBSETS = (
     "CMU",
     "BioMotionLab_NTroje",
     "MPI_HDM05",
 )
 FISHERPOSER_P1_TARGET_FPS = 60.0
-# Task Store 还需要当前帧后的 3 帧 future-leg 监督，因此不能只检查 61 帧窗口。
-FISHERPOSER_P1_MIN_SOURCE_FRAMES = REALTIME_POSE_HISTORY_LENGTH + 1 + 3
 LOCAL_TEST_RATIO = 0.1
 
 
@@ -33,7 +27,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     paths.add_argument(
         "--source_dir",
         default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
-        help="已转换 realtime pose source 目录，必须包含 manifest.jsonl。",
+        help="已转换 realtime pose source 目录；划分直接由相对路径生成。",
     )
     paths.add_argument(
         "--output_dir",
@@ -52,7 +46,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def seeded_order(source_key: str, seed: int) -> str:
-    """用路径和 seed 建立稳定顺序，避免 manifest 重排后改变划分。"""
+    """用路径和 seed 建立稳定顺序，避免目录扫描顺序改变划分。"""
 
     value = f"{int(seed)}\x1f{normalize_split_key(source_key)}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
@@ -66,18 +60,13 @@ def build_fisherposer_p1_splits(
 ) -> dict[str, Any]:
     source_root = Path(source_dir).resolve()
     output_root = Path(output_dir).resolve()
-    manifest_path = source_root / "manifest.jsonl"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"FisherPoser P1 必须从 source manifest 生成，找不到: {manifest_path}")
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"找不到 realtime pose source 目录: {source_root}")
     if output_root.exists():
         raise FileExistsError(f"为避免覆盖已有协议，输出目录必须不存在: {output_root}")
 
-    manifest_records = read_manifest_records(manifest_path)
     source_entries = read_source_entries(source_root)
-    eligible_by_key, eligibility_reasons, exclusion_counts = select_eligible_sources(
-        manifest_records=manifest_records,
-        source_entries=source_entries,
-    )
+    eligible_by_key, eligibility_reasons, exclusion_counts = select_directory_sources(source_entries)
 
     official_root = Path(official_split_dir).resolve() if official_split_dir else None
     official_meta: dict[str, Any] | None = None
@@ -109,14 +98,12 @@ def build_fisherposer_p1_splits(
         "subsets": list(FISHERPOSER_P1_SUBSETS),
         "mirror_policy": "disabled",
         "target_fps": FISHERPOSER_P1_TARGET_FPS,
-        "min_source_frames": FISHERPOSER_P1_MIN_SOURCE_FRAMES,
         "local_split_policy": {
             "test_ratio": LOCAL_TEST_RATIO,
             "ordering": "sha256(seed\\x1fsource_key)",
             "test_count_rounding": "ceil",
         },
-        # 对 manifest 记录做规范化后再 hash，使条目顺序不影响协议身份。
-        "source_manifest_canonical_sha256": canonical_manifest_sha256(manifest_records),
+        "source_directory_inventory_sha256": source_directory_inventory_sha256(source_entries),
         "eligibility_exclusion_counts": exclusion_counts,
         "counts": build_counts(
             eligible_by_key=eligible_by_key,
@@ -140,47 +127,11 @@ def build_fisherposer_p1_splits(
     return metadata
 
 
-def read_manifest_records(manifest_path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with manifest_path.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{manifest_path}:{line_number} 不是有效 JSON。") from exc
-            if not isinstance(record, dict):
-                raise TypeError(f"{manifest_path}:{line_number} 必须是 JSON object。")
-            records.append(record)
-    if not records:
-        raise RuntimeError(f"source manifest 为空: {manifest_path}")
-    return records
-
-
-def select_eligible_sources(
-    manifest_records: list[dict[str, Any]],
+def select_directory_sources(
     source_entries: list[dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str], dict[str, int]]:
     reasons: dict[str, str] = {}
     counts: defaultdict[str, int] = defaultdict(int)
-
-    # 先从原始 manifest 统计被 read_source_entries 过滤掉的失败 source。
-    for record in manifest_records:
-        key = manifest_record_key(record)
-        if not key:
-            counts["missing_split_key"] += 1
-            continue
-        subset, is_mirrored = source_subset_and_mirror(key, bool(record.get("is_mirrored", False)))
-        if subset not in FISHERPOSER_P1_SUBSETS:
-            reasons[key] = "outside_p1_subsets"
-            counts["outside_p1_subsets"] += 1
-        elif is_mirrored:
-            reasons[key] = "mirrored"
-            counts["mirrored"] += 1
-        elif record.get("status", "converted") not in USABLE_SOURCE_STATUSES:
-            reasons[key] = "unusable_status"
-            counts["unusable_status"] += 1
 
     eligible: dict[str, dict[str, Any]] = {}
     for entry in source_entries:
@@ -191,15 +142,6 @@ def select_eligible_sources(
             reason = "outside_p1_subsets"
         elif reason is None and is_mirrored:
             reason = "mirrored"
-        elif reason is None and not math.isclose(
-            float(entry["target_fps"]),
-            FISHERPOSER_P1_TARGET_FPS,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ):
-            reason = "target_fps_mismatch"
-        elif reason is None and int(entry["source_frames"]) < FISHERPOSER_P1_MIN_SOURCE_FRAMES:
-            reason = "too_short"
 
         if reason is not None:
             if key not in reasons:
@@ -207,16 +149,12 @@ def select_eligible_sources(
             reasons[key] = reason
             continue
         if key in eligible:
-            raise ValueError(f"source manifest 出现重复 stablemotion_split_key: {key}")
+            raise ValueError(f"source 目录出现重复 stablemotion_split_key: {key}")
         eligible[key] = entry
 
     for name in (
-        "missing_split_key",
         "outside_p1_subsets",
         "mirrored",
-        "unusable_status",
-        "target_fps_mismatch",
-        "too_short",
     ):
         counts[name] += 0
     return eligible, reasons, dict(sorted(counts.items()))
@@ -277,7 +215,7 @@ def import_official_splits(
             if key.rsplit("/", 1)[-1] == "shape":
                 reason = "non_motion_shape_file"
             else:
-                reason = eligibility_reasons.get(key, "not_in_usable_source_manifest")
+                reason = eligibility_reasons.get(key, "not_in_source_directory")
             official_exclusions[reason].append(output_split_key(key))
         return selected
 
@@ -364,11 +302,6 @@ def group_keys_by_subset(entries: dict[str, dict[str, Any]]) -> dict[str, list[s
     return grouped
 
 
-def manifest_record_key(record: dict[str, Any]) -> str:
-    raw_key = record.get("stablemotion_split_key") or record.get("source_relative_path")
-    return normalize_split_key(str(raw_key)) if raw_key else ""
-
-
 def source_subset_and_mirror(source_key: str, declared_mirror: bool) -> tuple[str, bool]:
     parts = normalize_split_key(source_key).split("/")
     path_mirror = bool(parts and parts[0] == "M")
@@ -386,25 +319,12 @@ def write_split_file(path: Path, source_keys: Iterable[str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
-def canonical_manifest_sha256(records: list[dict[str, Any]]) -> str:
-    canonical_records = []
-    for record in records:
-        canonical_records.append(
-            {
-                "key": manifest_record_key(record),
-                "status": str(record.get("status", "converted")),
-                "frames": record.get("frames"),
-                "target_fps": record.get("target_fps"),
-                "is_mirrored": bool(record.get("is_mirrored", False)),
-            }
-        )
-    payload = json.dumps(
-        sorted(canonical_records, key=lambda value: json.dumps(value, sort_keys=True)),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def source_directory_inventory_sha256(entries: list[dict[str, Any]]) -> str:
+    lines = []
+    for entry in sorted(entries, key=lambda value: str(value["stablemotion_split_key"])):
+        path = Path(entry["source_path"])
+        lines.append(f"{entry['source_relative_path']}\t{path.stat().st_size}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
 
 
 def canonical_keys_sha256(keys: Iterable[str]) -> str:

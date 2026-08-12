@@ -16,7 +16,7 @@ from data_converter.amass_smpl_utils import (
     normalize_gender,
 )
 from data_loaders.realtime_pose_kinematics import SMPL_JOINT_NAMES, SMPL_PARENTS
-from data_loaders.realtime_pose_validation import load_realtime_metadata
+from data_loaders.realtime_pose_validation import validate_realtime_source_arrays
 from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY, SMPL_JOINT_COUNT
 
 
@@ -49,6 +49,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_json", default=str(DEFAULT_SOURCE_REST_JSON), type=str)
     parser.add_argument("--smpl_model_dir", default=str(DEFAULT_SMPL_MODEL_DIR), type=str)
+    parser.add_argument(
+        "--amass_path",
+        required=True,
+        type=str,
+        help="显式指定与 source 对应的原始 AMASS npz；source 不再携带路径 metadata。",
+    )
     return parser
 
 
@@ -84,25 +90,9 @@ def resolve_source_npz_from_replay(replay_json: Path) -> Path:
     )
 
 
-def load_converted_source_metadata(source_npz: Path) -> dict[str, Any]:
+def validate_converted_source(source_npz: Path) -> None:
     with np.load(source_npz, allow_pickle=False) as payload:
-        if BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY not in payload.files:
-            raise KeyError(
-                f"{source_npz} 缺少 `{BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY}`，"
-                "不是当前 converted source。"
-            )
-        return load_realtime_metadata(payload, path=source_npz)
-
-
-def resolve_original_amass_path(source_npz: Path, metadata: dict[str, Any]) -> Path:
-    source_path = metadata.get("source_path")
-    if not source_path:
-        raise KeyError(f"{source_npz} metadata 缺少 source_path。")
-    return _resolve_existing_path(
-        str(source_path),
-        (DIFFUSIONPOSER_ROOT, source_npz.parent, Path.cwd()),
-        "converted source metadata",
-    )
+        validate_realtime_source_arrays(payload, path=source_npz)
 
 
 def load_amass_body_shape(amass_path: Path) -> tuple[np.ndarray, str]:
@@ -180,9 +170,12 @@ def _vector3(value: np.ndarray) -> dict[str, float]:
     return {"x": float(value[0]), "y": float(value[1]), "z": float(value[2])}
 
 
-def build_source_rest_payload(source_npz: Path, smpl_model_dir: Path) -> dict[str, Any]:
-    metadata = load_converted_source_metadata(source_npz)
-    amass_path = resolve_original_amass_path(source_npz, metadata)
+def build_source_rest_payload(
+    source_npz: Path,
+    amass_path: Path,
+    smpl_model_dir: Path,
+) -> dict[str, Any]:
+    validate_converted_source(source_npz)
     joints, vertices = load_smpl_zero_pose(amass_path, smpl_model_dir)
     rest_offsets, source_fk_offsets = build_rest_local_offsets(joints, vertices)
     rotations = [dict(IDENTITY_QUATERNION) for _ in range(SMPL_JOINT_COUNT)]
@@ -194,7 +187,7 @@ def build_source_rest_payload(source_npz: Path, smpl_model_dir: Path) -> dict[st
         "sourceAmass": str(amass_path),
         "bodyModelDir": str(smpl_model_dir.resolve()),
         "restPoseSource": "smpl_zero_pose_tpose",
-        "isMirrored": bool(metadata.get("is_mirrored", False)),
+        "isMirrored": "M" in source_npz.parts,
         "boneCount": SMPL_JOINT_COUNT,
         "boneNames": list(SMPL_JOINT_NAMES),
         "parentIndices": [int(value) for value in SMPL_PARENTS.tolist()],
@@ -208,10 +201,11 @@ def build_source_rest_payload(source_npz: Path, smpl_model_dir: Path) -> dict[st
 
 def export_source_rest_json(
     source_npz: Path,
+    amass_path: Path,
     output_json: Path,
     smpl_model_dir: Path,
 ) -> Path:
-    payload = build_source_rest_payload(source_npz, smpl_model_dir)
+    payload = build_source_rest_payload(source_npz, amass_path, smpl_model_dir)
     output_json.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w", encoding="utf-8", newline="\n") as file:
         json.dump(payload, file, indent=2, ensure_ascii=False)
@@ -228,6 +222,7 @@ def main(argv: list[str] | None = None) -> Path:
     )
     path = export_source_rest_json(
         source_npz=source_npz,
+        amass_path=Path(args.amass_path).resolve(),
         output_json=Path(args.output_json).resolve(),
         smpl_model_dir=Path(args.smpl_model_dir).resolve(),
     )

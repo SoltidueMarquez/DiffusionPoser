@@ -166,31 +166,16 @@ def build_ddim_schedule(
 
 
 def validate_normalizer_metadata(normalizer_dir: Path, schema_name: str) -> dict[str, Any]:
+    """保留导出调用接口；normalizer 只由八个张量文件定义。"""
+
+    del normalizer_dir
     schema = get_schema_spec(schema_name)
-    meta_path = normalizer_dir / "normalizer_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(
-            f"normalize_input=True requires {meta_path}; old parent-local normalizers are not compatible."
-        )
-    with meta_path.open("r", encoding="utf-8") as file:
-        meta = json.load(file)
-    if str(meta.get("schema_name", "")) != schema.name:
-        raise ValueError(f"normalizer schema_name={meta.get('schema_name')!r}, expected {schema.name!r}.")
-    validate_pose_representation(meta.get(POSE_REPRESENTATION_KEY), schema_name=schema.name, source=str(meta_path))
-    feature_dim = int(meta.get("feature_dim", -1))
-    if feature_dim != schema.feature_dim:
-        raise ValueError(f"normalizer feature_dim={feature_dim}, expected {schema.feature_dim}.")
-    if "root_y_policy" not in meta:
-        raise ValueError(f"normalizer metadata 缺少 root_y_policy: {meta_path}")
-    if str(meta["root_y_policy"]) != schema.root_y_policy:
-        raise ValueError(f"normalizer root_y_policy={meta.get('root_y_policy')!r}, expected {schema.root_y_policy!r}.")
-    if "pelvis_height_mode" not in meta:
-        raise ValueError(f"normalizer metadata 缺少 pelvis_height_mode: {meta_path}")
-    if str(meta["pelvis_height_mode"]) != schema.pelvis_height_mode:
-        raise ValueError(
-            f"normalizer pelvis_height_mode={meta.get('pelvis_height_mode')!r}, expected {schema.pelvis_height_mode!r}."
-        )
-    return meta
+    return {
+        "schema_name": schema.name,
+        "feature_dim": schema.feature_dim,
+        "root_y_policy": schema.root_y_policy,
+        "pelvis_height_mode": schema.pelvis_height_mode,
+    }
 
 
 def build_normalizer(

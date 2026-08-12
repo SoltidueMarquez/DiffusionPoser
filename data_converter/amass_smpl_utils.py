@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,8 +71,8 @@ def validate_args(args) -> None:
         raise ValueError("--target_fps 必须为正数")
     if args.batch_size <= 0:
         raise ValueError("--batch_size 必须为正整数")
-    if args.overwrite and args.skip_existing and not getattr(args, "rebuild_manifest", False):
-        raise ValueError("--overwrite 和 --skip_existing 不能同时启用；如只想重写 manifest，请使用 --rebuild_manifest")
+    if args.overwrite and args.skip_existing:
+        raise ValueError("--overwrite 和 --skip_existing 不能同时启用。")
 
 
 def iter_amass_motion_files(amass_dir: Path) -> list[Path]:
@@ -410,9 +409,3 @@ def transform_points_to_unity(points: np.ndarray) -> np.ndarray:
 
 def transform_rotations_to_unity(rotations: np.ndarray) -> np.ndarray:
     return AMASS_TO_UNITY @ rotations @ AMASS_TO_UNITY.T
-
-
-def write_manifest_record(manifest_path: Path, record: dict[str, Any]) -> None:
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")

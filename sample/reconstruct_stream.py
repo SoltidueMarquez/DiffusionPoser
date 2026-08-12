@@ -280,7 +280,6 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         seq_len=args.seq_len,
         normalizer_dir=args.normalizer_dir,
         normalize_input=args.normalize_input,
-        folder_path=getattr(args, "folder_path", "") or None,
     )
     item = dataset[0]
     batch = {

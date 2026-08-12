@@ -9,9 +9,8 @@ import torch
 from tqdm.auto import tqdm
 
 from data_loaders.build_realtime_longseq_eval_set import (
-    read_longseq_manifest,
-    resolve_longseq_eval_dir,
-    resolve_manifest_source_path,
+    read_longseq_source_entries,
+    resolve_source_entry_path,
 )
 from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
@@ -162,13 +161,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     args.ts_respace = f"ddim{int(args.inference_steps)}"
     fixseed(int(args.seed))
-    eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
-    entries = read_longseq_manifest(eval_set_dir)
+    entries = read_longseq_source_entries(
+        source_dir=args.source_dir,
+        split_dir=args.split_dir,
+        split=args.split,
+        min_frames=int(args.min_frames),
+        include_mirror=bool(args.include_mirror),
+    )
     selected = entries[: int(args.limit)] if int(args.limit) > 0 else entries
     if len(selected) != 1:
-        raise ValueError("重复采样诊断必须通过 limit/eval_set 恰好选择一条序列。")
+        raise ValueError("重复采样诊断必须通过 limit/source split 恰好选择一条序列。")
     entry = selected[0]
-    source = load_realtime_source(resolve_manifest_source_path(eval_set_dir, entry))
+    source = load_realtime_source(resolve_source_entry_path(entry))
     frame_count = int(source["tracker_pos_world"].shape[0])
     frame_index = int(args.diagnostic_frame)
     if not 60 <= frame_index < frame_count:

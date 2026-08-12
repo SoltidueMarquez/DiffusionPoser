@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-import json
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,6 @@ from data_converter.amass_smpl_utils import (
     mirror_motion_source,
     run_smpl_forward,
     validate_args as validate_shared_args,
-    write_manifest_record,
 )
 from data_loaders.body_fbx_kinematics import (
     BodyFbxRest,
@@ -40,14 +38,10 @@ from data_loaders.realtime_pose_kinematics import (
     derive_stationary_prob_5,
     rotation_6d_forward_up_np,
 )
-from data_loaders.realtime_pose_validation import (
-    load_realtime_metadata,
-    validate_realtime_source_arrays,
-)
+from data_loaders.realtime_pose_validation import validate_realtime_source_arrays
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
-    STATIONARY_JOINT_INDICES,
-    STATIONARY_JOINT_NAMES,
+    REALTIME_POSE_FPS,
 )
 
 
@@ -82,17 +76,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mirror", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
-    parser.add_argument("--rebuild_manifest", action="store_true")
     parser.add_argument("--allow_partial", action="store_true")
-    parser.add_argument("--reuse_source_dir", default="", type=Path)
     parser.add_argument("--body_fbx_rest_json", default="", type=Path)
-    # 复用 shared validate_args 所需字段；当前转换链路不实际使用这些可视化参数。
-    parser.add_argument("--height_threshold", default=0.04, type=float)
-    parser.add_argument("--speed_threshold", default=0.15, type=float)
-    parser.add_argument("--visualize", action="store_true")
-    parser.add_argument("--visualize_limit", default=0, type=int)
-    parser.add_argument("--visualize_dir", default=Path("output/realtime_pose_visualization"), type=Path)
-    parser.add_argument("--visualize_fps", default=20.0, type=float)
     return parser.parse_args(argv)
 
 
@@ -102,6 +87,8 @@ _WORKER_MODEL_CACHE: SmplModelCache | None = None
 
 def validate_converter_args(args: argparse.Namespace) -> None:
     validate_shared_args(args)
+    if not np.isclose(float(args.target_fps), float(REALTIME_POSE_FPS), rtol=0.0, atol=1e-6):
+        raise ValueError(f"当前 realtime pose source 固定为 {REALTIME_POSE_FPS:g} Hz。")
     if int(args.num_workers) <= 0:
         raise ValueError("--num_workers 必须为正整数")
     if int(args.worker_torch_threads) < 0:
@@ -224,31 +211,10 @@ def build_realtime_pose_features(
 def save_realtime_pose_motion(
     output_path: Path,
     features: dict[str, np.ndarray],
-    source: MotionSource,
-    target_fps: float,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "source_path": str(source.path),
-        "source_relative_path": str(source.relative_path),
-        "original_source_relative_path": str(source.original_relative_path or source.relative_path),
-        "stablemotion_split_key": str(source.relative_path.with_suffix(".npy")).replace("\\", "/"),
-        "is_mirrored": bool(source.is_mirrored),
-        "source_fps": float(source.source_fps),
-        "target_fps": float(target_fps),
-        "frames": int(features[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]),
-        "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
-    }
-    metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
-    metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
-    if "body_fbx_rest_json" in features:
-        metadata["body_fbx_rest_json"] = str(features["body_fbx_rest_json"].item())
-    validate_realtime_source_arrays(features, metadata=metadata, expected_fps=target_fps, path=output_path)
-    np.savez(output_path, **features, metadata=json.dumps(metadata, ensure_ascii=False))
-
-
-def load_metadata_from_npz(data: np.lib.npyio.NpzFile) -> dict[str, Any]:
-    return load_realtime_metadata(data)
+    validate_realtime_source_arrays(features, path=output_path)
+    np.savez(output_path, **features)
 
 
 def resolve_body_fbx_rest(args: argparse.Namespace) -> BodyFbxRest:
@@ -275,154 +241,31 @@ def record_for_output(
     status: str,
 ) -> dict[str, Any]:
     relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
-    metadata: dict[str, Any] = {}
     frames = 0
     if output_path.exists():
         with np.load(output_path, allow_pickle=False) as data:
-            metadata = load_metadata_from_npz(data)
-            frames = validate_realtime_source_arrays(
-                data,
-                metadata=metadata,
-                expected_fps=float(args.target_fps),
-                path=output_path,
-            )
-    source_relative_path = Path(str(metadata.get("source_relative_path", relative_path)))
-    stablemotion_key = str(metadata.get("stablemotion_split_key", source_relative_path.with_suffix(".npy"))).replace("\\", "/")
+            frames = validate_realtime_source_arrays(data, path=output_path)
     return {
         "status": status,
-        "source_path": str(metadata.get("source_path", path)),
-        "source_relative_path": str(source_relative_path),
-        "original_source_relative_path": str(metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
-        "is_mirrored": bool(metadata.get("is_mirrored", mirror_variant)),
-        "stablemotion_split_key": stablemotion_key,
+        "source_path": str(path),
+        "source_relative_path": str(relative_path),
+        "is_mirrored": bool(mirror_variant),
         "output_path": str(output_path),
-        "frames": int(metadata.get("frames", frames)),
-        "target_fps": float(metadata["target_fps"]),
+        "frames": int(frames),
     }
 
 
-def reusable_source_path_for(path: Path, args: argparse.Namespace, mirror_variant: bool) -> Path | None:
-    reuse_source_dir = Path(args.reuse_source_dir) if getattr(args, "reuse_source_dir", "") else None
-    if reuse_source_dir is None:
-        return None
-    relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
-    return reuse_source_dir / relative_path.with_suffix(".npz")
-
-
-def load_reusable_realtime_features(
-    reuse_path: Path,
-    expected_target_fps: float,
-) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    with np.load(reuse_path, allow_pickle=False) as data:
-        metadata = load_metadata_from_npz(data)
-        validate_realtime_source_arrays(
-            data,
-            metadata=metadata,
-            expected_fps=expected_target_fps,
-            path=reuse_path,
-        )
-        features = {
-            key: np.asarray(data[key]).astype(np.float32, copy=True)
-            for key in REUSABLE_SOURCE_FIELDS
-        }
-    return features, metadata
-
-
-def realtime_source_is_reusable(path: Path, expected_target_fps: float) -> bool:
+def realtime_source_is_reusable(path: Path) -> bool:
     if not path.exists():
         return False
     try:
         with np.load(path, allow_pickle=False) as data:
             if not REUSABLE_SOURCE_FIELDS.issubset(data.files):
                 return False
-            validate_realtime_source_arrays(data, expected_fps=expected_target_fps, path=path)
+            validate_realtime_source_arrays(data, path=path)
     except (KeyError, TypeError, ValueError, OSError):
         return False
     return True
-
-
-def save_reused_realtime_source(
-    output_path: Path,
-    features: dict[str, np.ndarray],
-    metadata: dict[str, Any],
-    path: Path,
-    args: argparse.Namespace,
-    mirror_variant: bool,
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    relative_path = source_relative_path_for(path=path, args=args, mirror_variant=mirror_variant)
-    next_metadata = dict(metadata)
-    next_metadata.update(
-        {
-            "source_path": str(next_metadata.get("source_path", path)),
-            "source_relative_path": str(next_metadata.get("source_relative_path", relative_path)),
-            "original_source_relative_path": str(next_metadata.get("original_source_relative_path", path.relative_to(args.amass_dir))),
-            "stablemotion_split_key": str(next_metadata.get("stablemotion_split_key", relative_path.with_suffix(".npy"))).replace("\\", "/"),
-            "is_mirrored": bool(next_metadata.get("is_mirrored", mirror_variant)),
-            "target_fps": float(args.target_fps),
-            "frames": int(features[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]),
-            "tracker_order": ["head", "left_wrist", "right_wrist", "waist", "left_foot", "right_foot"],
-        }
-    )
-    next_metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]
-    next_metadata["stationary_joint_names"] = list(STATIONARY_JOINT_NAMES)
-    validate_realtime_source_arrays(
-        features,
-        metadata=next_metadata,
-        expected_fps=float(args.target_fps),
-        path=output_path,
-    )
-    np.savez(output_path, **features, metadata=json.dumps(next_metadata, ensure_ascii=False))
-
-
-def try_reuse_existing_realtime_source(
-    path: Path,
-    output_path: Path,
-    args: argparse.Namespace,
-    mirror_variant: bool,
-) -> dict[str, Any] | None:
-    reuse_path = reusable_source_path_for(path=path, args=args, mirror_variant=mirror_variant)
-    if reuse_path is None or not reuse_path.exists():
-        return None
-    if not realtime_source_is_reusable(reuse_path, expected_target_fps=float(args.target_fps)):
-        return None
-    return reuse_realtime_source_file(
-        reuse_path=reuse_path,
-        output_path=output_path,
-        path=path,
-        args=args,
-        mirror_variant=mirror_variant,
-        status="reused_source",
-    )
-
-
-def reuse_realtime_source_file(
-    reuse_path: Path,
-    output_path: Path,
-    path: Path,
-    args: argparse.Namespace,
-    mirror_variant: bool,
-    status: str,
-) -> dict[str, Any]:
-    features, metadata = load_reusable_realtime_features(
-        reuse_path,
-        expected_target_fps=float(args.target_fps),
-    )
-    save_reused_realtime_source(
-        output_path=output_path,
-        features=features,
-        metadata=metadata,
-        path=path,
-        args=args,
-        mirror_variant=mirror_variant,
-    )
-    return record_for_output(
-        path=path,
-        output_path=output_path,
-        args=args,
-        mirror_variant=mirror_variant,
-        status=status,
-    )
 
 
 def convert_one_motion(
@@ -435,7 +278,7 @@ def convert_one_motion(
     output_path = args.output_dir / relative_path.with_suffix(".npz")
 
     if output_path.exists() and args.skip_existing:
-        if realtime_source_is_reusable(output_path, expected_target_fps=float(args.target_fps)):
+        if realtime_source_is_reusable(output_path):
             return record_for_output(
                 path=path,
                 output_path=output_path,
@@ -443,22 +286,12 @@ def convert_one_motion(
                 mirror_variant=mirror_variant,
                 status="skipped_existing",
             )
-        if not (args.overwrite or args.rebuild_manifest):
+        if not args.overwrite:
             raise ValueError(
-                f"已有 source 与当前字段或 target_fps={float(args.target_fps):g} 不兼容: {output_path}，"
-                "请使用 --overwrite 或 --rebuild_manifest 重新转换。"
+                f"已有 source 字段不完整或损坏: {output_path}，请使用 --overwrite 重新转换。"
             )
     elif output_path.exists() and not args.overwrite:
         raise FileExistsError(f"输出文件已存在: {output_path}，请使用 --overwrite 或 --skip_existing。")
-
-    reused_record = try_reuse_existing_realtime_source(
-        path=path,
-        output_path=output_path,
-        args=args,
-        mirror_variant=mirror_variant,
-    )
-    if reused_record is not None:
-        return reused_record
 
     source = load_motion_source(path=path, amass_dir=args.amass_dir, target_fps=args.target_fps)
     if mirror_variant:
@@ -473,8 +306,6 @@ def convert_one_motion(
     save_realtime_pose_motion(
         output_path=output_path,
         features=features,
-        source=source,
-        target_fps=args.target_fps,
     )
     return record_for_output(
         path=path,
@@ -594,22 +425,17 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
     args = parse_args(argv)
     validate_converter_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = args.output_dir / "manifest.jsonl"
-    if (args.overwrite or args.rebuild_manifest) and manifest_path.exists():
-        manifest_path.unlink()
 
     motion_files = iter_amass_motion_files(args.amass_dir)
     if args.limit:
         motion_files = motion_files[: args.limit]
     work_items = build_conversion_work_items(args=args, motion_files=motion_files)
 
-    converted = reused = skipped = skipped_short = failed = 0
+    converted = skipped = skipped_short = failed = 0
     failed_records: list[dict[str, Any]] = []
     for record in iter_conversion_records(args=args, work_items=work_items):
         if record["status"] == "converted":
             converted += 1
-        elif record["status"] in {"reused_source", "upgraded_existing_source"}:
-            reused += 1
         elif record["status"] == "skipped_short":
             skipped_short += 1
         elif record["status"] == "failed":
@@ -617,12 +443,9 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
             failed_records.append(record)
         else:
             skipped += 1
-        write_manifest_record(manifest_path, record)
-
     print(
         f"完成 AMASS 转换: converted={converted}, "
-        f"reused={reused}, skipped={skipped}, skipped_short={skipped_short}, "
-        f"failed={failed}, manifest={manifest_path}"
+        f"skipped={skipped}, skipped_short={skipped_short}, failed={failed}"
     )
     if failed_records and not args.allow_partial:
         preview = "; ".join(
@@ -635,7 +458,6 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         )
     return {
         "converted": converted,
-        "reused": reused,
         "skipped": skipped,
         "skipped_short": skipped_short,
         "failed": failed,

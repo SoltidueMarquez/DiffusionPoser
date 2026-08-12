@@ -13,11 +13,11 @@ import torch
 from tqdm.auto import tqdm
 
 from data_loaders.build_realtime_longseq_eval_set import (
-    DEFAULT_LONGSEQ_EVAL_ROOT,
+    DEFAULT_SOURCE_DIR,
+    DEFAULT_SPLIT_DIR,
     build_sequence_output_dir_name,
-    read_longseq_manifest,
-    resolve_longseq_eval_dir,
-    resolve_manifest_source_path,
+    read_longseq_source_entries,
+    resolve_source_entry_path,
 )
 from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
@@ -78,8 +78,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_sampling_options(parser)
 
     longseq = parser.add_argument_group("longseq_eval")
-    longseq.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
-    longseq.add_argument("--eval_set", default="latest", type=str)
+    longseq.add_argument("--source_dir", default=DEFAULT_SOURCE_DIR, type=str)
+    longseq.add_argument("--split_dir", default=DEFAULT_SPLIT_DIR, type=str)
+    longseq.add_argument("--split", default="test", type=str)
+    longseq.add_argument("--min_frames", default=0, type=int)
+    longseq.add_argument("--include_mirror", default=False, action=BooleanOptionalAction)
     longseq.add_argument(
         "--normalizer_dir",
         default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
@@ -632,7 +635,7 @@ def summarize_latency(values_ms: np.ndarray, warmup_frames: int = 0) -> dict[str
 
 def evaluate_longseq_entries(
     entries: list[dict[str, Any]],
-    eval_set_dir: Path,
+    source_dir: Path,
     output_dir: Path,
     model,
     diffusion,
@@ -659,7 +662,7 @@ def evaluate_longseq_entries(
     runtime_metadata: dict[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
-    eval_set_dir = Path(eval_set_dir).resolve()
+    source_dir = Path(source_dir).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_entries = entries[: int(limit)] if int(limit) > 0 else entries
@@ -689,7 +692,7 @@ def evaluate_longseq_entries(
         batch_diffusion_seeds: list[int] = []
         for entry, condition in batch_jobs:
             sequence_id = str(entry["sequence_id"])
-            source_path = resolve_manifest_source_path(eval_set_dir=eval_set_dir, entry=entry)
+            source_path = resolve_source_entry_path(entry)
             source = load_realtime_source(source_path)
             frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
             timeline = build_isolated_condition_timeline(
@@ -817,7 +820,7 @@ def evaluate_longseq_entries(
         "files": [public_result(result) for result in results],
         "metadata": {
             "kind": "realtime_pose_144d_longseq_isolated_conditions",
-            "eval_set_dir": str(eval_set_dir),
+            "source_dir": str(source_dir),
             "output_dir": str(output_dir),
             "model_path": str(model_path),
             "weights": str(weights),
@@ -836,7 +839,7 @@ def evaluate_longseq_entries(
 
 
 def build_default_output_dir(
-    eval_set_dir: Path,
+    source_dir: Path,
     model_path: str | Path,
     weights: str,
     projected_ddim_mode: str = "all_steps",
@@ -863,7 +866,7 @@ def build_default_output_dir(
         )
     # 摘要纳入评测集和 checkpoint 父目录，相同 step 的不同 run 不会覆盖。
     identity = _short_digest(
-        f"{Path(eval_set_dir).resolve()}\n{model_path.resolve().parent}",
+        f"{Path(source_dir).resolve()}\n{model_path.resolve().parent}",
         10,
     )
     condition_values = tuple(dict.fromkeys(str(value) for value in conditions))
@@ -899,8 +902,14 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     selected_conditions = list(dict.fromkeys(str(value) for value in args.conditions))
     args.ts_respace = f"ddim{int(args.inference_steps)}"
     fixseed(int(args.seed))
-    eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
-    entries = read_longseq_manifest(eval_set_dir)
+    source_dir = Path(args.source_dir).resolve()
+    entries = read_longseq_source_entries(
+        source_dir=source_dir,
+        split_dir=args.split_dir,
+        split=args.split,
+        min_frames=int(args.min_frames),
+        include_mirror=bool(args.include_mirror),
+    )
     normalizer = (
         RealtimePoseNormalizer(args.normalizer_dir)
         if bool(args.normalize_input)
@@ -933,7 +942,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         Path(args.output_dir).resolve()
         if str(args.output_dir).strip()
         else build_default_output_dir(
-            eval_set_dir,
+            source_dir,
             args.model_path,
             weights,
             projected_ddim_mode=args.projected_ddim_mode,
@@ -944,7 +953,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     )
     summary = evaluate_longseq_entries(
         entries=entries,
-        eval_set_dir=eval_set_dir,
+        source_dir=source_dir,
         output_dir=output_dir,
         model=model,
         diffusion=diffusion,

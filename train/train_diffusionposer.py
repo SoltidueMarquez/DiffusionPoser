@@ -14,7 +14,6 @@ from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
 from utils.parser_util import train_args
-from utils.run_dirs import resolve_latest_or_self
 
 
 TRAIN_PLATFORMS = {
@@ -27,7 +26,6 @@ def main():
     args = train_args()
     fixseed(args.seed)
     resolve_save_dir(args)
-    resolve_input_artifact_dirs(args)
     prepare_save_dir(args)
     dist_util.setup_dist(args.device if args.cuda else -1)
     logger.configure(dir=args.save_dir)
@@ -116,14 +114,6 @@ def resolve_save_dir(args):
     args.run_root = str(run_root)
     args.run_id = run_id
     args.save_dir = str(candidate)
-
-
-def resolve_input_artifact_dirs(args):
-    """把 data_dir/normalizer_dir 根目录解析到 latest 指向的实际产物目录。"""
-
-    args.data_dir = str(resolve_latest_or_self(args.data_dir, kind="tasks"))
-    if getattr(args, "normalizer_dir", ""):
-        args.normalizer_dir = str(resolve_latest_or_self(args.normalizer_dir, kind="normalizer"))
 
 
 def resolve_run_label(args) -> str:

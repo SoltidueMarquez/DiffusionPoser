@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from data_loaders.build_realtime_longseq_eval_set import (
-    DEFAULT_LONGSEQ_EVAL_ROOT,
+    DEFAULT_SOURCE_DIR,
+    DEFAULT_SPLIT_DIR,
     build_replay_filename,
-    read_longseq_manifest,
-    resolve_longseq_eval_dir,
-    resolve_manifest_source_path,
+    read_longseq_source_entries,
+    resolve_source_entry_path,
 )
 from data_loaders.generate_realtime_pose_tasks import load_realtime_source
 from data_loaders.longseq_eval_dropout import (
@@ -41,8 +41,11 @@ DEFAULT_UNITY_REPLAY_DIR = (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export Unity replay JSON files for a fixed longseq eval set.")
     paths = parser.add_argument_group("paths")
-    paths.add_argument("--eval_root", default=DEFAULT_LONGSEQ_EVAL_ROOT, type=str)
-    paths.add_argument("--eval_set", default="latest", type=str)
+    paths.add_argument("--source_dir", default=DEFAULT_SOURCE_DIR, type=str)
+    paths.add_argument("--split_dir", default=DEFAULT_SPLIT_DIR, type=str)
+    paths.add_argument("--split", default="test", type=str)
+    paths.add_argument("--min_frames", default=0, type=int)
+    paths.add_argument("--include_mirror", default=False, action=BooleanOptionalAction)
     paths.add_argument("--output_dir", default="", type=str)
     paths.add_argument("--also_write_unity", default=False, action=BooleanOptionalAction)
     paths.add_argument("--unity_output_dir", default=DEFAULT_UNITY_REPLAY_DIR, type=str)
@@ -58,7 +61,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def export_longseq_eval_unity_replays(
-    eval_set_dir: Path,
+    source_dir: Path,
+    split_dir: Path,
+    split: str = "test",
+    min_frames: int = 0,
+    include_mirror: bool = False,
     output_dir: Path | None = None,
     schema_name: str = DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     fps: float = DEFAULT_REPLAY_FPS,
@@ -69,13 +76,19 @@ def export_longseq_eval_unity_replays(
     also_write_unity: bool = False,
     unity_output_dir: Path | None = None,
 ) -> dict[str, Any]:
-    eval_set_dir = Path(eval_set_dir).resolve()
-    entries = read_longseq_manifest(eval_set_dir)
+    source_dir = Path(source_dir).resolve()
+    entries = read_longseq_source_entries(
+        source_dir=source_dir,
+        split_dir=split_dir,
+        split=split,
+        min_frames=min_frames,
+        include_mirror=include_mirror,
+    )
     dropout_config = dropout_config or LongseqDropoutConfig()
     replay_dir = (
         Path(output_dir).resolve()
         if output_dir is not None
-        else eval_set_dir / "unity_replays" / replay_subdir_name(dropout_config)
+        else source_dir / "unity_replays" / replay_subdir_name(dropout_config)
     )
     replay_dir.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +98,7 @@ def export_longseq_eval_unity_replays(
 
     files = []
     for entry in entries:
-        source_path = resolve_manifest_source_path(eval_set_dir=eval_set_dir, entry=entry)
+        source_path = resolve_source_entry_path(entry)
         source = load_realtime_source(source_path, schema_name=schema_name)
         source["sensor_valid"] = load_sensor_valid(source_path, int(source["tracker_pos_world"].shape[0]))
         source, dropout_metadata = apply_longseq_dropout_to_source(
@@ -126,7 +139,7 @@ def export_longseq_eval_unity_replays(
 
     summary = {
         "kind": "longseq_eval_unity_replays",
-        "eval_set_dir": str(eval_set_dir),
+        "source_dir": str(source_dir),
         "output_dir": str(replay_dir),
         "unity_output_dir": str(unity_dir) if unity_dir is not None else "",
         "schema_name": schema_name,
@@ -148,7 +161,6 @@ def export_longseq_eval_unity_replays(
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = build_arg_parser().parse_args(argv)
-    eval_set_dir = resolve_longseq_eval_dir(eval_root=args.eval_root, eval_set=args.eval_set)
     output_dir = Path(args.output_dir).resolve() if str(args.output_dir).strip() else None
     dropout_config = build_longseq_dropout_config(args)
     unity_output_dir = resolve_default_unity_output_dir(
@@ -156,7 +168,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         dropout_config=dropout_config,
     )
     summary = export_longseq_eval_unity_replays(
-        eval_set_dir=eval_set_dir,
+        source_dir=Path(args.source_dir).resolve(),
+        split_dir=Path(args.split_dir).resolve(),
+        split=str(args.split),
+        min_frames=int(args.min_frames),
+        include_mirror=bool(args.include_mirror),
         output_dir=output_dir,
         schema_name=str(args.schema),
         fps=float(args.fps),

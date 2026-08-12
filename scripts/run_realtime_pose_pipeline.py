@@ -1,28 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from argparse import BooleanOptionalAction
-from dataclasses import dataclass
 from pathlib import Path
 
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
-from data_loaders.realtime_pose_task_store import read_store_metadata
-from utils.run_dirs import resolve_latest_or_self
 
 
 PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train")
-SOURCE_USABLE_STATUSES = {"converted", "skipped_existing", "reused_source", "upgraded_existing_source"}
-
-
-@dataclass(frozen=True)
-class StageResult:
-    stage: str
-    status: str
-    message: str = ""
-    returncode: int = 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -56,23 +43,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--dry_run", action="store_true")
     pipeline.add_argument("--run_name", default="auto", type=str)
     pipeline.add_argument("--overwrite", action=BooleanOptionalAction, default=False)
-    pipeline.add_argument(
-        "--continue_on_error",
-        "--keep_going",
-        dest="continue_on_error",
-        action="store_true",
-        help="某个阶段失败后尽量继续后续阶段；最终仍会用非零退出汇总失败。",
-    )
-    pipeline.add_argument(
-        "--resume_pipeline",
-        action="store_true",
-        help="跳过已有可用的 source/task/normalizer 产物；训练阶段仍通过 --resume_latest 控制。",
-    )
 
     convert = parser.add_argument_group("convert")
     convert.add_argument("--skip_convert", action="store_true")
-    convert.add_argument("--rebuild_source", action="store_true")
-    convert.add_argument("--reuse_source_dir", default="", type=str)
     convert.add_argument("--target_fps", default=60.0, type=float)
     convert.add_argument("--convert_batch_size", default=256, type=int)
     convert.add_argument("--convert_num_workers", default=1, type=int)
@@ -220,103 +193,6 @@ def run_stage(stage: str, args: argparse.Namespace) -> None:
     run_python_module(module, module_args, dry_run=bool(args.dry_run))
 
 
-def should_skip_completed_stage(stage: str, args: argparse.Namespace) -> tuple[bool, str]:
-    if not bool(getattr(args, "resume_pipeline", False)):
-        return False, ""
-    if bool(getattr(args, "overwrite", False)):
-        return False, ""
-    if stage == "convert" and not bool(getattr(args, "rebuild_source", False)):
-        source_dir = Path(args.source_dir)
-        if has_usable_source_manifest(source_dir=source_dir):
-            return True, f"复用已有 source manifest: {source_dir / 'manifest.jsonl'}"
-    if stage == "tasks":
-        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-        if has_task_stores(task_dir=task_dir, splits=list(args.splits)):
-            return True, f"复用已有 task 产物: {task_dir}"
-    if stage == "normalizer":
-        normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
-        if has_normalizer_artifact(normalizer_dir=normalizer_dir):
-            return True, f"复用已有 normalizer 产物: {normalizer_dir}"
-    return False, ""
-
-
-def dependency_block_message(stage: str, failed_stages: set[str], args: argparse.Namespace) -> str:
-    """阶段失败后只在依赖产物仍可用时继续，避免误用旧的 latest 产物。"""
-
-    if stage == "tasks" and "convert" in failed_stages:
-        if has_usable_source_manifest(source_dir=Path(args.source_dir)):
-            return ""
-        return "convert 失败且 source manifest 中没有可用 source，跳过 tasks。"
-    if stage == "normalizer" and "tasks" in failed_stages:
-        task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-        if has_task_stores(task_dir=task_dir, splits=[str(args.normalizer_split)]):
-            return ""
-        return "tasks 失败且找不到可用于 normalizer_split 的 task store，跳过 normalizer。"
-    if stage == "train":
-        if "tasks" in failed_stages:
-            task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
-            if not has_task_stores(task_dir=task_dir, splits=["train"]):
-                return "tasks 失败且找不到 train task store，跳过 train。"
-        if "normalizer" in failed_stages and not bool(getattr(args, "skip_normalizer", False)):
-            normalizer_dir = resolve_latest_or_self(args.normalizer_dir, kind="normalizer")
-            if not has_normalizer_artifact(normalizer_dir=normalizer_dir):
-                return "normalizer 失败且找不到可用 normalizer 产物，跳过 train。"
-    return ""
-
-
-def has_usable_source_manifest(source_dir: Path) -> bool:
-    manifest_path = source_dir / "manifest.jsonl"
-    if not manifest_path.exists():
-        return False
-    try:
-        with manifest_path.open("r", encoding="utf-8") as file:
-            for line in file:
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                if entry.get("status") not in SOURCE_USABLE_STATUSES:
-                    continue
-                return True
-    except (OSError, json.JSONDecodeError):
-        return False
-    return False
-
-
-def has_task_stores(task_dir: Path, splits: list[str]) -> bool:
-    if not task_dir.exists():
-        return False
-    for split in splits:
-        split_dir = task_dir / str(split)
-        try:
-            read_store_metadata(split_dir)
-        except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
-            return False
-    return True
-
-
-def has_normalizer_artifact(normalizer_dir: Path) -> bool:
-    required = (
-        "pose_mean.pt",
-        "pose_scale.pt",
-        "tracker_mean.pt",
-        "tracker_std.pt",
-        "head_path_xz_mean.pt",
-        "head_path_xz_std.pt",
-        "head_height_mean.pt",
-        "head_height_std.pt",
-        "normalizer_meta.json",
-    )
-    return all((normalizer_dir / name).exists() for name in required)
-
-
-def format_pipeline_failures(failures: list[StageResult]) -> str:
-    parts = [
-        f"{failure.stage}(returncode={failure.returncode}): {failure.message}"
-        for failure in failures
-    ]
-    return "realtime_pose pipeline 存在失败阶段：" + "; ".join(parts)
-
-
 def build_convert_args(args: argparse.Namespace) -> list[str]:
     command = [
         "--amass_dir", normalize_path(args.amass_dir),
@@ -327,18 +203,13 @@ def build_convert_args(args: argparse.Namespace) -> list[str]:
         "--num_workers", str(args.convert_num_workers),
         "--worker_torch_threads", str(args.convert_worker_torch_threads),
     ]
-    if args.reuse_source_dir and not args.rebuild_source:
-        command.extend(["--reuse_source_dir", normalize_path(args.reuse_source_dir)])
     if int(args.convert_limit) > 0:
         command.extend(["--limit", str(args.convert_limit)])
     if args.body_fbx_rest_json:
         command.extend(["--body_fbx_rest_json", normalize_path(args.body_fbx_rest_json)])
     add_flag(command, bool(args.mirror), "--mirror")
-    if args.rebuild_source:
-        add_flag(command, bool(args.overwrite), "--overwrite")
-    else:
-        add_flag(command, bool(args.skip_existing), "--skip_existing")
-        add_flag(command, bool(args.overwrite), "--rebuild_manifest")
+    add_flag(command, bool(args.skip_existing) and not bool(args.overwrite), "--skip_existing")
+    add_flag(command, bool(args.overwrite), "--overwrite")
     add_flag(command, bool(args.allow_partial), "--allow_partial")
     return command
 
@@ -348,8 +219,8 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
         "--task_dir", normalize_path(args.task_dir),
         "--output_dir", normalize_path(args.normalizer_dir),
         "--split", args.normalizer_split,
-        "--run_name", args.run_name,
     ]
+    add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
 
@@ -362,8 +233,8 @@ def build_task_args(args: argparse.Namespace) -> list[str]:
         "--base_windows_per_source", str(args.base_windows_per_source),
         "--shard_size", str(args.shard_size),
         "--short_source_policy", args.short_source_policy,
-        "--run_name", args.run_name,
     ]
+    add_flag(command, bool(args.overwrite), "--overwrite")
     return command
 
 
@@ -423,41 +294,12 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
 
 def run_pipeline(args: argparse.Namespace) -> None:
     stages = selected_stages(args.start_at, args.stop_after)
-    failures: list[StageResult] = []
-    failed_stages: set[str] = set()
     for stage in stages:
         if stage_is_disabled(stage, args):
             print(f"[realtime_pose_pipeline] skip {stage}: --skip_{stage}", flush=True)
             continue
 
-        should_skip, skip_message = should_skip_completed_stage(stage, args)
-        if should_skip:
-            print(f"[realtime_pose_pipeline] skip {stage}: {skip_message}", flush=True)
-            continue
-
-        if bool(getattr(args, "continue_on_error", False)):
-            blocked_message = dependency_block_message(stage=stage, failed_stages=failed_stages, args=args)
-            if blocked_message:
-                print(f"[realtime_pose_pipeline] skip {stage}: {blocked_message}", flush=True)
-                continue
-
-        try:
-            run_stage(stage, args)
-        except subprocess.CalledProcessError as exc:
-            failed_stages.add(stage)
-            result = StageResult(
-                stage=stage,
-                status="failed",
-                message=str(exc),
-                returncode=int(exc.returncode),
-            )
-            failures.append(result)
-            print(f"[realtime_pose_pipeline] failed {stage}: {exc}", flush=True)
-            if not bool(getattr(args, "continue_on_error", False)):
-                raise
-
-    if failures:
-        raise RuntimeError(format_pipeline_failures(failures))
+        run_stage(stage, args)
 
 
 def main(argv: list[str] | None = None) -> int:

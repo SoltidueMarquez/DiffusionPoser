@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 from typing import Any
@@ -15,14 +14,13 @@ from data_loaders.sensor_masking import (
     TRACKER_FEATURE_DIM,
     TRACKER_MEASURED_VALID_OFFSET,
 )
-from utils.run_dirs import resolve_latest_or_self
-
-
 REALTIME_POSE_MIN_NORMALIZER_STD = 1e-4
 
 
 def _stabilize_std(value: torch.Tensor) -> torch.Tensor:
     value = value.float().clone()
+    if torch.any(value <= 0):
+        raise ValueError("normalizer scale/std 必须全部大于零。")
     value[value < REALTIME_POSE_MIN_NORMALIZER_STD] = 1.0
     return value
 
@@ -51,7 +49,7 @@ class RealtimePoseNormalizer:
     ):
         self.eps = _validate_eps(eps)
         self.disable = bool(disable)
-        self.base_dir = Path(base_dir) if disable else resolve_latest_or_self(base_dir, kind="normalizer")
+        self.base_dir = Path(base_dir).resolve()
         self.pose_mean_path = self.base_dir / "pose_mean.pt"
         self.pose_scale_path = self.base_dir / "pose_scale.pt"
         self.tracker_mean_path = self.base_dir / "tracker_mean.pt"
@@ -60,7 +58,6 @@ class RealtimePoseNormalizer:
         self.head_path_xz_std_path = self.base_dir / "head_path_xz_std.pt"
         self.head_height_mean_path = self.base_dir / "head_height_mean.pt"
         self.head_height_std_path = self.base_dir / "head_height_std.pt"
-        self.meta_path = self.base_dir / "normalizer_meta.json"
         self.pose_mean: torch.Tensor | None = None
         self.pose_scale: torch.Tensor | None = None
         self.tracker_mean: torch.Tensor | None = None
@@ -69,18 +66,10 @@ class RealtimePoseNormalizer:
         self.head_path_xz_std: torch.Tensor | None = None
         self.head_height_mean: torch.Tensor | None = None
         self.head_height_std: torch.Tensor | None = None
-        self.metadata: dict[str, Any] = {}
         if not self.disable:
             self.load()
 
     def load(self) -> None:
-        self.metadata = {}
-        if self.meta_path.exists():
-            value = json.loads(self.meta_path.read_text(encoding="utf-8"))
-            if isinstance(value, dict):
-                self.metadata = value
-                if "eps" in value:
-                    self.eps = _validate_eps(value["eps"])
         required = (
             self.pose_mean_path,
             self.pose_scale_path,
@@ -128,7 +117,6 @@ class RealtimePoseNormalizer:
         head_path_xz_std: Any,
         head_height_mean: Any,
         head_height_std: Any,
-        metadata: dict[str, Any] | None = None,
     ) -> None:
         self.pose_mean = torch.as_tensor(pose_mean, dtype=torch.float32).reshape(-1)
         self.pose_scale = torch.as_tensor(pose_scale, dtype=torch.float32).reshape(-1)
@@ -160,8 +148,6 @@ class RealtimePoseNormalizer:
         torch.save(self.head_path_xz_std, self.head_path_xz_std_path)
         torch.save(self.head_height_mean, self.head_height_mean_path)
         torch.save(self.head_height_std, self.head_height_std_path)
-        self._write_meta(metadata or {})
-        self.metadata = {**(metadata or {}), "eps": self.eps}
 
     def normalize_pose(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         if self.disable:
@@ -327,8 +313,3 @@ class RealtimePoseNormalizer:
             self.head_height_mean.to(device=value.device, dtype=value.dtype),
             self.head_height_std.to(device=value.device, dtype=value.dtype),
         )
-
-    def _write_meta(self, extra: dict[str, Any]) -> None:
-        meta = {**extra, "eps": self.eps}
-        with self.meta_path.open("w", encoding="utf-8") as file:
-            json.dump(meta, file, ensure_ascii=False, indent=2, sort_keys=True)

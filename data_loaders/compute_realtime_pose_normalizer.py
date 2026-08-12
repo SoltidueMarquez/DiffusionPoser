@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
-from data_loaders.realtime_pose_task_store import load_shard_stats, read_store_metadata
+from data_loaders.realtime_pose_task_store import load_shard_stats
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, TRACKER_CONTINUOUS_DIM, TRACKER_COUNT
 from utils.normalizer import RealtimePoseNormalizer, build_pose_scale
-from utils.run_dirs import resolve_latest_or_self, timestamped_child_dir, write_latest_pointer
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -23,17 +24,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--eps", default=1e-8, type=float)
-    parser.add_argument("--run_name", default="auto")
+    parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
 def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, object]:
-    task_dir = resolve_latest_or_self(args.task_dir, kind="tasks")
+    task_dir = Path(args.task_dir).resolve()
     split_dir = task_dir / str(args.split)
-    metadata = read_store_metadata(split_dir)
-    shards = sorted(metadata["shards"], key=lambda value: int(value["index"]))
+    shards_root = split_dir / "shards"
+    shards = sorted(path for path in shards_root.glob("shard_*") if path.is_dir())
     if not shards:
-        raise RuntimeError(f"{split_dir} 没有 shard。")
+        raise RuntimeError(f"{shards_root} 没有 shard_*/ 目录。")
 
     pose_sum = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float64)
     pose_sumsq = np.zeros_like(pose_sum)
@@ -47,8 +48,8 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     head_height_sum = np.float64(0.0)
     head_height_sumsq = np.float64(0.0)
     head_height_count = 0
-    for shard in shards:
-        stats = load_shard_stats(split_dir, shard)
+    for shard_dir in shards:
+        stats = load_shard_stats(shard_dir)
         pose_sum += stats["pose_sum"]
         pose_sumsq += stats["pose_sumsq"]
         pose_count += int(stats["pose_count"])
@@ -73,34 +74,42 @@ def compute_realtime_pose_normalizer(args: argparse.Namespace) -> dict[str, obje
     head_height_mean, head_height_std = finalize_mean_std(
         head_height_sum, head_height_sumsq, head_height_count, float(args.eps)
     )
-    output_root = Path(args.output_dir).resolve()
-    label = "rtp_144d_normalizer" if str(args.run_name).lower() in {"", "auto"} else str(args.run_name)
-    output_dir = timestamped_child_dir(output_root, label)
-    normalizer = RealtimePoseNormalizer(output_dir, eps=float(args.eps), disable=True)
-    normalizer_metadata = {
-        "generation_plan_hash": str(metadata["generation_plan_hash"]),
-        "task_dir": str(task_dir),
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir.parent == output_dir or output_dir == Path(__file__).resolve().parents[1]:
+        raise ValueError(f"拒绝将 normalizer output_dir 指向磁盘根目录或仓库根目录：{output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists() and not bool(args.overwrite):
+        raise FileExistsError(
+            f"normalizer 输出目录已存在: {output_dir}；请指定新目录或使用 --overwrite。"
+        )
+    temporary_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
+    )
+    try:
+        normalizer = RealtimePoseNormalizer(temporary_dir, eps=float(args.eps), disable=True)
+        normalizer.save(
+            pose_mean,
+            pose_scale,
+            tracker_mean,
+            tracker_std,
+            head_path_xz_mean,
+            head_path_xz_std,
+            head_height_mean,
+            head_height_std,
+        )
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        temporary_dir.replace(output_dir)
+    except BaseException:
+        if temporary_dir.exists():
+            shutil.rmtree(temporary_dir)
+        raise
+    return {
+        "output_dir": str(output_dir),
         "split": str(args.split),
-        "sample_count": int(metadata["sample_count"]),
         "pose_observation_count": int(pose_count),
         "tracker_observation_counts": tracker_count[:, 0].astype(int).tolist(),
-        "std_definition": "population",
-        "pose_scale_definition": "stabilized_pose_std_plus_eps",
     }
-    normalizer.save(
-        pose_mean,
-        pose_scale,
-        tracker_mean,
-        tracker_std,
-        head_path_xz_mean,
-        head_path_xz_std,
-        head_height_mean,
-        head_height_std,
-        metadata=normalizer_metadata,
-    )
-    result = {"output_dir": str(output_dir), **normalizer_metadata}
-    write_latest_pointer(output_root, "normalizer", output_dir, result)
-    return result
 
 
 def finalize_mean_std(

@@ -1,6 +1,6 @@
 # RealPose Python Contract
 
-本文档是当前 Python 主链路的数据契约。本次 current-only diffusion 不改变 Task Store、Dataset 或 normalizer 字段，现有符合下述契约的数据可以直接复用；旧的整窗扩散 checkpoint 与新模型结构不兼容，不提供迁移分支。
+本文档是当前 Python 主链路的数据契约。source、Task Store 和 normalizer 都由调用方传入的实际目录定义，不读取 manifest、meta、hash 或 latest 指针。
 
 ## 时间窗口与共同参考系
 
@@ -36,7 +36,7 @@ Pose、Tracker 和 Head 路径必须使用同一组锚点。11 帧全部表达�
 - `joint_rest_local_rotations_6d: [24,6]`
 - `stationary_prob_5: [T,5]`
 
-Source、Task Store 和 normalizer 可以复用；模型 checkpoint 必须按新结构重新训练。
+source key 由 `.npz` 相对 source 根目录的路径产生，`.npy/.npz` 后缀在 split 匹配时忽略；`M/` 首级目录表示镜像。source 文件不要求内嵌 metadata。
 
 ## Task Store
 
@@ -57,15 +57,16 @@ Task Store 是 task 生成阶段写入磁盘的未归一化数据。设样本数
 | `floor_y` | `[M]` | 当前地面世界高度 |
 | `future_leg_target` | `[M,3,8,6]` | 未来 3 帧双腿 rotation6D |
 | `contact_target` | `[M,2]` | 当前左右脚接触监督 |
-| `source_index` / `start_frame` | `[M]` | Source 索引与密集历史起始帧 |
+| `joint_offsets_parent` | `[M,24,3]` | 当前任务对应的骨架父子偏移 |
+| `joint_rest_local_rotations_6d` | `[M,24,6]` | 当前任务对应的骨架 rest local rotation6D |
+| `task_seed` / `start_frame` | `[M]` | 稳定任务种子与密集历史起始帧 |
 
-Store 根目录还包含 `generation_plan.jsonl` 与对应 SHA-256；每个 split 包含：
+Task Store 只使用目录结构：
 
-- `task_store.json`：`generation_plan_hash`、`split`、`sample_count`、`source_count`、`two_point_phase_counts`、`config_names`、`tracker_feature_dim`、`schema_fields` 和 `shards`；
-- `sources.jsonl`：Source 索引、路径、帧数、帧率及镜像标记；
-- `source_joint_offsets_parent.npy: [S,24,3]`；
-- `source_joint_rest_local_rotations_6d.npy: [S,24,6]`；
-- `shards/shard_*/`：上表各字段的独立 `.npy` 以及 normalizer 聚合使用的 `stats.npz`。
+- `<task_dir>/<split>/shards/shard_*/`：上表各字段的独立 `.npy`；
+- 每个 shard 的所有字段首维必须一致；
+- 每个 shard 包含 normalizer 聚合使用的 `stats.npz`；
+- shard 名称按字典序决定读取顺序，不存在额外索引或元数据文件。
 
 ## 模型 Batch
 
@@ -97,7 +98,7 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `contact_target` | `[B,2]` | 左右脚接触监督 |
 | `history_length` | `[B]` | 当前虚拟会话可见的密集历史帧数 |
 | `scenario_id` / `scenario` | `[B]` | 所选 Tracker 场景的索引与名称 |
-| `start_frame` / `task_id` / `source_path` | `[B]` | 样本定位与追踪信息 |
+| `start_frame` / `task_id` | `[B]` | 样本定位与稳定任务标识 |
 
 模型 diffusion state、模型输出和扩散采样结果均为当前帧 `[B,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain；`reconstruct_batch` 和 `RuntimeStepResult` 的外部契约仍为当前帧 `[B,144]`。
 
@@ -150,7 +151,7 @@ p_k^{head}=[x_k^{C_n},z_k^{C_n},h_k,\sin(\psi_k-\psi_n),\cos(\psi_k-\psi_n)].
 - `head_path_xz_mean.pt`、`head_path_xz_std.pt`: `[2]`
 - `head_height_mean.pt`、`head_height_std.pt`: 标量
 
-Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer 元数据必须与 task 的 generation-plan hash 一致。
+Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer 目录只包含上述八个张量文件，不读取 metadata，也不自动判断它与 task 是否匹配。
 
 ## 时空 DiT 与投影
 

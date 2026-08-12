@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -9,9 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from data_loaders.manifest_utils import filter_entries_by_folder_path
 from data_loaders.realtime_pose_geometry import assemble_tracker_features_np
-from data_loaders.realtime_pose_task_store import ShardReader, read_store_metadata
+from data_loaders.realtime_pose_task_store import ShardReader, discover_shards
 from data_loaders.sensor_masking import (
     REALTIME_POSE_FRAME_OFFSETS,
     REALTIME_POSE_HISTORY_ANCHOR_INDICES,
@@ -30,7 +28,29 @@ from data_loaders.tracker_reliability import (
 )
 from data_loaders.tracker_timeline import compute_tracker_durations, stable_context_seed
 from utils.normalizer import RealtimePoseNormalizer
-from utils.run_dirs import resolve_latest_or_self
+
+
+TASK_SHARD_FIELDS = (
+    "pose_window_clean",
+    "tracker_window_continuous",
+    "head_path_window",
+    "configured",
+    "measured_valid",
+    "target_joints_head_ref",
+    "target_root_position_head_ref",
+    "target_root_yaw_world",
+    "target_hip_height",
+    "current_head_yaw_world",
+    "current_head_position_world",
+    "floor_y",
+    "future_leg_target",
+    "previous_contact_target",
+    "contact_target",
+    "joint_offsets_parent",
+    "joint_rest_local_rotations_6d",
+    "task_seed",
+    "start_frame",
+)
 
 
 @dataclass(frozen=True)
@@ -50,60 +70,21 @@ class RealtimePoseTaskDataset(Dataset):
         seq_len: int = REALTIME_POSE_SEQ_LEN,
         normalizer_dir: str | Path | None = None,
         normalize_input: bool = True,
-        folder_path: str | Path | None = None,
     ):
         validate_realtime_seq_len(seq_len)
-        self.data_dir = resolve_latest_or_self(data_dir, kind="tasks")
+        self.data_dir = Path(data_dir).resolve()
         self.split = str(split)
         self.split_dir = self.data_dir / self.split
-        self.metadata = read_store_metadata(self.split_dir)
-        if int(self.metadata.get("tracker_feature_dim", -1)) != TRACKER_FEATURE_DIM:
-            raise ValueError(
-                f"task store 的 Tracker 特征维度必须为 {TRACKER_FEATURE_DIM}，请重建 task。"
-            )
-        if tuple(self.metadata.get("config_names", ())) != TRACKER_PATTERN_CATEGORIES:
-            raise ValueError("task store 的 Tracker 场景配置与当前代码不兼容，请重建 task。")
-        self.plan_hash = str(self.metadata["generation_plan_hash"])
-        self.shards = list(self.metadata["shards"])
+        self.shards = discover_shards(self.split_dir, TASK_SHARD_FIELDS)
         self.normalizer = create_normalizer(normalizer_dir, bool(normalize_input))
-        if self.normalizer is not None:
-            normalizer_hash = str(self.normalizer.metadata.get("generation_plan_hash", ""))
-            if normalizer_hash != self.plan_hash:
-                raise ValueError(
-                    "task 与 normalizer 的 generation-plan hash 不一致："
-                    f"{self.plan_hash} != {normalizer_hash}"
-                )
-
-        self.sources = read_jsonl(self.split_dir / "sources.jsonl")
-        self.sources.sort(key=lambda value: int(value["source_index"]))
-        self.joint_offsets_parent = np.load(
-            self.split_dir / "source_joint_offsets_parent.npy",
-            mmap_mode="r",
-            allow_pickle=False,
-        )
-        self.joint_rest_local_rotations_6d = np.load(
-            self.split_dir / "source_joint_rest_local_rotations_6d.npy",
-            mmap_mode="r",
-            allow_pickle=False,
-        )
-        allowed_sources = set(range(len(self.sources)))
-        if folder_path:
-            filtered = filter_entries_by_folder_path(self.sources, folder_path)
-            allowed_sources = {int(source["source_index"]) for source in filtered}
 
         self.locations: list[tuple[int, int]] = []
         self.indices_by_shard: list[list[int]] = [[] for _ in self.shards]
         for shard_index, shard in enumerate(self.shards):
-            source_indices = np.load(
-                self.split_dir / shard["path"] / "source_index.npy",
-                mmap_mode="r",
-                allow_pickle=False,
-            )
-            for row_index, source_index in enumerate(source_indices.tolist()):
-                if int(source_index) in allowed_sources:
-                    dataset_index = len(self.locations)
-                    self.locations.append((shard_index, row_index))
-                    self.indices_by_shard[shard_index].append(dataset_index)
+            for row_index in range(int(shard["row_count"])):
+                dataset_index = len(self.locations)
+                self.locations.append((shard_index, row_index))
+                self.indices_by_shard[shard_index].append(dataset_index)
         if not self.locations:
             raise RuntimeError(f"{self.split_dir} 中没有可用 task。")
         self.reader = ShardReader(self.split_dir, self.shards, max_open_shards=2)
@@ -113,20 +94,11 @@ class RealtimePoseTaskDataset(Dataset):
 
     def close(self) -> None:
         self.reader.close()
-        for array in (self.joint_offsets_parent, self.joint_rest_local_rotations_6d):
-            mmap = getattr(array, "_mmap", None)
-            if mmap is not None:
-                mmap.close()
 
     def __del__(self) -> None:
         reader = getattr(self, "reader", None)
         if reader is not None:
             reader.close()
-        for name in ("joint_offsets_parent", "joint_rest_local_rotations_6d"):
-            array = getattr(self, name, None)
-            mmap = getattr(array, "_mmap", None)
-            if mmap is not None:
-                mmap.close()
 
     def __getitem__(self, request: int | TaskRequest) -> dict[str, Any]:
         if isinstance(request, TaskRequest):
@@ -243,9 +215,8 @@ class RealtimePoseTaskDataset(Dataset):
         history_confidence = 0.5 * (rho_pos + rho_rot)
         history_confidence *= window_valid[:-1, None]
 
-        source_index = int(shard["source_index"][row_index])
-        source = self.sources[source_index]
         start_frame = int(shard["start_frame"][row_index])
+        task_seed = int(shard["task_seed"][row_index])
         result: dict[str, Any] = {
             "x": torch.from_numpy(pose_window).float(),
             "history_pose_observation": torch.from_numpy(pose_window[:-1].copy()).float(),
@@ -296,32 +267,28 @@ class RealtimePoseTaskDataset(Dataset):
                 np.asarray(shard["contact_target"][row_index], dtype=np.float32).copy()
             ).float(),
             "joint_offsets_parent": torch.from_numpy(
-                np.asarray(self.joint_offsets_parent[source_index], dtype=np.float32).copy()
+                np.asarray(shard["joint_offsets_parent"][row_index], dtype=np.float32).copy()
             ).float(),
             "joint_rest_local_rotations_6d": torch.from_numpy(
                 np.asarray(
-                    self.joint_rest_local_rotations_6d[source_index], dtype=np.float32
+                    shard["joint_rest_local_rotations_6d"][row_index], dtype=np.float32
                 ).copy()
             ).float(),
             "scenario_id": torch.tensor(config_index, dtype=torch.long),
-            "scenario": str(self.metadata["config_names"][config_index]),
+            "scenario": str(TRACKER_PATTERN_CATEGORIES[config_index]),
             "start_frame": torch.tensor(start_frame, dtype=torch.long),
-            "task_id": self.task_id_from_values(source, start_frame),
-            "source_path": str(source["source_path"]),
+            "task_id": self.task_id_from_seed(task_seed),
         }
         return result
 
     def task_id_at(self, task_index: int) -> str:
         shard_index, row_index = self.locations[int(task_index)]
         shard = self.reader.get(shard_index)
-        source = self.sources[int(shard["source_index"][row_index])]
-        start_frame = int(shard["start_frame"][row_index])
-        return self.task_id_from_values(source, start_frame)
+        return self.task_id_from_seed(int(shard["task_seed"][row_index]))
 
-    def task_id_from_values(self, source: dict[str, Any], start_frame: int) -> str:
-        from data_loaders.generate_realtime_pose_tasks import make_task_id
-
-        return make_task_id(self.split, str(source["source_id"]), start_frame)
+    @staticmethod
+    def task_id_from_seed(task_seed: int) -> str:
+        return f"task_{int(task_seed):016x}"
 
 
 class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
@@ -419,15 +386,6 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
         if self.drop_last:
             return len(self.dataset) // self.batch_size
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    values: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as file:
-        for line in file:
-            if line.strip():
-                values.append(json.loads(line))
-    return values
 
 
 def create_normalizer(

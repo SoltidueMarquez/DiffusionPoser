@@ -71,15 +71,19 @@ def canonical_motion_identity(raw_path: str) -> str:
 
 
 def build_source_identity_index(source_dir: Path) -> tuple[dict[str, dict[str, Any]], str]:
-    manifest_path = source_dir / "manifest.jsonl"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"找不到 source manifest: {manifest_path}")
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"找不到 source 目录: {source_dir}")
     identity_groups: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    inventory_lines: list[str] = []
     for entry in read_source_entries(source_dir):
         if entry["is_mirrored"]:
             continue
         identity = canonical_motion_identity(str(entry["stablemotion_split_key"]))
         identity_groups[identity].append(entry)
+        source_path = Path(entry["source_path"])
+        inventory_lines.append(
+            f"{entry['source_relative_path']}\t{source_path.stat().st_size}\n"
+        )
     ambiguous = {
         identity: [str(entry["stablemotion_split_key"]) for entry in entries]
         for identity, entries in identity_groups.items()
@@ -90,7 +94,7 @@ def build_source_identity_index(source_dir: Path) -> tuple[dict[str, dict[str, A
         raise ValueError(f"source 规范化后存在歧义: {first_identity} -> {first_entries}")
     return (
         {identity: entries[0] for identity, entries in identity_groups.items()},
-        sha256_file(manifest_path),
+        hashlib.sha256("".join(inventory_lines).encode("utf-8")).hexdigest(),
     )
 
 
@@ -158,7 +162,7 @@ def build_rpm_protocol_split(
     raw_index: dict[str, list[str]],
     raw_inventory_sha256: str,
     source_identities: set[str],
-    source_manifest_sha256: str,
+    source_inventory_sha256: str,
 ) -> dict[str, Any]:
     protocol = protocol.casefold()
     if protocol not in PROTOCOL_DIR_NAMES:
@@ -215,7 +219,7 @@ def build_rpm_protocol_split(
             "by_subset": counts_by_subset,
         },
         "raw_amass_inventory_sha256": raw_inventory_sha256,
-        "source_manifest_sha256": source_manifest_sha256,
+        "source_inventory_sha256": source_inventory_sha256,
         "input_split_sha256": dict(sorted(input_hashes.items())),
         "output_split_sha256": {
             f"{split}.txt": sha256_file(path)
@@ -254,7 +258,7 @@ def build_all_rpm_protocol_splits(
     raw_root = Path(raw_amass_dir).resolve()
     source_root = Path(source_dir).resolve()
     output_root = Path(output_root).resolve()
-    source_index, manifest_sha256 = build_source_identity_index(source_root)
+    source_index, source_inventory_sha256 = build_source_identity_index(source_root)
     raw_index, raw_inventory_sha256 = build_raw_identity_index(raw_root)
     return {
         protocol: build_rpm_protocol_split(
@@ -264,7 +268,7 @@ def build_all_rpm_protocol_splits(
             raw_index=raw_index,
             raw_inventory_sha256=raw_inventory_sha256,
             source_identities=set(source_index),
-            source_manifest_sha256=manifest_sha256,
+            source_inventory_sha256=source_inventory_sha256,
         )
         for protocol in ("p1", "p2")
     }

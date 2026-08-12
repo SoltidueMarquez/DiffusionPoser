@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -8,7 +7,6 @@ import numpy as np
 
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
-    REALTIME_POSE_FPS,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_SEQ_LEN,
@@ -72,37 +70,22 @@ TASK_SCALAR_FIELDS = (
     "current_head_yaw_world",
     "floor_y",
     "scenario",
-    "source_path",
     "start_frame",
     "scenario_id",
     "task_id",
 )
 
 
-def load_realtime_metadata(payload: Mapping[str, Any], path: Path | None = None) -> dict[str, Any]:
-    label = f"{path} " if path else ""
-    if "metadata" not in payload:
-        raise KeyError(f"{label}缺少 `metadata`")
-    value = np.asarray(payload["metadata"])
-    if value.shape != ():
-        raise ValueError(f"{label}metadata 必须是 JSON 标量，实际为 {value.shape}")
-    try:
-        metadata = json.loads(str(value.item()))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label}metadata 不是合法 JSON object") from exc
-    if not isinstance(metadata, dict):
-        raise ValueError(f"{label}metadata 必须解析为 JSON object")
-    return metadata
-
-
 def validate_realtime_source_arrays(
     payload: Mapping[str, Any],
     *,
-    metadata: Mapping[str, Any] | None = None,
-    expected_fps: float | None = REALTIME_POSE_FPS,
     path: Path | None = None,
 ) -> int:
-    """校验完整 source 契约并返回帧数，防止错误缓存进入 task 生成。"""
+    """校验 source 数组契约并返回帧数。
+
+    source 的身份、镜像状态和划分都由目录决定，因此这里不再读取内嵌
+    metadata。60 Hz 是转换与任务链路的固定接口，不再通过每个文件重复声明。
+    """
 
     label = f"{path} " if path else ""
     if BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY not in payload:
@@ -118,18 +101,6 @@ def validate_realtime_source_arrays(
         _validate_array(payload, key, (frame_count, *frame_shape), label)
     for key, shape in SOURCE_STATIC_SHAPES.items():
         _validate_array(payload, key, shape, label)
-
-    source_metadata = dict(metadata) if metadata is not None else load_realtime_metadata(payload, path)
-    declared_frames = int(source_metadata.get("frames", -1))
-    if declared_frames != frame_count:
-        raise ValueError(f"{label}metadata.frames={declared_frames}，实际帧数为 {frame_count}")
-    if "target_fps" not in source_metadata:
-        raise KeyError(f"{label}metadata 缺少 `target_fps`")
-    target_fps = float(source_metadata["target_fps"])
-    if not np.isfinite(target_fps) or target_fps <= 0.0:
-        raise ValueError(f"{label}metadata.target_fps 必须为正数，实际为 {target_fps}")
-    if expected_fps is not None and not np.isclose(target_fps, float(expected_fps), rtol=0.0, atol=1e-6):
-        raise ValueError(f"{label}target_fps={target_fps:g}，当前链路要求 {float(expected_fps):g}Hz")
     return frame_count
 
 
