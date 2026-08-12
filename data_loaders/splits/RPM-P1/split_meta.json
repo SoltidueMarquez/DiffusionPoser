@@ -1,0 +1,54 @@
+{
+  "counts": {
+    "by_subset": {
+      "test": {
+        "BioMotionLab_NTroje": 307,
+        "CMU": 197,
+        "MPI_HDM05": 22
+      },
+      "train": {
+        "BioMotionLab_NTroje": 2754,
+        "CMU": 1778,
+        "MPI_HDM05": 193
+      }
+    },
+    "test": 526,
+    "train": 4725
+  },
+  "current_source_coverage": {
+    "test": {
+      "covered": 526,
+      "missing": 0,
+      "missing_keys": []
+    },
+    "train": {
+      "covered": 4725,
+      "missing": 0,
+      "missing_keys": []
+    }
+  },
+  "input_split_sha256": {
+    "BioMotionLab_NTroje/test_split.txt": "cd546f7b1cdec634bf9c1ac30075f0da32e5026f12e6fd262b8cc6d3afe32124",
+    "BioMotionLab_NTroje/train_split.txt": "f5ea7963ff82095ee8dea5ed196dc3c1fefcd4b9c23f26dcc2ec75d601222986",
+    "CMU/test_split.txt": "20bda477608becced050f9114dafab697c1786989e91830b95ea832334aceb7e",
+    "CMU/train_split.txt": "d0b1bb72f2e1aacf0f03e4ea54595d8aa54551e6545234fbb3d49f3f9c60d9e2",
+    "MPI_HDM05/test_split.txt": "b0af529dbba9973c524e42fe707f3d6fb2937a44b20b3a0d845032f82e1f988e",
+    "MPI_HDM05/train_split.txt": "4e5aa7d374b4c6cba0f6401a945740df8542651d9a83cf6a5179e43f85cb13e8"
+  },
+  "mapping_audit": {
+    "ambiguous": 0,
+    "duplicates": 0,
+    "train_test_overlap": 0,
+    "unmatched": 0
+  },
+  "mapping_policy": "casefold_remove_punctuation_stageii_to_poses",
+  "mirror_policy": "disabled",
+  "output_split_sha256": {
+    "test.txt": "b6448fa0754115f6ba3e688d3a4af0e6d753cbf5f43b70cc8bbeeb31dcd8137c",
+    "train.txt": "e0afab1f321887908e493e3ba35d1cd6259f0062dc2f5c4260a791f708e0c128"
+  },
+  "protocol": "rpm_p1",
+  "raw_amass_inventory_sha256": "947ce533a159ece0edd07ddf6269729bf0708d953c6e850825c4e13f23291ffe",
+  "source_manifest_sha256": "cf88331c9e5bd66de120eb4fc80d5d6071964775f9e8a636d866d7a1961687dc",
+  "split_origin": "RPM_Table2_Research_Kit_P1_P2_20260811"
+}

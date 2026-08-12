@@ -1,0 +1,73 @@
+{
+  "counts": {
+    "by_subset": {
+      "test": {
+        "HumanEva": 28,
+        "Transitions_mocap": 110
+      },
+      "train": {
+        "ACCAD": 252,
+        "BMLmovi": 1801,
+        "BioMotionLab_NTroje": 1867,
+        "CMU": 1983,
+        "EKUT": 349,
+        "Eyes_Japan_Dataset": 750,
+        "KIT": 4232,
+        "MPI_HDM05": 207,
+        "MPI_Limits": 35,
+        "MPI_mosh": 77,
+        "SFU": 44,
+        "TotalCapture": 37
+      }
+    },
+    "test": 138,
+    "train": 11634
+  },
+  "current_source_coverage": {
+    "test": {
+      "covered": 138,
+      "missing": 0,
+      "missing_keys": []
+    },
+    "train": {
+      "covered": 11632,
+      "missing": 2,
+      "missing_keys": [
+        "EKUT/265/MTR03_poses",
+        "KIT/9/WalkingStraightBackwards08_poses"
+      ]
+    }
+  },
+  "input_split_sha256": {
+    "ACCAD/train_split.txt": "fd92ac4b7d4335482a809b7f5477bf711de839da1323d0e85a453c1e33fc0963",
+    "BMLmovi/train_split.txt": "8bc1db97acbb8e6d19f3449ffda360b8a743d1c2b3de3206d67f5a2143dcb46b",
+    "BioMotionLab_NTroje/train_split.txt": "ef6b59153009b1310a838bc0e9e8e7973c8ef90aeb09b4fc7e47bf0218cd1cb4",
+    "CMU/train_split.txt": "64689c9dbfb0b7041c87bd864b19ce645e598bd252fe733afd2b252ebfd5fb0c",
+    "EKUT/train_split.txt": "de425fced8aee83991a2a1575aaa9eb9e4c8e180eafbcdacb0eccbf95f671721",
+    "Eyes_Japan_Dataset/train_split.txt": "ff004e15a9f904bfc71ba694e7c817c69d497b55636117248394cbc903e37f5e",
+    "HumanEva/test_split.txt": "bedcbcace77c517e36e58ee4aed20d454787bdddc244f9fc985143e6bb602c5b",
+    "KIT/train_split.txt": "19029a696f155726a9a1ffd127cb903954e9d2a447df3f42fe5af3bf2bcefb06",
+    "MPI_HDM05/train_split.txt": "e89c5d03fd64b960762f76a78fb81c5f1e612c2c38be9981bc271586718413d2",
+    "MPI_Limits/train_split.txt": "af8081f56151f0cb9540f38099b6dba0802ab8f4986107cecdc7ba68c7d6b907",
+    "MPI_mosh/train_split.txt": "313bc8e165fd95ba428774a9ae04b1e131e5f9f440d540f25610e4a2b999738b",
+    "SFU/train_split.txt": "f08d6b862eac722c9db477ffd0c7b13a6d6175717fa0e7b0d356b8a9f8a5ce32",
+    "TotalCapture/train_split.txt": "02fad016b2fd0db3d1b1d1b12c3cdecb025a0ea7d98d4980b0b8374b8591680b",
+    "Transitions_mocap/test_split.txt": "b750bcd7359d38091c8095f53862b51029e70eb302aefb1f86347d7e9ed58a6a"
+  },
+  "mapping_audit": {
+    "ambiguous": 0,
+    "duplicates": 0,
+    "train_test_overlap": 0,
+    "unmatched": 0
+  },
+  "mapping_policy": "casefold_remove_punctuation_stageii_to_poses",
+  "mirror_policy": "disabled",
+  "output_split_sha256": {
+    "test.txt": "7fff73366b55348722e5f27e049082b96e700d438097a55b4e688548388d7dcf",
+    "train.txt": "14aa205b5acb093aa52b475536227bcbd76a656d076cf4ed34d8f5e1901c95a4"
+  },
+  "protocol": "rpm_p2",
+  "raw_amass_inventory_sha256": "947ce533a159ece0edd07ddf6269729bf0708d953c6e850825c4e13f23291ffe",
+  "source_manifest_sha256": "cf88331c9e5bd66de120eb4fc80d5d6071964775f9e8a636d866d7a1961687dc",
+  "split_origin": "RPM_Table2_Research_Kit_P1_P2_20260811"
+}
