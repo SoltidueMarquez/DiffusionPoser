@@ -2,6 +2,33 @@
 
 本文档是当前 Python 主链路的数据契约。source、Task Store 和 normalizer 都由调用方传入的实际目录定义，不读取 manifest、meta、hash 或 latest 指针。
 
+## 目录契约
+
+以 RPM-P2 为例，调用方传入的目录应直接落到实际协议产物：
+
+```text
+source_dir/
+  HumanEva/...
+  CMU/...
+  M/...
+
+task_dir/
+  train/shards/shard_*/...
+  test/shards/shard_*/...
+
+normalizer_dir/
+  pose_mean.pt
+  pose_scale.pt
+  tracker_mean.pt
+  tracker_std.pt
+  head_path_xz_mean.pt
+  head_path_xz_std.pt
+  head_height_mean.pt
+  head_height_std.pt
+```
+
+例如 `task_dir=artifacts/tasks/RPM-P2`、`normalizer_dir=artifacts/normalizer/RPM-P2`。Dataset 再根据 `split=train/test` 进入对应子目录；调用方不能只传 `artifacts/tasks` 或 `artifacts/normalizer` 并期待程序自动选择 RPM 协议或最新产物。
+
 ## 时间窗口与共同参考系
 
 运行时维护最近 60 帧密集世界状态，模型只读取 10 个历史锚点和当前帧：
@@ -56,10 +83,11 @@ Task Store 是 task 生成阶段写入磁盘的未归一化数据。设样本数
 | `current_head_position_world` | `[M,3]` | 当前 Head 世界位置 |
 | `floor_y` | `[M]` | 当前地面世界高度 |
 | `future_leg_target` | `[M,3,8,6]` | 未来 3 帧双腿 rotation6D |
+| `previous_contact_target` | `[M,2]` | 上一帧左右脚接触监督 |
 | `contact_target` | `[M,2]` | 当前左右脚接触监督 |
 | `joint_offsets_parent` | `[M,24,3]` | 当前任务对应的骨架父子偏移 |
 | `joint_rest_local_rotations_6d` | `[M,24,6]` | 当前任务对应的骨架 rest local rotation6D |
-| `task_seed` / `start_frame` | `[M]` | 稳定任务种子与密集历史起始帧 |
+| `task_seed` / `start_frame` | `[M]` | 稳定任务种子与密集历史起始帧；种子由 `split + source相对路径 + start_frame` 生成 |
 
 Task Store 只使用目录结构：
 
@@ -95,10 +123,13 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `current_head_position_world` | `[B,3]` | 当前 Head 世界位置 |
 | `floor_y` | `[B]` | 当前地面世界高度 |
 | `future_leg_target` | `[B,3,8,6]` | 未来 3 帧双腿监督 |
+| `previous_contact_target` | `[B,2]` | 上一帧左右脚接触监督 |
 | `contact_target` | `[B,2]` | 左右脚接触监督 |
 | `history_length` | `[B]` | 当前虚拟会话可见的密集历史帧数 |
 | `scenario_id` / `scenario` | `[B]` | 所选 Tracker 场景的索引与名称 |
-| `start_frame` / `task_id` | `[B]` | 样本定位与稳定任务标识 |
+| `start_frame` / `task_id` | `[B]` | 样本定位与稳定任务标识；`task_id` 是 `task_seed` 的固定十六进制表示 |
+
+Dataset 不返回 `source_path`，也不接受 `folder_path` 过滤。需要按数据集或序列筛选时，应使用 split 或单独的 Task Store 目录。
 
 模型 diffusion state、模型输出和扩散采样结果均为当前帧 `[B,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain；`reconstruct_batch` 和 `RuntimeStepResult` 的外部契约仍为当前帧 `[B,144]`。
 
@@ -146,7 +177,7 @@ p_k^{head}=[x_k^{C_n},z_k^{C_n},h_k,\sin(\psi_k-\psi_n),\cos(\psi_k-\psi_n)].
 
 ## Normalizer
 
-- `pose_mean.pt`、`pose_scale.pt`: `[144]`，其中 `pose_scale = pose_std + eps`，所有 Pose 物理空间转换统一使用该尺度
+- `pose_mean.pt`、`pose_scale.pt`: `[144]`；`pose_scale` 由标准差稳定化后再加 `eps`，所有 Pose 物理空间转换统一使用该尺度
 - `tracker_mean.pt`、`tracker_std.pt`: `[6,9]`
 - `head_path_xz_mean.pt`、`head_path_xz_std.pt`: `[2]`
 - `head_height_mean.pt`、`head_height_std.pt`: 标量

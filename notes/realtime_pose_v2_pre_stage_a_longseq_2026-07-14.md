@@ -1,5 +1,7 @@
 # Realtime Pose v2 训练前固定长序列基线（2026-07-14）
 
+> 历史记录：本文的复制版 eval set、manifest 与当时的 normalizer 路径仅用于复盘旧实验。当前长序列评估直接读取 `source_dir + split_dir + split`，操作方式见 `documents/复现.md`。
+
 ## 定位
 
 本记录用于 Stage A 开始前的工程连通性基线。模型仍是旧分布训练得到的

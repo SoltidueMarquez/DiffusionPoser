@@ -1,5 +1,7 @@
 # Realtime Pose v2 数据重建与短训练记录（2026-07-13/14）
 
+> 历史记录：本文保留当时使用的 manifest、hash、latest 指针和旧 Task Store 数据，不能作为当前主链路操作指南。当前目录式流程请阅读 `README.md`、`documents/复现.md` 和 `contract.md`。
+
 ## 运行边界
 
 - Git HEAD：`250ee5df5c6c1e9204f9af9eadef9f3863e08075`。
