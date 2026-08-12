@@ -1,6 +1,7 @@
 import numpy as np
 
 from eval.evaluate_realtime_pose import (
+    _sequence_macro_stats,
     compute_predicted_joint_jitter,
     evaluate_file,
     summarize,
@@ -22,9 +23,9 @@ METRIC_KEYS = (
 )
 
 
-def _result(samples: int, mpjpe_sum: float, mpjpe_count: int, known_max: float) -> dict:
-    stats = {key: {"sum": 0.0, "count": samples} for key in METRIC_KEYS}
-    stats["mpjpe_cm"] = {"sum": mpjpe_sum, "count": mpjpe_count}
+def _result(samples: int, mpjpe_mean: float, known_max: float) -> dict:
+    stats = {key: {"sum": 0.0, "count": 1} for key in METRIC_KEYS}
+    stats["mpjpe_cm"] = {"sum": mpjpe_mean, "count": 1}
     stats["mpjve_cm_s"] = {"sum": 0.0, "count": 0}
     stats["mpjae_cm_s2"] = {"sum": 0.0, "count": 0}
     stats["jitter_m_s3"] = {"sum": 0.0, "count": 0}
@@ -40,18 +41,28 @@ def _result(samples: int, mpjpe_sum: float, mpjpe_count: int, known_max: float) 
     }
 
 
-def test_eval_summary_uses_weighted_metric_counts_and_global_max():
+def test_eval_summary_uses_sequence_macro_average_and_global_max():
     summary = summarize(
         [
-            _result(samples=1, mpjpe_sum=1.0, mpjpe_count=1, known_max=0.1),
-            _result(samples=3, mpjpe_sum=9.0, mpjpe_count=3, known_max=0.3),
+            _result(samples=1, mpjpe_mean=1.0, known_max=0.1),
+            _result(samples=3, mpjpe_mean=3.0, known_max=0.3),
         ]
     )
     assert summary["samples"] == 4
-    assert summary["mpjpe_cm"] == 2.5
+    assert summary["aggregation"] == "sequence_macro"
+    assert summary["mpjpe_cm"] == 2.0
     assert summary["mpjve_cm_s"] is None
     assert summary["jitter_m_s3"] is None
     assert summary["known_tracker_rotation_max_error_deg"] == 0.3
+
+
+def test_sequence_macro_stats_does_not_give_long_sequences_more_weight():
+    values = np.asarray([[1.0, np.nan, np.nan], [3.0, 3.0, 3.0]])
+    mask = np.ones((2, 3), dtype=bool)
+
+    stats = _sequence_macro_stats(values, mask)
+
+    assert stats == {"sum": 4.0, "count": 2}
 
 
 def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):

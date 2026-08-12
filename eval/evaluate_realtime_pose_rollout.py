@@ -56,11 +56,22 @@ def evaluate_rollout_file(path: Path) -> dict[str, object]:
 def summarize_rollouts(results: list[dict[str, object]]) -> dict[str, object]:
     summary = summarize(results)
     reconnect_count = sum(int(result["_reconnect_stats"]["count"]) for result in results)
-    velocity_sum = sum(float(result["_reconnect_stats"]["velocity_sum"]) for result in results)
-    angular_sum = sum(float(result["_reconnect_stats"]["angular_sum_deg"]) for result in results)
+    reconnect_results = [
+        result for result in results if int(result["_reconnect_stats"]["count"]) > 0
+    ]
     summary["reconnect_frames"] = reconnect_count
-    summary["reconnect_velocity_jump_m"] = velocity_sum / reconnect_count if reconnect_count else 0.0
-    summary["reconnect_angular_jump_deg"] = angular_sum / reconnect_count if reconnect_count else 0.0
+    summary["reconnect_sequences"] = len(reconnect_results)
+    # 重连突变也按序列等权；没有重连事件的序列不定义该指标，因此不参与均值。
+    summary["reconnect_velocity_jump_m"] = (
+        float(np.mean([result["reconnect_velocity_jump_m"] for result in reconnect_results]))
+        if reconnect_results
+        else 0.0
+    )
+    summary["reconnect_angular_jump_deg"] = (
+        float(np.mean([result["reconnect_angular_jump_deg"] for result in reconnect_results]))
+        if reconnect_results
+        else 0.0
+    )
     return summary
 
 

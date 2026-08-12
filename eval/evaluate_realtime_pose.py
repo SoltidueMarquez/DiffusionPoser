@@ -80,11 +80,34 @@ def _load_result(path: Path) -> dict[str, np.ndarray]:
     return values
 
 
-def _stats(values: np.ndarray, mask: np.ndarray, scale: float = 1.0) -> dict[str, float | int]:
+def _sequence_macro_stats(
+    values: np.ndarray,
+    mask: np.ndarray,
+    scale: float = 1.0,
+) -> dict[str, float | int]:
+    """先在每条序列内部求均值，再对存在有效值的序列等权汇总。"""
+
     array = np.asarray(values, dtype=np.float64)
     selected_mask = np.broadcast_to(np.asarray(mask, dtype=bool), array.shape) & np.isfinite(array)
-    selected = array[selected_mask]
-    return {"sum": float(selected.sum() * scale), "count": int(selected.size)}
+    if array.ndim < 2:
+        raise ValueError("序列指标至少应包含 [N,T] 两个轴。")
+    sequence_count = array.shape[0]
+    flattened_values = np.where(selected_mask, array, 0.0).reshape(sequence_count, -1)
+    flattened_mask = selected_mask.reshape(sequence_count, -1)
+    valid_counts = flattened_mask.sum(axis=1)
+    valid_sequences = valid_counts > 0
+    sequence_means = np.divide(
+        flattened_values.sum(axis=1),
+        valid_counts,
+        out=np.zeros(sequence_count, dtype=np.float64),
+        where=valid_sequences,
+    )
+    # stats 的 count 表示参与宏平均的序列数，不再表示帧数。这样不同长度
+    # 的动作不会因为拥有更多帧而在最终指标中获得更大权重。
+    return {
+        "sum": float(sequence_means[valid_sequences].sum() * scale),
+        "count": int(valid_sequences.sum()),
+    }
 
 
 def _metric(stats: dict[str, float | int]) -> float | None:
@@ -113,11 +136,12 @@ def _group_metrics(
     metric_scales: dict[str, float],
 ) -> dict[str, object]:
     stats = {
-        name: _stats(values, frame_mask, metric_scales.get(name, 1.0))
+        name: _sequence_macro_stats(values, frame_mask, metric_scales.get(name, 1.0))
         for name, values in metric_values.items()
     }
     return {
         "samples": int(np.asarray(frame_mask, dtype=bool).sum()),
+        "aggregation": "sequence_macro",
         **{name: _metric(value) for name, value in stats.items()},
         "_metric_stats": stats,
     }
@@ -381,6 +405,7 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
     if not results:
         raise ValueError("没有可汇总的评估结果。")
     summary = _summarize_metric_stats(results)
+    summary["aggregation"] = "sequence_macro"
     summary["sequences"] = sum(int(result.get("sequences", 0)) for result in results)
     max_values = [
         float(result.get("hard_tracker_rotation_max_error_deg", result.get("known_tracker_rotation_max_error_deg", 0.0)))
