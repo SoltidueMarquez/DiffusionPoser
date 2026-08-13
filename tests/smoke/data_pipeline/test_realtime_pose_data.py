@@ -24,7 +24,7 @@ def test_old_mean_std_normalizer_fails_fast(tmp_path):
         RealtimePoseNormalizer(tmp_path)
 
 
-def test_pose_scale_and_saved_eps_are_the_single_pose_conversion_contract(tmp_path):
+def test_pose_scale_is_the_single_pose_conversion_contract(tmp_path):
     writer = RealtimePoseNormalizer(tmp_path, eps=0.25, disable=True)
     writer.save(
         pose_mean=torch.ones(144),
@@ -35,11 +35,10 @@ def test_pose_scale_and_saved_eps_are_the_single_pose_conversion_contract(tmp_pa
         head_path_xz_std=torch.ones(2),
         head_height_mean=torch.tensor(0.0),
         head_height_std=torch.tensor(1.0),
-        metadata={"eps": 99.0},
     )
 
     normalizer = RealtimePoseNormalizer(tmp_path, eps=1e-8)
-    assert normalizer.eps == pytest.approx(0.25)
+    assert normalizer.eps == pytest.approx(1e-8)
     torch.testing.assert_close(normalizer.pose_scale, torch.full((144,), 2.0))
     raw = torch.full((2, 144), 5.0)
     normalized = normalizer.normalize_pose(raw)

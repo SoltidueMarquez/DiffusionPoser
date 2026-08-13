@@ -13,7 +13,7 @@ from data_loaders.realtime_pose_geometry import (
     global_head_rotations_to_local_delta_6d_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_WINDOW_LENGTH
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
 from sample.utils import load_checkpoint_model
@@ -100,7 +100,7 @@ def reconstruct_batch(
 ) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
     if reference.ndim != 3 or tuple(reference.shape[1:]) != (
-        REALTIME_POSE_WINDOW_LENGTH,
+        REALTIME_POSE_TARGET_LENGTH,
         REALTIME_POSE_TARGET_DIM,
     ):
         raise ValueError(f"sample 应为 [B,11,144]，实际为 {tuple(reference.shape)}")
@@ -109,7 +109,11 @@ def reconstruct_batch(
     with torch.no_grad():
         result = diffusion.projected_ddim_sample_loop(
             model,
-            shape=(reference.shape[0], REALTIME_POSE_TARGET_DIM),
+            shape=(
+                reference.shape[0],
+                REALTIME_POSE_TARGET_LENGTH,
+                REALTIME_POSE_TARGET_DIM,
+            ),
             projection_fn=projection_fn,
             clip_denoised=False,
             model_kwargs=model_kwargs,
@@ -142,13 +146,21 @@ def save_reconstruction(
     normalizer=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if reference.ndim == 3:
-        reference = reference[:, -1]
-    reference_raw = inverse_normalized_target(reference, normalizer)
-    raw_prediction = inverse_normalized_target(reconstruction["raw_pred_xstart"], normalizer)
-    deployed_prediction = inverse_normalized_target(
+    if reference.ndim != 3 or tuple(reference.shape[1:]) != (
+        REALTIME_POSE_TARGET_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+    ):
+        raise ValueError(f"reference 应为 [B,11,144]，实际为 {tuple(reference.shape)}")
+    reference_horizon = inverse_normalized_target(reference, normalizer)
+    raw_prediction_horizon = inverse_normalized_target(
+        reconstruction["raw_pred_xstart"], normalizer
+    )
+    deployed_prediction_horizon = inverse_normalized_target(
         reconstruction["deployed_pred_xstart"], normalizer
     )
+    reference_raw = reference_horizon[:, 0]
+    raw_prediction = raw_prediction_horizon[:, 0]
+    deployed_prediction = deployed_prediction_horizon[:, 0]
     resolved = []
     reference_local_delta = []
     reference_joints_world = []
@@ -215,6 +227,12 @@ def save_reconstruction(
         reference_target_raw=add_time(reference_raw.astype(np.float32)),
         raw_pred_target_raw=add_time(raw_prediction.astype(np.float32)),
         deployed_pred_target_raw=add_time(deployed_prediction.astype(np.float32)),
+        reference_pose_horizon_raw=add_time(reference_horizon.astype(np.float32)),
+        raw_pred_pose_horizon_raw=add_time(raw_prediction_horizon.astype(np.float32)),
+        deployed_pred_pose_horizon_raw=add_time(deployed_prediction_horizon.astype(np.float32)),
+        pose_horizon_valid_mask=np.ones(
+            (deployed_prediction.shape[0], 1, REALTIME_POSE_TARGET_LENGTH), dtype=bool
+        ),
         reference_body_local_delta_6d=add_time(np.asarray(reference_local_delta, dtype=np.float32)),
         predicted_body_local_delta_6d=add_time(
             np.stack([value.body_local_delta_6d for value in resolved]).astype(np.float32)
@@ -255,13 +273,6 @@ def save_reconstruction(
                 torch.full_like(batch["contact_target"], float("nan")),
             ).detach().cpu().numpy()
         ),
-        future_leg_prediction=add_time(
-            reconstruction.get(
-                "future_leg",
-                torch.full_like(batch["future_leg_target"], float("nan")),
-            ).detach().cpu().numpy()
-        ),
-        future_leg_target=add_time(batch["future_leg_target"].detach().cpu().numpy()),
         scenario=add_time(scenario_values),
         eval_frame_mask=np.ones((deployed_prediction.shape[0], 1), dtype=bool),
         hard_rotation_max_error=add_time(

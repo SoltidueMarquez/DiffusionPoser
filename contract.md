@@ -31,14 +31,22 @@ normalizer_dir/
 
 ## 时间窗口与共同参考系
 
-运行时维护最近 60 帧密集世界状态，模型只读取 10 个历史锚点和当前帧：
+运行时维护最近 60 帧密集世界状态。Tracker/Head 条件由 10 个历史锚点和当前帧组成，扩散目标由当前帧和未来 10 帧组成：
 
 ```text
+dense tracker condition length = 61
+history anchor count           = 10
+condition window length        = 11
+future frame count             = 10
+diffusion horizon length       = 11
+model token length             = 21
+
 history anchor indices = [0, 7, 13, 20, 26, 33, 39, 46, 52, 59]
-frame offsets          = [-60, -53, -47, -40, -34, -27, -21, -14, -8, -1, 0]
+model frame offsets    = [-60, -53, -47, -40, -34, -27, -21, -14, -8, -1,
+                           0,   1,   2,   3,   4,   5,   6,   7,  8,  9, 10]
 ```
 
-Pose、Tracker 和 Head 路径必须使用同一组锚点。11 帧全部表达在当前参考系 `C_n`：
+10 个历史 Pose 与 11 个目标 Pose 全部表达在当前参考系 `C_n`；Tracker 和 Head 路径只保存 10 个历史槽和当前槽，不保存未来观测：
 
 - 原点为当前 Head 的水平位置与当前 `floor_y`；
 - 朝向为当前 Head yaw；
@@ -46,7 +54,7 @@ Pose、Tracker 和 Head 路径必须使用同一组锚点。11 帧全部表达�
 - Tracker 位置和旋转直接从世界状态变换到 `C_n`；
 - Head 路径表示每个锚点相对当前 Head 原点和朝向的绝对位置与 yaw。
 
-冷启动历史左侧锚点无效。所有无效锚点字段均在归一化后清为字面零，`window_valid_mask=False`；当前帧始终有效。
+冷启动历史左侧锚点无效。所有无效历史条件在归一化后清为字面零，`window_valid_mask=False`；当前条件槽始终有效，11 个扩散目标始终存在且不使用这个 mask。source 至少需要 71 帧，所有 Task 起点必须满足 `current_absolute + 10 < frame_count`。
 
 ## Source
 
@@ -71,7 +79,8 @@ Task Store 是 task 生成阶段写入磁盘的未归一化数据。设样本数
 
 | shard 字段 | 形状 | 语义 |
 |---|---:|---|
-| `pose_window_clean` | `[M,11,144]` | 当前参考系下的干净 Pose 窗口 |
+| `history_pose_clean` | `[M,10,144]` | 当前参考系下的 10 个历史 Pose 条件 |
+| `pose_target_horizon_clean` | `[M,11,144]` | 当前帧与未来 10 帧的联合扩散目标；索引 0 为当前帧 |
 | `tracker_window_continuous` | `[M,11,6,9]` | 未拼接状态通道的 Tracker 位置与 rotation6D |
 | `head_path_window` | `[M,11,5]` | 当前参考系下的 Head 路径 |
 | `configured` / `measured_valid` | `[M,5,61,6]` | 五套场景的密集 61 帧 Tracker 状态 |
@@ -82,7 +91,6 @@ Task Store 是 task 生成阶段写入磁盘的未归一化数据。设样本数
 | `current_head_yaw_world` | `[M]` | 当前 Head 世界 yaw |
 | `current_head_position_world` | `[M,3]` | 当前 Head 世界位置 |
 | `floor_y` | `[M]` | 当前地面世界高度 |
-| `future_leg_target` | `[M,3,8,6]` | 未来 3 帧双腿 rotation6D |
 | `previous_contact_target` | `[M,2]` | 上一帧左右脚接触监督 |
 | `contact_target` | `[M,2]` | 当前左右脚接触监督 |
 | `joint_offsets_parent` | `[M,24,3]` | 当前任务对应的骨架父子偏移 |
@@ -96,19 +104,21 @@ Task Store 只使用目录结构：
 - 每个 shard 包含 normalizer 聚合使用的 `stats.npz`；
 - shard 名称按字典序决定读取顺序，不存在额外索引或元数据文件。
 
+旧字段 `pose_window_clean`、`future_leg_target` 或缺少上述新字段的 Task Store 会被明确拒绝，不提供兼容读取路径。每个 shard 的 Pose normalizer 统计只聚合 10 个历史锚点和当前目标，不纳入未来 10 个密集目标帧。
+
 ## 模型 Batch
 
 Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新累计状态并抽取 10 个历史锚点和当前帧。以下形状均包含 batch 轴 `B`：
 
 | 字段 | 形状 | 语义 |
 |---|---:|---|
-| `x` | `[B,11,144]` | 干净监督窗口；只有 `x[:, -1]` 是 diffusion target，Dataset 不重复返回 Task Store 的 `pose_window_clean` 名称 |
+| `x` | `[B,11,144]` | 当前帧与未来 10 帧的联合 diffusion target；`x[:,0]` 为当前帧 |
 | `history_pose_observation` | `[B,10,144]` | 历史 Pose 条件；训练时可扰动，部署时为真实历史预测 |
 | `tracker_window` | `[B,11,6,13]` | 同步锚点的完整 Tracker 历史与当前 Tracker |
 | `head_path_window` | `[B,11,5]` | 同步锚点在 `C_n` 下的 Head 路径 |
 | `history_region_confidence` | `[B,10,5]` | 历史 Pose 逐帧、逐身体区域可信度 |
 | `window_valid_mask` | `[B,11]` | 锚点有效性；当前帧恒为 `True` |
-| `frame_offsets` | `[B,11]` | 固定真实帧偏移 |
+| `frame_offsets` | `[B,21]` | 10 个历史槽加 11 个目标槽的固定真实帧偏移 |
 | `configured` / `measured_valid` | `[B,11,6]` | 所选场景在同步锚点上的 Tracker 状态 |
 | `d_off` / `d_on` | `[B,11,6]` | 从虚拟会话起点重新累计的掉线与在线帧数 |
 | `tracker_window_raw` | `[B,11,6,13]` | 几何 Loss 使用的未归一化 Tracker 窗口；current-only projection 只读取 `[:, -1]` |
@@ -122,7 +132,6 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `current_head_yaw_world` | `[B]` | 当前 Head 世界 yaw |
 | `current_head_position_world` | `[B,3]` | 当前 Head 世界位置 |
 | `floor_y` | `[B]` | 当前地面世界高度 |
-| `future_leg_target` | `[B,3,8,6]` | 未来 3 帧双腿监督 |
 | `previous_contact_target` | `[B,2]` | 上一帧左右脚接触监督 |
 | `contact_target` | `[B,2]` | 左右脚接触监督 |
 | `history_length` | `[B]` | 当前虚拟会话可见的密集历史帧数 |
@@ -131,13 +140,13 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 
 Dataset 不返回 `source_path`，也不接受 `folder_path` 过滤。需要按数据集或序列筛选时，应使用 split 或单独的 Task Store 目录。
 
-模型 diffusion state、模型输出和扩散采样结果均为当前帧 `[B,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain；`reconstruct_batch` 和 `RuntimeStepResult` 的外部契约仍为当前帧 `[B,144]`。
+模型 diffusion state、模型输出和扩散采样结果均为 `[B,11,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain。`RuntimeStepResult` 返回 `raw_pred_pose_horizon/deployed_pred_pose_horizon: [11,144]`，只解析并回写 horizon 0。
 
 ## 144D Pose 与历史扰动
 
-每帧 Pose 由 24 个关节的全局 rotation6D 拼接而成。训练入口令 `x_start = x[:, -1]`，只对这个完整 144D 当前姿态执行 `q_sample()`，noise、diffusion target、raw/deployed `pred_xstart` 和 reconstruction loss 都是 `[B,144]`。历史帧不加噪、不执行 DDIM 更新、不产生重建输出，也没有历史 reconstruction 项或 temporal rotation loss。
+每帧 Pose 由 24 个关节的全局 rotation6D 拼接而成。训练入口令 `x_start = x`，对 `[B,11,144]` 联合目标执行 `q_sample()`。同一样本的 11 帧共享一个 diffusion timestep，各帧各特征独立采样噪声；`feature_w: [144]` 广播到 horizon 轴，reconstruction loss 对 horizon 和 feature 共同求均值。
 
-历史 Pose 扰动只修改独立条件 `history_pose_observation`，不会改变当前 diffusion target `x[:, -1]`。扰动在反归一化后的 SO(3) 空间执行：
+历史 Pose 扰动只修改独立条件 `history_pose_observation`，不会改变联合 diffusion target `x`。扰动在反归一化后的 SO(3) 空间执行：
 
 ```text
 history_noise_prob = 0.8
@@ -186,15 +195,26 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 
 ## 时空 DiT 与投影
 
-- `WindowObservationEncoder` 逐帧输出 Tracker state、position、rotation token，保留 11 帧时间轴，不使用历史 GRU summary；
-- 每层依次执行 Tracker cross-attention、24 关节 Spatial Self-Attention、同关节 11 帧 Temporal Self-Attention；
-- Temporal Attention 使用固定历史前缀 mask：有效历史 query 可双向读取全部有效历史 key，但不能读取当前 key；当前 query 可读取全部有效历史和自己；padding 永远不能作为 key；
+- 模型 token 网格为 `[B,21,24,D]`：`0:10` 是历史 Pose 条件，`10:21` 是当前与未来 10 帧的带噪目标；
+- `WindowObservationEncoder` 只编码 10 个历史槽和当前槽的 Tracker state、position、rotation token；未来 10 个槽补零且 Tracker cross-attention residual 严格清零；
+- 每层依次执行 Tracker cross-attention、24 关节 Spatial Self-Attention、同关节 21 槽 Temporal Self-Attention；
+- 模型分别维护 `token_valid_mask: [B,21]` 与 `tracker_condition_valid_mask: [B,21]`。冷启动无效历史不能作为 attention key；11 个目标 token 始终有效；
+- Temporal Attention 的历史 query 只能读取有效历史 key，不能读取任何目标 token；目标 query 可读取全部有效历史和全部 11 个目标，目标窗口内部双向 attention；
 - 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测、Loss 和 hard projection 从同一份条件与监督数据读取，不在顶层重复条件字段；
 - 历史 Pose、Tracker 窗口、Head 路径和置信度由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
-- 历史和当前使用独立输入投影，历史姿态不会同时经过当前 diffusion 输入投影；11 帧仍形成 `[B,11,24,D]` token 网格；
+- 历史和目标使用独立输入投影；共享一个 diffusion timestep embedding，21 个 frame-offset embedding 区分帧位置；
 - Tracker cross-attention 使用 `kappa` 与 coverage 构造 attention bias 并屏蔽无效测量；position/rotation attention residual 直接参与 token 更新；没有合法 key 的 query 通过二值有效性将安全回退输出清零；
-- 共享 diffusion timestep AdaLN 调制全部 11 帧；Temporal Attention 的时序残差强度由可学习 AdaLN gate 决定，padding 由 `window_valid_mask` 屏蔽；
-- 只解码当前 token；current loss 可经 Temporal Attention 反向训练历史编码路径，future-leg 与 contact head 也只读取当前 token；
-- current-only projection 对 `[B,144]` 的 24 个关节执行 rotation6D 到 SO(3) 投影，并只用 `tracker_window_raw[:, -1]` 与 `hard_rotation_state_window[:, -1]` 替换当前 hard Tracker 旋转；
-- Projected DDIM 的 state、初始 noise 和每步更新均为 `[B,144]`。长序列评估的 `per_frame`、`fixed_sequence` 和 `correlated` noise 也只描述当前帧；correlated 模式使用 `epsilon_n = rho * epsilon_(n-1) + sqrt(1-rho^2) * eta_n`；
+- 解码最后 11 个槽，输出 `[B,11,144]`；`contact_head` 只读取当前目标槽，不存在 `future_leg_head`；
+- SO(3) projection 对 `[B,11,144]` 的所有关节执行合法化，只用当前 Tracker 替换 `[:,0]` 的 hard Tracker rotation；旧 `[B,144]` 调用直接报错；
+- Projected DDIM 的 state、初始 noise 和每步更新均为 `[B,11,144]`。长序列评估的 `per_frame`、`fixed_sequence` 和 `correlated` noise 都作用于完整 horizon；correlated 模式使用 `epsilon_n = rho * epsilon_(n-1) + sqrt(1-rho^2) * eta_n`；
 - 训练阶段不执行模型 rollout；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。
+
+## Loss、运行时与长序列结果
+
+- diffusion reconstruction、global rotation、local rotation 和 rotation velocity loss 作用于全部 11 帧；
+- rotation velocity 比较相邻目标帧 `R_h^T R_(h+1)` 的 SO(3) 夹角，共 10 组，默认权重为 `1.0`；
+- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact、contact-slide 和 hard projection 只作用于 horizon 0；
+- `previous_pose_target` 是未扰动的最后一个历史 Pose；cold-start contact-slide 由最后历史槽有效性屏蔽；
+- 长序列结果同时保存 `reference_pose_horizon_raw`、`raw_pred_pose_horizon_raw`、`deployed_pred_pose_horizon_raw: [N,T,11,144]` 和 `pose_horizon_valid_mask: [N,T,11]`；序列尾部缺少的未来参考帧填 NaN；
+- 当前 MPJRE/MPJPE/MPJVE/Jitter/contact 等指标继续从 horizon 0 计算；另外报告 raw/deployed 的 horizon 0 到 10 全身 MPJRE，以及未来 1:10 宏平均。当前阶段不计算未来 MPJPE 或未来 root 位置误差；
+- 旧 Task Store、旧单帧 checkpoint/args 和联合 11 帧模型的 Unity/Sentis 导出均明确拒绝。Unity runtime schema 仍保持旧单帧接口，不生成联合模型 ONNX。

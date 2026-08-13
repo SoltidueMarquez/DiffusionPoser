@@ -29,7 +29,7 @@ class TrainEntrypointTest(unittest.TestCase):
             heads=8,
             dropout=0.0,
             zero_init=True,
-            max_seq_len=11,
+            max_seq_len=21,
             model_arch="spatiotemporal_dit",
             d_warm_pos=999,
             tracker_duration_cap=999,

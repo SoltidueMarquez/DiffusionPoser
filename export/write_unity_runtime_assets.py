@@ -31,7 +31,6 @@ from data_loaders.sensor_masking import (  # noqa: E402
     POSE_REPRESENTATION_BODY_FBX_LOCAL_DELTA_6D,
     REALTIME_POSE_SCHEMA_NAMES,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
     ROOT_YAW_DELTA_DIM,
     ROOT_YAW_DELTA_START,
@@ -47,6 +46,10 @@ from data_loaders.sensor_masking import (  # noqa: E402
     validate_pose_representation,
 )
 from utils.normalizer import enforce_realtime_pose_normalizer_contract  # noqa: E402
+
+
+# Unity runtime schema 尚未迁移到联合 11 帧输出，继续固定旧单帧接口。
+UNITY_RUNTIME_TARGET_LENGTH = 1
 
 
 def default_unity_model_dir() -> Path:
@@ -86,7 +89,7 @@ def build_realtime_pose_feature_schema(
         "featureDim": schema.feature_dim,
         "sequenceLength": REALTIME_POSE_SEQ_LEN,
         "targetStart": REALTIME_POSE_TARGET_START,
-        "targetLength": REALTIME_POSE_TARGET_LENGTH,
+        "targetLength": UNITY_RUNTIME_TARGET_LENGTH,
         "targetFeatureLength": schema.target_dim,
         "boneCount": len(SMPL_JOINT_NAMES),
         "boneNames": list(SMPL_JOINT_NAMES),

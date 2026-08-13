@@ -239,11 +239,11 @@ def decode_target_head_rotations_torch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if target.shape[-1] != REALTIME_POSE_TARGET_DIM:
         raise ValueError(f"target 最后一维必须为 {REALTIME_POSE_TARGET_DIM}，实际为 {tuple(target.shape)}")
-    batch_size = target.shape[0]
+    leading = target.shape[:-1]
     rotations = rotation_6d_to_matrix_torch(
-        target.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
+        target.reshape(*leading, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
     )
-    return rotations, extract_rotation_heading_torch(rotations[:, 0])
+    return rotations, extract_rotation_heading_torch(rotations[..., 0, :, :])
 
 
 def pelvis_relative_joint_positions_np(

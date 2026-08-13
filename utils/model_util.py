@@ -24,7 +24,7 @@ def create_model_and_diffusion(args):
 
 
 def create_gaussian_diffusion(args):
-    """创建只作用于当前 144D Pose、以 10 帧历史为条件的扩散过程。"""
+    """创建联合恢复当前帧和未来 10 帧、以 10 帧历史为条件的扩散过程。"""
 
     steps = int(args.diffusion_steps)
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
@@ -48,7 +48,9 @@ def create_gaussian_diffusion(args):
             args, "head_ref_joint_distance_loss_weight", 1.0
         ),
         head_to_root_xz_loss_weight=getattr(args, "head_to_root_xz_loss_weight", 1.0),
-        future_leg_loss_weight=getattr(args, "future_leg_loss_weight", 0.5),
+        rotation_velocity_loss_weight=getattr(
+            args, "rotation_velocity_loss_weight", 1.0
+        ),
         contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
         contact_slide_loss_weight=getattr(args, "contact_slide_loss_weight", 0.1),
     )

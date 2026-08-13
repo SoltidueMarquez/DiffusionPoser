@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-
 import numpy as np
+import pytest
 from torch.utils.data import DataLoader
 
 import data_loaders.get_data as get_data
@@ -16,9 +15,9 @@ from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     TaskRequest,
 )
-from data_loaders.realtime_pose_geometry import extract_forward_yaw_np
+from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_forward_yaw_np
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
-from data_loaders.realtime_pose_task_store import ShardWriter, read_store_metadata, write_json
+from data_loaders.realtime_pose_task_store import ShardWriter
 from data_loaders.realtime_pose_validation import validate_realtime_task_arrays
 from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
 from data_loaders.tracker_timeline import build_task_config_plan
@@ -26,7 +25,7 @@ from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
 
 def _build_row():
-    source = build_toy_realtime_source(frame_count=70)
+    source = build_toy_realtime_source(frame_count=71)
     joint_rotations = compute_source_joint_rotations_world(source)
     tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
     head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
@@ -35,7 +34,7 @@ def _build_row():
         joint_rotations_world=joint_rotations,
         head_yaws=head_yaws,
         start_frame=0,
-        source_index=0,
+        task_seed=0,
         config_plans=build_task_config_plan("toy", global_seed=10, max_rollout_steps=1),
     )
     return source, row
@@ -43,12 +42,12 @@ def _build_row():
 
 def test_task_bundle_materializes_synchronized_spatiotemporal_window():
     _source, row = _build_row()
-    assert row["pose_window_clean"].shape == (11, 144)
+    assert row["history_pose_clean"].shape == (10, 144)
+    assert row["pose_target_horizon_clean"].shape == (11, 144)
     assert row["tracker_window_continuous"].shape == (11, 6, 9)
     assert row["head_path_window"].shape == (11, 5)
     assert row["configured"].shape == (5, 61, 6)
     assert row["measured_valid"].shape == (5, 61, 6)
-    assert row["future_leg_target"].shape == (3, 8, 6)
     assert row["previous_contact_target"].shape == (2,)
     assert row["contact_target"].shape == (2,)
     np.testing.assert_allclose(
@@ -67,6 +66,34 @@ def test_task_bundle_materializes_synchronized_spatiotemporal_window():
         row["head_path_window"][:, :3],
         atol=1e-6,
     )
+    rotations = compute_source_joint_rotations_world(_source)
+    current_head_yaw = extract_forward_yaw_np(
+        rotation_6d_to_matrix_np(_source["tracker_rot_world_6d"])[:, 0]
+    )[60]
+    np.testing.assert_allclose(
+        row["pose_target_horizon_clean"],
+        build_pose_target_np(rotations[60:71], current_head_yaw),
+        atol=1e-6,
+    )
+
+
+def test_task_bundle_requires_ten_future_frames_and_accepts_71_frame_boundary():
+    source = build_toy_realtime_source(frame_count=70)
+    rotations = compute_source_joint_rotations_world(source)
+    head_yaws = extract_forward_yaw_np(
+        rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])[:, 0]
+    )
+    with pytest.raises(ValueError, match=r"current_absolute \+ 10 < frame_count"):
+        build_task_bundle_row(
+            source,
+            rotations,
+            head_yaws,
+            start_frame=0,
+            task_seed=0,
+            config_plans=build_task_config_plan("too-short", 10, 1),
+        )
+    _, row = _build_row()
+    assert row["pose_target_horizon_clean"].shape == (11, 144)
 
 
 def _write_store(tmp_path):
@@ -75,37 +102,6 @@ def _write_store(tmp_path):
     writer = ShardWriter(split_dir / "shards" / "shard_00000", 1, shard_fields())
     writer.write_row(0, row)
     writer.finish()
-    np.save(split_dir / "source_joint_offsets_parent.npy", source["joint_offsets_parent"][None])
-    np.save(
-        split_dir / "source_joint_rest_local_rotations_6d.npy",
-        source["joint_rest_local_rotations_6d"][None],
-    )
-    (split_dir / "sources.jsonl").write_text(
-        json.dumps(
-            {
-                "source_index": 0,
-                "source_id": "toy",
-                "source_path": "toy.npz",
-                "source_relative_path": "toy.npz",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    write_json(
-        split_dir / "task_store.json",
-        {
-            "generation_plan_hash": "temporary",
-            "split": "train",
-            "sample_count": 1,
-            "source_count": 1,
-            "two_point_phase_counts": {"dropout": 1, "reconnect": 0},
-            "config_names": list(TRACKER_PATTERN_CATEGORIES),
-            "tracker_feature_dim": TRACKER_FEATURE_DIM,
-            "schema_fields": sorted(shard_fields()),
-            "shards": [{"index": 0, "row_count": 1, "path": "shards/shard_00000"}],
-        },
-    )
     return tmp_path / "tasks"
 
 
@@ -114,7 +110,7 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     dataset = RealtimePoseTaskDataset(task_dir, normalize_input=False)
     item = dataset[TaskRequest(0, 0)]
     assert item["x"].shape == (11, 144)
-    assert "pose_window_clean" not in item
+    assert item["frame_offsets"].shape == (21,)
     assert item["history_pose_observation"].shape == (10, 144)
     assert item["tracker_window"].shape == (11, 6, 13)
     assert item["tracker_window_raw"].shape == (11, 6, 13)
@@ -136,7 +132,8 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
 
     cold = dataset[TaskRequest(0, 0, history_length=0)]
     assert cold["window_valid_mask"].tolist() == [False] * 10 + [True]
-    assert np.count_nonzero(cold["x"].numpy()[:-1]) == 0
+    assert np.count_nonzero(cold["history_pose_observation"].numpy()) == 0
+    np.testing.assert_allclose(cold["x"].numpy(), item["x"].numpy())
     assert np.count_nonzero(cold["tracker_window"].numpy()[:-1]) == 0
     assert np.count_nonzero(cold["head_path_window"].numpy()[:-1]) == 0
     np.testing.assert_array_equal(cold["d_on"].numpy()[-1], np.ones(6, dtype=np.int64))
@@ -206,16 +203,10 @@ def test_cold_start_sampler_is_deterministic():
     assert all(0 <= value < 60 for value in first)
 
 
-def test_old_task_metadata_is_rejected(tmp_path):
-    split_dir = tmp_path / "old" / "train"
-    split_dir.mkdir(parents=True)
-    (split_dir / "task_store.json").write_text(
-        json.dumps({"tracker_feature_dim": 12, "shards": []}) + "\n",
-        encoding="utf-8",
-    )
-    try:
-        read_store_metadata(split_dir)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("旧 task schema 必须被拒绝。")
+def test_old_task_fields_are_rejected(tmp_path):
+    shard_dir = tmp_path / "old" / "train" / "shards" / "shard_00000"
+    shard_dir.mkdir(parents=True)
+    np.save(shard_dir / "pose_window_clean.npy", np.zeros((1, 11, 144), dtype=np.float32))
+    np.save(shard_dir / "future_leg_target.npy", np.zeros((1, 3, 8, 6), dtype=np.float32))
+    with pytest.raises(ValueError, match="旧单帧 Task Store"):
+        RealtimePoseTaskDataset(tmp_path / "old", normalize_input=False)

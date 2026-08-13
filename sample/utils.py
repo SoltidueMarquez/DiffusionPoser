@@ -21,7 +21,12 @@ def load_checkpoint_model(model, model_path: str | Path, device, use_ema: bool =
         ema_path = model_path.with_name(model_path.name.replace("model", "ema", 1))
         if ema_path.exists():
             ema = EMA(model, include_online_model=False)
-            ema.load_state_dict(torch.load(ema_path, map_location="cpu"))
+            try:
+                ema.load_state_dict(torch.load(ema_path, map_location="cpu"))
+            except (RuntimeError, KeyError) as exc:
+                raise RuntimeError(
+                    "单帧 checkpoint 与联合 11 帧模型不兼容，无法加载 EMA 权重。"
+                ) from exc
             inference_model = ema.ema_model
             inference_model.to(device)
             inference_model.eval()
@@ -32,6 +37,11 @@ def load_checkpoint_model(model, model_path: str | Path, device, use_ema: bool =
     missing_keys = list(incompatible_keys.missing_keys)
     unexpected_keys = list(incompatible_keys.unexpected_keys)
     if missing_keys or unexpected_keys:
+        if (
+            "joint_diffusion_horizon_length" in missing_keys
+            or any("future_leg_head" in key for key in unexpected_keys)
+        ):
+            raise RuntimeError("单帧 checkpoint 与联合 11 帧模型不兼容。")
         raise RuntimeError(
             "checkpoint 与当前模型结构不匹配，已停止测试以避免生成不可信结果。"
             f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"

@@ -45,7 +45,7 @@ def test_longseq_default_output_path_is_short_stable_and_collision_resistant(tmp
     eval_set = tmp_path / "very_long_eval_set_directory_name"
     checkpoint = tmp_path / "very_long_training_run_directory_name" / "model000120000.pt"
     output = longseq.build_default_output_dir(
-        eval_set_dir=eval_set,
+        source_dir=eval_set,
         model_path=checkpoint,
         weights="ema",
         projected_ddim_mode="all_steps",
@@ -56,14 +56,14 @@ def test_longseq_default_output_path_is_short_stable_and_collision_resistant(tmp
     assert output.name.startswith("120000e-a-b4-")
     assert len(output.as_posix()) <= 40
     assert output == longseq.build_default_output_dir(
-        eval_set_dir=eval_set,
+        source_dir=eval_set,
         model_path=checkpoint,
         weights="ema",
         projected_ddim_mode="all_steps",
         sequence_batch_size=4,
     )
     assert output != longseq.build_default_output_dir(
-        eval_set_dir=tmp_path / "another_eval_set",
+        source_dir=tmp_path / "another_eval_set",
         model_path=checkpoint,
         weights="ema",
         projected_ddim_mode="all_steps",
@@ -150,6 +150,14 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     assert payload["current_tracker_raw"].shape == (1, 5, 6, 13)
     assert payload["raw_pred_target_raw"].shape == (1, 5, 144)
     assert payload["deployed_pred_target_raw"].shape == (1, 5, 144)
+    assert payload["reference_pose_horizon_raw"].shape == (1, 5, 11, 144)
+    assert payload["raw_pred_pose_horizon_raw"].shape == (1, 5, 11, 144)
+    assert payload["deployed_pred_pose_horizon_raw"].shape == (1, 5, 11, 144)
+    assert payload["pose_horizon_valid_mask"].shape == (1, 5, 11)
+    np.testing.assert_array_equal(
+        payload["pose_horizon_valid_mask"].sum(axis=-1), [[5, 4, 3, 2, 1]]
+    )
+    assert np.isnan(payload["reference_pose_horizon_raw"][0, -1, 1:]).all()
     assert "current_trajectory" not in payload
     reference_pelvis_yaw = longseq.extract_rotation_heading_np(
         longseq.compute_source_joint_rotations_world(source)[:, 0]
@@ -192,6 +200,8 @@ def test_longseq_cross_sequence_batch_supports_different_lengths_and_matches_sin
     assert batch_model.batch_sizes == [2, 2, 1, 1]
     assert payloads[0]["deployed_pred_target_raw"].shape == (1, 4, 144)
     assert payloads[1]["deployed_pred_target_raw"].shape == (1, 2, 144)
+    assert payloads[0]["deployed_pred_pose_horizon_raw"].shape == (1, 4, 11, 144)
+    assert payloads[1]["deployed_pred_pose_horizon_raw"].shape == (1, 2, 11, 144)
     assert "current_trajectory" not in payloads[0]
     assert "current_trajectory" not in payloads[1]
     np.testing.assert_array_equal(payloads[0]["history_length"], [[0, 1, 2, 3]])
@@ -244,11 +254,11 @@ def test_isolated_conditions_share_framewise_diffusion_noise_for_fair_comparison
 
     assert len(diffusion.noises) == 3
     for noise in diffusion.noises:
-        assert noise.shape == (2, 144)
+        assert noise.shape == (2, 11, 144)
         np.testing.assert_array_equal(noise[0], noise[1])
 
 
-def test_fixed_sequence_noise_reuses_current_frame_noise():
+def test_fixed_sequence_noise_reuses_full_horizon_noise():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.noises: list[torch.Tensor] = []
@@ -271,12 +281,12 @@ def test_fixed_sequence_noise_reuses_current_frame_noise():
         diffusion_noise_mode="fixed_sequence",
     )
 
-    assert all(noise.shape == (1, 144) for noise in diffusion.noises)
+    assert all(noise.shape == (1, 11, 144) for noise in diffusion.noises)
     torch.testing.assert_close(diffusion.noises[0], diffusion.noises[1])
     torch.testing.assert_close(diffusion.noises[0], diffusion.noises[2])
 
 
-def test_correlated_noise_uses_current_only_ar1_formula():
+def test_correlated_noise_uses_full_horizon_ar1_formula():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.noises: list[torch.Tensor] = []
@@ -302,8 +312,8 @@ def test_correlated_noise_uses_current_only_ar1_formula():
     )
 
     generator = torch.Generator(device="cpu").manual_seed(23)
-    first = torch.randn(144, generator=generator)
-    innovation = torch.randn(144, generator=generator)
+    first = torch.randn(11, 144, generator=generator)
+    innovation = torch.randn(11, 144, generator=generator)
     expected_second = rho * first + np.sqrt(1.0 - rho**2) * innovation
     torch.testing.assert_close(diffusion.noises[0][0], first)
     torch.testing.assert_close(diffusion.noises[1][0], expected_second)
@@ -319,7 +329,7 @@ def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp
         entries.append(
             {
                 "sequence_id": f"sequence_{index}",
-                "source_path": source_path.name,
+                "source_path": str(source_path.resolve()),
                 "source_relative_path": source_path.name,
             }
         )
@@ -327,7 +337,7 @@ def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp
     model = _RecordingModel()
     summary = longseq.evaluate_longseq_entries(
         entries=entries,
-        eval_set_dir=eval_set_dir,
+        source_dir=eval_set_dir,
         output_dir=tmp_path / "output",
         model=model,
         diffusion=_OneStepProjectedDiffusion(),

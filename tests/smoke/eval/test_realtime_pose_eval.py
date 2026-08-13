@@ -80,6 +80,9 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
     predicted_joints[0, :, 11, 0] = np.asarray([0.0, 1.0, 3.0])
     contact_target = np.asarray([[[0.0, 0.0], [1.0, 1.0], [1.0, 1.0]]], dtype=np.float32)
     contact_logits = np.where(contact_target > 0.5, 1.0, -1.0).astype(np.float32)
+    pose_horizon = np.tile(IDENTITY_6D, (1, steps, 11, 24, 1)).reshape(
+        1, steps, 11, 144
+    ).astype(np.float32)
     path = tmp_path / "result.npz"
     np.savez(
         path,
@@ -106,8 +109,10 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
         hard_rotation_state=hard,
         contact_target=contact_target,
         contact_logits=contact_logits,
-        future_leg_target=np.tile(IDENTITY_6D, (1, steps, 3, 8, 1)),
-        future_leg_prediction=np.tile(IDENTITY_6D, (1, steps, 3, 8, 1)),
+        reference_pose_horizon_raw=pose_horizon,
+        raw_pred_pose_horizon_raw=pose_horizon,
+        deployed_pred_pose_horizon_raw=pose_horizon,
+        pose_horizon_valid_mask=np.ones((1, steps, 11), dtype=bool),
         scenario=np.full((1, steps), "two_point_dropout_reconnect"),
         eval_frame_mask=np.ones((1, steps), dtype=bool),
         history_length=np.asarray([[0, 1, 60]], dtype=np.int64),
@@ -116,6 +121,10 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
     result = evaluate_file(path)
     assert result["raw_rotation_deg"] == 0.0
     assert result["deployed_rotation_deg"] == 0.0
+    assert result["raw_pose_horizon_0_rotation_deg"] == result["raw_rotation_deg"]
+    assert result["deployed_pose_horizon_0_rotation_deg"] == result["deployed_rotation_deg"]
+    assert result["raw_pose_horizon_10_rotation_deg"] == 0.0
+    assert result["deployed_future_pose_rotation_deg"] == 0.0
     assert result["contact_accuracy"] == 1.0
     assert np.isclose(result["measured_non_head_tracker_position_error_m"], 23.0 / 15.0)
     assert result["foot_slide_m_s"] == 120.0

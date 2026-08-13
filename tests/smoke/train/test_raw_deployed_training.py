@@ -35,6 +35,7 @@ from diffusion.realtime_pose_losses import (
     _contact_slide_loss,
     _radial_huber_loss,
     _rotation_angle,
+    compute_raw_deployed_losses,
 )
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
@@ -137,7 +138,7 @@ def test_adjacent_contact_weight_requires_contact_on_both_frames():
 
 
 def _training_batch() -> dict[str, torch.Tensor]:
-    source = build_toy_realtime_source(frame_count=70)
+    source = build_toy_realtime_source(frame_count=71)
     joint_rotations = compute_source_joint_rotations_world(source)
     head_yaws = extract_forward_yaw_np(
         rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])[:, 0]
@@ -167,8 +168,8 @@ def _training_batch() -> dict[str, torch.Tensor]:
     rho_pos, rho_rot = compute_region_coverage_np(kappa_pos, kappa_rot)
     confidence = 0.5 * (rho_pos + rho_rot)
     values = {
-        "x": row["pose_window_clean"],
-        "history_pose_observation": row["pose_window_clean"][:-1],
+        "x": row["pose_target_horizon_clean"],
+        "history_pose_observation": row["history_pose_clean"],
         "tracker_window": tracker,
         "head_path_window": row["head_path_window"],
         "history_region_confidence": confidence,
@@ -184,7 +185,6 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "target_root_position_head_ref": row["target_root_position_head_ref"],
         "target_root_yaw_world": row["target_root_yaw_world"],
         "current_head_yaw_world": row["current_head_yaw_world"],
-        "future_leg_target": row["future_leg_target"],
         "previous_contact_target": row["previous_contact_target"],
         "contact_target": row["contact_target"],
     }
@@ -193,7 +193,7 @@ def _training_batch() -> dict[str, torch.Tensor]:
 
 def _model_and_kwargs(batch):
     model = RealtimePoseSpatioTemporalDiT(
-        latent_dim=32, num_layers=1, num_heads=4, dropout=0.0, max_seq_len=11
+        latent_dim=32, num_layers=1, num_heads=4, dropout=0.0, max_seq_len=21
     )
     condition_names = (
         "history_pose_observation",
@@ -206,7 +206,7 @@ def _model_and_kwargs(batch):
     kwargs = {name: batch[name] for name in condition_names}
     kwargs["y"] = {
         **batch,
-        "previous_pose_target": batch["x"][:, -2],
+        "previous_pose_target": batch["history_pose_observation"][:, -1],
     }
     return model, kwargs
 
@@ -224,10 +224,10 @@ def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint()
     )
     terms = diffusion.training_losses(
         model,
-        batch["x"][:, -1].float(),
+        batch["x"].float(),
         torch.ones(1, dtype=torch.long),
         model_kwargs=model_kwargs,
-        noise=torch.zeros_like(batch["x"][:, -1], dtype=torch.float32),
+        noise=torch.zeros_like(batch["x"], dtype=torch.float32),
         return_pred_xstart=True,
     )
     assert all(torch.isfinite(value).all() for value in terms.values())
@@ -245,13 +245,13 @@ def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint()
         joint_index = TRACKER_TO_JOINT[tracker_index]
         start = joint_index * 6
         torch.testing.assert_close(
-            deployed[0, start : start + 6],
+            deployed[0, 0, start : start + 6],
             batch["tracker_window_raw"][0, -1, tracker_index, 3:9],
             atol=1e-5,
             rtol=1e-5,
         )
         hard_channels.extend(range(start, start + 6))
-    assert torch.linalg.norm(raw.grad[0, hard_channels]) > 0.0
+    assert torch.linalg.norm(raw.grad[0, 0, hard_channels]) > 0.0
 
 
 def test_current_training_uses_tracker_position_huber_beta():
@@ -272,10 +272,10 @@ def test_current_training_uses_tracker_position_huber_beta():
             losses.append(
                 diffusion.training_losses(
                     model,
-                    batch["x"][:, -1].float(),
+                    batch["x"].float(),
                     torch.ones(1, dtype=torch.long),
                     model_kwargs=model_kwargs,
-                    noise=torch.zeros_like(batch["x"][:, -1]),
+                    noise=torch.zeros_like(batch["x"]),
                 )["tracker_position_loss"]
             )
     assert not torch.allclose(losses[0], losses[1])
@@ -294,10 +294,10 @@ def test_current_training_respects_l1_and_feature_weights():
     )
     common = dict(
         model=model,
-        x_start=batch["x"][:, -1].float(),
+        x_start=batch["x"].float(),
         t=torch.ones(1, dtype=torch.long),
         model_kwargs=model_kwargs,
-        noise=torch.zeros_like(batch["x"][:, -1]),
+        noise=torch.zeros_like(batch["x"]),
     )
     with torch.no_grad():
         mse = diffusion.training_losses(**common, feature_w=torch.ones(1, 144))
@@ -307,3 +307,45 @@ def test_current_training_respects_l1_and_feature_weights():
         zero = diffusion.training_losses(**common, feature_w=torch.zeros(1, 144))
     assert not torch.allclose(mse["simple_loss"], l1["simple_loss"])
     torch.testing.assert_close(zero["simple_loss"], torch.zeros_like(zero["simple_loss"]))
+
+
+def test_future_only_rotation_changes_horizon_losses_but_not_current_losses():
+    batch = _training_batch()
+    batch["previous_pose_target"] = batch["history_pose_observation"][:, -1]
+    target = batch["x"].float()
+    auxiliary = {"contact_logits": torch.zeros(1, 2)}
+    exact = compute_raw_deployed_losses(
+        target,
+        target,
+        target,
+        batch,
+        auxiliary,
+        tracker_pos_huber_beta=0.05,
+    )
+    changed = target.clone()
+    changed[:, 1, :6] = torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0, 0.0])
+    future_error = compute_raw_deployed_losses(
+        changed,
+        changed,
+        target,
+        batch,
+        auxiliary,
+        tracker_pos_huber_beta=0.05,
+    )
+    torch.testing.assert_close(
+        exact["rotation_velocity_loss"], torch.zeros_like(exact["rotation_velocity_loss"])
+    )
+    assert future_error["global_rotation_loss"].item() > 0.0
+    assert future_error["local_rotation_loss"].item() > 0.0
+    assert future_error["rotation_velocity_loss"].item() > 0.0
+    for name in (
+        "tracker_rotation_loss",
+        "tracker_position_loss",
+        "fk_loss",
+        "head_ref_joint_distance_loss",
+        "root_loss",
+        "head_to_root_xz_loss",
+        "contact_loss",
+        "contact_slide_loss",
+    ):
+        torch.testing.assert_close(future_error[name], exact[name])

@@ -8,7 +8,7 @@ import torch.nn as nn
 from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.sensor_masking import (
     NON_HEAD_TRACKER_INDICES,
-    REALTIME_POSE_WINDOW_LENGTH,
+    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     TRACKER_CONFIGURED_OFFSET,
     TRACKER_COUNT,
     TRACKER_D_ON_OFFSET,
@@ -65,7 +65,7 @@ class WindowObservationEncoder(nn.Module):
         batch_size = tracker_window.shape[0]
         expected = (
             batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
+            REALTIME_POSE_CONDITION_WINDOW_LENGTH,
             TRACKER_COUNT,
             TRACKER_FEATURE_DIM,
         )
@@ -75,7 +75,7 @@ class WindowObservationEncoder(nn.Module):
             )
         if tuple(window_valid_mask.shape) != (
             batch_size,
-            REALTIME_POSE_WINDOW_LENGTH,
+            REALTIME_POSE_CONDITION_WINDOW_LENGTH,
         ):
             raise ValueError("window_valid_mask 必须为 [B,11]。")
 

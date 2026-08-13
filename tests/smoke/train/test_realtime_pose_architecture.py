@@ -19,7 +19,9 @@ from train.training_loop import (
 )
 
 
-FRAME_OFFSETS = torch.tensor([-60, -53, -47, -40, -34, -27, -21, -14, -8, -1, 0])
+FRAME_OFFSETS = torch.tensor(
+    [-60, -53, -47, -40, -34, -27, -21, -14, -8, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+)
 
 
 def _model() -> RealtimePoseSpatioTemporalDiT:
@@ -28,7 +30,7 @@ def _model() -> RealtimePoseSpatioTemporalDiT:
         num_layers=1,
         num_heads=8,
         dropout=0.0,
-        max_seq_len=11,
+        max_seq_len=21,
     ).eval()
 
 
@@ -66,7 +68,7 @@ def test_target_regions_cover_each_joint_once():
 def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite():
     model = _model()
     values = _conditioning(cold_start=True)
-    hidden = torch.randn(2, 144)
+    hidden = torch.randn(2, 11, 144)
     timestep = torch.tensor([1, 2])
     prepared = model.prepare_conditioning(**values)
     direct, direct_aux = model(hidden, timestep, **values, return_aux_outputs=True)
@@ -77,9 +79,9 @@ def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite()
         return_aux_outputs=True,
     )
     torch.testing.assert_close(direct, cached)
-    torch.testing.assert_close(direct_aux["future_leg"], cached_aux["future_leg"])
-    assert direct.shape == (2, 144)
-    assert direct_aux["future_leg"].shape == (2, 3, 8, 6)
+    torch.testing.assert_close(direct_aux["contact_logits"], cached_aux["contact_logits"])
+    assert direct.shape == (2, 11, 144)
+    assert set(direct_aux) == {"contact_logits"}
     assert direct_aux["contact_logits"].shape == (2, 2)
     assert torch.isfinite(direct).all()
 
@@ -97,13 +99,13 @@ def test_history_and_current_use_independent_input_projections_once():
         ),
     ]
     try:
-        model(torch.randn(1, 144), torch.ones(1), **values)
+        model(torch.randn(1, 11, 144), torch.ones(1), **values)
     finally:
         for handle in handles:
             handle.remove()
     assert inputs == {
         "history": [torch.Size([1, 10, 24, 6])],
-        "current": [torch.Size([1, 24, 6])],
+        "current": [torch.Size([1, 11, 24, 6])],
     }
 
 
@@ -142,14 +144,16 @@ def test_head_path_and_history_pose_are_independent_conditions():
 
 def test_temporal_mask_is_prefix_bidirectional_and_ignores_padding_keys():
     model = _model()
-    valid = torch.tensor([[False, False, True, True, True, True, True, True, True, True, True]])
-    mask = model._temporal_mask(valid, joint_count=24).reshape(1, 24, 8, 11, 11)
-    # 当前帧读取全部有效历史与自己；有效历史双向互读，但不能读取当前帧。
-    assert not mask[0, 0, 0, -1, 2:].any()
+    valid = torch.tensor([[False, False] + [True] * 19])
+    mask = model._temporal_mask(valid, joint_count=24).reshape(1, 24, 8, 21, 21)
+    # 历史 query 不能读取目标；目标 query 可双向读取整个目标窗口。
+    assert mask[0, 0, 0, 5, 10:].all()
+    assert not mask[0, 0, 0, 10, 2:].any()
+    assert not mask[0, 0, 0, 20, 10:].any()
     assert not mask[0, 0, 0, 5, 6]
     assert not mask[0, 0, 0, 6, 5]
-    assert mask[0, 0, 0, 5, -1]
-    assert mask[0, 0, 0, -1, :2].all()
+    assert mask[0, 0, 0, 5, 10]
+    assert mask[0, 0, 0, 10, :2].all()
     assert mask[0, 0, 0, 5, :2].all()
 
 
@@ -165,11 +169,13 @@ def test_changing_current_token_does_not_change_history_block_rows():
         lambda _module, _args, output: captured.append(output.detach().clone())
     )
     try:
-        model(torch.zeros(1, 144), torch.ones(1), **values)
-        model(torch.full((1, 144), 10.0), torch.ones(1), **values)
+        model(torch.zeros(1, 11, 144), torch.ones(1), **values)
+        changed = torch.zeros(1, 11, 144)
+        changed[:, 0] = 10.0
+        model(changed, torch.ones(1), **values)
     finally:
         handle.remove()
-    torch.testing.assert_close(captured[0][:, :-1], captured[1][:, :-1])
+    torch.testing.assert_close(captured[0][:, :10], captured[1][:, :10])
 
 
 def test_current_loss_backpropagates_into_history_input_projection():
@@ -180,44 +186,40 @@ def test_current_loss_backpropagates_into_history_input_projection():
         model.blocks[0].adaln_modulation[-1].bias[
             5 * latent_dim : 6 * latent_dim
         ].fill_(1.0)
-    output = model(torch.randn(1, 144), torch.ones(1), **values)
-    output.square().mean().backward()
+    output = model(torch.randn(1, 11, 144), torch.ones(1), **values)
+    output[:, 0].square().mean().backward()
     gradient = model.history_pose_input.weight.grad
     assert gradient is not None
     assert torch.linalg.norm(gradient) > 0.0
 
 
-def test_prior_gate_is_complementary_and_region_specific():
+def test_token_and_tracker_condition_masks_have_independent_semantics():
     model = _model()
-    stable = _conditioning(batch_size=1)
-    stable_prepared = model.prepare_conditioning(**stable)
-    torch.testing.assert_close(
-        stable_prepared.prior_gate_joint[:, :-1],
-        torch.ones_like(stable_prepared.prior_gate_joint[:, :-1]),
-    )
-    torch.testing.assert_close(
-        stable_prepared.prior_gate_joint[:, -1],
-        torch.full_like(stable_prepared.prior_gate_joint[:, -1], 0.1),
-    )
+    prepared = model.prepare_conditioning(**_conditioning(batch_size=1, cold_start=True))
+    assert prepared.token_valid_mask.shape == (1, 21)
+    assert not prepared.token_valid_mask[:, :10].any()
+    assert prepared.token_valid_mask[:, 10:].all()
+    assert prepared.tracker_condition_valid_mask[:, 10]
+    assert not prepared.tracker_condition_valid_mask[:, 11:].any()
+    assert torch.count_nonzero(prepared.observation.state_tokens[:, 11:]) == 0
 
-    missing = {name: value.clone() for name, value in stable.items()}
-    missing["tracker_window"][:, :, 1, 10] = 0.0
-    missing["tracker_window"][:, :, 1, 12] = 0.0
-    missing_prepared = model.prepare_conditioning(**missing)
-    left_arm_joint = int(torch.nonzero(model.joint_regions == 1)[0])
-    right_arm_joint = int(torch.nonzero(model.joint_regions == 2)[0])
-    torch.testing.assert_close(
-        missing_prepared.prior_gate_joint[:, :-1, left_arm_joint],
-        torch.ones(1, 10),
-    )
-    torch.testing.assert_close(
-        missing_prepared.prior_gate_joint[:, -1, left_arm_joint],
-        torch.ones(1),
-    )
-    torch.testing.assert_close(
-        missing_prepared.prior_gate_joint[:, -1, right_arm_joint],
-        torch.full((1,), 0.1),
-    )
+
+def test_future_tokens_and_temporal_attention_receive_finite_nonzero_gradients():
+    model = _model().train()
+    values = _conditioning(batch_size=1)
+    with torch.no_grad():
+        latent_dim = model.latent_dim
+        model.blocks[0].adaln_modulation[-1].bias[
+            5 * latent_dim : 6 * latent_dim
+        ].fill_(1.0)
+    hidden = torch.randn(1, 11, 144, requires_grad=True)
+    output = model(hidden, torch.ones(1), **values)
+    output[:, 1:].square().mean().backward()
+    assert torch.isfinite(hidden.grad).all()
+    assert torch.linalg.norm(hidden.grad[:, 1:]) > 0.0
+    gradient = model.blocks[0].temporal_attention.in_proj_weight.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert torch.linalg.norm(gradient) > 0.0
 
 
 def test_history_noise_only_changes_valid_history_in_so3_space():
@@ -281,7 +283,7 @@ def test_model_rejects_unknown_constructor_and_forward_arguments():
 
     model = _model()
     with pytest.raises(TypeError):
-        model(torch.randn(1, 144), torch.ones(1), obsolete_argument=True)
+        model(torch.randn(1, 11, 144), torch.ones(1), obsolete_argument=True)
 
 
 def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
@@ -312,7 +314,7 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "head_path_window": torch.zeros(1, 11, 5),
         "history_region_confidence": torch.zeros(1, 10, 5),
         "window_valid_mask": torch.ones(1, 11, dtype=torch.bool),
-        "frame_offsets": torch.zeros(1, 11, dtype=torch.long),
+        "frame_offsets": torch.zeros(1, 21, dtype=torch.long),
         "tracker_window_raw": torch.zeros(1, 11, 6, 13),
         "hard_rotation_state_window": torch.zeros(1, 11, 6, dtype=torch.bool),
         "target_joints_head_ref": torch.zeros(1, 24, 3),
@@ -320,7 +322,6 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "target_root_position_head_ref": torch.zeros(1, 3),
         "target_root_yaw_world": torch.zeros(1),
         "current_head_yaw_world": torch.zeros(1),
-        "future_leg_target": torch.zeros(1, 3, 8, 6),
         "previous_contact_target": torch.zeros(1, 2),
         "contact_target": torch.zeros(1, 2),
     }
@@ -332,7 +333,7 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
     assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
 
 
-def test_training_boundary_only_passes_current_frame_to_diffusion():
+def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
     class CapturingDiffusion:
         def __init__(self) -> None:
             self.targets: list[torch.Tensor] = []
@@ -360,5 +361,5 @@ def test_training_boundary_only_passes_current_frame_to_diffusion():
     batch["history_pose_observation"].add_(100.0)
     loop.compute_losses(batch, torch.ones(2, dtype=torch.long))
 
-    torch.testing.assert_close(loop.diffusion.targets[0], sample_window[:, -1])
-    torch.testing.assert_close(loop.diffusion.targets[1], sample_window[:, -1])
+    torch.testing.assert_close(loop.diffusion.targets[0], sample_window)
+    torch.testing.assert_close(loop.diffusion.targets[1], sample_window)

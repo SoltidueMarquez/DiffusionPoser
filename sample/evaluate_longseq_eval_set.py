@@ -28,6 +28,7 @@ from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
     TRACKER_PATTERN_CATEGORIES,
 )
 from data_loaders.tracker_timeline import (
@@ -155,41 +156,7 @@ def rollout_long_sequence_source(
         projected_ddim_mode=projected_ddim_mode,
         projected_ddim_late_steps=projected_ddim_late_steps,
     )
-    values: dict[str, list] = {
-        name: []
-        for name in (
-            "reference_target_raw",
-            "raw_pred_target_raw",
-            "deployed_pred_target_raw",
-            "reference_body_local_delta_6d",
-            "predicted_body_local_delta_6d",
-            "reference_joints_world",
-            "predicted_joints_world",
-            "reference_root_position_world",
-            "predicted_root_position_world",
-            "reference_root_yaw_world",
-            "predicted_root_yaw_world",
-            "reference_hip_height",
-            "predicted_hip_height",
-            "tracker_pos_world",
-            "tracker_rot_world_6d",
-            "current_tracker_raw",
-            "configured",
-            "measured_valid",
-            "d_off",
-            "d_on",
-            "hard_rotation_state",
-            "history_length",
-            "contact_target",
-            "contact_logits",
-            "future_leg_prediction",
-            "future_leg_target",
-            "scenario",
-            "hard_rotation_max_error",
-            "sampling_latency_ms",
-            "e2e_latency_ms",
-        )
-    }
+    values = _new_rollout_values()
     frame_indices = range(frame_count)
     if show_progress:
         frame_indices = tqdm(
@@ -218,80 +185,20 @@ def rollout_long_sequence_source(
             total_elapsed = (time.perf_counter() - frame_started) * 1000.0
         else:
             elapsed = total_elapsed = float("nan")
-        resolved = step.resolved_pose
-        reference_target = build_pose_target_np(
-            joint_rotations_world[frame_index : frame_index + 1],
-            runtime.previous_head_yaw,
-        )[0]
-        values["reference_target_raw"].append(reference_target)
-        values["raw_pred_target_raw"].append(step.raw_pred_xstart)
-        values["deployed_pred_target_raw"].append(step.deployed_pred_xstart)
-        values["reference_body_local_delta_6d"].append(
-            source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][frame_index]
+        _append_rollout_frame(
+            values=values,
+            source=source,
+            timeline=timeline,
+            runtime=runtime,
+            joint_rotations_world=joint_rotations_world,
+            frame_index=frame_index,
+            history_length=history_length,
+            step=step,
+            sampling_latency_ms=elapsed,
+            e2e_latency_ms=total_elapsed,
         )
-        values["predicted_body_local_delta_6d"].append(resolved.body_local_delta_6d)
-        values["reference_joints_world"].append(source["joints_world"][frame_index])
-        values["predicted_joints_world"].append(resolved.joints_world)
-        values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
-        values["predicted_root_position_world"].append(resolved.root_position_world)
-        values["reference_root_yaw_world"].append(
-            float(extract_rotation_heading_np(joint_rotations_world[frame_index, 0]))
-        )
-        values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
-        values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
-        values["predicted_hip_height"].append(resolved.hip_height)
-        for name in ("tracker_pos_world", "tracker_rot_world_6d"):
-            values[name].append(source[name][frame_index])
-        values["current_tracker_raw"].append(step.current_tracker_raw)
-        for name in ("configured", "measured_valid"):
-            values[name].append(getattr(timeline, name)[frame_index])
-        values["d_off"].append(runtime.previous_d_off.copy())
-        values["d_on"].append(runtime.previous_d_on.copy())
-        values["hard_rotation_state"].append(step.hard_rotation_state)
-        values["history_length"].append(history_length)
-        values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
-        values["contact_logits"].append(
-            np.full(2, np.nan, dtype=np.float32)
-            if step.contact_logits is None
-            else step.contact_logits
-        )
-        values["future_leg_prediction"].append(
-            np.full((3, 8, 6), np.nan, dtype=np.float32)
-            if step.future_leg_prediction is None
-            else step.future_leg_prediction
-        )
-        if frame_index + 3 < frame_count:
-            future_pose = build_pose_target_np(
-                joint_rotations_world[frame_index + 1 : frame_index + 4],
-                runtime.previous_head_yaw,
-            ).reshape(3, 24, 6)
-            values["future_leg_target"].append(
-                future_pose[:, np.asarray([1, 4, 7, 10, 2, 5, 8, 11])]
-            )
-        else:
-            values["future_leg_target"].append(np.full((3, 8, 6), np.nan, dtype=np.float32))
-        values["scenario"].append(_classify_timeline_frame(timeline, frame_index))
-        values["hard_rotation_max_error"].append(resolved.hard_rotation_max_error)
-        values["sampling_latency_ms"].append(elapsed)
-        values["e2e_latency_ms"].append(total_elapsed)
 
-    payload = {
-        name: np.asarray(items, dtype=np.float32 if name not in {
-            "configured", "measured_valid", "hard_rotation_state", "scenario"
-        } else None)[None]
-        for name, items in values.items()
-    }
-    payload["configured"] = payload["configured"].astype(bool)
-    payload["measured_valid"] = payload["measured_valid"].astype(bool)
-    payload["hard_rotation_state"] = payload["hard_rotation_state"].astype(bool)
-    payload["d_off"] = payload["d_off"].astype(np.int64)
-    payload["d_on"] = payload["d_on"].astype(np.int64)
-    payload["history_length"] = payload["history_length"].astype(np.int64)
-    payload["scenario"] = np.asarray(values["scenario"])[None]
-    payload["fps"] = np.float32(60.0)
-    payload["absolute_frame_index"] = np.arange(frame_count, dtype=np.int64)
-    payload["eval_frame_mask"] = np.ones((1, frame_count), dtype=bool)
-    return payload
+    return _finalize_rollout_values(values, frame_count)
 
 
 def rollout_long_sequence_sources(
@@ -380,6 +287,7 @@ def rollout_long_sequence_sources(
                 if diffusion_noise_mode == "fixed_sequence":
                     if fixed_noise[index] is None:
                         fixed_noise[index] = torch.randn(
+                            REALTIME_POSE_TARGET_LENGTH,
                             REALTIME_POSE_TARGET_DIM,
                             generator=noise_generators[index],
                             device=device,
@@ -387,6 +295,7 @@ def rollout_long_sequence_sources(
                     value = fixed_noise[index]
                 else:
                     innovation = torch.randn(
+                        REALTIME_POSE_TARGET_LENGTH,
                         REALTIME_POSE_TARGET_DIM,
                         generator=noise_generators[index],
                         device=device,
@@ -466,6 +375,10 @@ def _new_rollout_values() -> dict[str, list]:
             "reference_target_raw",
             "raw_pred_target_raw",
             "deployed_pred_target_raw",
+            "reference_pose_horizon_raw",
+            "raw_pred_pose_horizon_raw",
+            "deployed_pred_pose_horizon_raw",
+            "pose_horizon_valid_mask",
             "reference_body_local_delta_6d",
             "predicted_body_local_delta_6d",
             "reference_joints_world",
@@ -487,8 +400,6 @@ def _new_rollout_values() -> dict[str, list]:
             "history_length",
             "contact_target",
             "contact_logits",
-            "future_leg_prediction",
-            "future_leg_target",
             "scenario",
             "hard_rotation_max_error",
             "sampling_latency_ms",
@@ -510,13 +421,19 @@ def _append_rollout_frame(
     e2e_latency_ms: float,
 ) -> None:
     resolved = step.resolved_pose
-    reference_target = build_pose_target_np(
-        joint_rotations_world[frame_index : frame_index + 1],
+    reference_horizon, horizon_valid = _build_reference_pose_horizon(
+        joint_rotations_world,
+        frame_index,
         runtime.previous_head_yaw,
-    )[0]
+    )
+    reference_target = reference_horizon[0]
     values["reference_target_raw"].append(reference_target)
-    values["raw_pred_target_raw"].append(step.raw_pred_xstart)
-    values["deployed_pred_target_raw"].append(step.deployed_pred_xstart)
+    values["raw_pred_target_raw"].append(step.raw_pred_pose_horizon[0])
+    values["deployed_pred_target_raw"].append(step.deployed_pred_pose_horizon[0])
+    values["reference_pose_horizon_raw"].append(reference_horizon)
+    values["raw_pred_pose_horizon_raw"].append(step.raw_pred_pose_horizon)
+    values["deployed_pred_pose_horizon_raw"].append(step.deployed_pred_pose_horizon)
+    values["pose_horizon_valid_mask"].append(horizon_valid)
     values["reference_body_local_delta_6d"].append(
         source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][frame_index]
     )
@@ -546,22 +463,6 @@ def _append_rollout_frame(
         if step.contact_logits is None
         else step.contact_logits
     )
-    values["future_leg_prediction"].append(
-        np.full((3, 8, 6), np.nan, dtype=np.float32)
-        if step.future_leg_prediction is None
-        else step.future_leg_prediction
-    )
-    frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
-    if frame_index + 3 < frame_count:
-        future_pose = build_pose_target_np(
-            joint_rotations_world[frame_index + 1 : frame_index + 4],
-            runtime.previous_head_yaw,
-        ).reshape(3, 24, 6)
-        values["future_leg_target"].append(
-            future_pose[:, np.asarray([1, 4, 7, 10, 2, 5, 8, 11])]
-        )
-    else:
-        values["future_leg_target"].append(np.full((3, 8, 6), np.nan, dtype=np.float32))
     values["scenario"].append(_classify_timeline_frame(timeline, frame_index))
     values["hard_rotation_max_error"].append(resolved.hard_rotation_max_error)
     values["sampling_latency_ms"].append(sampling_latency_ms)
@@ -574,13 +475,24 @@ def _finalize_rollout_values(values: dict[str, list], frame_count: int) -> dict[
             items,
             dtype=(
                 np.float32
-                if name not in {"configured", "measured_valid", "hard_rotation_state", "scenario"}
+                if name not in {
+                    "configured",
+                    "measured_valid",
+                    "hard_rotation_state",
+                    "pose_horizon_valid_mask",
+                    "scenario",
+                }
                 else None
             ),
         )[None]
         for name, items in values.items()
     }
-    for name in ("configured", "measured_valid", "hard_rotation_state"):
+    for name in (
+        "configured",
+        "measured_valid",
+        "hard_rotation_state",
+        "pose_horizon_valid_mask",
+    ):
         payload[name] = payload[name].astype(bool)
     payload["d_off"] = payload["d_off"].astype(np.int64)
     payload["d_on"] = payload["d_on"].astype(np.int64)
@@ -590,6 +502,30 @@ def _finalize_rollout_values(values: dict[str, list], frame_count: int) -> dict[
     payload["absolute_frame_index"] = np.arange(frame_count, dtype=np.int64)
     payload["eval_frame_mask"] = np.ones((1, frame_count), dtype=bool)
     return payload
+
+
+def _build_reference_pose_horizon(
+    joint_rotations_world: np.ndarray,
+    frame_index: int,
+    current_head_yaw: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """将当前及未来目标统一表达在当前帧 Head-yaw 参考系中。"""
+
+    frame_count = int(joint_rotations_world.shape[0])
+    valid_count = min(REALTIME_POSE_TARGET_LENGTH, frame_count - frame_index)
+    horizon = np.full(
+        (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
+        np.nan,
+        dtype=np.float32,
+    )
+    valid = np.zeros(REALTIME_POSE_TARGET_LENGTH, dtype=bool)
+    if valid_count > 0:
+        horizon[:valid_count] = build_pose_target_np(
+            joint_rotations_world[frame_index : frame_index + valid_count],
+            current_head_yaw,
+        )
+        valid[:valid_count] = True
+    return horizon, valid
 
 
 def _classify_timeline_frame(timeline: TrackerTimeline, frame_index: int) -> str:

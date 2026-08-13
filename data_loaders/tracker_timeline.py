@@ -9,6 +9,7 @@ from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
+    REALTIME_POSE_FUTURE_FRAME_COUNT,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_START,
     SCENARIO_FIXED_SIX,
@@ -162,7 +163,11 @@ def build_source_scenario_events(
 ) -> list[dict]:
     """构造所有动态场景共用的绝对事件锚点；同一 source 重复调用结果一致。"""
 
-    last_target = int(frame_count) - int(max_rollout_steps) - 3
+    last_target = (
+        int(frame_count)
+        - int(max_rollout_steps)
+        - REALTIME_POSE_FUTURE_FRAME_COUNT
+    )
     if last_target < REALTIME_POSE_TARGET_START:
         return []
     rng = np.random.Generator(np.random.PCG64(stable_source_seed(source_id, global_seed)))
@@ -229,7 +234,13 @@ def candidate_source_window_starts_by_phase(
             start = target - REALTIME_POSE_TARGET_START
             if start < 0 or not _event_accepts_target(event, target):
                 continue
-            if target + int(max_rollout_steps) - 1 + 3 >= int(frame_count):
+            if (
+                target
+                + int(max_rollout_steps)
+                - 1
+                + REALTIME_POSE_FUTURE_FRAME_COUNT
+                >= int(frame_count)
+            ):
                 continue
             starts[phase].append(start)
     return {phase: sorted(set(values)) for phase, values in starts.items()}
@@ -266,7 +277,7 @@ def _event_accepts_target(event: dict, target_frame: int) -> bool:
 
 def materialize_task_configurations(
     config_plans: list[dict],
-    frame_count: int = REALTIME_POSE_SEQ_LEN + 3,
+    frame_count: int = REALTIME_POSE_SEQ_LEN + REALTIME_POSE_FUTURE_FRAME_COUNT,
     duration_prefix: int = 60,
     reliability_config: TrackerReliabilityConfig | None = None,
     absolute_start_frame: int = 0,

@@ -12,10 +12,12 @@ from data_loaders.realtime_pose_geometry import assemble_tracker_features_np
 from data_loaders.realtime_pose_task_store import ShardReader, discover_shards
 from data_loaders.sensor_masking import (
     REALTIME_POSE_FRAME_OFFSETS,
+    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_HISTORY_ANCHOR_INDICES,
+    REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
-    REALTIME_POSE_WINDOW_LENGTH,
+    REALTIME_POSE_TARGET_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_PATTERN_CATEGORIES,
@@ -31,7 +33,8 @@ from utils.normalizer import RealtimePoseNormalizer
 
 
 TASK_SHARD_FIELDS = (
-    "pose_window_clean",
+    "history_pose_clean",
+    "pose_target_horizon_clean",
     "tracker_window_continuous",
     "head_path_window",
     "configured",
@@ -43,7 +46,6 @@ TASK_SHARD_FIELDS = (
     "current_head_yaw_world",
     "current_head_position_world",
     "floor_y",
-    "future_leg_target",
     "previous_contact_target",
     "contact_target",
     "joint_offsets_parent",
@@ -51,6 +53,8 @@ TASK_SHARD_FIELDS = (
     "task_seed",
     "start_frame",
 )
+
+LEGACY_TASK_SHARD_FIELDS = ("pose_window_clean", "future_leg_target")
 
 
 @dataclass(frozen=True)
@@ -61,7 +65,7 @@ class TaskRequest:
 
 
 class RealtimePoseTaskDataset(Dataset):
-    """从 mmap task store 读取同步的 10 帧历史和 1 帧当前目标。"""
+    """从 mmap task store 读取 10 个历史条件和当前到未来 10 帧目标。"""
 
     def __init__(
         self,
@@ -75,6 +79,16 @@ class RealtimePoseTaskDataset(Dataset):
         self.data_dir = Path(data_dir).resolve()
         self.split = str(split)
         self.split_dir = self.data_dir / self.split
+        legacy_paths = [
+            path
+            for name in LEGACY_TASK_SHARD_FIELDS
+            for path in (self.split_dir / "shards").glob(f"shard_*/{name}.npy")
+        ]
+        if legacy_paths:
+            raise ValueError(
+                "检测到旧单帧 Task Store 字段，必须重新生成联合 11 帧 Task Store："
+                + ", ".join(str(path) for path in legacy_paths[:4])
+            )
         self.shards = discover_shards(self.split_dir, TASK_SHARD_FIELDS)
         self.normalizer = create_normalizer(normalizer_dir, bool(normalize_input))
 
@@ -179,7 +193,11 @@ class RealtimePoseTaskDataset(Dataset):
             shard["tracker_window_continuous"][row_index], dtype=np.float32
         ).copy()
         tracker_raw = np.zeros(
-            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+            (
+                REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+                TRACKER_COUNT,
+                TRACKER_FEATURE_DIM,
+            ),
             dtype=np.float32,
         )
         tracker_raw[window_valid] = assemble_tracker_features_np(
@@ -189,23 +207,30 @@ class RealtimePoseTaskDataset(Dataset):
             d_off[window_valid],
             d_on[window_valid],
         )
-        pose_window_raw = np.asarray(
-            shard["pose_window_clean"][row_index], dtype=np.float32
+        history_pose_raw = np.asarray(
+            shard["history_pose_clean"][row_index], dtype=np.float32
+        ).copy()
+        pose_target_horizon_raw = np.asarray(
+            shard["pose_target_horizon_clean"][row_index], dtype=np.float32
         ).copy()
         head_path_raw = np.asarray(
             shard["head_path_window"][row_index], dtype=np.float32
         ).copy()
         if self.normalizer is None:
-            pose_window = pose_window_raw
+            history_pose = history_pose_raw
+            pose_target_horizon = pose_target_horizon_raw
             tracker_window = tracker_raw
             head_path_window = head_path_raw
         else:
-            pose_window = self.normalizer.normalize_pose(pose_window_raw)
+            history_pose = self.normalizer.normalize_pose(history_pose_raw)
+            pose_target_horizon = self.normalizer.normalize_pose(
+                pose_target_horizon_raw
+            )
             tracker_window = self.normalizer.normalize_tracker(tracker_raw)
             head_path_window = self.normalizer.normalize_head_path(head_path_raw)
 
         # 归一化后再清零，确保 padding 在模型输入中仍是字面零。
-        pose_window[~window_valid] = 0.0
+        history_pose[~window_valid[:-1]] = 0.0
         tracker_window[~window_valid] = 0.0
         head_path_window[~window_valid] = 0.0
         kappa_pos, kappa_rot = compute_tracker_reliability_np(
@@ -218,8 +243,8 @@ class RealtimePoseTaskDataset(Dataset):
         start_frame = int(shard["start_frame"][row_index])
         task_seed = int(shard["task_seed"][row_index])
         result: dict[str, Any] = {
-            "x": torch.from_numpy(pose_window).float(),
-            "history_pose_observation": torch.from_numpy(pose_window[:-1].copy()).float(),
+            "x": torch.from_numpy(pose_target_horizon).float(),
+            "history_pose_observation": torch.from_numpy(history_pose).float(),
             "tracker_window": torch.from_numpy(tracker_window).float(),
             "head_path_window": torch.from_numpy(head_path_window).float(),
             "history_region_confidence": torch.from_numpy(history_confidence).float(),
@@ -255,9 +280,6 @@ class RealtimePoseTaskDataset(Dataset):
                 ).copy()
             ).float(),
             "floor_y": torch.tensor(float(shard["floor_y"][row_index]), dtype=torch.float32),
-            "future_leg_target": torch.from_numpy(
-                np.asarray(shard["future_leg_target"][row_index], dtype=np.float32).copy()
-            ).float(),
             "previous_contact_target": torch.from_numpy(
                 np.asarray(
                     shard["previous_contact_target"][row_index], dtype=np.float32

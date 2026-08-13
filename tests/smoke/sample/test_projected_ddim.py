@@ -31,7 +31,7 @@ def _tracker(batch_size: int = 2) -> torch.Tensor:
 
 def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
     torch.manual_seed(1)
-    raw = torch.randn(2, 144)
+    raw = torch.randn(2, 11, 144)
     tracker = _tracker()
     hard = torch.zeros(2, 6, dtype=torch.bool)
     hard[:, 0] = True
@@ -39,25 +39,29 @@ def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     repeated = project_realtime_pose_xstart(deployed, tracker, hard)
     torch.testing.assert_close(deployed, repeated, atol=1e-5, rtol=1e-5)
-    rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 24, 6))
+    rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 11, 24, 6))
     identity = torch.eye(3).expand_as(rotations)
     torch.testing.assert_close(rotations.transpose(-1, -2) @ rotations, identity, atol=1e-5, rtol=1e-5)
     assert torch.all(torch.linalg.det(rotations) > 0.9999)
     for tracker_index in (0, 3):
         joint_index = TRACKER_TO_JOINT[tracker_index]
         torch.testing.assert_close(
-            deployed[:, joint_index * 6 : joint_index * 6 + 6],
+            deployed[:, 0, joint_index * 6 : joint_index * 6 + 6],
             tracker[:, tracker_index, 3:9],
         )
     head_joint = TRACKER_TO_JOINT[0]
     torch.testing.assert_close(
-        deployed[:, head_joint * 6 : head_joint * 6 + 6],
+        deployed[:, 0, head_joint * 6 : head_joint * 6 + 6],
+        tracker[:, 0, 3:9],
+    )
+    assert not torch.allclose(
+        deployed[:, 1, head_joint * 6 : head_joint * 6 + 6],
         tracker[:, 0, 3:9],
     )
 
 
 def test_soft_tracker_is_not_replaced():
-    raw = project_rotation_6d_to_so3(torch.randn(1, 24, 6)).reshape(1, 144)
+    raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
     tracker = _tracker(batch_size=1)
     tracker[:, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
     hard = torch.zeros(1, 6, dtype=torch.bool)
@@ -65,15 +69,15 @@ def test_soft_tracker_is_not_replaced():
     deployed = project_realtime_pose_xstart(raw, tracker, hard)
     wrist = TRACKER_TO_JOINT[1]
     torch.testing.assert_close(
-        deployed[:, wrist * 6 : wrist * 6 + 6],
-        raw[:, wrist * 6 : wrist * 6 + 6],
+        deployed[:, 0, wrist * 6 : wrist * 6 + 6],
+        raw[:, 0, wrist * 6 : wrist * 6 + 6],
     )
 
 
-def test_projection_rejects_window_shaped_state():
+def test_projection_rejects_legacy_single_frame_state():
     with torch.no_grad(), np.testing.assert_raises(ValueError):
         project_realtime_pose_xstart(
-            torch.zeros(1, 11, 144),
+            torch.zeros(1, 144),
             torch.zeros(1, 6, 13),
             torch.zeros(1, 6, dtype=torch.bool),
         )
@@ -95,7 +99,6 @@ class _AuxiliaryXStart(_ConstantXStart):
         if not return_aux_outputs:
             return value
         return value, {
-            "future_leg": torch.zeros(x.shape[0], 3, 8, 6, device=x.device),
             "contact_logits": torch.ones(x.shape[0], 2, device=x.device),
         }
 
@@ -136,12 +139,15 @@ def test_projected_ddim_returns_final_auxiliary_heads():
         loss_type=LossType.MSE,
     )
     result = diffusion.projected_ddim_sample_loop(
-        _AuxiliaryXStart(torch.zeros(1, 4)),
-        shape=(1, 4),
+        _AuxiliaryXStart(torch.zeros(1, 11, 144)),
+        shape=(1, 11, 144),
         projection_fn=lambda value: value,
         device=torch.device("cpu"),
     )
-    assert result["auxiliary_outputs"]["future_leg"].shape == (1, 3, 8, 6)
+    assert result["sample"].shape == (1, 11, 144)
+    assert result["raw_pred_xstart"].shape == (1, 11, 144)
+    assert result["deployed_pred_xstart"].shape == (1, 11, 144)
+    assert set(result["auxiliary_outputs"]) == {"contact_logits"}
     assert result["auxiliary_outputs"]["contact_logits"].shape == (1, 2)
 
 

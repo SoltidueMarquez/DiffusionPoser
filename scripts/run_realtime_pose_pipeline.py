@@ -109,7 +109,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--head_ref_joint_distance_loss_weight", default=1.0, type=float
     )
     train.add_argument("--head_to_root_xz_loss_weight", default=1.0, type=float)
-    train.add_argument("--future_leg_loss_weight", default=0.5, type=float)
+    train.add_argument("--rotation_velocity_loss_weight", default=1.0, type=float)
     train.add_argument("--contact_loss_weight", default=0.1, type=float)
     train.add_argument("--contact_slide_loss_weight", default=0.1, type=float)
     return parser
@@ -275,7 +275,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--head_ref_joint_distance_loss_weight",
         str(args.head_ref_joint_distance_loss_weight),
         "--head_to_root_xz_loss_weight", str(args.head_to_root_xz_loss_weight),
-        "--future_leg_loss_weight", str(args.future_leg_loss_weight),
+        "--rotation_velocity_loss_weight", str(args.rotation_velocity_loss_weight),
         "--contact_loss_weight", str(args.contact_loss_weight),
         "--contact_slide_loss_weight", str(args.contact_slide_loss_weight),
     ]

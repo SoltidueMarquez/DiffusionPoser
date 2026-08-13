@@ -49,7 +49,7 @@ class RealtimePoseLossWeights:
     root: float = 1.0
     head_ref_joint_distance: float = 1.0
     head_to_root_xz: float = 1.0
-    future_leg: float = 0.5
+    rotation_velocity: float = 1.0
     contact: float = 0.1
     contact_slide: float = 0.1
 

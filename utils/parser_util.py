@@ -9,7 +9,7 @@ from data_loaders.sensor_masking import (
     DEFAULT_SCENARIO_WEIGHTS,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_WINDOW_LENGTH,
+    REALTIME_POSE_MODEL_TOKEN_LENGTH,
     TASK_MODE_REALTIME_POSE,
     TASK_MODES,
 )
@@ -51,6 +51,11 @@ def parse_and_load_from_model(parser: ArgumentParser, argv: list[str] | None = N
     checkpoint_args = load_args_json(Path(model_path))
     if not checkpoint_args:
         return args
+    if (
+        int(checkpoint_args.get("max_seq_len", -1)) != REALTIME_POSE_MODEL_TOKEN_LENGTH
+        or "future_leg_loss_weight" in checkpoint_args
+    ):
+        raise ValueError("单帧 checkpoint 与联合 11 帧模型不兼容，不能用于采样或评估。")
 
     ignore_keys = set(ignore_keys or set())
     for key, value in checkpoint_args.items():
@@ -125,7 +130,7 @@ def add_model_options(parser: ArgumentParser):
     group.add_argument("--latent_dim", default=512, type=int)
     group.add_argument("--dropout", default=0.0, type=float)
     group.add_argument("--zero_init", action="store_true")
-    group.add_argument("--max_seq_len", default=REALTIME_POSE_WINDOW_LENGTH, type=int)
+    group.add_argument("--max_seq_len", default=REALTIME_POSE_MODEL_TOKEN_LENGTH, type=int)
     group.add_argument(
         "--model_arch",
         default="spatiotemporal_dit",
@@ -176,7 +181,11 @@ def add_training_options(parser: ArgumentParser):
         type=float,
     )
     group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
-    group.add_argument("--future_leg_loss_weight", default=_LOSS_DEFAULTS.future_leg, type=float)
+    group.add_argument(
+        "--rotation_velocity_loss_weight",
+        default=_LOSS_DEFAULTS.rotation_velocity,
+        type=float,
+    )
     group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
     group.add_argument("--contact_slide_loss_weight", default=_LOSS_DEFAULTS.contact_slide, type=float)
     group.add_argument("--history_noise_prob", default=0.8, type=float)

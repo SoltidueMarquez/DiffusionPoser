@@ -17,7 +17,7 @@ from data_loaders.generate_realtime_pose_tasks import (
     load_realtime_source,
 )
 from data_loaders.realtime_pose_kinematics import SMPL_JOINT_NAMES
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
 from data_loaders.tracker_timeline import (
     build_isolated_condition_timeline,
     stable_context_seed,
@@ -216,7 +216,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     warmup_generator = torch.Generator(device=device).manual_seed(warmup_seed)
     for index in tqdm(range(frame_index), desc="repeat diagnostic warmup", unit="frame"):
         noise = torch.randn(
-            (1, REALTIME_POSE_TARGET_DIM), generator=warmup_generator, device=device
+            (1, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
+            generator=warmup_generator,
+            device=device,
         )
         step_realtime_pose_batch(
             [runtime],
@@ -232,7 +234,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     clones = [_clone_runtime_state(runtime) for _ in range(repeat_count)]
     repeat_generator = torch.Generator(device=device).manual_seed(int(args.seed) + 9137)
     repeat_noise = torch.randn(
-        (repeat_count, REALTIME_POSE_TARGET_DIM),
+        (repeat_count, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
         generator=repeat_generator,
         device=device,
     )
@@ -265,8 +267,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     root_yaw = np.asarray([step.resolved_pose.root_yaw_world for step in steps])
     root_position = np.stack([step.resolved_pose.root_position_world for step in steps])
     hip_height = np.asarray([step.resolved_pose.hip_height for step in steps])
-    raw_target = np.stack([step.raw_pred_xstart for step in steps])
-    deployed_target = np.stack([step.deployed_pred_xstart for step in steps])
+    raw_horizon = np.stack([step.raw_pred_pose_horizon for step in steps])
+    deployed_horizon = np.stack([step.deployed_pred_pose_horizon for step in steps])
     reference_rotations = compute_source_joint_rotations_world(source)[frame_index]
     summary = _repeat_summary(
         rotations,
@@ -296,8 +298,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     np.savez(
         output_dir / "repeat_samples.npz",
         noise=repeat_noise.detach().cpu().numpy(),
-        raw_pred_target_raw=raw_target,
-        deployed_pred_target_raw=deployed_target,
+        raw_pred_target_raw=raw_horizon[:, 0],
+        deployed_pred_target_raw=deployed_horizon[:, 0],
+        raw_pred_pose_horizon_raw=raw_horizon,
+        deployed_pred_pose_horizon_raw=deployed_horizon,
         predicted_joint_rotations_world=rotations,
         predicted_joints_world=joints,
         predicted_root_yaw_world=root_yaw,

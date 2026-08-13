@@ -27,18 +27,32 @@ if str(EXPORT_DIR) not in sys.path:
 
 
 from data_loaders.sensor_masking import (  # noqa: E402
-    DEFAULT_REALTIME_POSE_SCHEMA_NAME,
     REALTIME_POSE_SEQ_LEN,
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
-    get_schema_spec,
 )
 from utils.model_util import create_model_and_diffusion  # noqa: E402
-from write_unity_runtime_assets import default_unity_model_dir, validate_normalizer_metadata, write_runtime_assets  # noqa: E402
+
+
+DEFAULT_REALTIME_POSE_SCHEMA_NAME = "legacy_unity_single_frame"
+
+
+def default_unity_model_dir() -> Path:
+    return (
+        DIFFUSIONPOSER_ROOT.parent
+        / "SIGGRAPH2024Unity"
+        / "Assets"
+        / "Projects"
+        / "RealtimePose"
+        / "Models"
+        / "DiffusionPoserStationary5"
+    )
 
 
 DEFAULT_MODEL_CONFIG = {
     "schema": DEFAULT_REALTIME_POSE_SCHEMA_NAME,
-    "input_feats": get_schema_spec(DEFAULT_REALTIME_POSE_SCHEMA_NAME).feature_dim,
+    "input_feats": REALTIME_POSE_TARGET_DIM,
     "seq_len": REALTIME_POSE_SEQ_LEN,
     "max_seq_len": REALTIME_POSE_SEQ_LEN,
     "layers": 8,
@@ -307,6 +321,10 @@ def check_onnx_alignment(
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     cli_args = build_arg_parser().parse_args(argv)
+    if REALTIME_POSE_TARGET_LENGTH != 1:
+        raise NotImplementedError(
+            "Unity/Sentis 尚不支持联合 11 帧扩散模型；已停止导出，避免生成形状错误的 ONNX。"
+        )
     model_path = Path(cli_args.model_path).resolve()
     output_dir = Path(cli_args.output_dir).resolve()
     normalizer_dir = Path(cli_args.normalizer_dir).resolve() if cli_args.normalizer_dir else None

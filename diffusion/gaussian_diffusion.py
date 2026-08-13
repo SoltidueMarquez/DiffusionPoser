@@ -14,7 +14,10 @@ import numpy as np
 import torch
 import torch as th
 from copy import deepcopy
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
+)
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
 from diffusion.realtime_pose_losses import compute_raw_deployed_losses
@@ -137,7 +140,7 @@ class GaussianDiffusion:
         root_loss_weight=1.0,
         head_ref_joint_distance_loss_weight=1.0,
         head_to_root_xz_loss_weight=1.0,
-        future_leg_loss_weight=0.5,
+        rotation_velocity_loss_weight=1.0,
         contact_loss_weight=0.1,
         contact_slide_loss_weight=0.1,
     ):
@@ -160,7 +163,7 @@ class GaussianDiffusion:
             head_ref_joint_distance_loss_weight
         )
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
-        self.future_leg_loss_weight = float(future_leg_loss_weight)
+        self.rotation_velocity_loss_weight = float(rotation_velocity_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
         self.contact_slide_loss_weight = float(contact_slide_loss_weight)
 
@@ -1476,12 +1479,15 @@ class GaussianDiffusion:
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """只对当前 144D 姿态加噪，并显式分离 raw/deployed x0 路径。"""
+        """对当前到未来 10 帧联合加噪，并显式分离 raw/deployed x0 路径。"""
 
-        if x_start.ndim != 2 or x_start.shape[-1] != REALTIME_POSE_TARGET_DIM:
+        if x_start.ndim != 3 or tuple(x_start.shape[1:]) != (
+            REALTIME_POSE_TARGET_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ):
             raise ValueError(
-                f"RealtimePose diffusion target 必须为当前帧 "
-                f"[B,{REALTIME_POSE_TARGET_DIM}]。"
+                "RealtimePose diffusion target 必须为当前帧和未来 10 帧 "
+                f"[B,{REALTIME_POSE_TARGET_LENGTH},{REALTIME_POSE_TARGET_DIM}]。"
             )
         if noise is None:
             noise = th.randn_like(x_start)
@@ -1521,7 +1527,9 @@ class GaussianDiffusion:
                 dtype=elementwise_loss.dtype,
             )
             if feature_weight.ndim == 1:
-                feature_weight = feature_weight[None]
+                feature_weight = feature_weight[None, None]
+            elif feature_weight.ndim == 2:
+                feature_weight = feature_weight[:, None]
             if (
                 feature_weight.shape[-1] != elementwise_loss.shape[-1]
                 or feature_weight.shape[0] not in (1, elementwise_loss.shape[0])
@@ -1531,7 +1539,7 @@ class GaussianDiffusion:
                     f"实际为 {tuple(feature_weight.shape)}"
                 )
             elementwise_loss = elementwise_loss * feature_weight
-        simple_loss = elementwise_loss.mean(dim=-1)
+        simple_loss = elementwise_loss.flatten(1).mean(dim=1)
         if snr_gamma:
             snr = compute_snr(self, t)
             weight = torch.minimum(snr, torch.full_like(snr, float(snr_gamma)))
@@ -1559,7 +1567,8 @@ class GaussianDiffusion:
             + self.head_ref_joint_distance_loss_weight
             * terms["head_ref_joint_distance_loss"]
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
-            + self.future_leg_loss_weight * terms["future_leg_loss"]
+            + self.rotation_velocity_loss_weight
+            * terms["rotation_velocity_loss"]
             + self.contact_loss_weight * terms["contact_loss"]
             + self.contact_slide_loss_weight * terms["contact_slide_loss"]
         )

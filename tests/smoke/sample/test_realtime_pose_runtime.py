@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from ema_pytorch import EMA
 
 from data_loaders.realtime_pose_config import TrackerReliabilityConfig
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
+from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
 from sample.realtime_pose_runtime import RealtimePoseRuntime, step_realtime_pose_batch
 from sample.utils import load_checkpoint_model
+from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import IDENTITY_6D, build_toy_realtime_source
 
 
@@ -44,7 +46,7 @@ class _RecordingModel(torch.nn.Module):
         assert head_path_window.shape == (batch_size, 11, 5)
         assert history_region_confidence.shape == (batch_size, 10, 5)
         assert window_valid_mask.shape == (batch_size, 11)
-        assert frame_offsets.shape == (batch_size, 11)
+        assert frame_offsets.shape == (batch_size, 21)
         self.history_valid_counts.extend(
             int(value) for value in window_valid_mask[:, :-1].sum(dim=1).cpu().tolist()
         )
@@ -65,11 +67,11 @@ class _OneStepProjectedDiffusion:
         **kwargs,
     ):
         del model, model_kwargs, kwargs
-        assert shape[1:] == (REALTIME_POSE_TARGET_DIM,)
+        assert shape[1:] == (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
         frame = torch.as_tensor(
             np.tile(IDENTITY_6D, 24), device=device, dtype=torch.float32
         )
-        raw = frame.reshape(1, REALTIME_POSE_TARGET_DIM).expand(*shape).clone()
+        raw = frame.reshape(1, 1, REALTIME_POSE_TARGET_DIM).expand(*shape).clone()
         deployed = projection_fn(raw)
         return {
             "sample": deployed,
@@ -109,8 +111,8 @@ def test_runtime_uses_60_dense_frames_and_synchronized_anchors():
     current_head_path = model.head_paths[-1][0, -1]
     torch.testing.assert_close(current_head_path[:2], torch.zeros(2))
     torch.testing.assert_close(current_head_path[3:], torch.tensor([0.0, 1.0]))
-    assert results[-1].raw_pred_xstart.shape == (144,)
-    assert results[-1].deployed_pred_xstart.shape == (144,)
+    assert results[-1].raw_pred_pose_horizon.shape == (11, 144)
+    assert results[-1].deployed_pred_pose_horizon.shape == (11, 144)
 
 
 def test_runtime_dropout_and_reconnect_preserve_duration_semantics():
@@ -186,7 +188,39 @@ def test_batched_runtime_samples_one_window_per_sequence():
     )
     assert len(results) == 2
     assert model.batch_sizes == [2]
-    assert all(result.deployed_pred_xstart.shape == (144,) for result in results)
+    assert all(result.deployed_pred_pose_horizon.shape == (11, 144) for result in results)
+
+
+def test_runtime_pushes_only_horizon_zero_into_pose_history():
+    class DistinctFutureDiffusion(_OneStepProjectedDiffusion):
+        def projected_ddim_sample_loop(self, *args, **kwargs):
+            result = super().projected_ddim_sample_loop(*args, **kwargs)
+            result["raw_pred_xstart"][:, 1:, :6] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+            )
+            result["deployed_pred_xstart"] = kwargs["projection_fn"](
+                result["raw_pred_xstart"]
+            )
+            result["sample"] = result["deployed_pred_xstart"]
+            return result
+
+    source = build_toy_realtime_source(frame_count=1)
+    runtime = RealtimePoseRuntime(
+        _RecordingModel(),
+        DistinctFutureDiffusion(),
+        torch.device("cpu"),
+        source["joint_offsets_parent"],
+        source["joint_rest_local_rotations_6d"],
+    )
+    result = _step(runtime, source, 0, np.ones(6, dtype=bool))
+    assert not np.allclose(
+        result.deployed_pred_pose_horizon[0], result.deployed_pred_pose_horizon[1]
+    )
+    np.testing.assert_allclose(
+        runtime.pose_history[-1].joint_rotations_world,
+        result.resolved_pose.joint_rotations_world,
+        atol=1e-6,
+    )
 
 
 def test_ema_checkpoint_returns_inner_model_and_runs_runtime(tmp_path):
@@ -214,5 +248,21 @@ def test_ema_checkpoint_returns_inner_model_and_runs_runtime(tmp_path):
         source["joint_rest_local_rotations_6d"],
     )
     result = _step(runtime, source, 0, np.ones(6, dtype=bool))
-    assert result.deployed_pred_xstart.shape == (144,)
+    assert result.deployed_pred_pose_horizon.shape == (11, 144)
     assert loaded_model.history_valid_counts == [0]
+
+
+def test_legacy_single_frame_checkpoint_is_rejected_explicitly(tmp_path):
+    model = RealtimePoseSpatioTemporalDiT(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=21,
+    )
+    state = model.state_dict()
+    state.pop("joint_diffusion_horizon_length")
+    state["future_leg_head.weight"] = torch.zeros(1)
+    path = tmp_path / "model000000001.pt"
+    torch.save(state, path)
+    with pytest.raises(RuntimeError, match="单帧 checkpoint 与联合 11 帧模型不兼容"):
+        load_checkpoint_model(model, path, device=torch.device("cpu"), use_ema=False)

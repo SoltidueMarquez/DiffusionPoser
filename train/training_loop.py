@@ -16,8 +16,9 @@ from data_loaders.realtime_pose_history_noise import (
 )
 
 from data_loaders.sensor_masking import (
+    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_WINDOW_LENGTH,
+    REALTIME_POSE_TARGET_LENGTH,
     TASK_MODE_REALTIME_POSE,
 )
 from diffusion import logger
@@ -40,7 +41,6 @@ TRAIN_DEVICE_FIELDS = frozenset(
         "target_root_position_head_ref",
         "target_root_yaw_world",
         "current_head_yaw_world",
-        "future_leg_target",
         "previous_contact_target",
         "contact_target",
     }
@@ -187,6 +187,11 @@ class TrainLoop:
         missing_keys = list(incompatible_keys.missing_keys)
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if missing_keys or unexpected_keys:
+            if (
+                "joint_diffusion_horizon_length" in missing_keys
+                or any("future_leg_head" in key for key in unexpected_keys)
+            ):
+                raise RuntimeError("单帧 checkpoint 与联合 11 帧模型不兼容，无法恢复训练。")
             raise RuntimeError(
                 "checkpoint 与当前 root-y0 realtime_pose 模型结构不匹配，已停止恢复。"
                 f" missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
@@ -388,23 +393,21 @@ class TrainLoop:
                 self.scaler.scale(loss).backward()
 
     def compute_losses(self, batch: dict, timesteps: torch.Tensor) -> dict:
-        sample_window = batch["x"]  # [B,11,144]，Dataset 仍保留干净监督窗口。
-        if sample_window.ndim != 3 or tuple(sample_window.shape[1:]) != (
-            REALTIME_POSE_WINDOW_LENGTH,
+        x_start = batch["x"]  # [B,11,144]：当前帧和未来 10 帧联合目标。
+        if x_start.ndim != 3 or tuple(x_start.shape[1:]) != (
+            REALTIME_POSE_TARGET_LENGTH,
             REALTIME_POSE_TARGET_DIM,
         ):
             raise ValueError(
                 f"训练输入应为 [B,11,{REALTIME_POSE_TARGET_DIM}]，"
-                f"实际为 {tuple(sample_window.shape)}"
+                f"实际为 {tuple(x_start.shape)}"
             )
-        # 历史帧只通过 condition 进入模型，不属于 diffusion Markov chain。
-        x_start = sample_window[:, -1]
         feature_w = self._feature_weights_for_batch(x_start.shape[0])
         return self.diffusion.training_losses(
             self.model,
             x_start,
             timesteps,
-            model_kwargs=self.mask_manager(batch, sample_window),
+            model_kwargs=self.mask_manager(batch, x_start),
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
@@ -428,7 +431,10 @@ class TrainLoop:
 
     def mask_manager(self, batch, sample):
         window_valid_mask = batch["window_valid_mask"].bool()
-        if tuple(window_valid_mask.shape) != tuple(sample.shape[:2]):
+        if tuple(window_valid_mask.shape) != (
+            sample.shape[0],
+            REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+        ):
             raise ValueError("window_valid_mask 必须为 [B,11]。")
         history_observation = batch["history_pose_observation"]
         if self.model.training and torch.is_grad_enabled():
@@ -454,7 +460,7 @@ class TrainLoop:
             **conditions,
             # contact-slide 只读取未扰动的相邻 GT；带噪历史仍仅作为模型条件，
             # 避免把人为历史噪声误当成需要保持的脚部锚点。
-            "previous_pose_target": sample[:, -2],
+            "previous_pose_target": batch["history_pose_observation"][:, -1],
             "tracker_window_raw": batch["tracker_window_raw"],
             "hard_rotation_state_window": batch["hard_rotation_state_window"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
@@ -462,7 +468,6 @@ class TrainLoop:
             "target_root_position_head_ref": batch["target_root_position_head_ref"],
             "target_root_yaw_world": batch["target_root_yaw_world"],
             "current_head_yaw_world": batch["current_head_yaw_world"],
-            "future_leg_target": batch["future_leg_target"],
             "previous_contact_target": batch["previous_contact_target"],
             "contact_target": batch["contact_target"],
         }

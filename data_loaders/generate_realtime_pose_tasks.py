@@ -33,12 +33,14 @@ from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from data_loaders.realtime_pose_validation import validate_realtime_source_arrays
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
+    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_HISTORY_ANCHOR_INDICES,
+    REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_SEQ_LEN,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
     REALTIME_POSE_TARGET_START,
-    REALTIME_POSE_WINDOW_LENGTH,
     SCENARIO_TWO_POINT_DROPOUT_RECONNECT,
     TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
@@ -148,8 +150,8 @@ def plan_realtime_pose_task_generation(args: argparse.Namespace) -> TaskGenerati
         raise RuntimeError(f"{source_dir} 中没有可用 source。")
     split_dir = Path(args.split_dir).resolve() if args.split_dir else None
     split_plans: list[SplitTaskPlan] = []
-    # future-leg 固定监督当前帧之后 3 帧，因此 source 末尾必须额外留出 3 帧。
-    required_frames = REALTIME_POSE_HISTORY_LENGTH + 1 + 3
+    # 目标包含当前帧和未来 10 帧，因此一个起点至少需要 60 帧历史和 11 帧目标。
+    required_frames = REALTIME_POSE_HISTORY_LENGTH + REALTIME_POSE_TARGET_LENGTH
     for raw_split in args.splits:
         split = str(raw_split)
         split_keys = read_split_keys(split_dir, split)
@@ -382,7 +384,15 @@ def materialize_split(
                 config_plans=task["configs"],
             )
             writer.write_row(row_index, row)
-            pose = np.asarray(row["pose_window_clean"], dtype=np.float64)
+            # 为了与单帧基线保持可比，Pose 统计仍只覆盖 10 个历史锚点和当前帧；
+            # 未来密集目标参与训练，但不会改变归一化分布的采样权重。
+            pose = np.concatenate(
+                [
+                    np.asarray(row["history_pose_clean"], dtype=np.float64),
+                    np.asarray(row["pose_target_horizon_clean"], dtype=np.float64)[:1],
+                ],
+                axis=0,
+            )
             pose_sum += pose.sum(axis=0)
             pose_sumsq += np.square(pose).sum(axis=0)
             pose_count += pose.shape[0]
@@ -420,19 +430,26 @@ def materialize_split(
 
 def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
     return {
-        "pose_window_clean": (
-            (REALTIME_POSE_WINDOW_LENGTH, REALTIME_POSE_TARGET_DIM),
+        "history_pose_clean": (
+            (REALTIME_POSE_HISTORY_ANCHOR_COUNT, REALTIME_POSE_TARGET_DIM),
+            np.dtype("float32"),
+        ),
+        "pose_target_horizon_clean": (
+            (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
             np.dtype("float32"),
         ),
         "tracker_window_continuous": (
             (
-                REALTIME_POSE_WINDOW_LENGTH,
+                REALTIME_POSE_CONDITION_WINDOW_LENGTH,
                 TRACKER_COUNT,
                 TRACKER_CONTINUOUS_DIM,
             ),
             np.dtype("float32"),
         ),
-        "head_path_window": ((REALTIME_POSE_WINDOW_LENGTH, 5), np.dtype("float32")),
+        "head_path_window": (
+            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, 5),
+            np.dtype("float32"),
+        ),
         "configured": ((5, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT), np.dtype("uint8")),
         "measured_valid": ((5, REALTIME_POSE_SEQ_LEN, TRACKER_COUNT), np.dtype("uint8")),
         "target_joints_head_ref": ((24, 3), np.dtype("float32")),
@@ -442,7 +459,6 @@ def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "current_head_yaw_world": ((), np.dtype("float32")),
         "current_head_position_world": ((3,), np.dtype("float32")),
         "floor_y": ((), np.dtype("float32")),
-        "future_leg_target": ((3, 8, 6), np.dtype("float32")),
         "previous_contact_target": ((2,), np.dtype("float32")),
         "contact_target": ((2,), np.dtype("float32")),
         "joint_offsets_parent": ((24, 3), np.dtype("float32")),
@@ -460,7 +476,7 @@ def build_task_bundle_row(
     task_seed: int,
     config_plans: list[dict],
 ) -> dict[str, np.ndarray | int | float]:
-    """物化一个 10 帧历史锚点加当前帧的同步时空窗口。"""
+    """物化 10 个历史条件锚点，以及当前帧到未来 10 帧的联合目标。"""
 
     states = materialize_task_configurations(
         config_plans,
@@ -468,11 +484,20 @@ def build_task_bundle_row(
         absolute_start_frame=int(start_frame),
     )
     current_absolute = int(start_frame) + REALTIME_POSE_TARGET_START
+    frame_count = int(joint_rotations_world.shape[0])
+    if current_absolute < 0 or current_absolute + REALTIME_POSE_TARGET_LENGTH > frame_count:
+        raise ValueError(
+            "Task 起点必须保证 current_absolute + 10 < frame_count；"
+            f"当前 start_frame={start_frame}, frame_count={frame_count}。"
+        )
     anchor_absolute = int(start_frame) + np.asarray(
         REALTIME_POSE_HISTORY_ANCHOR_INDICES, dtype=np.int64
     )
-    window_absolute = np.concatenate(
+    condition_absolute = np.concatenate(
         [anchor_absolute, np.asarray([current_absolute], dtype=np.int64)]
+    )
+    target_absolute = current_absolute + np.arange(
+        REALTIME_POSE_TARGET_LENGTH, dtype=np.int64
     )
 
     current_head_yaw = float(head_yaws[current_absolute])
@@ -480,20 +505,24 @@ def build_task_bundle_row(
         np.float32
     )
     floor_y = float(source["root_pos_world"][current_absolute, 1])
-    pose_window = build_pose_target_np(
-        joint_rotations_world[window_absolute],
+    history_pose = build_pose_target_np(
+        joint_rotations_world[anchor_absolute],
+        current_head_yaw,
+    )
+    pose_target_horizon = build_pose_target_np(
+        joint_rotations_world[target_absolute],
         current_head_yaw,
     )
     tracker_window = build_tracker_measurements_np(
-        source["tracker_pos_world"][window_absolute],
-        source["tracker_rot_world_6d"][window_absolute],
+        source["tracker_pos_world"][condition_absolute],
+        source["tracker_rot_world_6d"][condition_absolute],
         current_head_position,
         floor_y,
         current_head_yaw,
     )
     head_path_window = build_head_path_window_np(
-        source["tracker_pos_world"][window_absolute, 0],
-        head_yaws[window_absolute],
+        source["tracker_pos_world"][condition_absolute, 0],
+        head_yaws[condition_absolute],
         current_head_position,
         floor_y,
         current_head_yaw,
@@ -521,14 +550,9 @@ def build_task_bundle_row(
     root_head = yaw_inv @ (
         source["root_pos_world"][current_absolute].astype(np.float64) - origin
     )
-    leg_joint_indices = np.asarray([1, 4, 7, 10, 2, 5, 8, 11], dtype=np.int64)
-    future_pose = build_pose_target_np(
-        joint_rotations_world[current_absolute + 1 : current_absolute + 4],
-        current_head_yaw,
-    ).reshape(3, 24, 6)
-
     return {
-        "pose_window_clean": pose_window.astype(np.float32),
+        "history_pose_clean": history_pose.astype(np.float32),
+        "pose_target_horizon_clean": pose_target_horizon.astype(np.float32),
         "tracker_window_continuous": tracker_window.astype(np.float32),
         "head_path_window": head_path_window.astype(np.float32),
         "configured": states.configured.astype(np.uint8),
@@ -545,7 +569,6 @@ def build_task_bundle_row(
         "current_head_yaw_world": np.float32(current_head_yaw),
         "current_head_position_world": current_head_position,
         "floor_y": np.float32(floor_y),
-        "future_leg_target": future_pose[:, leg_joint_indices].astype(np.float32),
         "previous_contact_target": source["stationary_prob_5"][
             current_absolute - 1, 1:3
         ].astype(np.float32),

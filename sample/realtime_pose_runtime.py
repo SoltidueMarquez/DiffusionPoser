@@ -19,12 +19,13 @@ from data_loaders.realtime_pose_geometry import (
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
+    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_FRAME_OFFSETS,
     REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_HISTORY_ANCHOR_INDICES,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_WINDOW_LENGTH,
+    REALTIME_POSE_TARGET_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_TO_JOINT,
@@ -68,13 +69,12 @@ class ResolvedPose:
 @dataclass(frozen=True)
 class RuntimeStepResult:
     resolved_pose: ResolvedPose
-    raw_pred_xstart: np.ndarray
-    deployed_pred_xstart: np.ndarray
+    raw_pred_pose_horizon: np.ndarray
+    deployed_pred_pose_horizon: np.ndarray
     kappa_position: np.ndarray
     kappa_rotation: np.ndarray
     hard_rotation_state: np.ndarray
     current_tracker_raw: np.ndarray
-    future_leg_prediction: np.ndarray | None = None
     contact_logits: np.ndarray | None = None
 
 
@@ -182,19 +182,21 @@ class RealtimePoseRuntime:
             dtype=np.float32,
         )
         tracker_positions = np.zeros(
-            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, 3), dtype=np.float32
+            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT, 3), dtype=np.float32
         )
         tracker_rotations = np.zeros(
-            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, 6), dtype=np.float32
+            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT, 6), dtype=np.float32
         )
         configured_window = np.zeros(
-            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT), dtype=bool
+            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT), dtype=bool
         )
         measured_window = np.zeros_like(configured_window)
         d_off_window = np.zeros_like(configured_window, dtype=np.int64)
         d_on_window = np.zeros_like(configured_window, dtype=np.int64)
-        head_positions = np.zeros((REALTIME_POSE_WINDOW_LENGTH, 3), dtype=np.float32)
-        head_yaws = np.zeros(REALTIME_POSE_WINDOW_LENGTH, dtype=np.float32)
+        head_positions = np.zeros(
+            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, 3), dtype=np.float32
+        )
+        head_yaws = np.zeros(REALTIME_POSE_CONDITION_WINDOW_LENGTH, dtype=np.float32)
 
         selected_pose_rotations: list[np.ndarray] = []
         selected_pose_slots: list[int] = []
@@ -235,7 +237,11 @@ class RealtimePoseRuntime:
             head_yaw,
         )
         tracker_raw = np.zeros(
-            (REALTIME_POSE_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
+            (
+                REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+                TRACKER_COUNT,
+                TRACKER_FEATURE_DIM,
+            ),
             dtype=np.float32,
         )
         tracker_raw[window_valid] = assemble_tracker_features_np(
@@ -395,15 +401,20 @@ class RealtimePoseRuntime:
     def _finish_step(
         self,
         prepared: _PreparedRuntimeStep,
-        raw_target: np.ndarray,
-        deployed_target: np.ndarray,
-        future_leg: np.ndarray | None,
+        raw_pose_horizon: np.ndarray,
+        deployed_pose_horizon: np.ndarray,
         contact_logits: np.ndarray | None,
     ) -> RuntimeStepResult:
         """用采样结果推进一条序列，不影响批内其他序列。"""
 
+        raw_pose_horizon = np.asarray(raw_pose_horizon, dtype=np.float32).reshape(
+            REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM
+        )
+        deployed_pose_horizon = np.asarray(
+            deployed_pose_horizon, dtype=np.float32
+        ).reshape(REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
         resolved = decode_and_resolve_pose(
-            deployed_target,
+            deployed_pose_horizon[0],
             prepared.tracker_window_raw[-1],
             prepared.hard_rotation_state_window[-1],
             prepared.head_yaw,
@@ -431,15 +442,12 @@ class RealtimePoseRuntime:
         self.previous_head_yaw = prepared.head_yaw
         return RuntimeStepResult(
             resolved_pose=resolved,
-            raw_pred_xstart=np.asarray(raw_target, dtype=np.float32),
-            deployed_pred_xstart=np.asarray(deployed_target, dtype=np.float32),
+            raw_pred_pose_horizon=raw_pose_horizon,
+            deployed_pred_pose_horizon=deployed_pose_horizon,
             kappa_position=prepared.kappa_position.copy(),
             kappa_rotation=prepared.kappa_rotation.copy(),
             hard_rotation_state=prepared.hard_rotation_state_window[-1].copy(),
             current_tracker_raw=prepared.tracker_window_raw[-1].copy(),
-            future_leg_prediction=(
-                None if future_leg is None else np.asarray(future_leg, dtype=np.float32)
-            ),
             contact_logits=(
                 None if contact_logits is None else np.asarray(contact_logits, dtype=np.float32)
             ),
@@ -521,15 +529,24 @@ def step_realtime_pose_batch(
         dtype=torch.bool,
     )
     if noise is not None:
-        if tuple(noise.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+        if tuple(noise.shape) != (
+            batch_size,
+            REALTIME_POSE_TARGET_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ):
             raise ValueError(
-                f"noise 应为 [{batch_size},{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(noise.shape)}"
+                f"noise 应为 [{batch_size},{REALTIME_POSE_TARGET_LENGTH},"
+                f"{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(noise.shape)}"
             )
         noise = noise.to(device=first.device, dtype=torch.float32)
     mean, scale = first._normalizer_pose_stats()
     sample = first.diffusion.projected_ddim_sample_loop(
         first.model,
-        shape=(batch_size, REALTIME_POSE_TARGET_DIM),
+        shape=(
+            batch_size,
+            REALTIME_POSE_TARGET_LENGTH,
+            REALTIME_POSE_TARGET_DIM,
+        ),
         projection_fn=lambda value: project_realtime_pose_xstart(
             value,
             tracker_window_tensor[:, -1],
@@ -547,14 +564,12 @@ def step_realtime_pose_batch(
     raw_targets = first._inverse_pose(sample["raw_pred_xstart"])
     deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])
     auxiliary = sample.get("auxiliary_outputs", {})
-    future_leg = _batch_auxiliary_numpy(auxiliary.get("future_leg"), batch_size)
     contact_logits = _batch_auxiliary_numpy(auxiliary.get("contact_logits"), batch_size)
     return [
         runtime._finish_step(
             prepared_steps[index],
             raw_targets[index],
             deployed_targets[index],
-            None if future_leg is None else future_leg[index],
             None if contact_logits is None else contact_logits[index],
         )
         for index, runtime in enumerate(runtimes)

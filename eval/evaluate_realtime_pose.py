@@ -11,6 +11,7 @@ from data_loaders.sensor_masking import (
     FOOT_TRACKER_INDICES,
     NON_HEAD_TRACKER_INDICES,
     REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
     SMPL_JOINT_COUNT,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
@@ -44,8 +45,10 @@ REQUIRED_RESULT_FIELDS = {
     "hard_rotation_state",
     "contact_target",
     "contact_logits",
-    "future_leg_target",
-    "future_leg_prediction",
+    "reference_pose_horizon_raw",
+    "raw_pred_pose_horizon_raw",
+    "deployed_pred_pose_horizon_raw",
+    "pose_horizon_valid_mask",
     "scenario",
     "eval_frame_mask",
     "fps",
@@ -272,12 +275,57 @@ def evaluate_file(path: Path) -> dict[str, object]:
             where=denominator > 0,
         )
 
-    future_target = values["future_leg_target"].reshape(sequence_count, steps, 3, 8, 6)
-    future_prediction = values["future_leg_prediction"].reshape(sequence_count, steps, 3, 8, 6)
-    future_rotation = np.degrees(_rotation_angle(
-        rotation_6d_to_matrix_np(future_prediction),
-        rotation_6d_to_matrix_np(future_target),
-    )).mean(axis=(-1, -2))
+    horizon_length = REALTIME_POSE_TARGET_LENGTH
+    reference_horizon = values["reference_pose_horizon_raw"].reshape(
+        sequence_count, steps, horizon_length, 24, 6
+    )
+    raw_horizon = values["raw_pred_pose_horizon_raw"].reshape(
+        sequence_count, steps, horizon_length, 24, 6
+    )
+    deployed_horizon = values["deployed_pred_pose_horizon_raw"].reshape(
+        sequence_count, steps, horizon_length, 24, 6
+    )
+    horizon_valid = values["pose_horizon_valid_mask"].reshape(
+        sequence_count, steps, horizon_length
+    ).astype(bool)
+    if not np.all(horizon_valid[:, :, 0]):
+        raise ValueError("pose_horizon_valid_mask 的 horizon 0 必须始终有效。")
+    reference_horizon_rotation = rotation_6d_to_matrix_np(reference_horizon)
+    raw_horizon_rotation = np.degrees(
+        _rotation_angle(rotation_6d_to_matrix_np(raw_horizon), reference_horizon_rotation)
+    ).mean(axis=-1)
+    deployed_horizon_rotation = np.degrees(
+        _rotation_angle(
+            rotation_6d_to_matrix_np(deployed_horizon), reference_horizon_rotation
+        )
+    ).mean(axis=-1)
+    raw_horizon_rotation = np.where(horizon_valid, raw_horizon_rotation, np.nan)
+    deployed_horizon_rotation = np.where(
+        horizon_valid, deployed_horizon_rotation, np.nan
+    )
+    if not np.allclose(raw_horizon_rotation[:, :, 0], raw_rotation, atol=1e-5, equal_nan=True):
+        raise ValueError("raw horizon 0 与当前帧 rotation 指标不一致。")
+    if not np.allclose(
+        deployed_horizon_rotation[:, :, 0],
+        deployed_rotation,
+        atol=1e-5,
+        equal_nan=True,
+    ):
+        raise ValueError("deployed horizon 0 与当前帧 rotation 指标不一致。")
+
+    future_valid_count = horizon_valid[:, :, 1:].sum(axis=-1)
+    raw_future_rotation = np.divide(
+        np.nansum(raw_horizon_rotation[:, :, 1:], axis=-1),
+        future_valid_count,
+        out=np.full(frame_shape, np.nan, dtype=np.float64),
+        where=future_valid_count > 0,
+    )
+    deployed_future_rotation = np.divide(
+        np.nansum(deployed_horizon_rotation[:, :, 1:], axis=-1),
+        future_valid_count,
+        out=np.full(frame_shape, np.nan, dtype=np.float64),
+        where=future_valid_count > 0,
+    )
 
     metric_values = {
         "raw_rotation_deg": raw_rotation,
@@ -295,10 +343,18 @@ def evaluate_file(path: Path) -> dict[str, object]:
         "root_xz_error_m": root_xz,
         "hip_height_error_m": hip_height,
         "root_step_delta_error_m": root_step_delta,
-        "future_leg_rotation_deg": future_rotation,
+        "raw_future_pose_rotation_deg": raw_future_rotation,
+        "deployed_future_pose_rotation_deg": deployed_future_rotation,
         "contact_accuracy": contact_accuracy,
         "foot_slide_m_s": foot_slide,
     }
+    for horizon_index in range(horizon_length):
+        metric_values[f"raw_pose_horizon_{horizon_index}_rotation_deg"] = (
+            raw_horizon_rotation[:, :, horizon_index]
+        )
+        metric_values[f"deployed_pose_horizon_{horizon_index}_rotation_deg"] = (
+            deployed_horizon_rotation[:, :, horizon_index]
+        )
     metric_scales = {"mpjpe_cm": 100.0, "mpjve_cm_s": 100.0, "mpjae_cm_s2": 100.0}
     result = _group_metrics(eval_mask, metric_values, metric_scales)
     result.update(

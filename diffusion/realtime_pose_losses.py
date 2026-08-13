@@ -42,11 +42,21 @@ def compute_raw_deployed_losses(
     deployed_global, deployed_root_yaw = decode_target_head_rotations_torch(deployed_pred)
     target_global, _ = decode_target_head_rotations_torch(target)
 
-    global_rotation_loss = _rotation_angle(raw_global, target_global).square().mean(dim=1)
+    global_rotation_loss = _rotation_angle(raw_global, target_global).square().flatten(1).mean(dim=1)
     parents = torch.as_tensor(SMPL_PARENTS[1:], device=raw_pred.device, dtype=torch.long)
-    raw_local = raw_global[:, parents].transpose(-1, -2) @ raw_global[:, 1:]
-    target_local = target_global[:, parents].transpose(-1, -2) @ target_global[:, 1:]
-    local_rotation_loss = _rotation_angle(raw_local, target_local).square().mean(dim=1)
+    raw_local = raw_global.index_select(2, parents).transpose(-1, -2) @ raw_global[:, :, 1:]
+    target_local = target_global.index_select(2, parents).transpose(-1, -2) @ target_global[:, :, 1:]
+    local_rotation_loss = _rotation_angle(raw_local, target_local).square().flatten(1).mean(dim=1)
+
+    raw_velocity = raw_global[:, :-1].transpose(-1, -2) @ raw_global[:, 1:]
+    target_velocity = target_global[:, :-1].transpose(-1, -2) @ target_global[:, 1:]
+    rotation_velocity_loss = (
+        _rotation_angle(raw_velocity, target_velocity).square().flatten(1).mean(dim=1)
+    )
+
+    raw_current_global = raw_global[:, 0]
+    deployed_current_global = deployed_global[:, 0]
+    deployed_current_root_yaw = deployed_root_yaw[:, 0]
 
     current_tracker = batch["tracker_window_raw"][:, -1].to(
         device=raw_pred.device, dtype=raw_pred.dtype
@@ -54,14 +64,16 @@ def compute_raw_deployed_losses(
     tracker_rot = rotation_6d_to_matrix_torch(current_tracker[..., 3:9])
     measured = current_tracker[..., 10] > 0.5
     tracker_joints = torch.as_tensor(TRACKER_TO_JOINT, device=raw_pred.device, dtype=torch.long)
-    tracker_rotation_error = _rotation_angle(raw_global.index_select(1, tracker_joints), tracker_rot)
+    tracker_rotation_error = _rotation_angle(
+        raw_current_global.index_select(1, tracker_joints), tracker_rot
+    )
     tracker_rotation_loss = _masked_mean(tracker_rotation_error.square(), measured)
 
     offsets = batch["joint_offsets_parent"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     tracker_pos = current_tracker[..., :3]
     deployed_root_position, _, deployed_joints = resolve_root_head_reference_torch(
-        deployed_global,
-        deployed_root_yaw,
+        deployed_current_global,
+        deployed_current_root_yaw,
         offsets,
         observed_head_height=tracker_pos[:, HEAD_TRACKER_INDEX, 1],
     )
@@ -87,7 +99,7 @@ def compute_raw_deployed_losses(
     current_head_yaw = batch["current_head_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     target_root_yaw = batch["target_root_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     root_yaw_error = torch.remainder(
-        deployed_root_yaw + current_head_yaw - target_root_yaw + math.pi,
+        deployed_current_root_yaw + current_head_yaw - target_root_yaw + math.pi,
         2.0 * math.pi,
     ) - math.pi
     # Actor Root 的 Y 固定在 floor；root_loss 只监督 yaw，避免与下面的
@@ -97,11 +109,6 @@ def compute_raw_deployed_losses(
         predicted_root[:, [0, 2]] - target_root[:, [0, 2]]
     ).mean(dim=-1)
 
-    future_target = batch["future_leg_target"].to(device=raw_pred.device, dtype=raw_pred.dtype)
-    future_prediction = auxiliary_outputs["future_leg"].to(dtype=raw_pred.dtype)
-    if future_prediction.shape != future_target.shape:
-        raise ValueError("future_leg 输出与监督必须同为 [B,3,8,6]。")
-    future_leg_loss = torch.square(future_prediction - future_target).flatten(1).mean(dim=1)
     contact_weight = batch["contact_target"].to(
         device=raw_pred.device, dtype=raw_pred.dtype
     ).clamp(0.0, 1.0)
@@ -164,13 +171,13 @@ def compute_raw_deployed_losses(
     return {
         "global_rotation_loss": global_rotation_loss,
         "local_rotation_loss": local_rotation_loss,
+        "rotation_velocity_loss": rotation_velocity_loss,
         "tracker_rotation_loss": tracker_rotation_loss,
         "fk_loss": fk_loss,
         "tracker_position_loss": tracker_position_loss,
         "root_loss": root_loss,
         "head_ref_joint_distance_loss": head_ref_joint_distance_loss,
         "head_to_root_xz_loss": head_to_root_xz_loss,
-        "future_leg_loss": future_leg_loss,
         "contact_loss": contact_loss,
         "contact_slide_loss": contact_slide_loss,
     }
