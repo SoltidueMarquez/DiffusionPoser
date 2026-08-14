@@ -114,7 +114,7 @@ class _PreparedRuntimeStep:
 
 
 class RealtimePoseRuntime:
-    """无 GT warmup 的状态化 Python runtime。"""
+    """维护 60 帧密集历史的状态化 Python runtime。"""
 
     def __init__(
         self,
@@ -169,6 +169,31 @@ class RealtimePoseRuntime:
             noise=noise,
             known_noise=known_noise,
         )[0]
+
+    def append_ground_truth_frame(
+        self,
+        pose_state: WorldPoseState,
+        tracker_pos_world: np.ndarray,
+        tracker_rot_world_6d: np.ndarray,
+        configured: np.ndarray,
+        measured_valid: np.ndarray,
+        floor_y: float,
+    ) -> None:
+        """不执行扩散采样，用一帧 GT Pose/Tracker 推进初始化历史。
+
+        长序列测评可先调用本方法填满 60 帧历史，再从下一帧开始闭环预测。
+        Tracker duration 与 Head yaw 仍按真实逐帧状态推进，避免 warmup 结束时
+        的可靠度状态和正常 runtime 路径发生分叉。
+        """
+
+        prepared = self._prepare_step(
+            tracker_pos_world,
+            tracker_rot_world_6d,
+            configured,
+            measured_valid,
+            floor_y,
+        )
+        self._append_history_state(prepared, pose_state)
 
     def _build_conditioning(
         self,
@@ -480,23 +505,7 @@ class RealtimePoseRuntime:
         self.previous_deployed_horizon_world = np.einsum(
             "ij,tajk->taik", yaw_rotation, horizon_head_rotations
         ).astype(np.float32)
-        frame_state = _TrackerFrameState(
-            prepared.position.copy(),
-            prepared.rotation_6d.copy(),
-            prepared.configured.copy(),
-            prepared.measured.copy(),
-            prepared.d_off.copy(),
-            prepared.d_on.copy(),
-            prepared.head_yaw,
-            prepared.floor_y,
-        )
-        self.pose_history.append(resolved.as_world_state())
-        self.tracker_history.append(frame_state)
-        self.pose_history = self.pose_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.tracker_history = self.tracker_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.previous_d_off = prepared.d_off.copy()
-        self.previous_d_on = prepared.d_on.copy()
-        self.previous_head_yaw = prepared.head_yaw
+        self._append_history_state(prepared, resolved.as_world_state())
         return RuntimeStepResult(
             resolved_pose=resolved,
             raw_pred_pose_horizon=raw_pose_horizon,
@@ -510,6 +519,41 @@ class RealtimePoseRuntime:
                 None if contact_logits is None else np.asarray(contact_logits, dtype=np.float32)
             ),
         )
+
+    def _append_history_state(
+        self,
+        prepared: _PreparedRuntimeStep,
+        pose_state: WorldPoseState,
+    ) -> None:
+        """以统一路径提交 Pose 与 Tracker，保证预测帧和 GT warmup 状态一致。"""
+
+        committed_pose = WorldPoseState(
+            joint_rotations_world=np.asarray(
+                pose_state.joint_rotations_world, dtype=np.float32
+            ).reshape(24, 3, 3).copy(),
+            root_yaw_world=float(pose_state.root_yaw_world),
+            hip_height=float(pose_state.hip_height),
+            root_position_world=np.asarray(
+                pose_state.root_position_world, dtype=np.float32
+            ).reshape(3).copy(),
+        )
+        frame_state = _TrackerFrameState(
+            prepared.position.copy(),
+            prepared.rotation_6d.copy(),
+            prepared.configured.copy(),
+            prepared.measured.copy(),
+            prepared.d_off.copy(),
+            prepared.d_on.copy(),
+            prepared.head_yaw,
+            prepared.floor_y,
+        )
+        self.pose_history.append(committed_pose)
+        self.tracker_history.append(frame_state)
+        self.pose_history = self.pose_history[-REALTIME_POSE_HISTORY_LENGTH:]
+        self.tracker_history = self.tracker_history[-REALTIME_POSE_HISTORY_LENGTH:]
+        self.previous_d_off = prepared.d_off.copy()
+        self.previous_d_on = prepared.d_on.copy()
+        self.previous_head_yaw = prepared.head_yaw
 
 
 def step_realtime_pose_batch(

@@ -115,6 +115,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "并清空预测 rolling prior，仅用于诊断历史误差反馈。"
         ),
     )
+    longseq.add_argument(
+        "--gt_history_warmup_frames",
+        default=0,
+        type=int,
+        help="先用指定数量的 GT Pose/Tracker 填充历史，再从下一帧开始闭环预测与评估。",
+    )
     longseq.add_argument("--inference_steps", default=5, type=int)
     longseq.add_argument("--latency_warmup_frames", default=20, type=int)
     longseq.add_argument("--require_cuda", default=True, action=BooleanOptionalAction)
@@ -143,8 +149,9 @@ def rollout_long_sequence_source(
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
+    gt_history_warmup_frames: int = 0,
 ) -> dict[str, np.ndarray]:
-    """从首帧冷启动逐帧闭环采样，不使用任何 GT pose warmup。"""
+    """可选 GT history warmup，之后逐帧闭环采样。"""
 
     frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
     if frame_count <= 0:
@@ -161,12 +168,25 @@ def rollout_long_sequence_source(
         future_confidence_decay=future_confidence_decay,
         fabrik_iterations=fabrik_iterations,
     )
+    warmup_frames = _validate_gt_history_warmup_frames(
+        gt_history_warmup_frames,
+        frame_count,
+    )
+    for frame_index in range(warmup_frames):
+        runtime.append_ground_truth_frame(
+            _ground_truth_world_pose_state(source, joint_rotations_world, frame_index),
+            source["tracker_pos_world"][frame_index],
+            source["tracker_rot_world_6d"][frame_index],
+            timeline.configured[frame_index],
+            timeline.measured_valid[frame_index],
+            float(source["root_pos_world"][frame_index, 1]),
+        )
     values = _new_rollout_values()
-    frame_indices = range(frame_count)
+    frame_indices = range(warmup_frames, frame_count)
     if show_progress:
         frame_indices = tqdm(
             frame_indices,
-            total=frame_count,
+            total=frame_count - warmup_frames,
             desc=progress_desc or "longseq",
             unit="frame",
             dynamic_ncols=True,
@@ -203,7 +223,11 @@ def rollout_long_sequence_source(
             e2e_latency_ms=total_elapsed,
         )
 
-    return _finalize_rollout_values(values, frame_count)
+    return _finalize_rollout_values(
+        values,
+        frame_count - warmup_frames,
+        absolute_start_frame=warmup_frames,
+    )
 
 
 def _next_sequence_noise(
@@ -256,6 +280,7 @@ def rollout_long_sequence_sources(
     diffusion_noise_mode: str = "per_frame",
     diffusion_noise_rho: float = 0.95,
     pose_history_mode: str = "predicted",
+    gt_history_warmup_frames: int = 0,
 ) -> list[dict[str, np.ndarray]]:
     """跨序列逐帧批处理，序列结束后仅保留其余活跃 runtime。"""
 
@@ -278,6 +303,10 @@ def rollout_long_sequence_sources(
         raise ValueError("timeline 帧数必须与对应 source 一致。")
 
     joint_rotations = [compute_source_joint_rotations_world(source) for source in sources]
+    warmup_counts = [
+        _validate_gt_history_warmup_frames(gt_history_warmup_frames, frame_count)
+        for frame_count in frame_counts
+    ]
     runtimes = [
         RealtimePoseRuntime(
             model,
@@ -292,6 +321,22 @@ def rollout_long_sequence_sources(
         )
         for source in sources
     ]
+    for source, timeline, rotations, runtime, warmup_count in zip(
+        sources,
+        timelines,
+        joint_rotations,
+        runtimes,
+        warmup_counts,
+    ):
+        for frame_index in range(warmup_count):
+            runtime.append_ground_truth_frame(
+                _ground_truth_world_pose_state(source, rotations, frame_index),
+                source["tracker_pos_world"][frame_index],
+                source["tracker_rot_world_6d"][frame_index],
+                timeline.configured[frame_index],
+                timeline.measured_valid[frame_index],
+                float(source["root_pos_world"][frame_index, 1]),
+            )
     values = [_new_rollout_values() for _ in sources]
     noise_generators = None
     known_noise_generators = None
@@ -314,15 +359,22 @@ def rollout_long_sequence_sources(
     progress = None
     if show_progress:
         progress = tqdm(
-            total=sum(frame_counts),
+            total=sum(
+                frame_count - warmup_count
+                for frame_count, warmup_count in zip(frame_counts, warmup_counts)
+            ),
             desc=progress_desc or "longseq batch",
             unit="frame",
             dynamic_ncols=True,
         )
     for frame_index in range(max(frame_counts)):
         active_indices = [
-            index for index, frame_count in enumerate(frame_counts) if frame_index < frame_count
+            index
+            for index, frame_count in enumerate(frame_counts)
+            if warmup_counts[index] <= frame_index < frame_count
         ]
+        if not active_indices:
+            continue
         active_runtimes = [runtimes[index] for index in active_indices]
         history_lengths = [len(runtime.pose_history) for runtime in active_runtimes]
         frame_started = time.perf_counter()
@@ -395,12 +447,12 @@ def rollout_long_sequence_sources(
                 # 当前输出仍按模型预测评估；下一帧只读取当前 GT 历史，
                 # 同时禁用预测 rolling prior，从而隔离自回归历史误差。
                 source = sources[sequence_index]
-                rotations = joint_rotations[sequence_index][frame_index]
-                runtimes[sequence_index].pose_history[-1] = WorldPoseState(
-                    joint_rotations_world=rotations.copy(),
-                    root_yaw_world=float(extract_rotation_heading_np(rotations[0])),
-                    hip_height=float(source["pelvis_height"][frame_index, 0]),
-                    root_position_world=source["root_pos_world"][frame_index].copy(),
+                runtimes[sequence_index].pose_history[-1] = (
+                    _ground_truth_world_pose_state(
+                        source,
+                        joint_rotations[sequence_index],
+                        frame_index,
+                    )
                 )
                 # GT 历史模式只允许下一帧读取上一帧真值，不得残留模型预测的未来 horizon。
                 runtimes[sequence_index].previous_deployed_horizon_world = None
@@ -409,9 +461,49 @@ def rollout_long_sequence_sources(
     if progress is not None:
         progress.close()
     return [
-        _finalize_rollout_values(sequence_values, frame_count)
-        for sequence_values, frame_count in zip(values, frame_counts)
+        _finalize_rollout_values(
+            sequence_values,
+            frame_count - warmup_count,
+            absolute_start_frame=warmup_count,
+        )
+        for sequence_values, frame_count, warmup_count in zip(
+            values,
+            frame_counts,
+            warmup_counts,
+        )
     ]
+
+
+def _validate_gt_history_warmup_frames(value: int, frame_count: int) -> int:
+    """验证 GT warmup 后至少保留一帧用于模型预测与质量评估。"""
+
+    warmup_frames = int(value)
+    if warmup_frames < 0:
+        raise ValueError("gt_history_warmup_frames 不能为负数。")
+    if warmup_frames >= int(frame_count):
+        raise ValueError(
+            "gt_history_warmup_frames 必须小于序列帧数，"
+            f"实际为 warmup={warmup_frames}, frame_count={frame_count}。"
+        )
+    return warmup_frames
+
+
+def _ground_truth_world_pose_state(
+    source: dict[str, np.ndarray],
+    joint_rotations_world: np.ndarray,
+    frame_index: int,
+) -> WorldPoseState:
+    """构造 runtime history 使用的单帧 GT 世界状态。"""
+
+    rotations = np.asarray(joint_rotations_world[frame_index], dtype=np.float32)
+    return WorldPoseState(
+        joint_rotations_world=rotations.copy(),
+        root_yaw_world=float(extract_rotation_heading_np(rotations[0])),
+        hip_height=float(source["pelvis_height"][frame_index, 0]),
+        root_position_world=np.asarray(
+            source["root_pos_world"][frame_index], dtype=np.float32
+        ).copy(),
+    )
 
 
 def _new_rollout_values() -> dict[str, list]:
@@ -515,7 +607,11 @@ def _append_rollout_frame(
     values["e2e_latency_ms"].append(e2e_latency_ms)
 
 
-def _finalize_rollout_values(values: dict[str, list], frame_count: int) -> dict[str, np.ndarray]:
+def _finalize_rollout_values(
+    values: dict[str, list],
+    frame_count: int,
+    absolute_start_frame: int = 0,
+) -> dict[str, np.ndarray]:
     payload = {
         name: np.asarray(
             items,
@@ -545,7 +641,11 @@ def _finalize_rollout_values(values: dict[str, list], frame_count: int) -> dict[
     payload["history_length"] = payload["history_length"].astype(np.int64)
     payload["scenario"] = np.asarray(values["scenario"])[None]
     payload["fps"] = np.float32(60.0)
-    payload["absolute_frame_index"] = np.arange(frame_count, dtype=np.int64)
+    payload["absolute_frame_index"] = np.arange(
+        int(absolute_start_frame),
+        int(absolute_start_frame) + frame_count,
+        dtype=np.int64,
+    )
     payload["eval_frame_mask"] = np.ones((1, frame_count), dtype=bool)
     return payload
 
@@ -635,6 +735,7 @@ def evaluate_longseq_entries(
     diffusion_noise_mode: str = "per_frame",
     diffusion_noise_rho: float = 0.95,
     pose_history_mode: str = "predicted",
+    gt_history_warmup_frames: int = 0,
     render_mp4: bool = False,
     render_fps: int = 30,
     render_stride: int = 1,
@@ -712,6 +813,7 @@ def evaluate_longseq_entries(
             diffusion_noise_mode=diffusion_noise_mode,
             diffusion_noise_rho=diffusion_noise_rho,
             pose_history_mode=pose_history_mode,
+            gt_history_warmup_frames=gt_history_warmup_frames,
         )
 
         for (entry, condition), source, payload, eval_mask in zip(
@@ -720,6 +822,11 @@ def evaluate_longseq_entries(
             payloads,
             batch_eval_masks,
         ):
+            warmup_frames = _validate_gt_history_warmup_frames(
+                gt_history_warmup_frames,
+                int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]),
+            )
+            eval_mask = eval_mask[warmup_frames:]
             payload["eval_frame_mask"] = eval_mask[None]
             sequence_id = str(entry["sequence_id"])
             frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
@@ -792,7 +899,11 @@ def evaluate_longseq_entries(
     metadata["fabrik_iterations"] = int(fabrik_iterations)
     metadata["sequence_batch_size"] = int(batch_size)
     metadata["latency_scope"] = "active_batch_wall_time_per_stream"
-    metadata["evaluation_protocol"] = "isolated_condition_cold_start"
+    metadata["evaluation_protocol"] = (
+        "isolated_condition_gt_history_warmup"
+        if int(gt_history_warmup_frames) > 0
+        else "isolated_condition_cold_start"
+    )
     metadata["conditions"] = list(selected_conditions)
     metadata["shared_diffusion_noise_across_conditions"] = True
     metadata["diffusion_noise_mode"] = str(diffusion_noise_mode)
@@ -803,6 +914,7 @@ def evaluate_longseq_entries(
         if pose_history_mode == "ground_truth"
         else "predicted_history_with_predicted_rolling_prior"
     )
+    metadata["gt_history_warmup_frames"] = int(gt_history_warmup_frames)
     if device.type == "cuda":
         metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
     summary_payload = {
@@ -870,6 +982,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         raise ValueError("inference_steps 必须大于 0。")
     if int(args.sequence_batch_size) <= 0:
         raise ValueError("sequence_batch_size 必须大于 0。")
+    if int(args.gt_history_warmup_frames) < 0:
+        raise ValueError("gt_history_warmup_frames 不能为负数。")
     if not -1.0 <= float(args.diffusion_noise_rho) <= 1.0:
         raise ValueError("diffusion_noise_rho 必须位于 [-1,1]。")
     selected_conditions = list(dict.fromkeys(str(value) for value in args.conditions))
@@ -909,6 +1023,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         f"[longseq] device={device}, train_steps={args.diffusion_steps}, "
         f"inference_steps={diffusion.num_timesteps}, "
         f"sequence_batch_size={args.sequence_batch_size}, conditions={selected_conditions}, "
+        f"gt_history_warmup_frames={args.gt_history_warmup_frames}, "
         f"timestep_map={timestep_map}"
     )
     output_dir = (
@@ -942,6 +1057,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         diffusion_noise_mode=str(args.diffusion_noise_mode),
         diffusion_noise_rho=float(args.diffusion_noise_rho),
         pose_history_mode=str(args.pose_history_mode),
+        gt_history_warmup_frames=int(args.gt_history_warmup_frames),
         render_mp4=bool(args.render_mp4),
         render_fps=int(args.render_fps),
         render_stride=int(args.render_stride),
@@ -963,7 +1079,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "diffusion_noise_rho": float(args.diffusion_noise_rho),
             "pose_history_mode": str(args.pose_history_mode),
             "latency_warmup_frames": int(args.latency_warmup_frames),
-            "history_initialization": "cold_start_zero_padding",
+            "history_initialization": (
+                f"ground_truth_first_{int(args.gt_history_warmup_frames)}_frames"
+                if int(args.gt_history_warmup_frames) > 0
+                else "cold_start_zero_padding"
+            ),
         },
         show_progress=bool(args.show_progress),
     )

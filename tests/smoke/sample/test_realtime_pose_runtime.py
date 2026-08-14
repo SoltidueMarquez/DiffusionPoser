@@ -5,12 +5,20 @@ import pytest
 import torch
 from ema_pytorch import EMA
 
-from data_loaders.realtime_pose_geometry import build_pose_target_np
+from data_loaders.generate_realtime_pose_tasks import compute_source_joint_rotations_world
+from data_loaders.realtime_pose_geometry import (
+    build_pose_target_np,
+    extract_rotation_heading_np,
+)
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
-from sample.realtime_pose_runtime import RealtimePoseRuntime, step_realtime_pose_batch
-from sample.utils import load_checkpoint_model
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
+from sample.realtime_pose_runtime import (
+    RealtimePoseRuntime,
+    WorldPoseState,
+    step_realtime_pose_batch,
+)
+from sample.utils import load_checkpoint_model
 from tests.smoke.realtime_pose_fixtures import (
     IDENTITY_6D,
     build_toy_realtime_source,
@@ -116,6 +124,47 @@ def test_runtime_uses_60_dense_frames_and_synchronized_anchors():
     torch.testing.assert_close(current_head_path[3:], torch.tensor([0.0, 1.0]))
     assert results[-1].raw_pred_pose_horizon.shape == (11, 144)
     assert results[-1].deployed_pred_pose_horizon.shape == (11, 144)
+
+
+def test_runtime_can_seed_sixty_ground_truth_frames_without_sampling():
+    source = build_toy_realtime_source(frame_count=61)
+    rotations = compute_source_joint_rotations_world(source)
+    model = _RecordingModel()
+    runtime = RealtimePoseRuntime(
+        model,
+        _OneStepProjectedDiffusion(),
+        torch.device("cpu"),
+        source["joint_offsets_parent"],
+        source["joint_rest_local_rotations_6d"],
+    )
+    valid = np.ones(6, dtype=bool)
+    for frame_index in range(60):
+        runtime.append_ground_truth_frame(
+            WorldPoseState(
+                joint_rotations_world=rotations[frame_index],
+                root_yaw_world=float(
+                    extract_rotation_heading_np(rotations[frame_index, 0])
+                ),
+                hip_height=float(source["pelvis_height"][frame_index, 0]),
+                root_position_world=source["root_pos_world"][frame_index],
+            ),
+            source["tracker_pos_world"][frame_index],
+            source["tracker_rot_world_6d"][frame_index],
+            valid,
+            valid,
+            float(source["root_pos_world"][frame_index, 1]),
+        )
+
+    assert model.batch_sizes == []
+    assert len(runtime.pose_history) == 60
+    np.testing.assert_allclose(
+        runtime.pose_history[-1].joint_rotations_world,
+        rotations[59],
+        atol=1e-6,
+    )
+    _step(runtime, source, 60, valid)
+    assert model.history_valid_counts == [10]
+    assert len(runtime.pose_history) == 60
 
 
 def test_runtime_dropout_and_reconnect_preserve_duration_semantics():

@@ -38,6 +38,7 @@ def test_longseq_defaults_to_five_steps_and_latency_summary_excludes_warmup():
     args = longseq.build_arg_parser().parse_args(["--model_path", "model.pt"])
     assert args.inference_steps == 5
     assert args.sequence_batch_size == 4
+    assert args.gt_history_warmup_frames == 0
     summary = longseq.summarize_latency(np.asarray([100.0, 10.0, 20.0]), warmup_frames=1)
     assert summary["frames"] == 2
     assert summary["mean_ms"] == 15.0
@@ -282,6 +283,28 @@ def test_ground_truth_history_clears_predicted_horizon_and_disables_future_prior
     assert not (payload["inpaint_confidence"][0, 1, 1:] > 0.0).any()
 
 
+def test_longseq_gt_history_warmup_starts_prediction_after_sixty_frames():
+    source = build_toy_realtime_source(frame_count=65)
+    configured = np.ones((65, 6), dtype=bool)
+    model = _RecordingModel()
+    payload = longseq.rollout_long_sequence_sources(
+        model,
+        _OneStepProjectedDiffusion(),
+        [source],
+        [_timeline(configured, configured.copy())],
+        torch.device("cpu"),
+        normalizer=None,
+        gt_history_warmup_frames=60,
+    )[0]
+
+    assert model.batch_sizes == [1] * 5
+    assert model.history_valid_counts == [10] * 5
+    assert payload["deployed_pred_target_raw"].shape == (1, 5, 144)
+    np.testing.assert_array_equal(payload["absolute_frame_index"], np.arange(60, 65))
+    np.testing.assert_array_equal(payload["history_length"], np.full((1, 5), 60))
+    np.testing.assert_array_equal(payload["eval_frame_mask"], np.ones((1, 5), dtype=bool))
+
+
 def test_isolated_conditions_share_framewise_diffusion_noise_for_fair_comparison():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
@@ -510,3 +533,35 @@ def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp
         for condition_tag in ("f6", "f3")
         for index in range(2)
     )
+
+
+def test_longseq_entry_evaluation_records_gt_history_warmup_protocol(tmp_path):
+    eval_set_dir = tmp_path / "eval_set"
+    eval_set_dir.mkdir()
+    source_path = eval_set_dir / "source.npz"
+    np.savez(source_path, **build_toy_realtime_source(frame_count=65))
+    summary = longseq.evaluate_longseq_entries(
+        entries=[
+            {
+                "sequence_id": "sequence",
+                "source_path": str(source_path.resolve()),
+                "source_relative_path": source_path.name,
+            }
+        ],
+        source_dir=eval_set_dir,
+        output_dir=tmp_path / "output",
+        model=_RecordingModel(),
+        diffusion=_OneStepProjectedDiffusion(),
+        device=torch.device("cpu"),
+        normalizer=None,
+        conditions=["fixed_six"],
+        gt_history_warmup_frames=60,
+        show_progress=False,
+    )
+
+    assert summary["metadata"]["evaluation_protocol"] == (
+        "isolated_condition_gt_history_warmup"
+    )
+    assert summary["metadata"]["gt_history_warmup_frames"] == 60
+    assert summary["files"][0]["num_frames"] == 65
+    assert summary["files"][0]["evaluated_frames"] == 5
