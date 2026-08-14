@@ -14,7 +14,6 @@ from data_loaders.realtime_pose_history_noise import (
     HistoryPoseNoiseConfig,
     corrupt_history_pose_observation,
 )
-
 from data_loaders.sensor_masking import (
     REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_TARGET_DIM,
@@ -29,13 +28,11 @@ TRAIN_DEVICE_FIELDS = frozenset(
     {
         "x",
         "history_pose_observation",
-        "tracker_window",
         "head_path_window",
         "history_region_confidence",
         "window_valid_mask",
         "frame_offsets",
         "tracker_window_raw",
-        "hard_rotation_state_window",
         "target_joints_head_ref",
         "joint_offsets_parent",
         "target_root_position_head_ref",
@@ -448,9 +445,14 @@ class TrainLoop:
                     pose_scale=self.pose_scale,
                     config=self.history_noise_config,
                 )
+        pose_mean = None
+        pose_scale = None
+        if self.pose_mean is not None and self.pose_scale is not None:
+            pose_mean = self.pose_mean.to(device=sample.device, dtype=torch.float32)
+            pose_scale = self.pose_scale.to(device=sample.device, dtype=torch.float32)
+
         conditions = {
             "history_pose_observation": history_observation,
-            "tracker_window": batch["tracker_window"],
             "head_path_window": batch["head_path_window"],
             "history_region_confidence": batch["history_region_confidence"],
             "window_valid_mask": window_valid_mask,
@@ -462,7 +464,6 @@ class TrainLoop:
             # 避免把人为历史噪声误当成需要保持的脚部锚点。
             "previous_pose_target": batch["history_pose_observation"][:, -1],
             "tracker_window_raw": batch["tracker_window_raw"],
-            "hard_rotation_state_window": batch["hard_rotation_state_window"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
             "target_root_position_head_ref": batch["target_root_position_head_ref"],
@@ -472,13 +473,9 @@ class TrainLoop:
             "contact_target": batch["contact_target"],
         }
         if self.pose_mean is not None and self.pose_scale is not None:
-            y["pose_mean"] = self.pose_mean.to(
-                device=sample.device, dtype=sample.dtype
-            )
-            y["pose_scale"] = self.pose_scale.to(
-                device=sample.device, dtype=sample.dtype
-            )
-        # 模型、Loss 和 hard projection 共用同一个 y，避免条件在两层字典中静默分叉。
+            y["pose_mean"] = pose_mean.to(dtype=sample.dtype)
+            y["pose_scale"] = pose_scale.to(dtype=sample.dtype)
+        # 模型与 Loss 共用同一个 y，避免条件在两层字典中静默分叉。
         return {"y": y}
 
 

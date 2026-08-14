@@ -21,6 +21,10 @@ from data_loaders.sensor_masking import (
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
 from diffusion.realtime_pose_losses import compute_raw_deployed_losses
+from diffusion.realtime_pose_inpainting import (
+    apply_realtime_pose_inpainting,
+    validate_realtime_pose_inpainting_condition,
+)
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
 
@@ -847,39 +851,47 @@ class GaussianDiffusion:
         clip_denoised=False,
         model_kwargs=None,
         eta=0.0,
-        projection_mode="all_steps",
-        late_steps=5,
+        inpaint_condition=None,
+        known_noise=None,
     ):
-        """用 projected x0 重算 epsilon；新 realtime pose 路径不再执行 x_t inpainting。"""
+        """在模型前注入 IK 条件，并用最终 deployed x0 重算 epsilon。"""
 
         if model_kwargs is None:
             model_kwargs = {}
+        x_model = x
+        if inpaint_condition is not None:
+            if known_noise is None:
+                raise ValueError("启用 IK-Inpainting 时必须复用同一份 known_noise。")
+            x_model, _ = apply_realtime_pose_inpainting(
+                x_t=x,
+                t=t,
+                condition=inpaint_condition,
+                known_noise=known_noise,
+                alphas_cumprod=self.alphas_cumprod,
+            )
         step_model_kwargs = dict(model_kwargs)
         if bool(torch.all(t == 0)):
             step_model_kwargs["return_aux_outputs"] = True
         out = self.p_mean_variance(
             model,
-            x,
+            x_model,
             t,
             clip_denoised=clip_denoised,
             model_kwargs=step_model_kwargs,
         )
         raw_pred_xstart = out["pred_xstart"]
-        should_project = self._should_project_ddim_step(
-            t,
-            projection_mode=projection_mode,
-            late_steps=late_steps,
-        )
+        # 置信度只通过 inpainting 生效；最终步 projection 只负责 SO(3) 合法化。
+        should_project = t == 0
         if bool(should_project.any()):
             projected = projection_fn(raw_pred_xstart)
             selector = should_project.view(-1, *([1] * (x.ndim - 1)))
             deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
         else:
-            # late/final 模式的早期步骤保持 raw x0，避免支付无效的 SO(3) 与 hard projection 开销。
+            # 早期步骤保持 raw x0，只在最终步做合法旋转投影。
             deployed_pred_xstart = raw_pred_xstart
-        eps = self._predict_eps_from_xstart(x, t, deployed_pred_xstart)
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        eps = self._predict_eps_from_xstart(x_model, t, deployed_pred_xstart)
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x_model.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x_model.shape)
         sigma = (
             eta
             * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
@@ -913,15 +925,22 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         eta=0.0,
-        projection_mode="all_steps",
-        late_steps=5,
         progress=False,
+        inpaint_condition=None,
+        known_noise=None,
     ):
-        """执行完整 Projected DDIM，并保留最终 raw/deployed x0。"""
+        """执行完整 IK-Inpainting DDIM，并保留最终 raw/deployed x0。"""
 
         if device is None:
             device = next(model.parameters()).device
         image = noise if noise is not None else th.randn(*shape, device=device)
+        if inpaint_condition is not None and known_noise is None:
+            raise ValueError(
+                "启用 IK-Inpainting 时必须显式提供 known_noise，"
+                "避免采样器内部引入不可控随机性。"
+            )
+        if inpaint_condition is not None:
+            validate_realtime_pose_inpainting_condition(inpaint_condition)
         indices = list(range(self.num_timesteps))[::-1]
         if progress:
             from tqdm.auto import tqdm
@@ -939,22 +958,13 @@ class GaussianDiffusion:
                     clip_denoised=clip_denoised,
                     model_kwargs=model_kwargs,
                     eta=eta,
-                    projection_mode=projection_mode,
-                    late_steps=late_steps,
+                    inpaint_condition=inpaint_condition,
+                    known_noise=known_noise,
                 )
             image = final["sample"]
         if final is None:
             raise RuntimeError("Projected DDIM 没有执行任何时间步。")
         return final
-
-    def _should_project_ddim_step(self, t, projection_mode, late_steps):
-        if projection_mode == "all_steps":
-            return th.ones_like(t, dtype=th.bool)
-        if projection_mode == "late_steps":
-            return t < max(1, int(late_steps))
-        if projection_mode == "final_step":
-            return t == 0
-        raise ValueError(f"未知 Projected DDIM 模式：{projection_mode}")
 
     def ddim_reverse_sample(
         self,
@@ -1448,13 +1458,7 @@ class GaussianDiffusion:
         """计算当前 144D RealtimePose 路径的单时间步训练损失。"""
 
         if model_kwargs is None:
-            raise ValueError("RealtimePose 训练必须提供动态 Tracker 条件。")
-        batch = model_kwargs.get("y", model_kwargs)
-        if "tracker_window" not in model_kwargs and "tracker_window" not in batch:
-            raise ValueError(
-                "GaussianDiffusion 已不兼容旧 mask/inpainting 训练路径；"
-                "请传入当前动态 Tracker batch。"
-            )
+            raise ValueError("RealtimePose 训练必须提供历史、路径与监督字段。")
         return self._realtime_pose_training_losses(
             model=model,
             x_start=x_start,
@@ -1499,7 +1503,11 @@ class GaussianDiffusion:
         if not isinstance(model_result, tuple) or len(model_result) != 2:
             raise TypeError("RealtimePose 模型训练时必须返回 (raw_output, auxiliary_outputs)。")
         model_output, auxiliary_outputs = model_result
-        target = x_start if self.model_mean_type == ModelMeanType.START_X else noise
+        target = (
+            x_start
+            if self.model_mean_type == ModelMeanType.START_X
+            else self._predict_eps_from_xstart(x_t, t, x_start)
+        )
         if model_output.shape != target.shape:
             raise ValueError("模型输出、diffusion target 和 x_start 必须同形。")
         raw_pred_xstart = (
@@ -1509,8 +1517,6 @@ class GaussianDiffusion:
         )
         deployed_pred_xstart = project_realtime_pose_xstart(
             raw_pred_xstart,
-            batch["tracker_window_raw"][:, -1],
-            batch["hard_rotation_state_window"][:, -1].bool(),
             batch.get("pose_mean"),
             batch.get("pose_scale"),
         )

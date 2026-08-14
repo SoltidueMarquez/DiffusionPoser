@@ -1,7 +1,6 @@
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
-from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 
 
 def create_model_and_diffusion(args):
@@ -16,9 +15,6 @@ def create_model_and_diffusion(args):
         dropout=args.dropout,
         zero_init=args.zero_init,
         max_seq_len=args.max_seq_len,
-        # Task 与 Runtime 当前都固定使用默认可靠度配置；在 metadata 契约完成前，
-        # 模型工厂也禁止从 CLI 覆盖，避免同一持续时间被按不同 duration_cap 解释。
-        reliability_config=TrackerReliabilityConfig().validate(),
     )
     return model, create_gaussian_diffusion(args)
 

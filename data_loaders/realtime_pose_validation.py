@@ -44,7 +44,6 @@ SOURCE_STATIC_SHAPES = {
 TASK_SHAPES = {
     "x": (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
     "history_pose_observation": (REALTIME_POSE_HISTORY_ANCHOR_COUNT, REALTIME_POSE_TARGET_DIM),
-    "tracker_window": (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT, TRACKER_FEATURE_DIM),
     "head_path_window": (REALTIME_POSE_CONDITION_WINDOW_LENGTH, 5),
     "history_region_confidence": (REALTIME_POSE_HISTORY_ANCHOR_COUNT, 5),
     "window_valid_mask": (REALTIME_POSE_CONDITION_WINDOW_LENGTH,),
@@ -133,12 +132,7 @@ def validate_realtime_task_arrays(
     validate_tracker_states(configured[window_valid], measured_valid[window_valid])
     if np.any(configured[~window_valid]) or np.any(measured_valid[~window_valid]):
         raise ValueError(f"{label}padding Tracker 状态必须清零。")
-    tracker = np.asarray(task["tracker_window"])
     tracker_raw = np.asarray(task["tracker_window_raw"])
-    if not np.array_equal(tracker[..., TRACKER_CONFIGURED_OFFSET] > 0.5, configured):
-        raise ValueError(f"{label}Tracker configured 与 task.configured 不一致")
-    if not np.array_equal(tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5, measured_valid):
-        raise ValueError(f"{label}Tracker measured_valid 与 task.measured_valid 不一致")
     if not np.array_equal(tracker_raw[..., TRACKER_CONFIGURED_OFFSET] > 0.5, configured):
         raise ValueError(f"{label}Raw Tracker configured 与 task.configured 不一致")
     if not np.array_equal(tracker_raw[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5, measured_valid):
@@ -147,12 +141,10 @@ def validate_realtime_task_arrays(
     d_on = np.asarray(task["d_on"], dtype=np.int64)
     if np.any((d_off < 0) | (d_off > 60)) or np.any((d_on < 0) | (d_on > 60)):
         raise ValueError(f"{label}d_off/d_on 必须位于 [0,60]")
-    if not np.allclose(tracker[..., TRACKER_D_OFF_OFFSET], d_off / 60.0, atol=1e-6):
-        raise ValueError(f"{label}Tracker d_off 与 task.d_off 不一致")
-    if not np.allclose(tracker[..., TRACKER_D_ON_OFFSET], d_on / 60.0, atol=1e-6):
-        raise ValueError(f"{label}Tracker d_on 与 task.d_on 不一致")
-    if not np.allclose(tracker[..., :9][~measured_valid], 0.0, atol=1e-7):
-        raise ValueError(f"{label}无效测量的前 9 维必须清零")
+    if not np.allclose(tracker_raw[..., TRACKER_D_OFF_OFFSET], d_off / 60.0, atol=1e-6):
+        raise ValueError(f"{label}Raw Tracker d_off 与 task.d_off 不一致")
+    if not np.allclose(tracker_raw[..., TRACKER_D_ON_OFFSET], d_on / 60.0, atol=1e-6):
+        raise ValueError(f"{label}Raw Tracker d_on 与 task.d_on 不一致")
     if not np.allclose(tracker_raw[..., :9][~measured_valid], 0.0, atol=1e-7):
         raise ValueError(f"{label}Raw Tracker 无效测量的前 9 维必须清零")
     hard = np.asarray(task["hard_rotation_state_window"], dtype=bool)

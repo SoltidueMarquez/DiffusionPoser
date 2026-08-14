@@ -1,9 +1,15 @@
 ---
 name: diffusionposer-experiment-branch
-description: Branch-and-document workflow for DiffusionPoser model, diffusion, loss, training, sampling, evaluation, or export experiments. Use when Codex is asked to start an ablation branch, preserve a baseline tag, create or update experiment records, document model/loss changes, add smoke tests, or launch a short training run while keeping dataset/runs/output artifacts out of commits.
+description: Explicitly requested branch-and-document workflow for DiffusionPoser experiments. Use only when the user directly invokes `$diffusionposer-experiment-branch`; do not infer this skill from ordinary model, diffusion, loss, training, sampling, testing, documentation, or evaluation work.
 ---
 
 # DiffusionPoser Experiment Branch
+
+## Invocation Gate
+
+Only use this workflow when the user explicitly invokes `$diffusionposer-experiment-branch`.
+Do not create or switch branches, create baseline tags, or update experiment records merely
+because a task changes model, diffusion, loss, training, sampling, tests, or evaluation code.
 
 ## Core Rule
 

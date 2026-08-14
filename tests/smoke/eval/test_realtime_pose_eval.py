@@ -23,7 +23,7 @@ METRIC_KEYS = (
 )
 
 
-def _result(samples: int, mpjpe_mean: float, known_max: float) -> dict:
+def _result(samples: int, mpjpe_mean: float) -> dict:
     stats = {key: {"sum": 0.0, "count": 1} for key in METRIC_KEYS}
     stats["mpjpe_cm"] = {"sum": mpjpe_mean, "count": 1}
     stats["mpjve_cm_s"] = {"sum": 0.0, "count": 0}
@@ -34,18 +34,17 @@ def _result(samples: int, mpjpe_mean: float, known_max: float) -> dict:
         "samples": samples,
         "velocity_pairs": 0,
         "acceleration_triplets": 0,
-        "known_tracker_rotation_max_error_deg": known_max,
         "by_scenario": {},
         "by_d_off": {},
         "_metric_stats": stats,
     }
 
 
-def test_eval_summary_uses_sequence_macro_average_and_global_max():
+def test_eval_summary_uses_sequence_macro_average():
     summary = summarize(
         [
-            _result(samples=1, mpjpe_mean=1.0, known_max=0.1),
-            _result(samples=3, mpjpe_mean=3.0, known_max=0.3),
+            _result(samples=1, mpjpe_mean=1.0),
+            _result(samples=3, mpjpe_mean=3.0),
         ]
     )
     assert summary["samples"] == 4
@@ -53,7 +52,6 @@ def test_eval_summary_uses_sequence_macro_average_and_global_max():
     assert summary["mpjpe_cm"] == 2.0
     assert summary["mpjve_cm_s"] is None
     assert summary["jitter_m_s3"] is None
-    assert summary["known_tracker_rotation_max_error_deg"] == 0.3
 
 
 def test_sequence_macro_stats_does_not_give_long_sequences_more_weight():
@@ -116,7 +114,6 @@ def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):
         scenario=np.full((1, steps), "two_point_dropout_reconnect"),
         eval_frame_mask=np.ones((1, steps), dtype=bool),
         history_length=np.asarray([[0, 1, 60]], dtype=np.int64),
-        hard_rotation_max_error=np.zeros((1, steps), dtype=np.float32),
     )
     result = evaluate_file(path)
     assert result["raw_rotation_deg"] == 0.0

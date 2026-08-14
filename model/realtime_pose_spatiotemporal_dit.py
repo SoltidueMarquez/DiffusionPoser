@@ -7,15 +7,11 @@ import torch
 import torch.nn as nn
 
 from data_loaders.realtime_pose_config import (
-    POSITION_COVERAGE,
-    ROTATION_COVERAGE,
     TARGET_JOINT_REGIONS,
     TRAJECTORY_REGION_MULTIPLIERS,
-    TrackerReliabilityConfig,
 )
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
-    NON_HEAD_TRACKER_INDICES,
     REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_MODEL_TOKEN_LENGTH,
@@ -24,23 +20,13 @@ from data_loaders.sensor_masking import (
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
 )
-from model.realtime_pose_window_observation_encoder import (
-    WindowObservationEncoder,
-    WindowObservationEncoding,
-)
 from model.timestep_embedding import SinusoidalTimestepEmbedding
 
 
 @dataclass
 class PreparedSpatioTemporalConditioning:
-    observation: WindowObservationEncoding
     static_pose_condition: torch.Tensor
     token_valid_mask: torch.Tensor
-    tracker_condition_valid_mask: torch.Tensor
-    position_attention_bias: torch.Tensor
-    rotation_attention_bias: torch.Tensor
-    position_measurement_valid: torch.Tensor
-    rotation_measurement_valid: torch.Tensor
     temporal_attention_mask: torch.Tensor
 
 
@@ -53,24 +39,14 @@ def _modulate(
 
 
 class SpatioTemporalDiTBlock(nn.Module):
-    """按 Tracker 条件、空间注意力、时间注意力的顺序更新窗口 token。"""
+    """按空间注意力、时间注意力的顺序更新窗口 token。"""
 
     def __init__(self, latent_dim: int, num_heads: int, dropout: float):
         super().__init__()
         self.num_heads = int(num_heads)
-        self.conditioning_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.spatial_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.temporal_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.mlp_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
-        self.state_attention = nn.MultiheadAttention(
-            latent_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.position_attention = nn.MultiheadAttention(
-            latent_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.rotation_attention = nn.MultiheadAttention(
-            latent_dim, num_heads, dropout=dropout, batch_first=True
-        )
         self.spatial_attention = nn.MultiheadAttention(
             latent_dim, num_heads, dropout=dropout, batch_first=True
         )
@@ -96,54 +72,8 @@ class SpatioTemporalDiTBlock(nn.Module):
         prepared: PreparedSpatioTemporalConditioning,
     ) -> torch.Tensor:
         batch_size, time_count, joint_count, latent_dim = target.shape
-        observation = prepared.observation
         frame_valid = prepared.token_valid_mask[..., None, None].to(target.dtype)
-        tracker_condition_valid = prepared.tracker_condition_valid_mask.reshape(
-            batch_size * time_count, 1, 1
-        ).to(target.dtype)
-
-        query = self.conditioning_norm(target).reshape(
-            batch_size * time_count, joint_count, latent_dim
-        )
-        state_keys = observation.state_tokens.reshape(
-            batch_size * time_count, observation.state_tokens.shape[2], latent_dim
-        )
-        position_keys = observation.position_tokens.reshape(
-            batch_size * time_count, observation.position_tokens.shape[2], latent_dim
-        )
-        rotation_keys = observation.rotation_tokens.reshape(
-            batch_size * time_count, observation.rotation_tokens.shape[2], latent_dim
-        )
-        state_value = self.state_attention(
-            query, state_keys, state_keys, need_weights=False
-        )[0] * tracker_condition_valid
-        position_value = self.position_attention(
-            query,
-            position_keys,
-            position_keys,
-            attn_mask=prepared.position_attention_bias,
-            need_weights=False,
-        )[0]
-        rotation_value = self.rotation_attention(
-            query,
-            rotation_keys,
-            rotation_keys,
-            attn_mask=prepared.rotation_attention_bias,
-            need_weights=False,
-        )[0]
-        # Attention 的连续作用强度由模型自行学习；这里只用二值有效性清除
-        # 全无合法 key 时为防止 softmax NaN 而临时开放的回退输出。
-        position_value = position_value * prepared.position_measurement_valid.to(
-            position_value.dtype
-        )
-        rotation_value = rotation_value * prepared.rotation_measurement_valid.to(
-            rotation_value.dtype
-        )
-        target = target + (
-            state_value
-            + position_value
-            + rotation_value
-        ).reshape(batch_size, time_count, joint_count, latent_dim)
+        # 这里只用二值有效性清除为防止 softmax NaN 而临时开放的 padding 输出。
         target = target * frame_valid
 
         modulation = self.adaln_modulation(diffusion_time)
@@ -200,7 +130,7 @@ class SpatioTemporalDiTBlock(nn.Module):
             attn_mask=prepared.temporal_attention_mask,
             need_weights=False,
         )[0]
-        # 不再根据 Tracker coverage 人工削弱历史，时序残差强度只由可学习 gate 决定。
+        # 时序残差强度只由可学习 gate 决定。
         temporal = temporal + temporal_gate_bj[:, None] * temporal_value
         target = temporal.reshape(
             batch_size, joint_count, time_count, latent_dim
@@ -225,7 +155,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         dropout: float = 0.0,
         zero_init: bool = False,
         max_seq_len: int = REALTIME_POSE_MODEL_TOKEN_LENGTH,
-        reliability_config: TrackerReliabilityConfig | None = None,
     ):
         super().__init__()
         if int(input_feats) != REALTIME_POSE_TARGET_DIM:
@@ -238,13 +167,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
         self.num_heads = int(num_heads)
-        # Runtime 直接读取模型上的同一个配置，避免 duration 与 kappa 在部署时被另一套参数解释。
-        self.reliability_config = (
-            reliability_config or TrackerReliabilityConfig()
-        ).validate()
-        self.observation_encoder = WindowObservationEncoder(
-            latent_dim, self.reliability_config
-        )
         self.joint_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.history_pose_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.head_path_encoder = nn.Sequential(
@@ -270,12 +192,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             "head_path_multipliers",
             torch.tensor(TRAJECTORY_REGION_MULTIPLIERS.copy(), dtype=torch.float32),
         )
-        self.register_buffer(
-            "position_coverage", torch.tensor(POSITION_COVERAGE.copy(), dtype=torch.float32)
-        )
-        self.register_buffer(
-            "rotation_coverage", torch.tensor(ROTATION_COVERAGE.copy(), dtype=torch.float32)
-        )
         # 持久化结构标记，使旧单帧权重不能被 strict=False 静默接受。
         self.register_buffer(
             "joint_diffusion_horizon_length",
@@ -291,7 +207,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
     def prepare_conditioning(
         self,
         history_pose_observation: torch.Tensor,
-        tracker_window: torch.Tensor,
         head_path_window: torch.Tensor,
         history_region_confidence: torch.Tensor,
         window_valid_mask: torch.Tensor,
@@ -324,44 +239,13 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         if not torch.all(window_valid_mask[:, -1]):
             raise ValueError("当前帧必须始终有效。")
 
-        condition_observation = self.observation_encoder(
-            tracker_window, window_valid_mask
-        )
-
-        def pad_future_condition(value: torch.Tensor) -> torch.Tensor:
-            """把 11 个观测槽对齐到 21 个模型槽；未来槽没有观测。"""
-
-            future_shape = list(value.shape)
-            future_shape[1] = (
-                REALTIME_POSE_MODEL_TOKEN_LENGTH
-                - REALTIME_POSE_CONDITION_WINDOW_LENGTH
-            )
-            return torch.cat([value, value.new_zeros(future_shape)], dim=1)
-
-        observation = WindowObservationEncoding(
-            state_tokens=pad_future_condition(condition_observation.state_tokens),
-            position_tokens=pad_future_condition(
-                condition_observation.position_tokens
-            ),
-            rotation_tokens=pad_future_condition(
-                condition_observation.rotation_tokens
-            ),
-            kappa_position=pad_future_condition(
-                condition_observation.kappa_position
-            ),
-            kappa_rotation=pad_future_condition(
-                condition_observation.kappa_rotation
-            ),
-        )
         history = history_pose_observation.reshape(
             batch_size,
             REALTIME_POSE_HISTORY_ANCHOR_COUNT,
             SMPL_JOINT_COUNT,
             ROTATION_6D_DIM,
         )
-        # 临时消融：Tracker 覆盖度只控制当前观测与当前 query 的先验门控，
-        # 不再把缺少 Tracker 的区域历史姿态直接清零。历史槽位是否存在仍由
-        # 下方的 window_valid_mask 统一控制，避免冷启动 padding 泄漏进模型。
+        # 历史槽位是否存在由 window_valid_mask 统一控制，避免冷启动 padding 泄漏。
         history_tokens = self.history_pose_input(history)
         history_tokens = torch.cat(
             [
@@ -418,41 +302,16 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         token_valid_mask = torch.cat(
             [window_valid_mask[:, :-1].bool(), target_valid], dim=1
         )
-        future_condition_invalid = torch.zeros(
-            batch_size,
-            REALTIME_POSE_MODEL_TOKEN_LENGTH
-            - REALTIME_POSE_CONDITION_WINDOW_LENGTH,
-            device=window_valid_mask.device,
-            dtype=torch.bool,
-        )
-        tracker_condition_valid_mask = torch.cat(
-            [window_valid_mask.bool(), future_condition_invalid], dim=1
-        )
         static_condition = static_condition * token_valid_mask[..., None, None].to(
             static_condition.dtype
-        )
-        # 这些 mask 只依赖输入窗口，在同一轮 DDIM 的所有去噪步之间保持不变。
-        position_attention_bias, position_measurement_valid = self._measurement_bias(
-            observation.kappa_position[:, :, NON_HEAD_TRACKER_INDICES],
-            self.position_coverage[:, NON_HEAD_TRACKER_INDICES],
-        )
-        rotation_attention_bias, rotation_measurement_valid = self._measurement_bias(
-            observation.kappa_rotation,
-            self.rotation_coverage,
         )
         temporal_attention_mask = self._temporal_mask(
             token_valid_mask,
             joint_count=SMPL_JOINT_COUNT,
         )
         return PreparedSpatioTemporalConditioning(
-            observation=observation,
             static_pose_condition=static_condition,
             token_valid_mask=token_valid_mask,
-            tracker_condition_valid_mask=tracker_condition_valid_mask,
-            position_attention_bias=position_attention_bias,
-            rotation_attention_bias=rotation_attention_bias,
-            position_measurement_valid=position_measurement_valid,
-            rotation_measurement_valid=rotation_measurement_valid,
             temporal_attention_mask=temporal_attention_mask,
         )
 
@@ -461,7 +320,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         history_pose_observation: Optional[torch.Tensor] = None,
-        tracker_window: Optional[torch.Tensor] = None,
         head_path_window: Optional[torch.Tensor] = None,
         history_region_confidence: Optional[torch.Tensor] = None,
         window_valid_mask: Optional[torch.Tensor] = None,
@@ -484,9 +342,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
                 if history_pose_observation is not None
                 else values.get("history_pose_observation")
             )
-            tracker_window = (
-                tracker_window if tracker_window is not None else values.get("tracker_window")
-            )
             head_path_window = (
                 head_path_window
                 if head_path_window is not None
@@ -507,7 +362,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             )
             required = (
                 history_pose_observation,
-                tracker_window,
                 head_path_window,
                 history_region_confidence,
                 window_valid_mask,
@@ -573,29 +427,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             ),
         }
         return raw_xstart, auxiliary
-
-    def _measurement_bias(
-        self, kappa: torch.Tensor, coverage: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, time_count, key_count = kappa.shape
-        flat = kappa.reshape(batch_size * time_count, key_count)
-        allowed = coverage.to(dtype=torch.bool).index_select(0, self.joint_regions)
-        bias = torch.log(flat.clamp_min(1e-6))[:, None].expand(
-            -1, SMPL_JOINT_COUNT, -1
-        )
-        bias = bias.masked_fill(~allowed[None], float("-inf"))
-        bias = bias.masked_fill(flat[:, None] <= 0.0, float("-inf"))
-        measurement_valid = torch.isfinite(bias).any(dim=-1)
-        empty = ~measurement_valid
-        # 空行临时回退到第一个 key 以避免 softmax NaN；调用方会用
-        # measurement_valid 将这部分输出严格清零，因此不会泄漏无效 Tracker 几何。
-        bias[..., 0] = torch.where(empty, torch.zeros_like(bias[..., 0]), bias[..., 0])
-        attention_bias = bias[:, None].expand(-1, self.num_heads, -1, -1).reshape(
-            batch_size * time_count * self.num_heads,
-            SMPL_JOINT_COUNT,
-            key_count,
-        )
-        return attention_bias, measurement_valid[..., None]
 
     def _temporal_mask(
         self, token_valid_mask: torch.Tensor, joint_count: int

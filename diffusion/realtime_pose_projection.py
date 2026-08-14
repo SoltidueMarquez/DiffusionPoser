@@ -7,9 +7,6 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
     SMPL_JOINT_COUNT,
-    TRACKER_COUNT,
-    TRACKER_FEATURE_DIM,
-    TRACKER_TO_JOINT,
 )
 
 
@@ -58,12 +55,10 @@ def project_rotation_6d_to_so3(
 
 def project_realtime_pose_xstart(
     pred_xstart: torch.Tensor,
-    current_tracker_raw: torch.Tensor,
-    hard_rotation_state: torch.Tensor,
     pose_mean: torch.Tensor | None = None,
     pose_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """投影 11 帧全部关节，并只替换当前帧 hard Tracker 对应旋转。"""
+    """只把 11 帧全部 rotation6D 合法化，不再执行额外 Tracker hard 覆盖。"""
 
     if pred_xstart.ndim != 3 or tuple(pred_xstart.shape[1:]) != (
         REALTIME_POSE_TARGET_LENGTH,
@@ -74,15 +69,6 @@ def project_realtime_pose_xstart(
             f"{REALTIME_POSE_TARGET_DIM}]。"
         )
     batch_size = pred_xstart.shape[0]
-    if tuple(current_tracker_raw.shape) != (
-        batch_size,
-        TRACKER_COUNT,
-        TRACKER_FEATURE_DIM,
-    ):
-        raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
-    if tuple(hard_rotation_state.shape) != (batch_size, TRACKER_COUNT):
-        raise ValueError("hard_rotation_state 必须为 [B,6]。")
-
     raw = _inverse_pose(pred_xstart, pose_mean, pose_scale)
     rotations = project_rotation_6d_to_so3(
         raw.reshape(
@@ -92,29 +78,8 @@ def project_realtime_pose_xstart(
             6,
         )
     )
-    tracker_rotations = project_rotation_6d_to_so3(current_tracker_raw[..., 3:9])
-    joint_indices = torch.as_tensor(
-        TRACKER_TO_JOINT,
-        device=pred_xstart.device,
-        dtype=torch.long,
-    )
-    deployed = rotations.clone()
-    # 一次更新全部 Tracker 关节，避免逐关节 Python 循环触发设备同步。
-    deployed_current = deployed[:, 0]
-    current_rotations = deployed_current.index_select(1, joint_indices)
-    hard_current = hard_rotation_state.to(
-        device=pred_xstart.device,
-        dtype=torch.bool,
-    )
-    replacement = torch.where(
-        hard_current[..., None],
-        tracker_rotations,
-        current_rotations,
-    )
-    deployed_current.index_copy_(1, joint_indices, replacement)
-    deployed[:, 0] = deployed_current
     return _normalize_pose(
-        deployed.reshape(
+        rotations.reshape(
             batch_size,
             REALTIME_POSE_TARGET_LENGTH,
             REALTIME_POSE_TARGET_DIM,

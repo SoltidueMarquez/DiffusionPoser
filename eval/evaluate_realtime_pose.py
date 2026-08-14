@@ -76,10 +76,6 @@ def _load_result(path: Path) -> dict[str, np.ndarray]:
         values = {key: np.asarray(data[key]) for key in REQUIRED_RESULT_FIELDS}
         if "history_length" in data.files:
             values["history_length"] = np.asarray(data["history_length"], dtype=np.int64)
-        values["hard_rotation_max_error"] = np.asarray(
-            data["hard_rotation_max_error"] if "hard_rotation_max_error" in data.files else 0.0,
-            dtype=np.float64,
-        )
     return values
 
 
@@ -360,9 +356,6 @@ def evaluate_file(path: Path) -> dict[str, object]:
     result.update(
         path=str(path),
         sequences=sequence_count,
-        hard_tracker_rotation_max_error_deg=float(
-            np.degrees(np.nanmax(values["hard_rotation_max_error"]))
-        ),
     )
     scenarios = values["scenario"].reshape(frame_shape).astype(str)
     result["by_scenario"] = {
@@ -463,13 +456,6 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
     summary = _summarize_metric_stats(results)
     summary["aggregation"] = "sequence_macro"
     summary["sequences"] = sum(int(result.get("sequences", 0)) for result in results)
-    max_values = [
-        float(result.get("hard_tracker_rotation_max_error_deg", result.get("known_tracker_rotation_max_error_deg", 0.0)))
-        for result in results
-    ]
-    summary["hard_tracker_rotation_max_error_deg"] = max(max_values, default=0.0)
-    # 保留汇总调用的旧键仅作为报告别名，不再参与任何数据/模型契约。
-    summary["known_tracker_rotation_max_error_deg"] = summary["hard_tracker_rotation_max_error_deg"]
     for group_name in (
         "by_scenario",
         "by_d_off",

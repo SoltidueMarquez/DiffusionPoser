@@ -115,12 +115,9 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--source_fps", default=60.0, type=float)
     group.add_argument("--use_ema", default=True, type=str2bool)
-    group.add_argument(
-        "--projected_ddim_mode",
-        default="all_steps",
-        choices=["all_steps", "late_steps", "final_step"],
-    )
-    group.add_argument("--projected_ddim_late_steps", default=5, type=int)
+    group.add_argument("--tracker_confidence_warmup", default=15, type=int)
+    group.add_argument("--future_confidence_decay", default=0.9, type=float)
+    group.add_argument("--fabrik_iterations", default=2, type=int)
 
 
 def add_model_options(parser: ArgumentParser):

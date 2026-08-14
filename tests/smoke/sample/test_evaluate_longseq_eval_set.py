@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 import sample.evaluate_longseq_eval_set as longseq
@@ -13,7 +14,9 @@ from data_loaders.sensor_masking import (
 )
 from data_loaders.tracker_timeline import TrackerTimeline
 from eval.evaluate_realtime_pose import evaluate_file
-from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
+from tests.smoke.realtime_pose_fixtures import (
+    build_toy_realtime_source,
+)
 from tests.smoke.sample.test_realtime_pose_runtime import (
     _OneStepProjectedDiffusion,
     _RecordingModel,
@@ -39,6 +42,10 @@ def test_longseq_defaults_to_five_steps_and_latency_summary_excludes_warmup():
     assert summary["frames"] == 2
     assert summary["mean_ms"] == 15.0
     assert summary["p95_ms"] == 19.5
+    with pytest.raises(SystemExit):
+        longseq.build_arg_parser().parse_args(
+            ["--model_path", "model.pt", "--ik_reliability_lut_path", "removed.npz"]
+        )
 
 
 def test_longseq_default_output_path_is_short_stable_and_collision_resistant(tmp_path):
@@ -48,25 +55,22 @@ def test_longseq_default_output_path_is_short_stable_and_collision_resistant(tmp
         source_dir=eval_set,
         model_path=checkpoint,
         weights="ema",
-        projected_ddim_mode="all_steps",
         sequence_batch_size=4,
     )
 
     assert output.parent == Path("output") / "l"
-    assert output.name.startswith("120000e-a-b4-")
+    assert output.name.startswith("120000e-b4-")
     assert len(output.as_posix()) <= 40
     assert output == longseq.build_default_output_dir(
         source_dir=eval_set,
         model_path=checkpoint,
         weights="ema",
-        projected_ddim_mode="all_steps",
         sequence_batch_size=4,
     )
     assert output != longseq.build_default_output_dir(
         source_dir=tmp_path / "another_eval_set",
         model_path=checkpoint,
         weights="ema",
-        projected_ddim_mode="all_steps",
         sequence_batch_size=4,
     )
 
@@ -93,7 +97,7 @@ def test_longseq_classification_distinguishes_configuration_addition_from_reconn
     assert longseq._classify_timeline_frame(reconnect_timeline, 20) == SCENARIO_FIXED_SIX
 
 
-def test_longseq_forwards_projected_ddim_ablation_to_runtime():
+def test_longseq_has_no_projected_ddim_ablation_arguments():
     class RecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -112,11 +116,9 @@ def test_longseq_forwards_projected_ddim_ablation_to_runtime():
         _timeline(configured, configured.copy()),
         torch.device("cpu"),
         normalizer=None,
-        projected_ddim_mode="late_steps",
-        projected_ddim_late_steps=2,
     )
-    assert diffusion.calls[-1]["projection_mode"] == "late_steps"
-    assert diffusion.calls[-1]["late_steps"] == 2
+    assert "projection_mode" not in diffusion.calls[-1]
+    assert "late_steps" not in diffusion.calls[-1]
 
 
 def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
@@ -154,6 +156,10 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     assert payload["raw_pred_pose_horizon_raw"].shape == (1, 5, 11, 144)
     assert payload["deployed_pred_pose_horizon_raw"].shape == (1, 5, 11, 144)
     assert payload["pose_horizon_valid_mask"].shape == (1, 5, 11)
+    assert payload["inpaint_confidence"].shape == (1, 5, 11, 24)
+    assert "tracker_combination" not in payload
+    assert "ik_joint_reliability" not in payload
+    assert "joint_online_confidence" not in payload
     np.testing.assert_array_equal(
         payload["pose_horizon_valid_mask"].sum(axis=-1), [[5, 4, 3, 2, 1]]
     )
@@ -227,13 +233,66 @@ def test_longseq_cross_sequence_batch_supports_different_lengths_and_matches_sin
     )
 
 
+def test_ground_truth_history_clears_predicted_horizon_and_disables_future_prior(monkeypatch):
+    instances = []
+
+    class PriorRecordingRuntime(longseq.RealtimePoseRuntime):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prior_inputs = []
+            instances.append(self)
+
+        def _ik_prior_inputs(self, current_head_yaw):
+            values = super()._ik_prior_inputs(current_head_yaw)
+            self.prior_inputs.append(
+                (float(current_head_yaw), values[0].copy(), values[1], values[2].copy(), values[3])
+            )
+            return values
+
+    monkeypatch.setattr(longseq, "RealtimePoseRuntime", PriorRecordingRuntime)
+    source = build_toy_realtime_source(frame_count=2)
+    configured = np.ones((2, 6), dtype=bool)
+    timeline = TrackerTimeline(
+        configured=configured,
+        measured_valid=configured.copy(),
+        d_off=np.zeros((2, 6), dtype=np.uint8),
+        d_on=np.ones((2, 6), dtype=np.uint8),
+        hard_rotation_state=np.zeros((2, 6), dtype=bool),
+    )
+    payload = longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        _OneStepProjectedDiffusion(),
+        [source],
+        [timeline],
+        torch.device("cpu"),
+        normalizer=None,
+        tracker_confidence_warmup=1,
+        pose_history_mode="ground_truth",
+    )[0]
+
+    runtime = instances[0]
+    second_prior = runtime.prior_inputs[1]
+    expected_previous = longseq.build_pose_target_np(
+        longseq.compute_source_joint_rotations_world(source)[0:1], second_prior[0]
+    )[0]
+    assert second_prior[2]
+    np.testing.assert_allclose(second_prior[1], expected_previous, atol=1e-6)
+    assert not second_prior[4]
+    assert runtime.previous_deployed_horizon_world is None
+    assert not (payload["inpaint_confidence"][0, 1, 1:] > 0.0).any()
+
+
 def test_isolated_conditions_share_framewise_diffusion_noise_for_fair_comparison():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.noises: list[np.ndarray] = []
+            self.known_noises: list[np.ndarray] = []
 
         def projected_ddim_sample_loop(self, *args, **kwargs):
             self.noises.append(kwargs["noise"].detach().cpu().numpy().copy())
+            self.known_noises.append(
+                kwargs["known_noise"].detach().cpu().numpy().copy()
+            )
             return super().projected_ddim_sample_loop(*args, **kwargs)
 
     source = build_toy_realtime_source(frame_count=3)
@@ -253,18 +312,91 @@ def test_isolated_conditions_share_framewise_diffusion_noise_for_fair_comparison
     )
 
     assert len(diffusion.noises) == 3
-    for noise in diffusion.noises:
+    assert len(diffusion.known_noises) == 3
+    for noise, known_noise in zip(diffusion.noises, diffusion.known_noises):
         assert noise.shape == (2, 11, 144)
+        assert known_noise.shape == (2, 11, 144)
         np.testing.assert_array_equal(noise[0], noise[1])
+        np.testing.assert_array_equal(known_noise[0], known_noise[1])
+
+
+def test_sequence_noise_is_independent_of_batch_size_and_lane_order():
+    class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
+        def __init__(self) -> None:
+            self.noises: list[torch.Tensor] = []
+            self.known_noises: list[torch.Tensor] = []
+
+        def projected_ddim_sample_loop(self, *args, **kwargs):
+            self.noises.append(kwargs["noise"].detach().cpu().clone())
+            self.known_noises.append(kwargs["known_noise"].detach().cpu().clone())
+            return super().projected_ddim_sample_loop(*args, **kwargs)
+
+    sources = [
+        build_toy_realtime_source(frame_count=3),
+        build_toy_realtime_source(frame_count=3),
+    ]
+    timelines = [
+        longseq.build_isolated_condition_timeline("source-a", 3, "fixed_six"),
+        longseq.build_isolated_condition_timeline("source-b", 3, "fixed_three"),
+    ]
+
+    batched = NoiseRecordingDiffusion()
+    longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        batched,
+        sources,
+        timelines,
+        torch.device("cpu"),
+        normalizer=None,
+        diffusion_seeds=[31, 47],
+    )
+    reversed_batch = NoiseRecordingDiffusion()
+    longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        reversed_batch,
+        sources[::-1],
+        timelines[::-1],
+        torch.device("cpu"),
+        normalizer=None,
+        diffusion_seeds=[47, 31],
+    )
+    single = NoiseRecordingDiffusion()
+    longseq.rollout_long_sequence_sources(
+        _RecordingModel(),
+        single,
+        sources[:1],
+        timelines[:1],
+        torch.device("cpu"),
+        normalizer=None,
+        diffusion_seeds=[31],
+    )
+
+    for frame_index in range(3):
+        torch.testing.assert_close(
+            batched.noises[frame_index][0], single.noises[frame_index][0]
+        )
+        torch.testing.assert_close(
+            batched.known_noises[frame_index][0],
+            single.known_noises[frame_index][0],
+        )
+        torch.testing.assert_close(
+            reversed_batch.noises[frame_index][1], single.noises[frame_index][0]
+        )
+        torch.testing.assert_close(
+            reversed_batch.known_noises[frame_index][1],
+            single.known_noises[frame_index][0],
+        )
 
 
 def test_fixed_sequence_noise_reuses_full_horizon_noise():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.noises: list[torch.Tensor] = []
+            self.known_noises: list[torch.Tensor] = []
 
         def projected_ddim_sample_loop(self, *args, **kwargs):
             self.noises.append(kwargs["noise"].detach().cpu().clone())
+            self.known_noises.append(kwargs["known_noise"].detach().cpu().clone())
             return super().projected_ddim_sample_loop(*args, **kwargs)
 
     source = build_toy_realtime_source(frame_count=3)
@@ -284,15 +416,19 @@ def test_fixed_sequence_noise_reuses_full_horizon_noise():
     assert all(noise.shape == (1, 11, 144) for noise in diffusion.noises)
     torch.testing.assert_close(diffusion.noises[0], diffusion.noises[1])
     torch.testing.assert_close(diffusion.noises[0], diffusion.noises[2])
+    torch.testing.assert_close(diffusion.known_noises[0], diffusion.known_noises[1])
+    torch.testing.assert_close(diffusion.known_noises[0], diffusion.known_noises[2])
 
 
 def test_correlated_noise_uses_full_horizon_ar1_formula():
     class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
         def __init__(self) -> None:
             self.noises: list[torch.Tensor] = []
+            self.known_noises: list[torch.Tensor] = []
 
         def projected_ddim_sample_loop(self, *args, **kwargs):
             self.noises.append(kwargs["noise"].detach().cpu().clone())
+            self.known_noises.append(kwargs["known_noise"].detach().cpu().clone())
             return super().projected_ddim_sample_loop(*args, **kwargs)
 
     rho = 0.6
@@ -317,6 +453,14 @@ def test_correlated_noise_uses_full_horizon_ar1_formula():
     expected_second = rho * first + np.sqrt(1.0 - rho**2) * innovation
     torch.testing.assert_close(diffusion.noises[0][0], first)
     torch.testing.assert_close(diffusion.noises[1][0], expected_second)
+
+    known_seed = int(longseq.stable_context_seed(23, "longseq_inpaint_noise") % (2**63))
+    known_generator = torch.Generator(device="cpu").manual_seed(known_seed)
+    known_first = torch.randn(11, 144, generator=known_generator)
+    known_innovation = torch.randn(11, 144, generator=known_generator)
+    known_second = rho * known_first + np.sqrt(1.0 - rho**2) * known_innovation
+    torch.testing.assert_close(diffusion.known_noises[0][0], known_first)
+    torch.testing.assert_close(diffusion.known_noises[1][0], known_second)
 
 
 def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp_path):

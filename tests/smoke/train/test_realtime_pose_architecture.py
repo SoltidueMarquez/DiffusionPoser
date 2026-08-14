@@ -38,10 +38,6 @@ def _conditioning(batch_size: int = 2, cold_start: bool = False) -> dict[str, to
     valid = torch.ones(batch_size, 11, dtype=torch.bool)
     if cold_start:
         valid[:, :-1] = False
-    tracker = torch.zeros(batch_size, 11, 6, 13)
-    tracker[..., 9:11] = 1.0
-    tracker[..., 12] = 1.0
-    tracker[~valid] = 0.0
     history = torch.randn(batch_size, 10, 144)
     history[~valid[:, :-1]] = 0.0
     head_path = torch.randn(batch_size, 11, 5)
@@ -52,12 +48,15 @@ def _conditioning(batch_size: int = 2, cold_start: bool = False) -> dict[str, to
     confidence[~valid[:, :-1]] = 0.0
     return {
         "history_pose_observation": history,
-        "tracker_window": tracker,
         "head_path_window": head_path,
         "history_region_confidence": confidence,
         "window_valid_mask": valid,
         "frame_offsets": FRAME_OFFSETS,
     }
+
+
+def _static_conditioning(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return dict(values)
 
 
 def test_target_regions_cover_each_joint_once():
@@ -70,7 +69,7 @@ def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite()
     values = _conditioning(cold_start=True)
     hidden = torch.randn(2, 11, 144)
     timestep = torch.tensor([1, 2])
-    prepared = model.prepare_conditioning(**values)
+    prepared = model.prepare_conditioning(**_static_conditioning(values))
     direct, direct_aux = model(hidden, timestep, **values, return_aux_outputs=True)
     cached, cached_aux = model(
         hidden,
@@ -109,31 +108,26 @@ def test_history_and_current_use_independent_input_projections_once():
     }
 
 
-def test_tracker_history_is_encoded_per_frame_without_gru_summary():
+def test_model_has_no_inpainting_kind_or_confidence_embeddings():
     model = _model()
-    values = _conditioning(batch_size=1)
-    first = model.prepare_conditioning(**values)
-    changed = {name: value.clone() for name, value in values.items()}
-    changed["tracker_window"][:, 3, 1, :9] += 5.0
-    second = model.prepare_conditioning(**changed)
-    assert not torch.allclose(
-        first.observation.rotation_tokens[:, 3],
-        second.observation.rotation_tokens[:, 3],
-    )
-    torch.testing.assert_close(
-        first.observation.rotation_tokens[:, 2],
-        second.observation.rotation_tokens[:, 2],
-    )
-    assert not hasattr(model.observation_encoder, "history_gru")
+    assert not hasattr(model, "constraint_kind_embedding")
+    assert not hasattr(model, "confidence_projection")
+
+
+def test_tracker_cross_attention_and_constraint_tokens_are_removed():
+    model = _model()
+    assert not any("attention" in name and "tracker" in name for name, _ in model.named_modules())
+    assert not hasattr(model, "observation_encoder")
+    assert not hasattr(model, "constraint_tokens")
 
 
 def test_head_path_and_history_pose_are_independent_conditions():
     model = _model()
     values = _conditioning(batch_size=1)
-    first = model.prepare_conditioning(**values)
+    first = model.prepare_conditioning(**_static_conditioning(values))
     changed = {name: value.clone() for name, value in values.items()}
     changed["head_path_window"][:, 4, 0] += 10.0
-    second = model.prepare_conditioning(**changed)
+    second = model.prepare_conditioning(**_static_conditioning(changed))
     assert not torch.allclose(
         first.static_pose_condition[:, 4], second.static_pose_condition[:, 4]
     )
@@ -193,15 +187,14 @@ def test_current_loss_backpropagates_into_history_input_projection():
     assert torch.linalg.norm(gradient) > 0.0
 
 
-def test_token_and_tracker_condition_masks_have_independent_semantics():
+def test_token_valid_mask_has_history_and_target_semantics():
     model = _model()
-    prepared = model.prepare_conditioning(**_conditioning(batch_size=1, cold_start=True))
+    values = _conditioning(batch_size=1, cold_start=True)
+    prepared = model.prepare_conditioning(**_static_conditioning(values))
     assert prepared.token_valid_mask.shape == (1, 21)
     assert not prepared.token_valid_mask[:, :10].any()
     assert prepared.token_valid_mask[:, 10:].all()
-    assert prepared.tracker_condition_valid_mask[:, 10]
-    assert not prepared.tracker_condition_valid_mask[:, 11:].any()
-    assert torch.count_nonzero(prepared.observation.state_tokens[:, 11:]) == 0
+    assert not hasattr(prepared, "tracker_condition_valid_mask")
 
 
 def test_future_tokens_and_temporal_attention_receive_finite_nonzero_gradients():
@@ -289,6 +282,7 @@ def test_model_rejects_unknown_constructor_and_forward_arguments():
 def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
     assert "configured" not in TRAIN_DEVICE_FIELDS
     assert "joint_rest_local_rotations_6d" not in TRAIN_DEVICE_FIELDS
+    assert "hard_rotation_state_window" not in TRAIN_DEVICE_FIELDS
     batch = {
         "x": torch.zeros(1),
         "configured": torch.ones(1, dtype=torch.bool),
@@ -304,13 +298,14 @@ def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
 
 def test_training_model_kwargs_use_y_as_the_only_condition_source():
     loop = object.__new__(TrainLoop)
-    loop.model = torch.nn.Identity().eval()
+    loop.model = _model()
     loop.pose_mean = None
     loop.pose_scale = None
+    loop.device = torch.device("cpu")
+    loop.history_noise_config = HistoryPoseNoiseConfig(probability=0.0)
     sample = torch.zeros(1, 11, 144)
     batch = {
         "history_pose_observation": torch.zeros(1, 10, 144),
-        "tracker_window": torch.zeros(1, 11, 6, 13),
         "head_path_window": torch.zeros(1, 11, 5),
         "history_region_confidence": torch.zeros(1, 10, 5),
         "window_valid_mask": torch.ones(1, 11, dtype=torch.bool),
@@ -319,6 +314,9 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "hard_rotation_state_window": torch.zeros(1, 11, 6, dtype=torch.bool),
         "target_joints_head_ref": torch.zeros(1, 24, 3),
         "joint_offsets_parent": torch.zeros(1, 24, 3),
+        "joint_rest_local_rotations_6d": torch.tensor(
+            [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+        ).reshape(1, 1, 6).expand(1, 24, 6).clone(),
         "target_root_position_head_ref": torch.zeros(1, 3),
         "target_root_yaw_world": torch.zeros(1),
         "current_head_yaw_world": torch.zeros(1),
@@ -329,7 +327,12 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
     model_kwargs = loop.mask_manager(batch, sample)
 
     assert set(model_kwargs) == {"y"}
-    assert model_kwargs["y"]["tracker_window"] is batch["tracker_window"]
+    assert "tracker_window" not in model_kwargs["y"]
+    assert "inpaint_pose" not in model_kwargs["y"]
+    assert "inpaint_confidence" not in model_kwargs["y"]
+    assert "inpaint_kind" not in model_kwargs["y"]
+    assert "inpaint_mask" not in model_kwargs["y"]
+    assert "hard_rotation_state_window" not in model_kwargs["y"]
     assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
 
 

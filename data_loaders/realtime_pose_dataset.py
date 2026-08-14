@@ -219,19 +219,16 @@ class RealtimePoseTaskDataset(Dataset):
         if self.normalizer is None:
             history_pose = history_pose_raw
             pose_target_horizon = pose_target_horizon_raw
-            tracker_window = tracker_raw
             head_path_window = head_path_raw
         else:
             history_pose = self.normalizer.normalize_pose(history_pose_raw)
             pose_target_horizon = self.normalizer.normalize_pose(
                 pose_target_horizon_raw
             )
-            tracker_window = self.normalizer.normalize_tracker(tracker_raw)
             head_path_window = self.normalizer.normalize_head_path(head_path_raw)
 
         # 归一化后再清零，确保 padding 在模型输入中仍是字面零。
         history_pose[~window_valid[:-1]] = 0.0
-        tracker_window[~window_valid] = 0.0
         head_path_window[~window_valid] = 0.0
         kappa_pos, kappa_rot = compute_tracker_reliability_np(
             configured[:-1], measured_valid[:-1], d_on[:-1]
@@ -245,7 +242,6 @@ class RealtimePoseTaskDataset(Dataset):
         result: dict[str, Any] = {
             "x": torch.from_numpy(pose_target_horizon).float(),
             "history_pose_observation": torch.from_numpy(history_pose).float(),
-            "tracker_window": torch.from_numpy(tracker_window).float(),
             "head_path_window": torch.from_numpy(head_path_window).float(),
             "history_region_confidence": torch.from_numpy(history_confidence).float(),
             "window_valid_mask": torch.from_numpy(window_valid).bool(),

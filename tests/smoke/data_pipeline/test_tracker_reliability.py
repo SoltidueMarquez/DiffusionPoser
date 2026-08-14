@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
-from data_loaders.realtime_pose_config import TrackerReliabilityConfig
+from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS, TrackerReliabilityConfig
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
@@ -18,7 +19,10 @@ from data_loaders.generate_realtime_pose_tasks import (
 from data_loaders.tracker_reliability import (
     compute_hard_rotation_state_np,
     compute_region_coverage_np,
+    compute_tracker_online_confidence_np,
+    compute_tracker_online_confidence_torch,
     compute_tracker_reliability_np,
+    map_tracker_confidence_to_joints_torch,
 )
 from data_loaders.tracker_timeline import (
     build_isolated_condition_timeline,
@@ -88,6 +92,32 @@ def test_reliability_uses_validity_and_modality_specific_recovery_windows():
     # Head position不覆盖 torso，但 Head rotation覆盖 torso。
     assert np.isclose(rho_pos[0, 0], 1.0)  # Hip position 仍完整覆盖 torso。
     assert np.isclose(rho_rot[0, 0], 1.0)
+
+
+def test_inpaint_tracker_confidence_uses_validity_and_warmup_only():
+    valid = np.asarray([[True, True, True, False, True, True]], dtype=bool)
+    d_on = np.asarray([[0, 10, 20, 20, 5, 30]], dtype=np.int64)
+    expected = np.asarray([[0.0, 1.0, 1.0, 0.0, 0.5, 1.0]], dtype=np.float32)
+
+    actual_np = compute_tracker_online_confidence_np(valid, d_on, warmup_frames=10)
+    actual_torch = compute_tracker_online_confidence_torch(
+        torch.from_numpy(valid), torch.from_numpy(d_on), warmup_frames=10
+    )
+
+    np.testing.assert_allclose(actual_np, expected)
+    torch.testing.assert_close(actual_torch, torch.from_numpy(expected))
+
+
+def test_inpaint_joint_mapping_uses_region_max_without_noisy_or():
+    tracker_confidence = torch.tensor([[0.5, 0.2, 0.3, 0.5, 0.4, 0.6]])
+    joint_confidence = map_tracker_confidence_to_joints_torch(tracker_confidence)
+    expected_by_region = torch.tensor([0.5, 0.2, 0.3, 0.4, 0.6])
+
+    region_indices = torch.from_numpy(TARGET_JOINT_REGIONS.copy())
+    torch.testing.assert_close(joint_confidence[0], expected_by_region[region_indices])
+    # Torso 同时收到两个 0.5 Tracker 时仍为 0.5，可排除 noisy-or 的 0.75。
+    torso_mask = torch.from_numpy((TARGET_JOINT_REGIONS == 0).copy())
+    assert torch.all(joint_confidence[0, torso_mask] == 0.5)
 
 
 def test_hard_rotation_uses_validity_and_recovery_duration_only():

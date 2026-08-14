@@ -42,15 +42,47 @@ def _clone_runtime_state(runtime: RealtimePoseRuntime) -> RealtimePoseRuntime:
         runtime.joint_offsets_parent,
         runtime.joint_rest_local_rotations_6d,
         normalizer=runtime.normalizer,
-        projected_ddim_mode=runtime.projected_ddim_mode,
-        projected_ddim_late_steps=runtime.projected_ddim_late_steps,
+        tracker_confidence_warmup=runtime.ik_inpainting_config.tracker_confidence_warmup,
+        future_confidence_decay=runtime.ik_inpainting_config.future_confidence_decay,
+        fabrik_iterations=runtime.ik_inpainting_config.fabrik_iterations,
     )
     cloned.pose_history = list(runtime.pose_history)
     cloned.tracker_history = list(runtime.tracker_history)
     cloned.previous_d_off = runtime.previous_d_off.copy()
     cloned.previous_d_on = runtime.previous_d_on.copy()
     cloned.previous_head_yaw = runtime.previous_head_yaw
+    cloned.previous_deployed_horizon_world = (
+        None
+        if runtime.previous_deployed_horizon_world is None
+        else runtime.previous_deployed_horizon_world.copy()
+    )
     return cloned
+
+
+def save_repeat_sampling_artifact(
+    path: Path,
+    repeat_noise: torch.Tensor,
+    repeat_known_noise: torch.Tensor,
+    **result_arrays: np.ndarray,
+) -> None:
+    """保存重复采样的两条随机输入流及其结果数组。
+
+    `noise` 是 DDIM 初始状态，`known_noise` 是 IK-Inpainting 条件在所有去噪步
+    复用的噪声。两者共同决定诊断输出，因此必须放在同一个 NPZ 中才能直接复现。
+    """
+
+    expected_suffix = (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
+    if repeat_noise.ndim != 3 or tuple(repeat_noise.shape[1:]) != expected_suffix:
+        raise ValueError("repeat_noise 必须为 [R,11,144]。")
+    if tuple(repeat_known_noise.shape) != tuple(repeat_noise.shape):
+        raise ValueError("repeat_known_noise 必须与 repeat_noise 同形。")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        noise=repeat_noise.detach().cpu().numpy(),
+        known_noise=repeat_known_noise.detach().cpu().numpy(),
+        **result_arrays,
+    )
 
 
 def _pairwise_rotation_angles(rotations: np.ndarray) -> np.ndarray:
@@ -203,8 +235,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         source["joint_offsets_parent"],
         source["joint_rest_local_rotations_6d"],
         normalizer=normalizer,
-        projected_ddim_mode=str(args.projected_ddim_mode),
-        projected_ddim_late_steps=int(args.projected_ddim_late_steps),
+        tracker_confidence_warmup=int(args.tracker_confidence_warmup),
+        future_confidence_decay=float(args.future_confidence_decay),
+        fabrik_iterations=int(args.fabrik_iterations),
     )
 
     warmup_seed = int(
@@ -214,10 +247,21 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         % (2**63)
     )
     warmup_generator = torch.Generator(device=device).manual_seed(warmup_seed)
+    warmup_known_seed = int(
+        stable_context_seed(warmup_seed, "inpaint_noise") % (2**63)
+    )
+    warmup_known_generator = torch.Generator(device=device).manual_seed(
+        warmup_known_seed
+    )
     for index in tqdm(range(frame_index), desc="repeat diagnostic warmup", unit="frame"):
         noise = torch.randn(
             (1, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
             generator=warmup_generator,
+            device=device,
+        )
+        known_noise = torch.randn(
+            (1, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
+            generator=warmup_known_generator,
             device=device,
         )
         step_realtime_pose_batch(
@@ -228,14 +272,27 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             timeline.measured_valid[index : index + 1],
             np.asarray([source["root_pos_world"][index, 1]], dtype=np.float32),
             noise=noise,
+            known_noise=known_noise,
         )
 
     repeat_count = int(args.repeat_count)
     clones = [_clone_runtime_state(runtime) for _ in range(repeat_count)]
-    repeat_generator = torch.Generator(device=device).manual_seed(int(args.seed) + 9137)
+    repeat_seed = int(args.seed) + 9137
+    repeat_generator = torch.Generator(device=device).manual_seed(repeat_seed)
     repeat_noise = torch.randn(
         (repeat_count, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
         generator=repeat_generator,
+        device=device,
+    )
+    repeat_known_seed = int(
+        stable_context_seed(repeat_seed, "inpaint_noise") % (2**63)
+    )
+    repeat_known_generator = torch.Generator(device=device).manual_seed(
+        repeat_known_seed
+    )
+    repeat_known_noise = torch.randn(
+        (repeat_count, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
+        generator=repeat_known_generator,
         device=device,
     )
     steps = step_realtime_pose_batch(
@@ -260,6 +317,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         ),
         np.full(repeat_count, source["root_pos_world"][frame_index, 1], dtype=np.float32),
         noise=repeat_noise,
+        known_noise=repeat_known_noise,
     )
 
     rotations = np.stack([step.resolved_pose.joint_rotations_world for step in steps])
@@ -289,15 +347,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "weights": str(weights),
             "inference_steps": int(diffusion.num_timesteps),
             "warmup_seed": warmup_seed,
-            "repeat_seed": int(args.seed) + 9137,
+            "warmup_known_seed": warmup_known_seed,
+            "repeat_seed": repeat_seed,
+            "repeat_known_seed": repeat_known_seed,
         }
     )
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(
+    save_repeat_sampling_artifact(
         output_dir / "repeat_samples.npz",
-        noise=repeat_noise.detach().cpu().numpy(),
+        repeat_noise=repeat_noise,
+        repeat_known_noise=repeat_known_noise,
         raw_pred_target_raw=raw_horizon[:, 0],
         deployed_pred_target_raw=deployed_horizon[:, 0],
         raw_pred_pose_horizon_raw=raw_horizon,

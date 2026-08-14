@@ -110,7 +110,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--pose_history_mode",
         default="predicted",
         choices=("predicted", "ground_truth"),
-        help="控制下一帧读取预测历史还是GT历史；ground_truth仅用于诊断历史误差反馈。",
+        help=(
+            "predicted 使用预测历史与 rolling prior；ground_truth 使用 GT 历史，"
+            "并清空预测 rolling prior，仅用于诊断历史误差反馈。"
+        ),
     )
     longseq.add_argument("--inference_steps", default=5, type=int)
     longseq.add_argument("--latency_warmup_frames", default=20, type=int)
@@ -134,8 +137,9 @@ def rollout_long_sequence_source(
     timeline: TrackerTimeline,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
-    projected_ddim_mode: str = "all_steps",
-    projected_ddim_late_steps: int = 5,
+    tracker_confidence_warmup: int = 15,
+    future_confidence_decay: float = 0.9,
+    fabrik_iterations: int = 2,
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
@@ -153,8 +157,9 @@ def rollout_long_sequence_source(
         source["joint_offsets_parent"],
         source["joint_rest_local_rotations_6d"],
         normalizer=normalizer,
-        projected_ddim_mode=projected_ddim_mode,
-        projected_ddim_late_steps=projected_ddim_late_steps,
+        tracker_confidence_warmup=tracker_confidence_warmup,
+        future_confidence_decay=future_confidence_decay,
+        fabrik_iterations=fabrik_iterations,
     )
     values = _new_rollout_values()
     frame_indices = range(frame_count)
@@ -201,6 +206,39 @@ def rollout_long_sequence_source(
     return _finalize_rollout_values(values, frame_count)
 
 
+def _next_sequence_noise(
+    generator: torch.Generator,
+    mode: str,
+    rho: float,
+    fixed_value: torch.Tensor | None,
+    previous_value: torch.Tensor | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """按单序列随机流生成 `[11,144]` 噪声，并返回更新后的时序状态。"""
+
+    if mode == "fixed_sequence":
+        if fixed_value is None:
+            fixed_value = torch.randn(
+                REALTIME_POSE_TARGET_LENGTH,
+                REALTIME_POSE_TARGET_DIM,
+                generator=generator,
+                device=device,
+            )
+        return fixed_value, fixed_value, previous_value
+
+    innovation = torch.randn(
+        REALTIME_POSE_TARGET_LENGTH,
+        REALTIME_POSE_TARGET_DIM,
+        generator=generator,
+        device=device,
+    )
+    if mode == "correlated" and previous_value is not None:
+        value = rho * previous_value + np.sqrt(1.0 - rho**2) * innovation
+    else:
+        value = innovation
+    return value, fixed_value, value
+
+
 def rollout_long_sequence_sources(
     model,
     diffusion,
@@ -208,8 +246,9 @@ def rollout_long_sequence_sources(
     timelines: list[TrackerTimeline],
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
-    projected_ddim_mode: str = "all_steps",
-    projected_ddim_late_steps: int = 5,
+    tracker_confidence_warmup: int = 15,
+    future_confidence_decay: float = 0.9,
+    fabrik_iterations: int = 2,
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
@@ -247,21 +286,31 @@ def rollout_long_sequence_sources(
             source["joint_offsets_parent"],
             source["joint_rest_local_rotations_6d"],
             normalizer=normalizer,
-            projected_ddim_mode=projected_ddim_mode,
-            projected_ddim_late_steps=projected_ddim_late_steps,
+            tracker_confidence_warmup=tracker_confidence_warmup,
+            future_confidence_decay=future_confidence_decay,
+            fabrik_iterations=fabrik_iterations,
         )
         for source in sources
     ]
     values = [_new_rollout_values() for _ in sources]
     noise_generators = None
+    known_noise_generators = None
     if diffusion_seeds is not None:
         noise_generators = []
+        known_noise_generators = []
         for seed in diffusion_seeds:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(seed))
             noise_generators.append(generator)
+            known_generator = torch.Generator(device=device)
+            known_generator.manual_seed(
+                int(stable_context_seed(seed, "longseq_inpaint_noise") % (2**63))
+            )
+            known_noise_generators.append(known_generator)
     fixed_noise: list[torch.Tensor | None] = [None] * len(sources)
     previous_noise: list[torch.Tensor | None] = [None] * len(sources)
+    fixed_known_noise: list[torch.Tensor | None] = [None] * len(sources)
+    previous_known_noise: list[torch.Tensor | None] = [None] * len(sources)
     progress = None
     if show_progress:
         progress = tqdm(
@@ -281,39 +330,33 @@ def rollout_long_sequence_sources(
             torch.cuda.synchronize(device)
             sampling_started = time.perf_counter()
         frame_noise = None
+        frame_known_noise = None
         if noise_generators is not None:
             noise_values = []
+            known_noise_values = []
             for index in active_indices:
-                if diffusion_noise_mode == "fixed_sequence":
-                    if fixed_noise[index] is None:
-                        fixed_noise[index] = torch.randn(
-                            REALTIME_POSE_TARGET_LENGTH,
-                            REALTIME_POSE_TARGET_DIM,
-                            generator=noise_generators[index],
-                            device=device,
-                        )
-                    value = fixed_noise[index]
-                else:
-                    innovation = torch.randn(
-                        REALTIME_POSE_TARGET_LENGTH,
-                        REALTIME_POSE_TARGET_DIM,
-                        generator=noise_generators[index],
-                        device=device,
+                value, fixed_noise[index], previous_noise[index] = _next_sequence_noise(
+                    noise_generators[index],
+                    diffusion_noise_mode,
+                    float(diffusion_noise_rho),
+                    fixed_noise[index],
+                    previous_noise[index],
+                    device,
+                )
+                known_value, fixed_known_noise[index], previous_known_noise[index] = (
+                    _next_sequence_noise(
+                        known_noise_generators[index],
+                        diffusion_noise_mode,
+                        float(diffusion_noise_rho),
+                        fixed_known_noise[index],
+                        previous_known_noise[index],
+                        device,
                     )
-                    if (
-                        diffusion_noise_mode == "correlated"
-                        and previous_noise[index] is not None
-                    ):
-                        rho = float(diffusion_noise_rho)
-                        value = (
-                            rho * previous_noise[index]
-                            + np.sqrt(1.0 - rho**2) * innovation
-                        )
-                    else:
-                        value = innovation
-                    previous_noise[index] = value
+                )
                 noise_values.append(value)
+                known_noise_values.append(known_value)
             frame_noise = torch.stack(noise_values)
+            frame_known_noise = torch.stack(known_noise_values)
         steps = step_realtime_pose_batch(
             active_runtimes,
             np.stack([sources[index]["tracker_pos_world"][frame_index] for index in active_indices]),
@@ -327,6 +370,7 @@ def rollout_long_sequence_sources(
                 dtype=np.float32,
             ),
             noise=frame_noise,
+            known_noise=frame_known_noise,
         )
         if measure_latency:
             torch.cuda.synchronize(device)
@@ -348,8 +392,8 @@ def rollout_long_sequence_sources(
                 e2e_latency_ms=e2e_elapsed,
             )
             if pose_history_mode == "ground_truth":
-                # 当前输出仍按模型预测评估；这里只替换下一帧将读取的 pose history，
-                # 从而单独测量自回归历史误差对后续预测与抖动的贡献。
+                # 当前输出仍按模型预测评估；下一帧只读取当前 GT 历史，
+                # 同时禁用预测 rolling prior，从而隔离自回归历史误差。
                 source = sources[sequence_index]
                 rotations = joint_rotations[sequence_index][frame_index]
                 runtimes[sequence_index].pose_history[-1] = WorldPoseState(
@@ -358,6 +402,8 @@ def rollout_long_sequence_sources(
                     hip_height=float(source["pelvis_height"][frame_index, 0]),
                     root_position_world=source["root_pos_world"][frame_index].copy(),
                 )
+                # GT 历史模式只允许下一帧读取上一帧真值，不得残留模型预测的未来 horizon。
+                runtimes[sequence_index].previous_deployed_horizon_world = None
         if progress is not None:
             progress.update(len(active_indices))
     if progress is not None:
@@ -397,11 +443,11 @@ def _new_rollout_values() -> dict[str, list]:
             "d_off",
             "d_on",
             "hard_rotation_state",
+            "inpaint_confidence",
             "history_length",
             "contact_target",
             "contact_logits",
             "scenario",
-            "hard_rotation_max_error",
             "sampling_latency_ms",
             "e2e_latency_ms",
         )
@@ -456,6 +502,7 @@ def _append_rollout_frame(
     values["d_off"].append(runtime.previous_d_off.copy())
     values["d_on"].append(runtime.previous_d_on.copy())
     values["hard_rotation_state"].append(step.hard_rotation_state)
+    values["inpaint_confidence"].append(step.inpaint_confidence)
     values["history_length"].append(history_length)
     values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
     values["contact_logits"].append(
@@ -464,7 +511,6 @@ def _append_rollout_frame(
         else step.contact_logits
     )
     values["scenario"].append(_classify_timeline_frame(timeline, frame_index))
-    values["hard_rotation_max_error"].append(resolved.hard_rotation_max_error)
     values["sampling_latency_ms"].append(sampling_latency_ms)
     values["e2e_latency_ms"].append(e2e_latency_ms)
 
@@ -577,8 +623,9 @@ def evaluate_longseq_entries(
     diffusion,
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
-    projected_ddim_mode: str = "all_steps",
-    projected_ddim_late_steps: int = 5,
+    tracker_confidence_warmup: int = 15,
+    future_confidence_decay: float = 0.9,
+    fabrik_iterations: int = 2,
     model_path: str | Path = "",
     weights: str = "",
     limit: int = 0,
@@ -652,8 +699,9 @@ def evaluate_longseq_entries(
             timelines=batch_timelines,
             device=device,
             normalizer=normalizer,
-            projected_ddim_mode=projected_ddim_mode,
-            projected_ddim_late_steps=projected_ddim_late_steps,
+            tracker_confidence_warmup=tracker_confidence_warmup,
+            future_confidence_decay=future_confidence_decay,
+            fabrik_iterations=fabrik_iterations,
             measure_latency=device.type == "cuda",
             show_progress=bool(show_progress),
             progress_desc=(
@@ -739,8 +787,9 @@ def evaluate_longseq_entries(
         "e2e": summarize_latency(np.concatenate(e2e_latency_values)),
     }
     metadata = dict(runtime_metadata or {})
-    metadata["projected_ddim_mode"] = str(projected_ddim_mode)
-    metadata["projected_ddim_late_steps"] = int(projected_ddim_late_steps)
+    metadata["tracker_confidence_warmup"] = int(tracker_confidence_warmup)
+    metadata["future_confidence_decay"] = float(future_confidence_decay)
+    metadata["fabrik_iterations"] = int(fabrik_iterations)
     metadata["sequence_batch_size"] = int(batch_size)
     metadata["latency_scope"] = "active_batch_wall_time_per_stream"
     metadata["evaluation_protocol"] = "isolated_condition_cold_start"
@@ -749,6 +798,11 @@ def evaluate_longseq_entries(
     metadata["diffusion_noise_mode"] = str(diffusion_noise_mode)
     metadata["diffusion_noise_rho"] = float(diffusion_noise_rho)
     metadata["pose_history_mode"] = str(pose_history_mode)
+    metadata["pose_history_protocol"] = (
+        "ground_truth_history_without_predicted_rolling_prior"
+        if pose_history_mode == "ground_truth"
+        else "predicted_history_with_predicted_rolling_prior"
+    )
     if device.type == "cuda":
         metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
     summary_payload = {
@@ -778,8 +832,6 @@ def build_default_output_dir(
     source_dir: Path,
     model_path: str | Path,
     weights: str,
-    projected_ddim_mode: str = "all_steps",
-    projected_ddim_late_steps: int = 5,
     sequence_batch_size: int = 1,
     conditions: list[str] | tuple[str, ...] = TRACKER_PATTERN_CATEGORIES,
 ) -> Path:
@@ -790,16 +842,6 @@ def build_default_output_dir(
     step_text = model_stem.removeprefix("model")
     step_tag = str(int(step_text)) if step_text.isdigit() else _short_digest(model_stem, 6)
     weight_tag = {"ema": "e", "model": "m", "": "m"}.get(str(weights), "w")
-    projection_tag = {
-        "all_steps": "a",
-        "final_step": "f",
-    }.get(str(projected_ddim_mode))
-    if projection_tag is None:
-        projection_tag = (
-            f"l{int(projected_ddim_late_steps)}"
-            if str(projected_ddim_mode) == "late_steps"
-            else "p"
-        )
     # 摘要纳入评测集和 checkpoint 父目录，相同 step 的不同 run 不会覆盖。
     identity = _short_digest(
         f"{Path(source_dir).resolve()}\n{model_path.resolve().parent}",
@@ -809,10 +851,7 @@ def build_default_output_dir(
     condition_tag = f"c{len(condition_values)}"
     if condition_values != TRACKER_PATTERN_CATEGORIES:
         condition_tag += _short_digest("\n".join(condition_values), 4)
-    leaf = (
-        f"{step_tag}{weight_tag}-{projection_tag}-b{int(sequence_batch_size)}-"
-        f"{condition_tag}-{identity}"
-    )
+    leaf = f"{step_tag}{weight_tag}-b{int(sequence_batch_size)}-{condition_tag}-{identity}"
     return Path("output") / "l" / leaf
 
 
@@ -829,8 +868,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     )
     if int(args.inference_steps) <= 0:
         raise ValueError("inference_steps 必须大于 0。")
-    if int(args.projected_ddim_late_steps) <= 0:
-        raise ValueError("projected_ddim_late_steps 必须大于 0。")
     if int(args.sequence_batch_size) <= 0:
         raise ValueError("sequence_batch_size 必须大于 0。")
     if not -1.0 <= float(args.diffusion_noise_rho) <= 1.0:
@@ -881,8 +918,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             source_dir,
             args.model_path,
             weights,
-            projected_ddim_mode=args.projected_ddim_mode,
-            projected_ddim_late_steps=args.projected_ddim_late_steps,
             sequence_batch_size=args.sequence_batch_size,
             conditions=selected_conditions,
         ).resolve()
@@ -895,8 +930,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         diffusion=diffusion,
         device=device,
         normalizer=normalizer,
-        projected_ddim_mode=str(args.projected_ddim_mode),
-        projected_ddim_late_steps=int(args.projected_ddim_late_steps),
+        tracker_confidence_warmup=int(args.tracker_confidence_warmup),
+        future_confidence_decay=float(args.future_confidence_decay),
+        fabrik_iterations=int(args.fabrik_iterations),
         model_path=args.model_path,
         weights=weights,
         limit=int(args.limit),
@@ -926,8 +962,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "diffusion_noise_mode": str(args.diffusion_noise_mode),
             "diffusion_noise_rho": float(args.diffusion_noise_rho),
             "pose_history_mode": str(args.pose_history_mode),
-            "projected_ddim_mode": str(args.projected_ddim_mode),
-            "projected_ddim_late_steps": int(args.projected_ddim_late_steps),
             "latency_warmup_frames": int(args.latency_warmup_frames),
             "history_initialization": "cold_start_zero_padding",
         },

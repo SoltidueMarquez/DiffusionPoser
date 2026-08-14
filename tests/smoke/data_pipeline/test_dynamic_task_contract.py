@@ -112,7 +112,6 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert item["x"].shape == (11, 144)
     assert item["frame_offsets"].shape == (21,)
     assert item["history_pose_observation"].shape == (10, 144)
-    assert item["tracker_window"].shape == (11, 6, 13)
     assert item["tracker_window_raw"].shape == (11, 6, 13)
     assert item["hard_rotation_state_window"].shape == (11, 6)
     assert item["previous_contact_target"].shape == (2,)
@@ -134,7 +133,7 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert cold["window_valid_mask"].tolist() == [False] * 10 + [True]
     assert np.count_nonzero(cold["history_pose_observation"].numpy()) == 0
     np.testing.assert_allclose(cold["x"].numpy(), item["x"].numpy())
-    assert np.count_nonzero(cold["tracker_window"].numpy()[:-1]) == 0
+    assert np.count_nonzero(cold["tracker_window_raw"].numpy()[:-1]) == 0
     assert np.count_nonzero(cold["head_path_window"].numpy()[:-1]) == 0
     np.testing.assert_array_equal(cold["d_on"].numpy()[-1], np.ones(6, dtype=np.int64))
     assert not cold["hard_rotation_state_window"][:-1].any()
@@ -144,7 +143,6 @@ def test_dataset_returns_window_contract_and_replays_cold_start(tmp_path):
     assert almost_full["window_valid_mask"].sum().item() == 10
     assert not almost_full["window_valid_mask"][0]
     worker_batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
-    assert worker_batch["tracker_window"].shape == (1, 11, 6, 13)
     assert worker_batch["tracker_window_raw"].shape == (1, 11, 6, 13)
     assert worker_batch["hard_rotation_state_window"].shape == (1, 11, 6)
     dataset.close()

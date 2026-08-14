@@ -114,15 +114,14 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 |---|---:|---|
 | `x` | `[B,11,144]` | 当前帧与未来 10 帧的联合 diffusion target；`x[:,0]` 为当前帧 |
 | `history_pose_observation` | `[B,10,144]` | 历史 Pose 条件；训练时可扰动，部署时为真实历史预测 |
-| `tracker_window` | `[B,11,6,13]` | 同步锚点的完整 Tracker 历史与当前 Tracker |
 | `head_path_window` | `[B,11,5]` | 同步锚点在 `C_n` 下的 Head 路径 |
 | `history_region_confidence` | `[B,10,5]` | 历史 Pose 逐帧、逐身体区域可信度 |
 | `window_valid_mask` | `[B,11]` | 锚点有效性；当前帧恒为 `True` |
 | `frame_offsets` | `[B,21]` | 10 个历史槽加 11 个目标槽的固定真实帧偏移 |
 | `configured` / `measured_valid` | `[B,11,6]` | 所选场景在同步锚点上的 Tracker 状态 |
 | `d_off` / `d_on` | `[B,11,6]` | 从虚拟会话起点重新累计的掉线与在线帧数 |
-| `tracker_window_raw` | `[B,11,6,13]` | 几何 Loss 使用的未归一化 Tracker 窗口；current-only projection 只读取 `[:, -1]` |
-| `hard_rotation_state_window` | `[B,11,6]` | 逐锚点 hard rotation 集合；padding 和未稳定测量恒为 `False` |
+| `tracker_window_raw` | `[B,11,6,13]` | IK 与几何 Loss 使用的未归一化 Tracker 窗口 |
+| `hard_rotation_state_window` | `[B,11,6]` | 保留的旧诊断字段；不再进入当前采样控制链 |
 | `joint_offsets_parent` | `[B,24,3]` | 目标骨架父子偏移 |
 | `joint_rest_local_rotations_6d` | `[B,24,6]` | 目标骨架 rest local rotation6D |
 | `target_joints_head_ref` | `[B,24,3]` | 当前帧关节位置监督 |
@@ -138,9 +137,18 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `scenario_id` / `scenario` | `[B]` | 所选 Tracker 场景的索引与名称 |
 | `start_frame` / `task_id` | `[B]` | 样本定位与稳定任务标识；`task_id` 是 `task_seed` 的固定十六进制表示 |
 
+`history_region_confidence` 只描述过去 10 个历史条件槽位，用于历史 Pose 条件和训练期历史扰动；它不参与当前帧逐关节置信度计算，也不参与 `T_soft` 或当前逐关节 inpainting 控制。
+
 Dataset 不返回 `source_path`，也不接受 `folder_path` 过滤。需要按数据集或序列筛选时，应使用 split 或单独的 Task Store 目录。
 
-模型 diffusion state、模型输出和扩散采样结果均为 `[B,11,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain。`RuntimeStepResult` 返回 `raw_pred_pose_horizon/deployed_pred_pose_horizon: [11,144]`，只解析并回写 horizon 0。
+训练不构造 IK、rolling prior 或 inpainting 张量。Runtime 在采样时只构造两个动态张量：
+
+| 字段 | 形状 | 语义 |
+|---|---:|---|
+| `inpaint_pose` | `[B,11,144]` | 当前 IK 均值与上一轮 horizon 左移后的未来先验，按 Pose normalizer 归一化 |
+| `inpaint_confidence` | `[B,11,24]` | 逐目标帧、逐关节标量置信度，范围 `[0,1]` |
+
+如需 mask，在当前 DDIM 步由 `confidence > 0`、`t >= T_soft` 与 `t > 0` 局部派生，不持久化 `inpaint_kind` 或独立 `inpaint_mask`。模型 diffusion state、模型输出和扩散采样结果均为 `[B,11,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain。`RuntimeStepResult` 返回 `raw_pred_pose_horizon/deployed_pred_pose_horizon: [11,144]` 和 `inpaint_confidence: [11,24]`，只解析 horizon 0 并追加到密集历史。
 
 ## 144D Pose 与历史扰动
 
@@ -168,11 +176,11 @@ sigma(c) = 2° + (1-c) * 8°
 position3 + rotation6D + configured + measured_valid + d_off + d_on
 ```
 
-通道偏移为 `0:3`、`3:9`、`9`、`10`、`11`、`12`。无效测量的前 9 维严格清零。只有前 9 维连续量参与 normalizer；状态与持续时间不参与。`d_off/d_on` 输入模型前除以 60，物理状态仍使用整数帧数。
+通道偏移为 `0:3`、`3:9`、`9`、`10`、`11`、`12`。无效测量的前 9 维严格清零。只有前 9 维连续量参与 normalizer；状态与持续时间不参与。`tracker_window_raw` 中的 `d_off/d_on` 仍以 60 归一化；Runtime 使用当前密集帧的整数 `d_on` 计算在线置信度。
 
 Task store 保留密集的 `configured/measured_valid: [M,5,61,6]`。Dataset 从虚拟会话起点重新累计 `d_on/d_off` 和 hard state，再抽取模型锚点，不能直接继承被裁掉历史的持续时间。
 
-`TrackerReliabilityConfig` 由模型持有；Runtime 必须直接读取模型配置，不提供独立覆盖入口。`duration_cap`、kappa 与 hard rotation gate 始终使用同一套参数。
+当前 inpainting 只使用一套 Tracker 在线置信度：`w_t = valid_t * clamp(d_on / tracker_confidence_warmup, 0, 1)`。该配置属于 Runtime/采样器，不挂到 DiT 参数或 checkpoint 上。`kappa_position/kappa_rotation` 和 `hard_rotation_state` 可作历史诊断字段，不再决定当前 inpainting 强度。
 
 ## Head 路径
 
@@ -196,24 +204,41 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 ## 时空 DiT 与投影
 
 - 模型 token 网格为 `[B,21,24,D]`：`0:10` 是历史 Pose 条件，`10:21` 是当前与未来 10 帧的带噪目标；
-- `WindowObservationEncoder` 只编码 10 个历史槽和当前槽的 Tracker state、position、rotation token；未来 10 个槽补零且 Tracker cross-attention residual 严格清零；
-- 每层依次执行 Tracker cross-attention、24 关节 Spatial Self-Attention、同关节 21 槽 Temporal Self-Attention；
-- 模型分别维护 `token_valid_mask: [B,21]` 与 `tracker_condition_valid_mask: [B,21]`。冷启动无效历史不能作为 attention key；11 个目标 token 始终有效；
+- Tracker position 先经 IK 转换成同一 144D Pose 状态；DiT 不再实例化或执行 Tracker state/position/rotation cross-attention；
+- 每层只执行 24 关节 Spatial Self-Attention 与同关节 21 槽 Temporal Self-Attention；
+- 模型只维护 `token_valid_mask: [B,21]`。冷启动无效历史不能作为 attention key；11 个目标 token 始终有效；
 - Temporal Attention 的历史 query 只能读取有效历史 key，不能读取任何目标 token；目标 query 可读取全部有效历史和全部 11 个目标，目标窗口内部双向 attention；
-- 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测、Loss 和 hard projection 从同一份条件与监督数据读取，不在顶层重复条件字段；
-- 历史 Pose、Tracker 窗口、Head 路径和置信度由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
+- 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测与 Loss 从同一份条件和监督数据读取，不在顶层重复条件字段；
+- 历史 Pose 与 Head 路径由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
 - 历史和目标使用独立输入投影；共享一个 diffusion timestep embedding，21 个 frame-offset embedding 区分帧位置；
-- Tracker cross-attention 使用 `kappa` 与 coverage 构造 attention bias 并屏蔽无效测量；position/rotation attention residual 直接参与 token 更新；没有合法 key 的 query 通过二值有效性将安全回退输出清零；
+- DiT 不接收 `inpaint_confidence` 或 `inpaint_kind`，不存在 constraint/confidence embedding；置信度只在模型调用前决定哪些 `x_t` 关节被条件覆盖；
 - 解码最后 11 个槽，输出 `[B,11,144]`；`contact_head` 只读取当前目标槽，不存在 `future_leg_head`；
-- SO(3) projection 对 `[B,11,144]` 的所有关节执行合法化，只用当前 Tracker 替换 `[:,0]` 的 hard Tracker rotation；旧 `[B,144]` 调用直接报错；
-- Projected DDIM 的 state、初始 noise 和每步更新均为 `[B,11,144]`。长序列评估的 `per_frame`、`fixed_sequence` 和 `correlated` noise 都作用于完整 horizon；correlated 模式使用 `epsilon_n = rho * epsilon_(n-1) + sqrt(1-rho^2) * eta_n`；
-- 训练阶段不执行模型 rollout；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。
+- SO(3) projection 只对 `[B,11,144]` 的所有 rotation6D 执行合法化；最终步也不再用 Tracker rotation 强制覆盖当前帧；
+- DDIM 的 state、初始 noise 和每步更新均为 `[B,11,144]`。每个实时帧另采样一份 `known_noise: [B,11,144]` 并在完整去噪轨迹复用；
+- 训练阶段不执行 IK、inpainting 或模型 rollout，不使用未来 GT 伪造 rolling prior；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。
+
+## IK-Inpainting
+
+- 有上一轮 horizon 时，`previous_horizon[1]` 正好对齐新一轮当前帧，重编码到当前 Head-yaw 参考系后作为 IK 初值；尚无 horizon 时使用上一帧已部署 Pose，首帧再回退到 rest rotation。初值本身不标成当前观测；
+- 固定执行两轮 FABRIK：Hip 有效时求解躯干到 Head；手臂求解 Shoulder–Elbow–Wrist；Hip 与对应 Foot 同时有效时求解 Hip–Knee–Ankle–Foot；缺失必要 Tracker 时整条链跳过；
+- 从旧骨向量到新骨向量的 shortest-arc rotation 左乘上一帧 global rotation，使上一帧 twist 随 IK soft 条件连续保留；直接测得的 Head、Pelvis、Wrist、Foot rotation 在 IK 后覆盖；
+
+### 当前与未来置信度
+
+- 当前 IK 只生成 `[B,144]` Pose 初值，不评价自身准确性，也不参与置信度计算；
+- 当前 inpainting 使用固定 Tracker→区域 mapping：`Torso ← Head、Hip`，左右手臂分别由对应 Hand 覆盖，左右腿分别由对应 Foot 覆盖；五区域再按 `TARGET_JOINT_REGIONS` 展开成只读 `[24,6]` 二值矩阵；
+- 每个 Tracker 的在线置信度为 `w_t = valid_t * clamp(d_on_t / tracker_confidence_warmup, 0, 1)`；当前逐关节置信度唯一公式为 `c[j,0] = max_t(mapping[j,t] * w_t)`，禁止平均、noisy-or、骨链 `min` 或额外 solved mask；
+- 采样入口保留 `--tracker_confidence_warmup`、`--future_confidence_decay` 和 `--fabrik_iterations`；这些参数不属于 DiT 构造参数；
+- 上一轮世界 horizon 用索引 `2..10` 对齐新一轮未来 `1..9`，最远帧重复旧末帧，并重新编码到当前 Head-yaw 参考系；首次推理的未来置信度全为 `0`；
+- 未来置信度严格为 `c[j,k]=c[j,0]*future_confidence_decay^k`，`k=1..10`，默认 decay 为 `0.9`；
+- 统一 DDIM timestep 为 `t`，逐关节使用连续阈值 `T_soft(c)=(1-c)*T_max`，不平方、不取整。当 `c>0`、`t>=T_soft` 且 `t>0` 时，用同一全局 `t` 下的 `q(inpaint_pose,t,known_noise)` 覆盖该关节；当 `t<T_soft` 时停止覆盖，由当前 diffusion state 继续去噪。`c=1` 在全部 `t>0` 步骤持续注入，但最终 `t=0` 与其他置信度一起释放，允许模型保留此前修正并完成最后一次前向；`c=0` 从不注入。同一个实时帧在完整 DDIM 轨迹中复用同一份 `known_noise`。
+- `pose_history_mode=ground_truth` 只在当前帧评估结束后用当前 GT 替换历史状态，并立即清空预测 horizon；下一帧 IK 读取上一帧 GT Pose，未来 rolling prior 保持无效且置信度为零，不读取未来 GT。
 
 ## Loss、运行时与长序列结果
 
 - diffusion reconstruction、global rotation、local rotation 和 rotation velocity loss 作用于全部 11 帧；
 - rotation velocity 比较相邻目标帧 `R_h^T R_(h+1)` 的 SO(3) 夹角，共 10 组，默认权重为 `1.0`；
-- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact、contact-slide 和 hard projection 只作用于 horizon 0；
+- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact 和 contact-slide 只作用于 horizon 0；`deployed_pred_xstart` 只是全 horizon 的 SO(3) 合法化结果，不包含 Tracker hard 覆盖；
 - `previous_pose_target` 是未扰动的最后一个历史 Pose；cold-start contact-slide 由最后历史槽有效性屏蔽；
 - 长序列结果同时保存 `reference_pose_horizon_raw`、`raw_pred_pose_horizon_raw`、`deployed_pred_pose_horizon_raw: [N,T,11,144]` 和 `pose_horizon_valid_mask: [N,T,11]`；序列尾部缺少的未来参考帧填 NaN；
 - 当前 MPJRE/MPJPE/MPJVE/Jitter/contact 等指标继续从 horizon 0 计算；另外报告 raw/deployed 的 horizon 0 到 10 全身 MPJRE，以及未来 1:10 宏平均。当前阶段不计算未来 MPJPE 或未来 root 位置误差；

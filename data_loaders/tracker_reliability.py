@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_config import (
+    INPAINT_JOINT_COVERAGE,
     POSITION_COVERAGE,
     ROTATION_COVERAGE,
     TrackerReliabilityConfig,
@@ -30,6 +31,69 @@ def compute_tracker_reliability_np(
     kappa_pos = common * np.minimum(1.0, d_on_value / float(cfg.d_warm_pos))
     kappa_rot = common * np.minimum(1.0, d_on_value / float(cfg.d_warm_rot))
     return kappa_pos.astype(np.float32), kappa_rot.astype(np.float32)
+
+
+def compute_tracker_online_confidence_np(
+    tracker_valid: np.ndarray,
+    d_on: np.ndarray,
+    warmup_frames: int,
+) -> np.ndarray:
+    """按连续在线时长计算当前帧唯一的逐 Tracker 置信度。"""
+
+    valid = np.asarray(tracker_valid, dtype=bool)
+    duration = np.asarray(d_on, dtype=np.float32)
+    if valid.ndim == 0 or valid.shape != duration.shape or valid.shape[-1] != TRACKER_COUNT:
+        raise ValueError("tracker_valid 和 d_on 必须同形且尾维为 6。")
+    if int(warmup_frames) <= 0:
+        raise ValueError("warmup_frames 必须大于 0。")
+    if not np.isfinite(duration).all() or np.any(duration < 0.0):
+        raise ValueError("d_on 必须为有限非负数。")
+    return (
+        valid.astype(np.float32)
+        * np.clip(duration / float(warmup_frames), 0.0, 1.0)
+    ).astype(np.float32)
+
+
+def compute_tracker_online_confidence_torch(
+    tracker_valid: torch.Tensor,
+    d_on: torch.Tensor,
+    warmup_frames: int,
+) -> torch.Tensor:
+    """Torch 版本的逐 Tracker 在线置信度，输入输出尾维均为 6。"""
+
+    valid = tracker_valid.bool()
+    duration = d_on.float()
+    if valid.ndim == 0 or valid.shape != duration.shape or valid.shape[-1] != TRACKER_COUNT:
+        raise ValueError("tracker_valid 和 d_on 必须同形且尾维为 6。")
+    if int(warmup_frames) <= 0:
+        raise ValueError("warmup_frames 必须大于 0。")
+    if not bool(torch.isfinite(duration).all()) or bool((duration < 0.0).any()):
+        raise ValueError("d_on 必须为有限非负数。")
+    return valid.to(duration.dtype) * torch.clamp(
+        duration / float(warmup_frames), min=0.0, max=1.0
+    )
+
+
+def map_tracker_confidence_to_joints_torch(
+    tracker_confidence: torch.Tensor,
+) -> torch.Tensor:
+    """用固定区域 mapping 将 `[B,6]` Tracker 置信度映射为 `[B,24]`。"""
+
+    confidence = tracker_confidence.float()
+    if confidence.ndim != 2 or confidence.shape[1] != TRACKER_COUNT:
+        raise ValueError("tracker_confidence 必须为 [B,6]。")
+    if not bool(torch.isfinite(confidence).all()) or bool(
+        ((confidence < 0.0) | (confidence > 1.0)).any()
+    ):
+        raise ValueError("tracker_confidence 必须为有限的 [0,1] 数值。")
+    coverage = torch.tensor(
+        INPAINT_JOINT_COVERAGE.copy(),
+        device=confidence.device,
+        dtype=confidence.dtype,
+    )
+    # 每个关节只取所有覆盖 Tracker 中的最大置信度；禁止使用平均、noisy-or
+    # 或骨链 min，确保公式与部署约定 c[j]=max_t(A[j,t]w_t) 完全一致。
+    return (confidence[:, None, :] * coverage[None]).amax(dim=-1)
 
 
 def compute_region_coverage_np(

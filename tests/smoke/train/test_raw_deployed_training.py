@@ -16,7 +16,6 @@ from data_loaders.realtime_pose_kinematics import (
 from data_loaders.sensor_masking import (
     REALTIME_POSE_FRAME_OFFSETS,
     REALTIME_POSE_HISTORY_ANCHOR_INDICES,
-    TRACKER_TO_JOINT,
 )
 from data_loaders.tracker_reliability import (
     compute_hard_rotation_state_np,
@@ -37,6 +36,7 @@ from diffusion.realtime_pose_losses import (
     _rotation_angle,
     compute_raw_deployed_losses,
 )
+from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
@@ -48,9 +48,14 @@ def test_training_rejects_removed_legacy_inpainting_contract():
         model_var_type=ModelVarType.FIXED_SMALL,
         loss_type=LossType.MSE,
     )
-    with pytest.raises(ValueError):
+    class StrictModel(torch.nn.Module):
+        def forward(self, value, timestep, return_aux_outputs=False):
+            del timestep, return_aux_outputs
+            return value
+
+    with pytest.raises(TypeError, match="inpaint_cond"):
         diffusion.training_losses(
-            model=None,
+            model=StrictModel(),
             x_start=torch.zeros(1, 11, 144),
             t=torch.ones(1, dtype=torch.long),
             model_kwargs={"inpaint_cond": torch.ones(1, 11, 144)},
@@ -197,7 +202,6 @@ def _model_and_kwargs(batch):
     )
     condition_names = (
         "history_pose_observation",
-        "tracker_window",
         "head_path_window",
         "history_region_confidence",
         "window_valid_mask",
@@ -211,7 +215,7 @@ def _model_and_kwargs(batch):
     return model, kwargs
 
 
-def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint():
+def test_current_training_only_legalizes_so3_without_hard_tracker_overwrite():
     torch.manual_seed(7)
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
@@ -236,22 +240,11 @@ def test_current_training_keeps_raw_hard_joint_gradient_and_current_constraint()
     assert "world_joint_loss" not in terms
     raw = terms["raw_pred_xstart"]
     deployed = terms["deployed_pred_xstart"]
+    torch.testing.assert_close(deployed, project_realtime_pose_xstart(raw))
     raw.retain_grad()
     terms["loss"].mean().backward()
-    hard_channels = []
-    for tracker_index in torch.nonzero(
-        batch["hard_rotation_state_window"][0, -1]
-    ).flatten().tolist():
-        joint_index = TRACKER_TO_JOINT[tracker_index]
-        start = joint_index * 6
-        torch.testing.assert_close(
-            deployed[0, 0, start : start + 6],
-            batch["tracker_window_raw"][0, -1, tracker_index, 3:9],
-            atol=1e-5,
-            rtol=1e-5,
-        )
-        hard_channels.extend(range(start, start + 6))
-    assert torch.linalg.norm(raw.grad[0, 0, hard_channels]) > 0.0
+    assert torch.isfinite(raw.grad).all()
+    assert torch.linalg.norm(raw.grad) > 0.0
 
 
 def test_current_training_uses_tracker_position_huber_beta():

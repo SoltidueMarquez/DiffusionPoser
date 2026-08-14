@@ -13,7 +13,22 @@ from data_loaders.realtime_pose_geometry import (
     global_head_rotations_to_local_delta_6d_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
+from data_loaders.realtime_pose_ik import build_current_ik_pose
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
+    TRACKER_CONFIGURED_OFFSET,
+    TRACKER_D_ON_OFFSET,
+    TRACKER_MEASURED_VALID_OFFSET,
+)
+from data_loaders.tracker_reliability import (
+    compute_tracker_online_confidence_torch,
+    map_tracker_confidence_to_joints_torch,
+)
+from diffusion.realtime_pose_inpainting import (
+    RealtimePoseInpaintingCondition,
+    build_realtime_pose_inpainting_condition,
+)
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
 from sample.utils import load_checkpoint_model
@@ -46,7 +61,6 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
         name: batch[name].to(device)
         for name in (
             "history_pose_observation",
-            "tracker_window",
             "head_path_window",
             "history_region_confidence",
             "window_valid_mask",
@@ -57,7 +71,6 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
     with torch.no_grad():
         prepared = model_impl.prepare_conditioning(
             values["history_pose_observation"],
-            values["tracker_window"],
             values["head_path_window"],
             values["history_region_confidence"],
             values["window_valid_mask"].bool(),
@@ -66,13 +79,74 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
     return {"prepared_conditioning": prepared}
 
 
+def build_sampling_inpainting_condition(
+    model,
+    batch: dict,
+    device: torch.device,
+    normalizer=None,
+    tracker_confidence_warmup: int = 15,
+    future_confidence_decay: float = 0.9,
+    fabrik_iterations: int = 2,
+) -> RealtimePoseInpaintingCondition:
+    """离线单 batch 按首次 runtime 语义构造条件：当前做 IK，未来不偷看 GT。"""
+
+    del model
+    previous_pose = batch["history_pose_observation"][:, -1].to(device).float()
+    mean = scale = None
+    if normalizer is not None:
+        if normalizer.pose_mean is None or normalizer.pose_scale is None:
+            normalizer.load()
+        mean = normalizer.pose_mean.to(device).float()
+        scale = normalizer.pose_scale.to(device).float()
+        previous_pose = previous_pose * scale + mean
+    current_tracker = batch["tracker_window_raw"][:, -1].to(device).float()
+    configured = current_tracker[..., TRACKER_CONFIGURED_OFFSET] > 0.5
+    measured = current_tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
+    tracker_valid = configured & measured
+    d_on = current_tracker[..., TRACKER_D_ON_OFFSET] * 60.0
+    tracker_confidence = compute_tracker_online_confidence_torch(
+        tracker_valid=tracker_valid,
+        d_on=d_on,
+        warmup_frames=tracker_confidence_warmup,
+    )
+    current_pose_raw = build_current_ik_pose(
+        previous_pose_raw=previous_pose,
+        previous_pose_valid=batch["window_valid_mask"][:, -2].to(device).bool(),
+        current_tracker_raw=current_tracker,
+        joint_offsets_parent=batch["joint_offsets_parent"].to(device).float(),
+        joint_rest_local_rotations_6d=batch[
+            "joint_rest_local_rotations_6d"
+        ].to(device).float(),
+        fabrik_iterations=fabrik_iterations,
+    )
+    current_confidence = map_tracker_confidence_to_joints_torch(
+        tracker_confidence
+    )
+    return build_realtime_pose_inpainting_condition(
+        current_pose_raw=current_pose_raw,
+        current_confidence=current_confidence,
+        future_prior_raw=torch.zeros(
+            previous_pose.shape[0],
+            REALTIME_POSE_TARGET_LENGTH - 1,
+            REALTIME_POSE_TARGET_DIM,
+            device=device,
+            dtype=torch.float32,
+        ),
+        future_prior_valid=torch.zeros(
+            previous_pose.shape[0], device=device, dtype=torch.bool
+        ),
+        pose_mean=mean,
+        pose_scale=scale,
+        future_confidence_decay=future_confidence_decay,
+    )
+
+
 def build_projection_fn(
     batch: dict,
     device: torch.device,
     normalizer=None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    current_tracker_raw = batch["tracker_window_raw"][:, -1].to(device)
-    hard_rotation_state = batch["hard_rotation_state_window"][:, -1].to(device).bool()
+    del batch
     if normalizer is None:
         mean = scale = None
     else:
@@ -82,8 +156,6 @@ def build_projection_fn(
         scale = normalizer.pose_scale.to(device)
     return lambda value: project_realtime_pose_xstart(
         value,
-        current_tracker_raw,
-        hard_rotation_state,
         mean,
         scale,
     )
@@ -95,8 +167,9 @@ def reconstruct_batch(
     batch: dict,
     device: torch.device,
     normalizer=None,
-    projection_mode: str = "all_steps",
-    late_steps: int = 5,
+    tracker_confidence_warmup: int = 15,
+    future_confidence_decay: float = 0.9,
+    fabrik_iterations: int = 2,
 ) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
     if reference.ndim != 3 or tuple(reference.shape[1:]) != (
@@ -105,7 +178,18 @@ def reconstruct_batch(
     ):
         raise ValueError(f"sample 应为 [B,11,144]，实际为 {tuple(reference.shape)}")
     model_kwargs = build_sampling_model_kwargs(model, batch, device)
+    inpainting = build_sampling_inpainting_condition(
+        model,
+        batch,
+        device,
+        normalizer=normalizer,
+        tracker_confidence_warmup=tracker_confidence_warmup,
+        future_confidence_decay=future_confidence_decay,
+        fabrik_iterations=fabrik_iterations,
+    )
     projection_fn = build_projection_fn(batch, device, normalizer)
+    # 离线入口也显式创建条件噪声；完整 DDIM 轨迹由 diffusion 复用同一张量。
+    known_noise = torch.randn_like(reference)
     with torch.no_grad():
         result = diffusion.projected_ddim_sample_loop(
             model,
@@ -118,8 +202,8 @@ def reconstruct_batch(
             clip_denoised=False,
             model_kwargs=model_kwargs,
             device=device,
-            projection_mode=projection_mode,
-            late_steps=late_steps,
+            inpaint_condition=inpainting,
+            known_noise=known_noise,
         )
     output = {
         "sample": result["sample"],
@@ -168,11 +252,9 @@ def save_reconstruction(
     tracker_positions_world = []
     for batch_index in range(deployed_prediction.shape[0]):
         current_tracker_raw = batch["tracker_window_raw"][batch_index, -1].detach().cpu().numpy()
-        hard_rotation = batch["hard_rotation_state_window"][batch_index, -1].detach().cpu().numpy()
         value = decode_and_resolve_pose(
             deployed_prediction[batch_index],
             current_tracker_raw,
-            hard_rotation,
             float(batch["current_head_yaw_world"][batch_index].item()),
             batch["current_head_position_world"][batch_index].detach().cpu().numpy(),
             float(batch["floor_y"][batch_index].item()),
@@ -275,9 +357,6 @@ def save_reconstruction(
         ),
         scenario=add_time(scenario_values),
         eval_frame_mask=np.ones((deployed_prediction.shape[0], 1), dtype=bool),
-        hard_rotation_max_error=add_time(
-            np.asarray([value.hard_rotation_max_error for value in resolved], dtype=np.float32)
-        ),
     )
 
 
@@ -307,8 +386,9 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         batch,
         device=device,
         normalizer=dataset.normalizer,
-        projection_mode=args.projected_ddim_mode,
-        late_steps=args.projected_ddim_late_steps,
+        tracker_confidence_warmup=args.tracker_confidence_warmup,
+        future_confidence_decay=args.future_confidence_decay,
+        fabrik_iterations=args.fabrik_iterations,
     )
     output_dir = Path(args.output_dir or "output/realtime_pose_144d").resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"

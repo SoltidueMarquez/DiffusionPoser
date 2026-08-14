@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_torch
-from data_loaders.sensor_masking import TRACKER_TO_JOINT
 from diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     LossType,
@@ -21,65 +20,28 @@ from diffusion.realtime_pose_projection import (
 IDENTITY_6D = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
 
 
-def _tracker(batch_size: int = 2) -> torch.Tensor:
-    tracker = torch.zeros(batch_size, 6, 13)
-    tracker[..., 3:9] = IDENTITY_6D
-    tracker[..., 9:11] = 1.0
-    tracker[..., 12] = 1.0
-    return tracker
-
-
-def test_so3_projection_is_idempotent_and_hard_rotation_is_exact():
+def test_so3_projection_is_idempotent_without_tracker_overwrite():
     torch.manual_seed(1)
     raw = torch.randn(2, 11, 144)
-    tracker = _tracker()
-    hard = torch.zeros(2, 6, dtype=torch.bool)
-    hard[:, 0] = True
-    hard[:, 3] = True
-    deployed = project_realtime_pose_xstart(raw, tracker, hard)
-    repeated = project_realtime_pose_xstart(deployed, tracker, hard)
+    deployed = project_realtime_pose_xstart(raw)
+    repeated = project_realtime_pose_xstart(deployed)
     torch.testing.assert_close(deployed, repeated, atol=1e-5, rtol=1e-5)
     rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 11, 24, 6))
     identity = torch.eye(3).expand_as(rotations)
     torch.testing.assert_close(rotations.transpose(-1, -2) @ rotations, identity, atol=1e-5, rtol=1e-5)
     assert torch.all(torch.linalg.det(rotations) > 0.9999)
-    for tracker_index in (0, 3):
-        joint_index = TRACKER_TO_JOINT[tracker_index]
-        torch.testing.assert_close(
-            deployed[:, 0, joint_index * 6 : joint_index * 6 + 6],
-            tracker[:, tracker_index, 3:9],
-        )
-    head_joint = TRACKER_TO_JOINT[0]
-    torch.testing.assert_close(
-        deployed[:, 0, head_joint * 6 : head_joint * 6 + 6],
-        tracker[:, 0, 3:9],
-    )
-    assert not torch.allclose(
-        deployed[:, 1, head_joint * 6 : head_joint * 6 + 6],
-        tracker[:, 0, 3:9],
-    )
 
 
-def test_soft_tracker_is_not_replaced():
+def test_projection_only_legalizes_each_rotation6d():
     raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
-    tracker = _tracker(batch_size=1)
-    tracker[:, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
-    hard = torch.zeros(1, 6, dtype=torch.bool)
-    hard[:, 0] = True
-    deployed = project_realtime_pose_xstart(raw, tracker, hard)
-    wrist = TRACKER_TO_JOINT[1]
-    torch.testing.assert_close(
-        deployed[:, 0, wrist * 6 : wrist * 6 + 6],
-        raw[:, 0, wrist * 6 : wrist * 6 + 6],
-    )
+    deployed = project_realtime_pose_xstart(raw)
+    torch.testing.assert_close(deployed, raw, atol=1e-5, rtol=1e-5)
 
 
 def test_projection_rejects_legacy_single_frame_state():
     with torch.no_grad(), np.testing.assert_raises(ValueError):
         project_realtime_pose_xstart(
             torch.zeros(1, 144),
-            torch.zeros(1, 6, 13),
-            torch.zeros(1, 6, dtype=torch.bool),
         )
 
 
@@ -103,7 +65,7 @@ class _AuxiliaryXStart(_ConstantXStart):
         }
 
 
-def test_projected_ddim_recomputes_epsilon_from_deployed_xstart():
+def test_projected_ddim_keeps_soft_prediction_until_final_projection():
     diffusion = GaussianDiffusion(
         betas=np.asarray([0.1, 0.2], dtype=np.float64),
         model_mean_type=ModelMeanType.START_X,
@@ -120,15 +82,23 @@ def test_projected_ddim_recomputes_epsilon_from_deployed_xstart():
         timestep,
         projection_fn=lambda _: deployed_xstart,
         eta=0.0,
-        projection_mode="all_steps",
     )
     alpha = torch.tensor(diffusion.alphas_cumprod[1], dtype=x.dtype)
     alpha_prev = torch.tensor(diffusion.alphas_cumprod_prev[1], dtype=x.dtype)
-    epsilon = (x - torch.sqrt(alpha) * deployed_xstart) / torch.sqrt(1.0 - alpha)
-    expected = torch.sqrt(alpha_prev) * deployed_xstart + torch.sqrt(1.0 - alpha_prev) * epsilon
+    epsilon = (x - torch.sqrt(alpha) * raw_xstart) / torch.sqrt(1.0 - alpha)
+    expected = torch.sqrt(alpha_prev) * raw_xstart + torch.sqrt(1.0 - alpha_prev) * epsilon
     torch.testing.assert_close(result["sample"], expected, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(result["raw_pred_xstart"], raw_xstart)
-    torch.testing.assert_close(result["deployed_pred_xstart"], deployed_xstart)
+    torch.testing.assert_close(result["deployed_pred_xstart"], raw_xstart)
+
+    final = diffusion.projected_ddim_sample(
+        _ConstantXStart(raw_xstart),
+        x,
+        torch.tensor([0]),
+        projection_fn=lambda _: deployed_xstart,
+        eta=0.0,
+    )
+    torch.testing.assert_close(final["sample"], deployed_xstart)
 
 
 def test_projected_ddim_returns_final_auxiliary_heads():
@@ -151,7 +121,7 @@ def test_projected_ddim_returns_final_auxiliary_heads():
     assert result["auxiliary_outputs"]["contact_logits"].shape == (1, 2)
 
 
-def test_projected_ddim_only_calls_projection_on_selected_steps():
+def test_projected_ddim_only_projects_once_at_final_step():
     diffusion = GaussianDiffusion(
         betas=np.asarray([0.1, 0.15, 0.2, 0.25], dtype=np.float64),
         model_mean_type=ModelMeanType.START_X,
@@ -159,23 +129,16 @@ def test_projected_ddim_only_calls_projection_on_selected_steps():
         loss_type=LossType.MSE,
     )
     model = _ConstantXStart(torch.zeros(1, 4))
-    for mode, late_steps, expected_calls in (
-        ("all_steps", 2, 4),
-        ("late_steps", 2, 2),
-        ("final_step", 2, 1),
-    ):
-        projection_calls = []
+    projection_calls = []
 
-        def projection_fn(value):
-            projection_calls.append(1)
-            return value
+    def projection_fn(value):
+        projection_calls.append(1)
+        return value
 
-        diffusion.projected_ddim_sample_loop(
-            model,
-            shape=(1, 4),
-            projection_fn=projection_fn,
-            device=torch.device("cpu"),
-            projection_mode=mode,
-            late_steps=late_steps,
-        )
-        assert len(projection_calls) == expected_calls
+    diffusion.projected_ddim_sample_loop(
+        model,
+        shape=(1, 4),
+        projection_fn=projection_fn,
+        device=torch.device("cpu"),
+    )
+    assert len(projection_calls) == 1

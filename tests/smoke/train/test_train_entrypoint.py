@@ -8,7 +8,6 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from unittest.mock import patch
 
-from data_loaders.realtime_pose_config import TrackerReliabilityConfig
 from train.train_diffusionposer import prepare_save_dir, resolve_save_dir, save_args
 from train.train_platforms import TensorboardPlatform
 from utils import model_util
@@ -21,7 +20,7 @@ from utils.parser_util import (
 
 
 class TrainEntrypointTest(unittest.TestCase):
-    def test_model_factory_uses_fixed_default_reliability_config(self):
+    def test_model_factory_does_not_attach_runtime_reliability_configuration(self):
         args = Namespace(
             input_feats=144,
             latent_dim=64,
@@ -41,8 +40,9 @@ class TrainEntrypointTest(unittest.TestCase):
         ):
             model_util.create_model_and_diffusion(args)
 
-        reliability_config = model_constructor.call_args.kwargs["reliability_config"]
-        self.assertEqual(reliability_config, TrackerReliabilityConfig())
+        constructor_kwargs = model_constructor.call_args.kwargs
+        self.assertNotIn("reliability_config", constructor_kwargs)
+        self.assertNotIn("ik_inpainting_config", constructor_kwargs)
 
     def test_model_options_do_not_expose_unpropagated_reliability_controls(self):
         parser = ArgumentParser()
@@ -72,6 +72,13 @@ class TrainEntrypointTest(unittest.TestCase):
     def test_sampling_options_do_not_expose_abandoned_diffusion_ik(self):
         parser = ArgumentParser()
         add_sampling_options(parser)
+        args = parser.parse_args(["--model_path", "model.pt"])
+
+        self.assertEqual(args.tracker_confidence_warmup, 15)
+        self.assertEqual(args.future_confidence_decay, 0.9)
+        self.assertEqual(args.fabrik_iterations, 2)
+        self.assertNotIn("--projected_ddim_mode", parser._option_string_actions)
+        self.assertNotIn("--projected_ddim_late_steps", parser._option_string_actions)
 
         for option in (
             "--ik_init_mode",
