@@ -880,14 +880,14 @@ class GaussianDiffusion:
             model_kwargs=step_model_kwargs,
         )
         raw_pred_xstart = out["pred_xstart"]
-        # 置信度只通过 inpainting 生效；最终步 projection 只负责 SO(3) 合法化。
+        # 置信度只通过 inpainting 生效；最终步额外执行一次 Tracker hard projection。
         should_project = t == 0
         if bool(should_project.any()):
             projected = projection_fn(raw_pred_xstart)
             selector = should_project.view(-1, *([1] * (x.ndim - 1)))
             deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
         else:
-            # 早期步骤保持 raw x0，只在最终步做合法旋转投影。
+            # 早期步骤保持 raw x0，禁止提前覆盖 hard Tracker。
             deployed_pred_xstart = raw_pred_xstart
         eps = self._predict_eps_from_xstart(x_model, t, deployed_pred_xstart)
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x_model.shape)
@@ -1450,6 +1450,8 @@ class GaussianDiffusion:
         t,
         model_kwargs=None,
         noise=None,
+        inpaint_condition=None,
+        known_noise=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
@@ -1465,6 +1467,8 @@ class GaussianDiffusion:
             t=t,
             model_kwargs=model_kwargs,
             noise=noise,
+            inpaint_condition=inpaint_condition,
+            known_noise=known_noise,
             feature_w=feature_w,
             snr_gamma=snr_gamma,
             use_l1=use_l1,
@@ -1478,6 +1482,8 @@ class GaussianDiffusion:
         t,
         model_kwargs,
         noise=None,
+        inpaint_condition=None,
+        known_noise=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
@@ -1496,29 +1502,49 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
+        if inpaint_condition is None:
+            if known_noise is not None:
+                raise ValueError("没有 inpaint_condition 时不得单独提供 known_noise。")
+            x_model = x_t
+        else:
+            validate_realtime_pose_inpainting_condition(
+                inpaint_condition,
+                require_current_only=True,
+            )
+            if known_noise is None:
+                raise ValueError("训练 IK Inpainting 必须显式提供独立 known_noise。")
+            x_model, _ = apply_realtime_pose_inpainting(
+                x_t=x_t,
+                t=t,
+                condition=inpaint_condition,
+                known_noise=known_noise,
+                alphas_cumprod=self.alphas_cumprod,
+            )
         batch = model_kwargs.get("y", model_kwargs)
         call_kwargs = dict(model_kwargs)
         call_kwargs["return_aux_outputs"] = True
-        model_result = model(x_t, self._scale_timesteps(t), **call_kwargs)
+        model_result = model(x_model, self._scale_timesteps(t), **call_kwargs)
         if not isinstance(model_result, tuple) or len(model_result) != 2:
             raise TypeError("RealtimePose 模型训练时必须返回 (raw_output, auxiliary_outputs)。")
         model_output, auxiliary_outputs = model_result
         target = (
             x_start
             if self.model_mean_type == ModelMeanType.START_X
-            else self._predict_eps_from_xstart(x_t, t, x_start)
+            else self._predict_eps_from_xstart(x_model, t, x_start)
         )
         if model_output.shape != target.shape:
             raise ValueError("模型输出、diffusion target 和 x_start 必须同形。")
         raw_pred_xstart = (
             model_output
             if self.model_mean_type == ModelMeanType.START_X
-            else self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            else self._predict_xstart_from_eps(x_t=x_model, t=t, eps=model_output)
         )
         deployed_pred_xstart = project_realtime_pose_xstart(
-            raw_pred_xstart,
-            batch.get("pose_mean"),
-            batch.get("pose_scale"),
+            pred_xstart=raw_pred_xstart,
+            current_tracker_raw=batch["tracker_window_raw"][:, -1],
+            hard_rotation_state=batch["hard_rotation_state_window"][:, -1],
+            pose_mean=batch.get("pose_mean"),
+            pose_scale=batch.get("pose_scale"),
         )
         # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。

@@ -43,8 +43,9 @@ def _clone_runtime_state(runtime: RealtimePoseRuntime) -> RealtimePoseRuntime:
         runtime.joint_rest_local_rotations_6d,
         normalizer=runtime.normalizer,
         tracker_confidence_warmup=runtime.ik_inpainting_config.tracker_confidence_warmup,
-        future_confidence_decay=runtime.ik_inpainting_config.future_confidence_decay,
         fabrik_iterations=runtime.ik_inpainting_config.fabrik_iterations,
+        use_future_rolling_prior=runtime.future_rolling_prior_config.enabled,
+        future_confidence_decay=runtime.future_rolling_prior_config.confidence_decay,
     )
     cloned.pose_history = list(runtime.pose_history)
     cloned.tracker_history = list(runtime.tracker_history)
@@ -183,7 +184,15 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     diagnostic = parser.add_argument_group("sampling_variance")
     diagnostic.add_argument("--diagnostic_frame", default=600, type=int)
     diagnostic.add_argument("--repeat_count", default=32, type=int)
-    args = parse_and_load_from_model(parser, argv=argv, ignore_keys={"ts_respace"})
+    args = parse_and_load_from_model(
+        parser,
+        argv=argv,
+        ignore_keys={
+            "ts_respace",
+            "use_future_rolling_prior",
+            "future_confidence_decay",
+        },
+    )
     if len(args.conditions) != 1:
         raise ValueError("重复采样诊断必须只指定一种 conditions。")
     if int(args.repeat_count) < 2:
@@ -236,8 +245,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         source["joint_rest_local_rotations_6d"],
         normalizer=normalizer,
         tracker_confidence_warmup=int(args.tracker_confidence_warmup),
-        future_confidence_decay=float(args.future_confidence_decay),
         fabrik_iterations=int(args.fabrik_iterations),
+        use_future_rolling_prior=bool(args.use_future_rolling_prior),
+        future_confidence_decay=float(args.future_confidence_decay),
     )
 
     warmup_seed = int(

@@ -24,6 +24,7 @@ def build_train_arg_parser() -> ArgumentParser:
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
+    add_ik_inpainting_options(parser)
     add_training_options(parser)
     return parser
 
@@ -115,9 +116,28 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--source_fps", default=60.0, type=float)
     group.add_argument("--use_ema", default=True, type=str2bool)
+    add_ik_inpainting_options(parser)
+    add_future_rolling_prior_options(parser)
+
+
+def add_ik_inpainting_options(parser: ArgumentParser):
+    """注册训练与采样必须一致的当前帧 IK 参数。"""
+
+    group = parser.add_argument_group("ik inpainting")
     group.add_argument("--tracker_confidence_warmup", default=15, type=int)
-    group.add_argument("--future_confidence_decay", default=0.9, type=float)
     group.add_argument("--fabrik_iterations", default=2, type=int)
+
+
+def add_future_rolling_prior_options(parser: ArgumentParser):
+    """注册仅影响推理采样、不写入训练 checkpoint 的 rolling prior 参数。"""
+
+    group = parser.add_argument_group("future rolling prior")
+    group.add_argument(
+        "--use_future_rolling_prior",
+        default=False,
+        action=BooleanOptionalAction,
+    )
+    group.add_argument("--future_confidence_decay", default=0.9, type=float)
 
 
 def add_model_options(parser: ArgumentParser):

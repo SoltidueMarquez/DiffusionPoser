@@ -10,6 +10,7 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 
+from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_history_noise import (
     HistoryPoseNoiseConfig,
     corrupt_history_pose_observation,
@@ -21,6 +22,10 @@ from data_loaders.sensor_masking import (
     TASK_MODE_REALTIME_POSE,
 )
 from diffusion import logger
+from diffusion.realtime_pose_inpainting import (
+    RealtimePoseInpaintingCondition,
+    build_current_realtime_pose_inpainting_condition,
+)
 from utils import dist_util
 
 
@@ -33,6 +38,11 @@ TRAIN_DEVICE_FIELDS = frozenset(
         "window_valid_mask",
         "frame_offsets",
         "tracker_window_raw",
+        "configured",
+        "measured_valid",
+        "d_on",
+        "joint_rest_local_rotations_6d",
+        "hard_rotation_state_window",
         "target_joints_head_ref",
         "joint_offsets_parent",
         "target_root_position_head_ref",
@@ -75,6 +85,12 @@ class TrainLoop:
             temporal_rho=float(getattr(args, "history_noise_temporal_rho", 0.95)),
             region_ratio=float(getattr(args, "history_noise_region_ratio", 0.75)),
             joint_ratio=float(getattr(args, "history_noise_joint_ratio", 0.25)),
+        ).validate()
+        self.ik_inpainting_config = IKInpaintingConfig(
+            tracker_confidence_warmup=int(
+                getattr(args, "tracker_confidence_warmup", 15)
+            ),
+            fabrik_iterations=int(getattr(args, "fabrik_iterations", 2)),
         ).validate()
         self.save_dir = Path(args.save_dir)
         self.step = 0
@@ -400,11 +416,28 @@ class TrainLoop:
                 f"实际为 {tuple(x_start.shape)}"
             )
         feature_w = self._feature_weights_for_batch(x_start.shape[0])
+        history_observation = self._prepare_history_observation(batch)
+        model_kwargs = self.mask_manager(
+            batch,
+            x_start,
+            history_observation=history_observation,
+        )
+        inpaint_condition = self.build_training_inpainting_condition(
+            batch,
+            history_observation,
+            x_start,
+        )
+        # 两条噪声流彼此独立：noise 生成普通 x_t，known_noise 只生成已知 IK 状态。
+        noise = torch.randn_like(x_start)
+        known_noise = torch.randn_like(x_start)
         return self.diffusion.training_losses(
             self.model,
             x_start,
             timesteps,
-            model_kwargs=self.mask_manager(batch, x_start),
+            model_kwargs=model_kwargs,
+            noise=noise,
+            inpaint_condition=inpaint_condition,
+            known_noise=known_noise,
             feature_w=feature_w,
             snr_gamma=self.snr_gamma,
             use_l1=self.use_l1,
@@ -426,13 +459,8 @@ class TrainLoop:
             return None
         return self.feature_w.to(self.device)[None].repeat(batch_size, 1)
 
-    def mask_manager(self, batch, sample):
+    def _prepare_history_observation(self, batch: dict) -> torch.Tensor:
         window_valid_mask = batch["window_valid_mask"].bool()
-        if tuple(window_valid_mask.shape) != (
-            sample.shape[0],
-            REALTIME_POSE_CONDITION_WINDOW_LENGTH,
-        ):
-            raise ValueError("window_valid_mask 必须为 [B,11]。")
         history_observation = batch["history_pose_observation"]
         if self.model.training and torch.is_grad_enabled():
             # SO(3) 扰动始终使用 float32，避免 AMP 降低小角度指数映射精度。
@@ -445,6 +473,54 @@ class TrainLoop:
                     pose_scale=self.pose_scale,
                     config=self.history_noise_config,
                 )
+        return history_observation
+
+    def build_training_inpainting_condition(
+        self,
+        batch: dict,
+        history_observation: torch.Tensor,
+        sample: torch.Tensor,
+    ) -> RealtimePoseInpaintingCondition:
+        """在历史扰动之后构造与 runtime 相同的当前帧 IK 条件。"""
+
+        pose_mean = pose_scale = None
+        if self.pose_mean is not None and self.pose_scale is not None:
+            pose_mean = self.pose_mean.to(device=sample.device, dtype=torch.float32)
+            pose_scale = self.pose_scale.to(device=sample.device, dtype=torch.float32)
+        previous_pose_raw = history_observation[:, -1].float()
+        if pose_mean is not None and pose_scale is not None:
+            previous_pose_raw = previous_pose_raw * pose_scale + pose_mean
+        with autocast(device_type=self.device.type, enabled=False):
+            return build_current_realtime_pose_inpainting_condition(
+                previous_pose_raw=previous_pose_raw,
+                previous_pose_valid=batch["window_valid_mask"][:, -2].bool(),
+                current_tracker_raw=batch["tracker_window_raw"][:, -1].float(),
+                configured=batch["configured"][:, -1].bool(),
+                measured_valid=batch["measured_valid"][:, -1].bool(),
+                d_on=batch["d_on"][:, -1].float(),
+                joint_offsets_parent=batch["joint_offsets_parent"].float(),
+                joint_rest_local_rotations_6d=batch[
+                    "joint_rest_local_rotations_6d"
+                ].float(),
+                pose_mean=pose_mean,
+                pose_scale=pose_scale,
+                config=self.ik_inpainting_config,
+            )
+
+    def mask_manager(
+        self,
+        batch: dict,
+        sample: torch.Tensor,
+        history_observation: torch.Tensor | None = None,
+    ) -> dict:
+        window_valid_mask = batch["window_valid_mask"].bool()
+        if tuple(window_valid_mask.shape) != (
+            sample.shape[0],
+            REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+        ):
+            raise ValueError("window_valid_mask 必须为 [B,11]。")
+        if history_observation is None:
+            history_observation = self._prepare_history_observation(batch)
         pose_mean = None
         pose_scale = None
         if self.pose_mean is not None and self.pose_scale is not None:
@@ -464,6 +540,7 @@ class TrainLoop:
             # 避免把人为历史噪声误当成需要保持的脚部锚点。
             "previous_pose_target": batch["history_pose_observation"][:, -1],
             "tracker_window_raw": batch["tracker_window_raw"],
+            "hard_rotation_state_window": batch["hard_rotation_state_window"],
             "target_joints_head_ref": batch["target_joints_head_ref"],
             "joint_offsets_parent": batch["joint_offsets_parent"],
             "target_root_position_head_ref": batch["target_root_position_head_ref"],

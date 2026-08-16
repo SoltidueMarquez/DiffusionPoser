@@ -12,9 +12,11 @@ from diffusion.gaussian_diffusion import (
 )
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
+    add_future_rolling_prior_to_condition,
     apply_realtime_pose_inpainting,
     build_realtime_pose_inpainting_condition,
     confidence_to_t_soft,
+    validate_realtime_pose_inpainting_condition,
 )
 
 
@@ -23,42 +25,90 @@ def _current_pose_raw() -> torch.Tensor:
 
 
 def _condition(confidence: torch.Tensor) -> RealtimePoseInpaintingCondition:
+    horizon_confidence = torch.zeros(1, 11, 24)
+    horizon_confidence[:, 0] = confidence
     return RealtimePoseInpaintingCondition(
         pose=torch.zeros(1, 11, 144),
-        confidence=confidence.reshape(1, 1, 24).expand(1, 11, 24).clone(),
+        confidence=horizon_confidence,
     )
 
 
-def test_future_prior_inherits_current_confidence_with_exact_gamma_decay():
+def test_condition_only_populates_current_frame_and_normalizes_it():
     current_confidence = torch.zeros(1, 24)
     current_confidence[0, 0] = 1.0
     current_confidence[0, 1] = 0.5
+    current_pose = torch.arange(144, dtype=torch.float32).reshape(1, 144)
+    mean = torch.ones(144)
+    scale = torch.full((144,), 2.0)
     condition = build_realtime_pose_inpainting_condition(
-        current_pose_raw=_current_pose_raw(),
+        current_pose_raw=current_pose,
         current_confidence=current_confidence,
-        future_prior_raw=torch.ones(1, 10, 144),
-        future_prior_valid=torch.tensor([True]),
-        pose_mean=None,
-        pose_scale=None,
-        future_confidence_decay=0.9,
+        pose_mean=mean,
+        pose_scale=scale,
     )
-    expected = torch.tensor([0.9**index for index in range(11)])
-    torch.testing.assert_close(condition.confidence[0, :, 0], expected)
-    torch.testing.assert_close(condition.confidence[0, :, 1], 0.5 * expected)
-    assert not (condition.confidence[0, :, 2:] > 0.0).any()
+    torch.testing.assert_close(condition.pose[:, 0], (current_pose - mean) / scale)
+    torch.testing.assert_close(condition.pose[:, 1:], torch.zeros(1, 10, 144))
+    torch.testing.assert_close(condition.confidence[:, 0], current_confidence)
+    torch.testing.assert_close(condition.confidence[:, 1:], torch.zeros(1, 10, 24))
 
 
 def test_first_runtime_step_has_no_future_inpainting():
     condition = build_realtime_pose_inpainting_condition(
         current_pose_raw=_current_pose_raw(),
         current_confidence=torch.ones(1, 24),
-        future_prior_raw=torch.zeros(1, 10, 144),
-        future_prior_valid=torch.tensor([False]),
         pose_mean=None,
         pose_scale=None,
     )
     assert torch.all(condition.confidence[:, 0] == 1.0)
     assert not (condition.confidence[:, 1:] > 0.0).any()
+
+
+def test_future_rolling_prior_only_fills_aligned_horizon_one_to_nine():
+    current_confidence = torch.zeros(2, 24)
+    current_confidence[:, 0] = 1.0
+    current = build_realtime_pose_inpainting_condition(
+        current_pose_raw=torch.zeros(2, 144),
+        current_confidence=current_confidence,
+        pose_mean=torch.ones(144),
+        pose_scale=torch.full((144,), 2.0),
+    )
+    aligned_prior = torch.stack(
+        [torch.full((2, 144), float(index)) for index in range(2, 11)],
+        dim=1,
+    )
+    condition = add_future_rolling_prior_to_condition(
+        current_condition=current,
+        aligned_future_prior_raw=aligned_prior,
+        future_prior_valid=torch.tensor([True, False]),
+        pose_mean=torch.ones(144),
+        pose_scale=torch.full((144,), 2.0),
+        confidence_decay=0.9,
+    )
+
+    torch.testing.assert_close(
+        condition.pose[0, 1:-1], (aligned_prior[0] - 1.0) / 2.0
+    )
+    torch.testing.assert_close(condition.pose[1, 1:], torch.zeros(10, 144))
+    expected_decay = torch.tensor([0.9**index for index in range(1, 10)])
+    torch.testing.assert_close(condition.confidence[0, 1:-1, 0], expected_decay)
+    torch.testing.assert_close(condition.confidence[1, 1:], torch.zeros(10, 24))
+    torch.testing.assert_close(condition.pose[:, -1], torch.zeros(2, 144))
+    torch.testing.assert_close(condition.confidence[:, -1], torch.zeros(2, 24))
+    x_t = torch.full((2, 11, 144), 7.0)
+    injected, _ = apply_realtime_pose_inpainting(
+        x_t=x_t,
+        t=torch.full((2,), 9, dtype=torch.long),
+        condition=condition,
+        known_noise=torch.zeros_like(x_t),
+        alphas_cumprod=np.linspace(0.99, 0.1, 10),
+    )
+    assert not torch.equal(injected[0, 1:-1], x_t[0, 1:-1])
+    torch.testing.assert_close(injected[:, -1], x_t[:, -1])
+    with pytest.raises(ValueError, match="current-only"):
+        validate_realtime_pose_inpainting_condition(
+            condition,
+            require_current_only=True,
+        )
 
 
 def test_t_soft_is_linear_without_rounding_or_square_mapping():
@@ -108,6 +158,24 @@ def test_c_one_inpaints_until_final_step_c_zero_never_inpaints_and_soft_releases
         alphas_cumprod=alphas_cumprod,
     )
     torch.testing.assert_close(final, x_t)
+
+
+def test_zero_confidence_is_exactly_equivalent_to_plain_x_t():
+    x_t = torch.randn(2, 11, 144)
+    pose = torch.zeros_like(x_t)
+    pose[:, 0] = torch.randn(2, 144)
+    condition = RealtimePoseInpaintingCondition(
+        pose=pose,
+        confidence=torch.zeros(2, 11, 24),
+    )
+    x_model, _ = apply_realtime_pose_inpainting(
+        x_t=x_t,
+        t=torch.tensor([1, 7]),
+        condition=condition,
+        known_noise=torch.randn_like(x_t),
+        alphas_cumprod=np.linspace(0.99, 0.1, 10),
+    )
+    torch.testing.assert_close(x_model, x_t)
 
 
 def test_projected_ddim_reuses_one_known_noise_for_every_step(monkeypatch):
@@ -187,8 +255,6 @@ def test_wrong_ik_pose_at_full_confidence_is_released_for_final_correction():
     condition = build_realtime_pose_inpainting_condition(
         current_pose_raw=wrong_ik_pose,
         current_confidence=torch.ones(1, 24),
-        future_prior_raw=torch.zeros(1, 10, 144),
-        future_prior_valid=torch.tensor([False]),
         pose_mean=None,
         pose_scale=None,
     )

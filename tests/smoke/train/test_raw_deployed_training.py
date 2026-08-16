@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.generate_realtime_pose_tasks import (
     build_task_bundle_row,
     compute_source_joint_rotations_world,
@@ -36,9 +37,14 @@ from diffusion.realtime_pose_losses import (
     _rotation_angle,
     compute_raw_deployed_losses,
 )
+from diffusion.realtime_pose_inpainting import (
+    RealtimePoseInpaintingCondition,
+    apply_realtime_pose_inpainting,
+)
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
+from train.training_loop import TrainLoop
 
 
 def test_training_rejects_removed_legacy_inpainting_contract():
@@ -184,6 +190,9 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "hard_rotation_state_window": compute_hard_rotation_state_np(
             configured, measured, d_on
         ),
+        "configured": configured,
+        "measured_valid": measured,
+        "d_on": d_on,
         "target_joints_head_ref": row["target_joints_head_ref"],
         "joint_offsets_parent": source["joint_offsets_parent"],
         "joint_rest_local_rotations_6d": source["joint_rest_local_rotations_6d"],
@@ -215,7 +224,7 @@ def _model_and_kwargs(batch):
     return model, kwargs
 
 
-def test_current_training_only_legalizes_so3_without_hard_tracker_overwrite():
+def test_current_training_uses_same_final_hard_tracker_projection():
     torch.manual_seed(7)
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
@@ -226,12 +235,20 @@ def test_current_training_only_legalizes_so3_without_hard_tracker_overwrite():
         loss_type=LossType.MSE,
         tracker_pos_loss_weight=10.0,
     )
+    inpaint_condition = RealtimePoseInpaintingCondition(
+        pose=torch.zeros_like(batch["x"], dtype=torch.float32),
+        confidence=torch.cat(
+            [torch.ones(1, 1, 24), torch.zeros(1, 10, 24)], dim=1
+        ),
+    )
     terms = diffusion.training_losses(
         model,
         batch["x"].float(),
         torch.ones(1, dtype=torch.long),
         model_kwargs=model_kwargs,
         noise=torch.zeros_like(batch["x"], dtype=torch.float32),
+        inpaint_condition=inpaint_condition,
+        known_noise=torch.ones_like(batch["x"], dtype=torch.float32),
         return_pred_xstart=True,
     )
     assert all(torch.isfinite(value).all() for value in terms.values())
@@ -240,11 +257,166 @@ def test_current_training_only_legalizes_so3_without_hard_tracker_overwrite():
     assert "world_joint_loss" not in terms
     raw = terms["raw_pred_xstart"]
     deployed = terms["deployed_pred_xstart"]
-    torch.testing.assert_close(deployed, project_realtime_pose_xstart(raw))
+    torch.testing.assert_close(
+        deployed,
+        project_realtime_pose_xstart(
+            raw,
+            batch["tracker_window_raw"][:, -1],
+            batch["hard_rotation_state_window"][:, -1],
+        ),
+    )
     raw.retain_grad()
     terms["loss"].mean().backward()
     assert torch.isfinite(raw.grad).all()
     assert torch.linalg.norm(raw.grad) > 0.0
+
+
+def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
+    batch = _training_batch()
+    batch["window_valid_mask"][:, -2] = False
+    loop = object.__new__(TrainLoop)
+    loop.device = torch.device("cpu")
+    loop.pose_mean = torch.linspace(-0.2, 0.2, 144)
+    loop.pose_scale = torch.linspace(0.5, 1.5, 144)
+    loop.ik_inpainting_config = IKInpaintingConfig()
+    first_history = torch.randn_like(batch["history_pose_observation"].float())
+    second_history = first_history.clone()
+    second_history[:, -1] += 100.0
+
+    first = loop.build_training_inpainting_condition(
+        batch, first_history, batch["x"].float()
+    )
+    second = loop.build_training_inpainting_condition(
+        batch, second_history, batch["x"].float()
+    )
+    pose_mean, pose_scale = loop.pose_mean, loop.pose_scale
+    loop.pose_mean = None
+    loop.pose_scale = None
+    raw = loop.build_training_inpainting_condition(
+        batch, first_history, batch["x"].float()
+    )
+
+    # 上一历史槽无效时 IK 必须忽略其数值并统一从 rest rotation 启动。
+    torch.testing.assert_close(first.pose[:, 0], second.pose[:, 0])
+    torch.testing.assert_close(
+        first.pose[:, 0] * pose_scale + pose_mean, raw.pose[:, 0]
+    )
+    assert torch.isfinite(first.pose).all()
+    torch.testing.assert_close(first.pose[:, 1:], torch.zeros_like(first.pose[:, 1:]))
+    torch.testing.assert_close(
+        first.confidence[:, 1:], torch.zeros_like(first.confidence[:, 1:])
+    )
+
+
+class _RecordingTrainingModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_input: torch.Tensor | None = None
+
+    def forward(self, value, _timestep, **_kwargs):
+        self.seen_input = value.detach().clone()
+        return torch.zeros_like(value), {
+            "contact_logits": torch.zeros(value.shape[0], 2, device=value.device)
+        }
+
+
+def test_training_inpainting_uses_x_model_for_forward_and_epsilon_target():
+    batch = _training_batch()
+    _, model_kwargs = _model_and_kwargs(batch)
+    diffusion = GaussianDiffusion(
+        betas=np.asarray([0.01, 0.02], dtype=np.float64),
+        model_mean_type=ModelMeanType.EPSILON,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+    )
+    model = _RecordingTrainingModel()
+    x_start = batch["x"].float()
+    noise = torch.zeros_like(x_start)
+    known_noise = torch.ones_like(x_start)
+    confidence = torch.zeros(1, 11, 24)
+    confidence[:, 0, 0] = 1.0
+    condition = RealtimePoseInpaintingCondition(
+        pose=torch.zeros_like(x_start),
+        confidence=confidence,
+    )
+    timestep = torch.ones(1, dtype=torch.long)
+    x_t = diffusion.q_sample(x_start, timestep, noise=noise)
+    expected_x_model, _ = apply_realtime_pose_inpainting(
+        x_t,
+        timestep,
+        condition,
+        known_noise,
+        diffusion.alphas_cumprod,
+    )
+
+    terms = diffusion.training_losses(
+        model,
+        x_start,
+        timestep,
+        model_kwargs=model_kwargs,
+        noise=noise,
+        inpaint_condition=condition,
+        known_noise=known_noise,
+    )
+
+    torch.testing.assert_close(model.seen_input, expected_x_model)
+    # 未来 confidence 恒零，因此未来帧仍是普通 q_sample 的 x_t。
+    torch.testing.assert_close(model.seen_input[:, 1:], x_t[:, 1:])
+    expected_target = diffusion._predict_eps_from_xstart(
+        expected_x_model, timestep, x_start
+    )
+    torch.testing.assert_close(
+        terms["simple_loss"], expected_target.square().flatten(1).mean(dim=1)
+    )
+
+
+def test_training_inpainting_requires_independent_known_noise():
+    batch = _training_batch()
+    model, model_kwargs = _model_and_kwargs(batch)
+    condition = RealtimePoseInpaintingCondition(
+        pose=torch.zeros_like(batch["x"], dtype=torch.float32),
+        confidence=torch.zeros(1, 11, 24),
+    )
+    diffusion = GaussianDiffusion(
+        betas=np.asarray([0.01, 0.02], dtype=np.float64),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+    )
+    with pytest.raises(ValueError, match="known_noise"):
+        diffusion.training_losses(
+            model,
+            batch["x"].float(),
+            torch.ones(1, dtype=torch.long),
+            model_kwargs=model_kwargs,
+            inpaint_condition=condition,
+        )
+
+
+def test_training_rejects_inference_only_future_rolling_prior():
+    batch = _training_batch()
+    model, model_kwargs = _model_and_kwargs(batch)
+    pose = torch.zeros_like(batch["x"], dtype=torch.float32)
+    confidence = torch.zeros(1, 11, 24)
+    pose[:, 1] = 1.0
+    confidence[:, 1] = 0.5
+    condition = RealtimePoseInpaintingCondition(pose=pose, confidence=confidence)
+    diffusion = GaussianDiffusion(
+        betas=np.asarray([0.01, 0.02], dtype=np.float64),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+    )
+
+    with pytest.raises(ValueError, match="current-only"):
+        diffusion.training_losses(
+            model,
+            batch["x"].float(),
+            torch.ones(1, dtype=torch.long),
+            model_kwargs=model_kwargs,
+            inpaint_condition=condition,
+            known_noise=torch.zeros_like(batch["x"], dtype=torch.float32),
+        )
 
 
 def test_current_training_uses_tracker_position_huber_beta():

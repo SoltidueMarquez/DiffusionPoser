@@ -40,22 +40,35 @@ class TrackerReliabilityConfig:
 
 @dataclass(frozen=True)
 class IKInpaintingConfig:
-    """采样侧 IK、Tracker 置信度与未来衰减的公共超参数。"""
+    """训练与采样共享的当前帧 IK Inpainting 超参数。"""
 
     tracker_confidence_warmup: int = 15
-    future_confidence_decay: float = 0.9
     fabrik_iterations: int = 2
 
     def validate(self) -> "IKInpaintingConfig":
         if int(self.tracker_confidence_warmup) <= 0:
             raise ValueError("tracker_confidence_warmup 必须大于 0。")
-        if not 0.0 < float(self.future_confidence_decay) <= 1.0:
-            raise ValueError("future_confidence_decay 必须位于 (0,1]。")
         if int(self.fabrik_iterations) <= 0:
             raise ValueError("fabrik_iterations 必须大于 0。")
         return self
 
     def to_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FutureRollingPriorConfig:
+    """仅用于推理采样的未来 rolling prior 配置。"""
+
+    enabled: bool = False
+    confidence_decay: float = 0.9
+
+    def validate(self) -> "FutureRollingPriorConfig":
+        if not 0.0 < float(self.confidence_decay) <= 1.0:
+            raise ValueError("future_confidence_decay 必须位于 (0,1]。")
+        return self
+
+    def to_dict(self) -> dict[str, float | bool]:
         return asdict(self)
 
 

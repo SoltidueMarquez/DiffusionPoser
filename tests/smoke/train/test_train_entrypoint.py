@@ -69,14 +69,19 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertNotIn("--tracker_latency_max_frames", parser._option_string_actions)
         self.assertNotIn("--tracker_mask_policy", parser._option_string_actions)
 
-    def test_sampling_options_do_not_expose_abandoned_diffusion_ik(self):
+    def test_sampling_options_expose_runtime_rolling_prior_controls(self):
         parser = ArgumentParser()
         add_sampling_options(parser)
         args = parser.parse_args(["--model_path", "model.pt"])
 
         self.assertEqual(args.tracker_confidence_warmup, 15)
-        self.assertEqual(args.future_confidence_decay, 0.9)
         self.assertEqual(args.fabrik_iterations, 2)
+        self.assertFalse(args.use_future_rolling_prior)
+        self.assertEqual(args.future_confidence_decay, 0.9)
+        enabled = parser.parse_args(
+            ["--model_path", "model.pt", "--use_future_rolling_prior"]
+        )
+        self.assertTrue(enabled.use_future_rolling_prior)
         self.assertNotIn("--projected_ddim_mode", parser._option_string_actions)
         self.assertNotIn("--projected_ddim_late_steps", parser._option_string_actions)
 
@@ -279,11 +284,14 @@ class TrainEntrypointTest(unittest.TestCase):
                 platform = TensorboardPlatform(str(save_dir))
                 platform.close()
 
-            fallback_path = Path((save_dir / "tensorboard_log_dir.txt").read_text(encoding="utf-8"))
-            expected_first_log_dir = str(fallback_path) if sys.platform.startswith("win") else str(save_dir)
-            self.assertEqual(writer_log_dirs[0], expected_first_log_dir)
             if sys.platform.startswith("win"):
+                fallback_path = Path(
+                    (save_dir / "tensorboard_log_dir.txt").read_text(encoding="utf-8")
+                )
+                self.assertEqual(writer_log_dirs[0], str(fallback_path))
                 self.assertTrue(str(fallback_path).isascii())
+            else:
+                self.assertEqual(writer_log_dirs[0], str(save_dir))
 
 
 if __name__ == "__main__":

@@ -111,8 +111,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="predicted",
         choices=("predicted", "ground_truth"),
         help=(
-            "predicted 使用预测历史与 rolling prior；ground_truth 使用 GT 历史，"
-            "并清空预测 rolling prior，仅用于诊断历史误差反馈。"
+            "predicted 使用上一已部署 Pose；ground_truth 使用上一帧 GT Pose，"
+            "仅用于诊断历史误差反馈。"
         ),
     )
     longseq.add_argument(
@@ -144,8 +144,9 @@ def rollout_long_sequence_source(
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
     tracker_confidence_warmup: int = 15,
-    future_confidence_decay: float = 0.9,
     fabrik_iterations: int = 2,
+    use_future_rolling_prior: bool = False,
+    future_confidence_decay: float = 0.9,
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
@@ -165,8 +166,9 @@ def rollout_long_sequence_source(
         source["joint_rest_local_rotations_6d"],
         normalizer=normalizer,
         tracker_confidence_warmup=tracker_confidence_warmup,
-        future_confidence_decay=future_confidence_decay,
         fabrik_iterations=fabrik_iterations,
+        use_future_rolling_prior=use_future_rolling_prior,
+        future_confidence_decay=future_confidence_decay,
     )
     warmup_frames = _validate_gt_history_warmup_frames(
         gt_history_warmup_frames,
@@ -271,8 +273,9 @@ def rollout_long_sequence_sources(
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
     tracker_confidence_warmup: int = 15,
-    future_confidence_decay: float = 0.9,
     fabrik_iterations: int = 2,
+    use_future_rolling_prior: bool = False,
+    future_confidence_decay: float = 0.9,
     measure_latency: bool = False,
     show_progress: bool = False,
     progress_desc: str = "",
@@ -316,8 +319,9 @@ def rollout_long_sequence_sources(
             source["joint_rest_local_rotations_6d"],
             normalizer=normalizer,
             tracker_confidence_warmup=tracker_confidence_warmup,
-            future_confidence_decay=future_confidence_decay,
             fabrik_iterations=fabrik_iterations,
+            use_future_rolling_prior=use_future_rolling_prior,
+            future_confidence_decay=future_confidence_decay,
         )
         for source in sources
     ]
@@ -445,7 +449,7 @@ def rollout_long_sequence_sources(
             )
             if pose_history_mode == "ground_truth":
                 # 当前输出仍按模型预测评估；下一帧只读取当前 GT 历史，
-                # 同时禁用预测 rolling prior，从而隔离自回归历史误差。
+                # 从而隔离自回归历史误差。
                 source = sources[sequence_index]
                 runtimes[sequence_index].pose_history[-1] = (
                     _ground_truth_world_pose_state(
@@ -454,8 +458,6 @@ def rollout_long_sequence_sources(
                         frame_index,
                     )
                 )
-                # GT 历史模式只允许下一帧读取上一帧真值，不得残留模型预测的未来 horizon。
-                runtimes[sequence_index].previous_deployed_horizon_world = None
         if progress is not None:
             progress.update(len(active_indices))
     if progress is not None:
@@ -724,8 +726,9 @@ def evaluate_longseq_entries(
     device: torch.device,
     normalizer: RealtimePoseNormalizer | None,
     tracker_confidence_warmup: int = 15,
-    future_confidence_decay: float = 0.9,
     fabrik_iterations: int = 2,
+    use_future_rolling_prior: bool = False,
+    future_confidence_decay: float = 0.9,
     model_path: str | Path = "",
     weights: str = "",
     limit: int = 0,
@@ -801,8 +804,9 @@ def evaluate_longseq_entries(
             device=device,
             normalizer=normalizer,
             tracker_confidence_warmup=tracker_confidence_warmup,
-            future_confidence_decay=future_confidence_decay,
             fabrik_iterations=fabrik_iterations,
+            use_future_rolling_prior=use_future_rolling_prior,
+            future_confidence_decay=future_confidence_decay,
             measure_latency=device.type == "cuda",
             show_progress=bool(show_progress),
             progress_desc=(
@@ -895,8 +899,9 @@ def evaluate_longseq_entries(
     }
     metadata = dict(runtime_metadata or {})
     metadata["tracker_confidence_warmup"] = int(tracker_confidence_warmup)
-    metadata["future_confidence_decay"] = float(future_confidence_decay)
     metadata["fabrik_iterations"] = int(fabrik_iterations)
+    metadata["use_future_rolling_prior"] = bool(use_future_rolling_prior)
+    metadata["future_confidence_decay"] = float(future_confidence_decay)
     metadata["sequence_batch_size"] = int(batch_size)
     metadata["latency_scope"] = "active_batch_wall_time_per_stream"
     metadata["evaluation_protocol"] = (
@@ -910,9 +915,9 @@ def evaluate_longseq_entries(
     metadata["diffusion_noise_rho"] = float(diffusion_noise_rho)
     metadata["pose_history_mode"] = str(pose_history_mode)
     metadata["pose_history_protocol"] = (
-        "ground_truth_history_without_predicted_rolling_prior"
+        "ground_truth_previous_pose"
         if pose_history_mode == "ground_truth"
-        else "predicted_history_with_predicted_rolling_prior"
+        else "previous_deployed_pose"
     )
     metadata["gt_history_warmup_frames"] = int(gt_history_warmup_frames)
     if device.type == "cuda":
@@ -946,6 +951,8 @@ def build_default_output_dir(
     weights: str,
     sequence_batch_size: int = 1,
     conditions: list[str] | tuple[str, ...] = TRACKER_PATTERN_CATEGORIES,
+    use_future_rolling_prior: bool = False,
+    future_confidence_decay: float = 0.9,
 ) -> Path:
     """构造短路径，并用稳定摘要隔离不同评测集与训练 run。"""
 
@@ -963,8 +970,27 @@ def build_default_output_dir(
     condition_tag = f"c{len(condition_values)}"
     if condition_values != TRACKER_PATTERN_CATEGORIES:
         condition_tag += _short_digest("\n".join(condition_values), 4)
-    leaf = f"{step_tag}{weight_tag}-b{int(sequence_batch_size)}-{condition_tag}-{identity}"
+    prior_tag = build_future_rolling_prior_tag(
+        use_future_rolling_prior,
+        future_confidence_decay,
+    )
+    leaf = (
+        f"{step_tag}{weight_tag}-b{int(sequence_batch_size)}-"
+        f"{condition_tag}-{prior_tag}-{identity}"
+    )
     return Path("output") / "l" / leaf
+
+
+def build_future_rolling_prior_tag(
+    enabled: bool,
+    confidence_decay: float,
+) -> str:
+    """生成短且可读的采样策略标签，防止 baseline 与 rolling 结果互相覆盖。"""
+
+    if not bool(enabled):
+        return "rp0"
+    decay_tag = f"{float(confidence_decay):.4g}".replace(".", "p")
+    return f"rp1g{decay_tag}"
 
 
 def _short_digest(value: str, length: int) -> str:
@@ -976,7 +1002,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_and_load_from_model(
         build_arg_parser(),
         argv=argv,
-        ignore_keys={"ts_respace"},
+        ignore_keys={
+            "ts_respace",
+            "use_future_rolling_prior",
+            "future_confidence_decay",
+        },
     )
     if int(args.inference_steps) <= 0:
         raise ValueError("inference_steps 必须大于 0。")
@@ -1024,19 +1054,27 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         f"inference_steps={diffusion.num_timesteps}, "
         f"sequence_batch_size={args.sequence_batch_size}, conditions={selected_conditions}, "
         f"gt_history_warmup_frames={args.gt_history_warmup_frames}, "
+        f"future_rolling_prior={args.use_future_rolling_prior}, "
         f"timestep_map={timestep_map}"
     )
-    output_dir = (
-        Path(args.output_dir).resolve()
-        if str(args.output_dir).strip()
-        else build_default_output_dir(
+    if str(args.output_dir).strip():
+        output_dir = (
+            Path(args.output_dir).resolve()
+            / build_future_rolling_prior_tag(
+                bool(args.use_future_rolling_prior),
+                float(args.future_confidence_decay),
+            )
+        )
+    else:
+        output_dir = build_default_output_dir(
             source_dir,
             args.model_path,
             weights,
             sequence_batch_size=args.sequence_batch_size,
             conditions=selected_conditions,
+            use_future_rolling_prior=bool(args.use_future_rolling_prior),
+            future_confidence_decay=float(args.future_confidence_decay),
         ).resolve()
-    )
     summary = evaluate_longseq_entries(
         entries=entries,
         source_dir=source_dir,
@@ -1046,8 +1084,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         device=device,
         normalizer=normalizer,
         tracker_confidence_warmup=int(args.tracker_confidence_warmup),
-        future_confidence_decay=float(args.future_confidence_decay),
         fabrik_iterations=int(args.fabrik_iterations),
+        use_future_rolling_prior=bool(args.use_future_rolling_prior),
+        future_confidence_decay=float(args.future_confidence_decay),
         model_path=args.model_path,
         weights=weights,
         limit=int(args.limit),

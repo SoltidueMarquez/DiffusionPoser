@@ -7,27 +7,20 @@ from typing import Callable
 import numpy as np
 import torch
 
+from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_dataset import RealtimePoseTaskDataset
 from data_loaders.realtime_pose_geometry import (
     decode_target_head_rotations_np,
     global_head_rotations_to_local_delta_6d_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
-from data_loaders.realtime_pose_ik import build_current_ik_pose
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
-    TRACKER_CONFIGURED_OFFSET,
-    TRACKER_D_ON_OFFSET,
-    TRACKER_MEASURED_VALID_OFFSET,
-)
-from data_loaders.tracker_reliability import (
-    compute_tracker_online_confidence_torch,
-    map_tracker_confidence_to_joints_torch,
 )
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    build_realtime_pose_inpainting_condition,
+    build_current_realtime_pose_inpainting_condition,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
@@ -85,7 +78,6 @@ def build_sampling_inpainting_condition(
     device: torch.device,
     normalizer=None,
     tracker_confidence_warmup: int = 15,
-    future_confidence_decay: float = 0.9,
     fabrik_iterations: int = 2,
 ) -> RealtimePoseInpaintingCondition:
     """离线单 batch 按首次 runtime 语义构造条件：当前做 IK，未来不偷看 GT。"""
@@ -100,44 +92,23 @@ def build_sampling_inpainting_condition(
         scale = normalizer.pose_scale.to(device).float()
         previous_pose = previous_pose * scale + mean
     current_tracker = batch["tracker_window_raw"][:, -1].to(device).float()
-    configured = current_tracker[..., TRACKER_CONFIGURED_OFFSET] > 0.5
-    measured = current_tracker[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
-    tracker_valid = configured & measured
-    d_on = current_tracker[..., TRACKER_D_ON_OFFSET] * 60.0
-    tracker_confidence = compute_tracker_online_confidence_torch(
-        tracker_valid=tracker_valid,
-        d_on=d_on,
-        warmup_frames=tracker_confidence_warmup,
-    )
-    current_pose_raw = build_current_ik_pose(
+    return build_current_realtime_pose_inpainting_condition(
         previous_pose_raw=previous_pose,
         previous_pose_valid=batch["window_valid_mask"][:, -2].to(device).bool(),
         current_tracker_raw=current_tracker,
+        configured=batch["configured"][:, -1].to(device).bool(),
+        measured_valid=batch["measured_valid"][:, -1].to(device).bool(),
+        d_on=batch["d_on"][:, -1].to(device).float(),
         joint_offsets_parent=batch["joint_offsets_parent"].to(device).float(),
         joint_rest_local_rotations_6d=batch[
             "joint_rest_local_rotations_6d"
         ].to(device).float(),
-        fabrik_iterations=fabrik_iterations,
-    )
-    current_confidence = map_tracker_confidence_to_joints_torch(
-        tracker_confidence
-    )
-    return build_realtime_pose_inpainting_condition(
-        current_pose_raw=current_pose_raw,
-        current_confidence=current_confidence,
-        future_prior_raw=torch.zeros(
-            previous_pose.shape[0],
-            REALTIME_POSE_TARGET_LENGTH - 1,
-            REALTIME_POSE_TARGET_DIM,
-            device=device,
-            dtype=torch.float32,
-        ),
-        future_prior_valid=torch.zeros(
-            previous_pose.shape[0], device=device, dtype=torch.bool
-        ),
         pose_mean=mean,
         pose_scale=scale,
-        future_confidence_decay=future_confidence_decay,
+        config=IKInpaintingConfig(
+            tracker_confidence_warmup=tracker_confidence_warmup,
+            fabrik_iterations=fabrik_iterations,
+        ),
     )
 
 
@@ -146,7 +117,6 @@ def build_projection_fn(
     device: torch.device,
     normalizer=None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    del batch
     if normalizer is None:
         mean = scale = None
     else:
@@ -155,9 +125,13 @@ def build_projection_fn(
         mean = normalizer.pose_mean.to(device)
         scale = normalizer.pose_scale.to(device)
     return lambda value: project_realtime_pose_xstart(
-        value,
-        mean,
-        scale,
+        pred_xstart=value,
+        current_tracker_raw=batch["tracker_window_raw"][:, -1].to(device).float(),
+        hard_rotation_state=batch["hard_rotation_state_window"][:, -1]
+        .to(device)
+        .bool(),
+        pose_mean=mean,
+        pose_scale=scale,
     )
 
 
@@ -168,7 +142,6 @@ def reconstruct_batch(
     device: torch.device,
     normalizer=None,
     tracker_confidence_warmup: int = 15,
-    future_confidence_decay: float = 0.9,
     fabrik_iterations: int = 2,
 ) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
@@ -184,7 +157,6 @@ def reconstruct_batch(
         device,
         normalizer=normalizer,
         tracker_confidence_warmup=tracker_confidence_warmup,
-        future_confidence_decay=future_confidence_decay,
         fabrik_iterations=fabrik_iterations,
     )
     projection_fn = build_projection_fn(batch, device, normalizer)
@@ -361,7 +333,11 @@ def save_reconstruction(
 
 
 def main(argv: list[str] | None = None) -> dict[str, Path]:
-    args = parse_and_load_from_model(build_arg_parser(), argv=argv)
+    args = parse_and_load_from_model(
+        build_arg_parser(),
+        argv=argv,
+        ignore_keys={"use_future_rolling_prior", "future_confidence_decay"},
+    )
     dist_util.setup_dist(args.device if args.cuda else -1)
     device = dist_util.dev()
     dataset = RealtimePoseTaskDataset(
@@ -387,7 +363,6 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         device=device,
         normalizer=dataset.normalizer,
         tracker_confidence_warmup=args.tracker_confidence_warmup,
-        future_confidence_decay=args.future_confidence_decay,
         fabrik_iterations=args.fabrik_iterations,
     )
     output_dir = Path(args.output_dir or "output/realtime_pose_144d").resolve()

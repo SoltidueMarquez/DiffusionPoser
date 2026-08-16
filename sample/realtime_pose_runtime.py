@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from data_loaders.realtime_pose_config import IKInpaintingConfig, TrackerReliabilityConfig
+from data_loaders.realtime_pose_config import (
+    FutureRollingPriorConfig,
+    IKInpaintingConfig,
+    TrackerReliabilityConfig,
+)
 from data_loaders.realtime_pose_geometry import (
     assemble_tracker_features_np,
     build_head_path_window_np,
@@ -17,7 +21,6 @@ from data_loaders.realtime_pose_geometry import (
     resolve_root_head_reference_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
-from data_loaders.realtime_pose_ik import build_current_ik_pose
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     REALTIME_POSE_CONDITION_WINDOW_LENGTH,
@@ -33,13 +36,12 @@ from data_loaders.sensor_masking import (
 from data_loaders.tracker_reliability import (
     compute_hard_rotation_state_np,
     compute_region_coverage_np,
-    compute_tracker_online_confidence_np,
     compute_tracker_reliability_np,
-    map_tracker_confidence_to_joints_torch,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from diffusion.realtime_pose_inpainting import (
-    build_realtime_pose_inpainting_condition,
+    add_future_rolling_prior_to_condition,
+    build_current_realtime_pose_inpainting_condition,
 )
 
 
@@ -105,7 +107,6 @@ class _PreparedRuntimeStep:
     d_on: np.ndarray
     kappa_position: np.ndarray
     kappa_rotation: np.ndarray
-    tracker_online_confidence: np.ndarray
     head_yaw: float
     floor_y: float
     tracker_window_raw: np.ndarray
@@ -125,8 +126,9 @@ class RealtimePoseRuntime:
         joint_rest_local_rotations_6d: np.ndarray,
         normalizer=None,
         tracker_confidence_warmup: int = 15,
-        future_confidence_decay: float = 0.9,
         fabrik_iterations: int = 2,
+        use_future_rolling_prior: bool = False,
+        future_confidence_decay: float = 0.9,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -135,8 +137,11 @@ class RealtimePoseRuntime:
         self.reliability_config = TrackerReliabilityConfig().validate()
         self.ik_inpainting_config = IKInpaintingConfig(
             tracker_confidence_warmup=int(tracker_confidence_warmup),
-            future_confidence_decay=float(future_confidence_decay),
             fabrik_iterations=int(fabrik_iterations),
+        ).validate()
+        self.future_rolling_prior_config = FutureRollingPriorConfig(
+            enabled=bool(use_future_rolling_prior),
+            confidence_decay=float(future_confidence_decay),
         ).validate()
         self.joint_offsets_parent = np.asarray(joint_offsets_parent, dtype=np.float32).reshape(24, 3)
         self.joint_rest_local_rotations_6d = np.asarray(
@@ -147,6 +152,7 @@ class RealtimePoseRuntime:
         self.previous_d_off = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_head_yaw: float | None = None
+        # 只在开启推理消融时保存模型上一轮 deployed horizon；它不进入训练数据。
         self.previous_deployed_horizon_world: np.ndarray | None = None
 
     def step(
@@ -359,18 +365,10 @@ class RealtimePoseRuntime:
             cpu = self.normalizer.inverse_pose(cpu)
         return np.asarray(cpu, dtype=np.float32)
 
-    def _ik_prior_inputs(
-        self, current_head_yaw: float
-    ) -> tuple[np.ndarray, bool, np.ndarray, bool]:
-        """返回当前 IK 初值 `[144]` 与滚动未来先验 `[10,144]`。"""
+    def _previous_pose_for_ik(self, current_head_yaw: float) -> tuple[np.ndarray, bool]:
+        """把唯一的上一已部署 Pose 转到当前 Head-yaw 参考系。"""
 
-        if self.previous_deployed_horizon_world is not None:
-            # 上一轮 horizon[1] 正好预测当前帧；它比上一已部署帧更符合 rolling prior 语义。
-            previous_pose_raw = build_pose_target_np(
-                self.previous_deployed_horizon_world[1:2], current_head_yaw
-            )[0]
-            previous_pose_valid = True
-        elif self.pose_history:
+        if self.pose_history:
             previous_pose_raw = build_pose_target_np(
                 self.pose_history[-1].joint_rotations_world[None], current_head_yaw
             )[0]
@@ -378,25 +376,27 @@ class RealtimePoseRuntime:
         else:
             previous_pose_raw = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float32)
             previous_pose_valid = False
+        return previous_pose_raw, previous_pose_valid
 
-        if self.previous_deployed_horizon_world is None:
-            future_prior_raw = np.zeros(
-                (REALTIME_POSE_TARGET_LENGTH - 1, REALTIME_POSE_TARGET_DIM),
-                dtype=np.float32,
-            )
-            future_prior_valid = False
-        else:
-            # 上一轮索引 2..10 对齐新一轮未来 1..9；最远帧重复旧 horizon 末帧。
-            shifted_world = np.concatenate(
-                [
-                    self.previous_deployed_horizon_world[2:],
-                    self.previous_deployed_horizon_world[-1:],
-                ],
-                axis=0,
-            )
-            future_prior_raw = build_pose_target_np(shifted_world, current_head_yaw)
-            future_prior_valid = True
-        return previous_pose_raw, previous_pose_valid, future_prior_raw, future_prior_valid
+    def _future_rolling_prior(
+        self,
+        current_head_yaw: float,
+    ) -> tuple[np.ndarray, bool]:
+        """返回与新 horizon 1..9 严格对齐的旧 horizon 2..10。"""
+
+        shape = (
+            REALTIME_POSE_TARGET_LENGTH - 2,
+            REALTIME_POSE_TARGET_DIM,
+        )
+        if (
+            not self.future_rolling_prior_config.enabled
+            or self.previous_deployed_horizon_world is None
+        ):
+            return np.zeros(shape, dtype=np.float32), False
+        aligned_world = self.previous_deployed_horizon_world[2:]
+        if tuple(aligned_world.shape[:1]) != (REALTIME_POSE_TARGET_LENGTH - 2,):
+            raise RuntimeError("上一轮 deployed horizon 必须包含完整 11 帧。")
+        return build_pose_target_np(aligned_world, current_head_yaw), True
 
     def _prepare_step(
         self,
@@ -439,11 +439,6 @@ class RealtimePoseRuntime:
             d_on,
             config=self.reliability_config,
         )
-        tracker_online_confidence = compute_tracker_online_confidence_np(
-            configured & measured,
-            d_on,
-            self.ik_inpainting_config.tracker_confidence_warmup,
-        )
         conditioning, tracker_window_raw, hard_rotation_state_window = self._build_conditioning(
             position,
             rotation_6d,
@@ -463,7 +458,6 @@ class RealtimePoseRuntime:
             d_on=d_on,
             kappa_position=kappa_pos,
             kappa_rotation=kappa_rot,
-            tracker_online_confidence=tracker_online_confidence,
             head_yaw=head_yaw,
             floor_y=float(floor_y),
             tracker_window_raw=tracker_window_raw,
@@ -496,15 +490,18 @@ class RealtimePoseRuntime:
             self.joint_offsets_parent,
             self.joint_rest_local_rotations_6d,
         )
-        horizon_head_rotations, _ = decode_target_head_rotations_np(
-            deployed_pose_horizon
-        )
-        yaw_rotation = make_yaw_rotation_np(
-            np.asarray([prepared.head_yaw], dtype=np.float64)
-        )[0]
-        self.previous_deployed_horizon_world = np.einsum(
-            "ij,tajk->taik", yaw_rotation, horizon_head_rotations
-        ).astype(np.float32)
+        if self.future_rolling_prior_config.enabled:
+            horizon_head_rotations, _ = decode_target_head_rotations_np(
+                deployed_pose_horizon
+            )
+            yaw_rotation = make_yaw_rotation_np(
+                np.asarray([prepared.head_yaw], dtype=np.float64)
+            )[0]
+            self.previous_deployed_horizon_world = np.einsum(
+                "ij,tajk->taik",
+                yaw_rotation,
+                horizon_head_rotations,
+            ).astype(np.float32)
         self._append_history_state(prepared, resolved.as_world_state())
         return RuntimeStepResult(
             resolved_pose=resolved,
@@ -583,6 +580,8 @@ def step_realtime_pose_batch(
             raise ValueError("批内 runtime 必须共享 device 和 normalizer。")
         if runtime.ik_inpainting_config != first.ik_inpainting_config:
             raise ValueError("批内 runtime 必须使用相同的 IK/Inpainting 配置。")
+        if runtime.future_rolling_prior_config != first.future_rolling_prior_config:
+            raise ValueError("批内 runtime 必须使用相同的 future rolling prior 配置。")
 
     positions = np.asarray(tracker_pos_world, dtype=np.float32).reshape(
         batch_size, TRACKER_COUNT, 3
@@ -622,40 +621,41 @@ def step_realtime_pose_batch(
         device=first.device,
         dtype=torch.float32,
     )
-    prior_inputs = [
-        runtime._ik_prior_inputs(step.head_yaw)
+    previous_pose_inputs = [
+        runtime._previous_pose_for_ik(step.head_yaw)
         for runtime, step in zip(runtimes, prepared_steps)
     ]
     previous_pose_raw = torch.as_tensor(
-        np.stack([value[0] for value in prior_inputs]),
+        np.stack([value[0] for value in previous_pose_inputs]),
         device=first.device,
         dtype=torch.float32,
     )
     previous_pose_valid = torch.as_tensor(
-        np.asarray([value[1] for value in prior_inputs]),
-        device=first.device,
-        dtype=torch.bool,
-    )
-    future_prior_raw = torch.as_tensor(
-        np.stack([value[2] for value in prior_inputs]),
-        device=first.device,
-        dtype=torch.float32,
-    )
-    future_prior_valid = torch.as_tensor(
-        np.asarray([value[3] for value in prior_inputs]),
+        np.asarray([value[1] for value in previous_pose_inputs]),
         device=first.device,
         dtype=torch.bool,
     )
     with torch.no_grad():
-        tracker_online_confidence = torch.as_tensor(
-            np.stack([step.tracker_online_confidence for step in prepared_steps]),
-            device=first.device,
-            dtype=torch.float32,
-        )
-        current_pose_raw = build_current_ik_pose(
+        mean, scale = first._normalizer_pose_stats()
+        inpainting = build_current_realtime_pose_inpainting_condition(
             previous_pose_raw=previous_pose_raw,
             previous_pose_valid=previous_pose_valid,
             current_tracker_raw=tracker_window_tensor[:, -1],
+            configured=torch.as_tensor(
+                np.stack([step.configured for step in prepared_steps]),
+                device=first.device,
+                dtype=torch.bool,
+            ),
+            measured_valid=torch.as_tensor(
+                np.stack([step.measured for step in prepared_steps]),
+                device=first.device,
+                dtype=torch.bool,
+            ),
+            d_on=torch.as_tensor(
+                np.stack([step.d_on for step in prepared_steps]),
+                device=first.device,
+                dtype=torch.float32,
+            ),
             joint_offsets_parent=torch.as_tensor(
                 np.stack([runtime.joint_offsets_parent for runtime in runtimes]),
                 device=first.device,
@@ -668,21 +668,33 @@ def step_realtime_pose_batch(
                 device=first.device,
                 dtype=torch.float32,
             ),
-            fabrik_iterations=first.ik_inpainting_config.fabrik_iterations,
-        )
-        current_confidence = map_tracker_confidence_to_joints_torch(
-            tracker_online_confidence
-        )
-        mean, scale = first._normalizer_pose_stats()
-        inpainting = build_realtime_pose_inpainting_condition(
-            current_pose_raw=current_pose_raw,
-            current_confidence=current_confidence,
-            future_prior_raw=future_prior_raw,
-            future_prior_valid=future_prior_valid,
             pose_mean=mean,
             pose_scale=scale,
-            future_confidence_decay=first.ik_inpainting_config.future_confidence_decay,
+            config=first.ik_inpainting_config,
         )
+        if first.future_rolling_prior_config.enabled:
+            future_inputs = [
+                runtime._future_rolling_prior(step.head_yaw)
+                for runtime, step in zip(runtimes, prepared_steps)
+            ]
+            inpainting = add_future_rolling_prior_to_condition(
+                current_condition=inpainting,
+                aligned_future_prior_raw=torch.as_tensor(
+                    np.stack([value[0] for value in future_inputs]),
+                    device=first.device,
+                    dtype=torch.float32,
+                ),
+                future_prior_valid=torch.as_tensor(
+                    np.asarray([value[1] for value in future_inputs]),
+                    device=first.device,
+                    dtype=torch.bool,
+                ),
+                pose_mean=mean,
+                pose_scale=scale,
+                confidence_decay=(
+                    first.future_rolling_prior_config.confidence_decay
+                ),
+            )
     sampling_shape = (
         batch_size,
         REALTIME_POSE_TARGET_LENGTH,
@@ -709,9 +721,17 @@ def step_realtime_pose_batch(
         first.model,
         shape=sampling_shape,
         projection_fn=lambda value: project_realtime_pose_xstart(
-            value,
-            mean,
-            scale,
+            pred_xstart=value,
+            current_tracker_raw=tracker_window_tensor[:, -1],
+            hard_rotation_state=torch.as_tensor(
+                np.stack(
+                    [step.hard_rotation_state_window[-1] for step in prepared_steps]
+                ),
+                device=first.device,
+                dtype=torch.bool,
+            ),
+            pose_mean=mean,
+            pose_scale=scale,
         ),
         clip_denoised=False,
         model_kwargs={"prepared_conditioning": prepared_conditioning},

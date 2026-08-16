@@ -11,6 +11,7 @@ from data_loaders.realtime_pose_history_noise import (
     corrupt_history_pose_observation,
 )
 from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_torch
+from diffusion.realtime_pose_inpainting import RealtimePoseInpaintingCondition
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from train.training_loop import (
     TRAIN_DEVICE_FIELDS,
@@ -279,21 +280,28 @@ def test_model_rejects_unknown_constructor_and_forward_arguments():
         model(torch.randn(1, 11, 144), torch.ones(1), obsolete_argument=True)
 
 
-def test_training_device_transfer_keeps_reconstruction_only_fields_on_cpu():
-    assert "configured" not in TRAIN_DEVICE_FIELDS
-    assert "joint_rest_local_rotations_6d" not in TRAIN_DEVICE_FIELDS
-    assert "hard_rotation_state_window" not in TRAIN_DEVICE_FIELDS
+def test_training_device_transfer_moves_all_ik_and_projection_fields():
+    for name in (
+        "configured",
+        "measured_valid",
+        "d_on",
+        "joint_rest_local_rotations_6d",
+        "hard_rotation_state_window",
+    ):
+        assert name in TRAIN_DEVICE_FIELDS
     batch = {
         "x": torch.zeros(1),
         "configured": torch.ones(1, dtype=torch.bool),
         "joint_rest_local_rotations_6d": torch.zeros(24, 6),
+        "hard_rotation_state_window": torch.zeros(11, 6, dtype=torch.bool),
     }
 
     moved = move_training_batch_to_device(batch, torch.device("meta"))
 
     assert moved["x"].device.type == "meta"
-    assert moved["configured"].device.type == "cpu"
-    assert moved["joint_rest_local_rotations_6d"].device.type == "cpu"
+    assert moved["configured"].device.type == "meta"
+    assert moved["joint_rest_local_rotations_6d"].device.type == "meta"
+    assert moved["hard_rotation_state_window"].device.type == "meta"
 
 
 def test_training_model_kwargs_use_y_as_the_only_condition_source():
@@ -332,7 +340,9 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
     assert "inpaint_confidence" not in model_kwargs["y"]
     assert "inpaint_kind" not in model_kwargs["y"]
     assert "inpaint_mask" not in model_kwargs["y"]
-    assert "hard_rotation_state_window" not in model_kwargs["y"]
+    assert model_kwargs["y"]["hard_rotation_state_window"] is batch[
+        "hard_rotation_state_window"
+    ]
     assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
 
 
@@ -340,9 +350,11 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
     class CapturingDiffusion:
         def __init__(self) -> None:
             self.targets: list[torch.Tensor] = []
+            self.kwargs: list[dict] = []
 
-        def training_losses(self, _model, x_start, _timesteps, **_kwargs):
+        def training_losses(self, _model, x_start, _timesteps, **kwargs):
             self.targets.append(x_start.detach().clone())
+            self.kwargs.append(kwargs)
             return {"loss": torch.zeros(x_start.shape[0])}
 
     loop = object.__new__(TrainLoop)
@@ -351,10 +363,20 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
     loop.feature_w = None
     loop.snr_gamma = 0.0
     loop.use_l1 = False
-    loop.mask_manager = lambda batch, sample: {
+    loop._prepare_history_observation = lambda batch: batch[
+        "history_pose_observation"
+    ]
+    loop.mask_manager = lambda batch, sample, history_observation=None: {
         "y": {"history_pose_observation": batch["history_pose_observation"]}
     }
     sample_window = torch.randn(2, 11, 144)
+    condition = RealtimePoseInpaintingCondition(
+        pose=torch.zeros_like(sample_window),
+        confidence=torch.zeros(2, 11, 24),
+    )
+    loop.build_training_inpainting_condition = (
+        lambda batch, history_observation, sample: condition
+    )
     batch = {
         "x": sample_window.clone(),
         "history_pose_observation": torch.randn(2, 10, 144),
@@ -366,3 +388,7 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
 
     torch.testing.assert_close(loop.diffusion.targets[0], sample_window)
     torch.testing.assert_close(loop.diffusion.targets[1], sample_window)
+    assert loop.diffusion.kwargs[0]["inpaint_condition"] is condition
+    assert loop.diffusion.kwargs[0]["known_noise"].data_ptr() != loop.diffusion.kwargs[0][
+        "noise"
+    ].data_ptr()

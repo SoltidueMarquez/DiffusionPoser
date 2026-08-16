@@ -141,12 +141,12 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 
 Dataset 不返回 `source_path`，也不接受 `folder_path` 过滤。需要按数据集或序列筛选时，应使用 split 或单独的 Task Store 目录。
 
-训练不构造 IK、rolling prior 或 inpainting 张量。Runtime 在采样时只构造两个动态张量：
+训练与 Runtime 使用同一套当前帧 IK 条件构造逻辑，并在模型调用前构造两个动态张量：
 
 | 字段 | 形状 | 语义 |
 |---|---:|---|
-| `inpaint_pose` | `[B,11,144]` | 当前 IK 均值与上一轮 horizon 左移后的未来先验，按 Pose normalizer 归一化 |
-| `inpaint_confidence` | `[B,11,24]` | 逐目标帧、逐关节标量置信度，范围 `[0,1]` |
+| `inpaint_pose` | `[B,11,144]` | 索引 0 为当前 IK Pose；训练和默认采样的未来为零，rolling-prior 采样可填索引 1..9，索引 10 始终为零 |
+| `inpaint_confidence` | `[B,11,24]` | 索引 0 为当前逐关节置信度；rolling-prior 采样可填索引 1..9，索引 10 始终为零，范围 `[0,1]` |
 
 如需 mask，在当前 DDIM 步由 `confidence > 0`、`t >= T_soft` 与 `t > 0` 局部派生，不持久化 `inpaint_kind` 或独立 `inpaint_mask`。模型 diffusion state、模型输出和扩散采样结果均为 `[B,11,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain。`RuntimeStepResult` 返回 `raw_pred_pose_horizon/deployed_pred_pose_horizon: [11,144]` 和 `inpaint_confidence: [11,24]`，只解析 horizon 0 并追加到密集历史。
 
@@ -180,7 +180,7 @@ position3 + rotation6D + configured + measured_valid + d_off + d_on
 
 Task store 保留密集的 `configured/measured_valid: [M,5,61,6]`。Dataset 从虚拟会话起点重新累计 `d_on/d_off` 和 hard state，再抽取模型锚点，不能直接继承被裁掉历史的持续时间。
 
-当前 inpainting 只使用一套 Tracker 在线置信度：`w_t = valid_t * clamp(d_on / tracker_confidence_warmup, 0, 1)`。该配置属于 Runtime/采样器，不挂到 DiT 参数或 checkpoint 上。`kappa_position/kappa_rotation` 和 `hard_rotation_state` 可作历史诊断字段，不再决定当前 inpainting 强度。
+当前 inpainting 只使用一套 Tracker 在线置信度：`w_t = valid_t * clamp(d_on / tracker_confidence_warmup, 0, 1)`。该配置由训练与 Runtime 共享并写入 `args.json`，但不改变 DiT 参数结构。`kappa_position/kappa_rotation` 和 `hard_rotation_state` 可作历史诊断字段，不再决定当前 inpainting 强度。
 
 ## Head 路径
 
@@ -213,33 +213,35 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 - 历史和目标使用独立输入投影；共享一个 diffusion timestep embedding，21 个 frame-offset embedding 区分帧位置；
 - DiT 不接收 `inpaint_confidence` 或 `inpaint_kind`，不存在 constraint/confidence embedding；置信度只在模型调用前决定哪些 `x_t` 关节被条件覆盖；
 - 解码最后 11 个槽，输出 `[B,11,144]`；`contact_head` 只读取当前目标槽，不存在 `future_leg_head`；
-- SO(3) projection 只对 `[B,11,144]` 的所有 rotation6D 执行合法化；最终步也不再用 Tracker rotation 强制覆盖当前帧；
+- SO(3) projection 先合法化 `[B,11,144]` 的所有 rotation6D，再只对 horizon 0 中处于 hard 状态的 Tracker 关节覆盖实测旋转；
 - DDIM 的 state、初始 noise 和每步更新均为 `[B,11,144]`。每个实时帧另采样一份 `known_noise: [B,11,144]` 并在完整去噪轨迹复用；
-- 训练阶段不执行 IK、inpainting 或模型 rollout，不使用未来 GT 伪造 rolling prior；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。
+- 训练阶段在 history corruption 后执行当前帧 IK 与 inpainting，不使用未来 GT 或预测 horizon；长序列闭环只用于评估，运行时每步只追加当前部署预测，不重写过去历史。
 
 ## IK-Inpainting
 
-- 有上一轮 horizon 时，`previous_horizon[1]` 正好对齐新一轮当前帧，重编码到当前 Head-yaw 参考系后作为 IK 初值；尚无 horizon 时使用上一帧已部署 Pose，首帧再回退到 rest rotation。初值本身不标成当前观测；
+- 训练使用经过 history corruption 的最后一个有效历史 Pose，Runtime 使用上一帧实际部署 Pose 并重编码到当前 Head-yaw 参考系；无有效上一帧时统一回退到 rest rotation。初值本身不标成当前观测；
 - 固定执行两轮 FABRIK：Hip 有效时求解躯干到 Head；手臂求解 Shoulder–Elbow–Wrist；Hip 与对应 Foot 同时有效时求解 Hip–Knee–Ankle–Foot；缺失必要 Tracker 时整条链跳过；
 - 从旧骨向量到新骨向量的 shortest-arc rotation 左乘上一帧 global rotation，使上一帧 twist 随 IK soft 条件连续保留；直接测得的 Head、Pelvis、Wrist、Foot rotation 在 IK 后覆盖；
 
-### 当前与未来置信度
+### 当前帧与推理 rolling prior 置信度
 
 - 当前 IK 只生成 `[B,144]` Pose 初值，不评价自身准确性，也不参与置信度计算；
 - 当前 inpainting 使用固定 Tracker→区域 mapping：`Torso ← Head、Hip`，左右手臂分别由对应 Hand 覆盖，左右腿分别由对应 Foot 覆盖；五区域再按 `TARGET_JOINT_REGIONS` 展开成只读 `[24,6]` 二值矩阵；
 - 每个 Tracker 的在线置信度为 `w_t = valid_t * clamp(d_on_t / tracker_confidence_warmup, 0, 1)`；当前逐关节置信度唯一公式为 `c[j,0] = max_t(mapping[j,t] * w_t)`，禁止平均、noisy-or、骨链 `min` 或额外 solved mask；
-- 采样入口保留 `--tracker_confidence_warmup`、`--future_confidence_decay` 和 `--fabrik_iterations`；这些参数不属于 DiT 构造参数；
-- 上一轮世界 horizon 用索引 `2..10` 对齐新一轮未来 `1..9`，最远帧重复旧末帧，并重新编码到当前 Head-yaw 参考系；首次推理的未来置信度全为 `0`；
-- 未来置信度严格为 `c[j,k]=c[j,0]*future_confidence_decay^k`，`k=1..10`，默认 decay 为 `0.9`；
+- 训练与采样入口共享 `--tracker_confidence_warmup` 和 `--fabrik_iterations`，默认分别为 `15`、`2`，并写入 checkpoint 的 `args.json`；这些参数不属于 DiT 构造参数；
+- `--use_future_rolling_prior` 与 `--future_confidence_decay` 只属于推理采样，默认关闭和 `0.9`，不进入训练 checkpoint 参数；关闭时不保存预测 horizon，未来 confidence 全为零；
+- 开启时，上一轮 `deployed_horizon[2..10]` 严格对齐新一轮未来索引 `1..9`，并重编码到当前 Head-yaw 参考系；索引 10 没有时间对齐的旧预测，不重复最远帧且 confidence 为零；
+- rolling prior 使用 `c[j,k]=c[j,0]*future_confidence_decay^k`，`k=1..9`；第一次模型预测没有上一轮 horizon，因此不注入未来 prior；
 - 统一 DDIM timestep 为 `t`，逐关节使用连续阈值 `T_soft(c)=(1-c)*T_max`，不平方、不取整。当 `c>0`、`t>=T_soft` 且 `t>0` 时，用同一全局 `t` 下的 `q(inpaint_pose,t,known_noise)` 覆盖该关节；当 `t<T_soft` 时停止覆盖，由当前 diffusion state 继续去噪。`c=1` 在全部 `t>0` 步骤持续注入，但最终 `t=0` 与其他置信度一起释放，允许模型保留此前修正并完成最后一次前向；`c=0` 从不注入。同一个实时帧在完整 DDIM 轨迹中复用同一份 `known_noise`。
-- `pose_history_mode=ground_truth` 只在当前帧评估结束后用当前 GT 替换历史状态，并立即清空预测 horizon；下一帧 IK 读取上一帧 GT Pose，未来 rolling prior 保持无效且置信度为零，不读取未来 GT。
+- `pose_history_mode=ground_truth` 只在当前帧评估结束后用当前 GT 替换历史状态；下一帧 IK 只读取上一帧 GT Pose，不读取未来 GT；若开启 rolling prior，未来部分仍只来自模型上一轮预测。
 
 ## Loss、运行时与长序列结果
 
 - diffusion reconstruction、global rotation、local rotation 和 rotation velocity loss 作用于全部 11 帧；
 - rotation velocity 比较相邻目标帧 `R_h^T R_(h+1)` 的 SO(3) 夹角，共 10 组，默认权重为 `1.0`；
-- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact 和 contact-slide 只作用于 horizon 0；`deployed_pred_xstart` 只是全 horizon 的 SO(3) 合法化结果，不包含 Tracker hard 覆盖；
+- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact 和 contact-slide 只作用于 horizon 0；`deployed_pred_xstart` 在全 horizon SO(3) 合法化后，仅对 horizon 0 的 hard Tracker 旋转执行覆盖；Head 始终 hard，其他 Tracker 仅在 configured、measured_valid 且 `d_on >= d_hard` 时 hard；
 - `previous_pose_target` 是未扰动的最后一个历史 Pose；cold-start contact-slide 由最后历史槽有效性屏蔽；
 - 长序列结果同时保存 `reference_pose_horizon_raw`、`raw_pred_pose_horizon_raw`、`deployed_pred_pose_horizon_raw: [N,T,11,144]` 和 `pose_horizon_valid_mask: [N,T,11]`；序列尾部缺少的未来参考帧填 NaN；
 - 当前 MPJRE/MPJPE/MPJVE/Jitter/contact 等指标继续从 horizon 0 计算；另外报告 raw/deployed 的 horizon 0 到 10 全身 MPJRE，以及未来 1:10 宏平均。当前阶段不计算未来 MPJPE 或未来 root 位置误差；
+- 长序列评估 metadata 记录 rolling-prior 开关和 decay；默认输出目录用 `rp0` 与 `rp1g<decay>` 区分 baseline/rolling，显式 `--output_dir` 下也自动追加该策略子目录；
 - 旧 Task Store、旧单帧 checkpoint/args 和联合 11 帧模型的 Unity/Sentis 导出均明确拒绝。Unity runtime schema 仍保持旧单帧接口，不生成联合模型 ONNX。

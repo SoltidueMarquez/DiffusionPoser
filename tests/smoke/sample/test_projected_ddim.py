@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_torch
+from data_loaders.sensor_masking import TRACKER_TO_JOINT
 from diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     LossType,
@@ -20,11 +21,18 @@ from diffusion.realtime_pose_projection import (
 IDENTITY_6D = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
 
 
-def test_so3_projection_is_idempotent_without_tracker_overwrite():
+def _tracker_inputs(batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    tracker = torch.zeros(batch_size, 6, 13)
+    tracker[..., 3:9] = IDENTITY_6D
+    return tracker, torch.zeros(batch_size, 6, dtype=torch.bool)
+
+
+def test_so3_projection_is_idempotent_when_all_trackers_are_soft():
     torch.manual_seed(1)
     raw = torch.randn(2, 11, 144)
-    deployed = project_realtime_pose_xstart(raw)
-    repeated = project_realtime_pose_xstart(deployed)
+    tracker, hard = _tracker_inputs(2)
+    deployed = project_realtime_pose_xstart(raw, tracker, hard)
+    repeated = project_realtime_pose_xstart(deployed, tracker, hard)
     torch.testing.assert_close(deployed, repeated, atol=1e-5, rtol=1e-5)
     rotations = rotation_6d_to_matrix_torch(deployed.reshape(2, 11, 24, 6))
     identity = torch.eye(3).expand_as(rotations)
@@ -34,14 +42,60 @@ def test_so3_projection_is_idempotent_without_tracker_overwrite():
 
 def test_projection_only_legalizes_each_rotation6d():
     raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
-    deployed = project_realtime_pose_xstart(raw)
+    tracker, hard = _tracker_inputs(1)
+    deployed = project_realtime_pose_xstart(raw, tracker, hard)
     torch.testing.assert_close(deployed, raw, atol=1e-5, rtol=1e-5)
+
+
+def test_projection_overwrites_only_hard_trackers_on_current_frame():
+    torch.manual_seed(3)
+    raw = project_rotation_6d_to_so3(torch.randn(1, 11, 24, 6)).reshape(1, 11, 144)
+    tracker, hard = _tracker_inputs(1)
+    tracker[:, 1, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    tracker[:, 2, 3:9] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    hard[:, 1] = True
+
+    deployed = project_realtime_pose_xstart(raw, tracker, hard).reshape(1, 11, 24, 6)
+    expected_tracker = project_rotation_6d_to_so3(tracker[..., 3:9])
+    torch.testing.assert_close(
+        deployed[:, 0, TRACKER_TO_JOINT[1]], expected_tracker[:, 1], atol=1e-5, rtol=1e-5
+    )
+    # soft Tracker 与未来 horizon 都只能经过 SO(3) 合法化，不能被测量覆盖。
+    torch.testing.assert_close(
+        deployed[:, 0, TRACKER_TO_JOINT[2]],
+        raw.reshape(1, 11, 24, 6)[:, 0, TRACKER_TO_JOINT[2]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        deployed[:, 1:], raw.reshape(1, 11, 24, 6)[:, 1:], atol=1e-5, rtol=1e-5
+    )
+
+
+def test_projection_has_same_raw_semantics_with_normalization():
+    torch.manual_seed(4)
+    raw = torch.randn(1, 11, 144)
+    tracker, hard = _tracker_inputs(1)
+    hard[:, 0] = True
+    mean = torch.randn(144)
+    scale = torch.rand(144) + 0.5
+    normalized = (raw - mean) / scale
+
+    normalized_result = project_realtime_pose_xstart(
+        normalized, tracker, hard, pose_mean=mean, pose_scale=scale
+    )
+    raw_result = project_realtime_pose_xstart(raw, tracker, hard)
+    torch.testing.assert_close(
+        normalized_result * scale + mean, raw_result, atol=1e-5, rtol=1e-5
+    )
 
 
 def test_projection_rejects_legacy_single_frame_state():
     with torch.no_grad(), np.testing.assert_raises(ValueError):
         project_realtime_pose_xstart(
             torch.zeros(1, 144),
+            torch.zeros(1, 6, 13),
+            torch.zeros(1, 6, dtype=torch.bool),
         )
 
 

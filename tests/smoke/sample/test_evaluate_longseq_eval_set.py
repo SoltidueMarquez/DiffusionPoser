@@ -39,6 +39,8 @@ def test_longseq_defaults_to_five_steps_and_latency_summary_excludes_warmup():
     assert args.inference_steps == 5
     assert args.sequence_batch_size == 4
     assert args.gt_history_warmup_frames == 0
+    assert args.use_future_rolling_prior is False
+    assert args.future_confidence_decay == pytest.approx(0.9)
     summary = longseq.summarize_latency(np.asarray([100.0, 10.0, 20.0]), warmup_frames=1)
     assert summary["frames"] == 2
     assert summary["mean_ms"] == 15.0
@@ -74,6 +76,17 @@ def test_longseq_default_output_path_is_short_stable_and_collision_resistant(tmp
         weights="ema",
         sequence_batch_size=4,
     )
+    rolling_output = longseq.build_default_output_dir(
+        source_dir=eval_set,
+        model_path=checkpoint,
+        weights="ema",
+        sequence_batch_size=4,
+        use_future_rolling_prior=True,
+        future_confidence_decay=0.9,
+    )
+    assert rolling_output != output
+    assert "rp0" in output.name
+    assert "rp1g0p9" in rolling_output.name
 
 
 def test_longseq_classification_distinguishes_configuration_addition_from_reconnect():
@@ -234,7 +247,7 @@ def test_longseq_cross_sequence_batch_supports_different_lengths_and_matches_sin
     )
 
 
-def test_ground_truth_history_clears_predicted_horizon_and_disables_future_prior(monkeypatch):
+def test_ground_truth_history_is_the_only_previous_pose_prior(monkeypatch):
     instances = []
 
     class PriorRecordingRuntime(longseq.RealtimePoseRuntime):
@@ -243,10 +256,10 @@ def test_ground_truth_history_clears_predicted_horizon_and_disables_future_prior
             self.prior_inputs = []
             instances.append(self)
 
-        def _ik_prior_inputs(self, current_head_yaw):
-            values = super()._ik_prior_inputs(current_head_yaw)
+        def _previous_pose_for_ik(self, current_head_yaw):
+            values = super()._previous_pose_for_ik(current_head_yaw)
             self.prior_inputs.append(
-                (float(current_head_yaw), values[0].copy(), values[1], values[2].copy(), values[3])
+                (float(current_head_yaw), values[0].copy(), values[1])
             )
             return values
 
@@ -278,7 +291,6 @@ def test_ground_truth_history_clears_predicted_horizon_and_disables_future_prior
     )[0]
     assert second_prior[2]
     np.testing.assert_allclose(second_prior[1], expected_previous, atol=1e-6)
-    assert not second_prior[4]
     assert runtime.previous_deployed_horizon_world is None
     assert not (payload["inpaint_confidence"][0, 1, 1:] > 0.0).any()
 
@@ -519,6 +531,8 @@ def test_longseq_entry_evaluation_uses_sequence_batch_and_writes_each_result(tmp
     assert summary["metadata"]["sequence_batch_size"] == 2
     assert summary["metadata"]["evaluation_protocol"] == "isolated_condition_cold_start"
     assert summary["metadata"]["conditions"] == ["fixed_six", "fixed_three"]
+    assert summary["metadata"]["use_future_rolling_prior"] is False
+    assert summary["metadata"]["future_confidence_decay"] == pytest.approx(0.9)
     assert summary["metadata"]["latency_scope"] == "active_batch_wall_time_per_stream"
     assert len(summary["files"]) == 4
     assert set(summary["summary"]["by_condition"]) == {"fixed_six", "fixed_three"}
