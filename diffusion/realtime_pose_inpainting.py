@@ -4,16 +4,22 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_ik import RealtimePoseIKResult, build_current_ik
 from data_loaders.sensor_masking import (
+    CURRENT_JOINT_CONDITION_DIM,
+    CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
+    TRACKER_COUNT,
     TRACKER_CONFIGURED_OFFSET,
+    TRACKER_FEATURE_DIM,
     TRACKER_MEASURED_VALID_OFFSET,
+    TRACKER_TO_JOINT,
 )
 from data_loaders.tracker_reliability import (
     compute_tracker_online_confidence_torch,
@@ -97,7 +103,7 @@ def build_realtime_pose_inpainting_condition(
     return condition
 
 
-def build_current_realtime_pose_ik_and_inpainting_condition(
+def build_current_realtime_pose_conditions(
     previous_pose_raw: torch.Tensor,
     previous_pose_valid: torch.Tensor,
     current_tracker_raw: torch.Tensor,
@@ -108,9 +114,11 @@ def build_current_realtime_pose_ik_and_inpainting_condition(
     joint_rest_local_rotations_6d: torch.Tensor,
     pose_mean: torch.Tensor | None,
     pose_scale: torch.Tensor | None,
+    tracker_position_mean: torch.Tensor | None,
+    tracker_position_scale: torch.Tensor | None,
     config: IKInpaintingConfig | None = None,
-) -> tuple[RealtimePoseIKResult, RealtimePoseInpaintingCondition]:
-    """用训练/runtime 完全相同的流程构造 IK 结果和当前帧条件。"""
+) -> tuple[RealtimePoseIKResult, RealtimePoseInpaintingCondition, torch.Tensor]:
+    """统一构造 IK、soft inpainting 与 `[B,24,10]` 模型条件。"""
 
     cfg = (config or IKInpaintingConfig()).validate()
     raw_configured = current_tracker_raw[..., TRACKER_CONFIGURED_OFFSET] > 0.5
@@ -138,7 +146,130 @@ def build_current_realtime_pose_ik_and_inpainting_condition(
         pose_mean=pose_mean,
         pose_scale=pose_scale,
     )
-    return ik_result, condition
+    current_joint_condition = build_current_joint_condition(
+        ik_result=ik_result,
+        current_tracker_raw=current_tracker_raw,
+        configured=configured,
+        measured_valid=measured_valid,
+        tracker_position_mean=tracker_position_mean,
+        tracker_position_scale=tracker_position_scale,
+    )
+    return ik_result, condition, current_joint_condition
+
+
+def build_current_joint_condition(
+    ik_result: RealtimePoseIKResult,
+    current_tracker_raw: torch.Tensor,
+    configured: torch.Tensor,
+    measured_valid: torch.Tensor,
+    tracker_position_mean: torch.Tensor | None,
+    tracker_position_scale: torch.Tensor | None,
+) -> torch.Tensor:
+    """把 Tracker 几何与 IK 语义对齐为 `[B,24,10]` joint condition。
+
+    前三维位置只写入六个直接 Tracker 关节。IK 骨链父关节只接收
+    valid/confidence/type，端点位置由当前帧 spatial self-attention 传播。
+    """
+
+    batch_size = ik_result.pose.shape[0]
+    if tuple(current_tracker_raw.shape) != (
+        batch_size,
+        TRACKER_COUNT,
+        TRACKER_FEATURE_DIM,
+    ):
+        raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
+    if tuple(configured.shape) != (batch_size, TRACKER_COUNT):
+        raise ValueError("configured 必须为 [B,6]。")
+    if tuple(measured_valid.shape) != (batch_size, TRACKER_COUNT):
+        raise ValueError("measured_valid 必须为 [B,6]。")
+    if tuple(ik_result.updated_mask.shape) != (batch_size, SMPL_JOINT_COUNT):
+        raise ValueError("ik_result.updated_mask 必须为 [B,24]。")
+    if tuple(ik_result.confidence.shape) != (batch_size, SMPL_JOINT_COUNT):
+        raise ValueError("ik_result.confidence 必须为 [B,24]。")
+    if tuple(ik_result.constraint_type.shape) != (batch_size, SMPL_JOINT_COUNT):
+        raise ValueError("ik_result.constraint_type 必须为 [B,24]。")
+    if ik_result.constraint_type.dtype != torch.int64:
+        raise ValueError("ik_result.constraint_type 必须为 int64。")
+    if (tracker_position_mean is None) != (tracker_position_scale is None):
+        raise ValueError("Tracker position mean 与 scale 必须同时提供或同时省略。")
+
+    tracker_positions = current_tracker_raw[..., :3]
+    if tracker_position_mean is not None and tracker_position_scale is not None:
+        if tuple(tracker_position_mean.shape) != (TRACKER_COUNT, 3):
+            raise ValueError("tracker_position_mean 必须为 [6,3]。")
+        if tuple(tracker_position_scale.shape) != (TRACKER_COUNT, 3):
+            raise ValueError("tracker_position_scale 必须为 [6,3]。")
+        mean = tracker_position_mean.to(
+            device=tracker_positions.device,
+            dtype=tracker_positions.dtype,
+        )
+        scale = tracker_position_scale.to(
+            device=tracker_positions.device,
+            dtype=tracker_positions.dtype,
+        )
+        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
+            raise ValueError("Tracker position normalizer 必须为有限数值。")
+        if bool((scale <= 0.0).any()):
+            raise ValueError("tracker_position_scale 必须全部大于零。")
+        tracker_positions = (tracker_positions - mean) / scale
+
+    position_valid = configured.bool() & measured_valid.bool()
+    tracker_positions = torch.where(
+        position_valid[..., None],
+        tracker_positions,
+        torch.zeros_like(tracker_positions),
+    )
+    tracker_joint_indices = torch.as_tensor(
+        TRACKER_TO_JOINT,
+        device=current_tracker_raw.device,
+        dtype=torch.long,
+    )
+    joint_positions = tracker_positions.new_zeros(
+        batch_size,
+        SMPL_JOINT_COUNT,
+        3,
+    )
+    joint_position_valid = tracker_positions.new_zeros(
+        batch_size,
+        SMPL_JOINT_COUNT,
+        1,
+    )
+    joint_positions[:, tracker_joint_indices] = tracker_positions
+    joint_position_valid[:, tracker_joint_indices, 0] = position_valid.to(
+        tracker_positions.dtype
+    )
+
+    constraint_type = ik_result.constraint_type
+    if bool(
+        (
+            (constraint_type < 0)
+            | (constraint_type >= CURRENT_JOINT_CONSTRAINT_TYPE_COUNT)
+        ).any()
+    ):
+        raise ValueError("constraint_type 必须位于 [0,3]。")
+    constraint_one_hot = F.one_hot(
+        constraint_type,
+        num_classes=CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
+    ).to(tracker_positions.dtype)
+    current_joint_condition = torch.cat(
+        [
+            joint_positions,
+            joint_position_valid,
+            ik_result.updated_mask[..., None].to(tracker_positions.dtype),
+            ik_result.confidence[..., None].to(tracker_positions.dtype),
+            constraint_one_hot,
+        ],
+        dim=-1,
+    )
+    if tuple(current_joint_condition.shape) != (
+        batch_size,
+        SMPL_JOINT_COUNT,
+        CURRENT_JOINT_CONDITION_DIM,
+    ):
+        raise RuntimeError("current_joint_condition 内部布局错误。")
+    if not bool(torch.isfinite(current_joint_condition).all()):
+        raise ValueError("current_joint_condition 必须为有限数值。")
+    return current_joint_condition
 
 
 def apply_realtime_pose_inpainting(

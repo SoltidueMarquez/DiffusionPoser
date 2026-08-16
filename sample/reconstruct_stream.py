@@ -20,7 +20,7 @@ from data_loaders.sensor_masking import (
 )
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    build_current_realtime_pose_ik_and_inpainting_condition,
+    build_current_realtime_pose_conditions,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
@@ -47,7 +47,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dict:
+def build_sampling_model_kwargs(
+    model,
+    batch: dict,
+    device: torch.device,
+    current_joint_condition: torch.Tensor,
+) -> dict:
     """每个目标帧只编码一次历史条件，后续 DDIM step 直接复用。"""
 
     values = {
@@ -68,11 +73,12 @@ def build_sampling_model_kwargs(model, batch: dict, device: torch.device) -> dic
             values["history_region_confidence"],
             values["window_valid_mask"].bool(),
             values["frame_offsets"],
+            current_joint_condition,
         )
     return {"prepared_conditioning": prepared}
 
 
-def build_sampling_inpainting_condition(
+def build_sampling_current_conditions(
     model,
     batch: dict,
     device: torch.device,
@@ -82,8 +88,8 @@ def build_sampling_inpainting_condition(
     ik_direction_only_quality: float | None = None,
     ik_residual_scale: float | None = None,
     ik_position_solved_quality: float | None = None,
-) -> RealtimePoseInpaintingCondition:
-    """离线单 batch 按首次 runtime 语义构造条件：当前做 IK，未来不偷看 GT。"""
+) -> tuple[RealtimePoseInpaintingCondition, torch.Tensor]:
+    """离线 batch 一次构造 inpainting 与 `[B,24,10]` 模型条件。"""
 
     del model
     previous_pose = batch["history_pose_observation"][:, -1].to(device).float()
@@ -95,7 +101,15 @@ def build_sampling_inpainting_condition(
         scale = normalizer.pose_scale.to(device).float()
         previous_pose = previous_pose * scale + mean
     current_tracker = batch["tracker_window_raw"][:, -1].to(device).float()
-    _, condition = build_current_realtime_pose_ik_and_inpainting_condition(
+    tracker_position_mean = tracker_position_scale = None
+    if normalizer is not None:
+        if normalizer.tracker_mean is None or normalizer.tracker_std is None:
+            normalizer.load()
+        tracker_position_mean = normalizer.tracker_mean[:, :3].to(device).float()
+        tracker_position_scale = (
+            normalizer.tracker_std[:, :3].to(device).float() + float(normalizer.eps)
+        )
+    _, condition, current_joint_condition = build_current_realtime_pose_conditions(
         previous_pose_raw=previous_pose,
         previous_pose_valid=batch["window_valid_mask"][:, -2].to(device).bool(),
         current_tracker_raw=current_tracker,
@@ -108,6 +122,8 @@ def build_sampling_inpainting_condition(
         ].to(device).float(),
         pose_mean=mean,
         pose_scale=scale,
+        tracker_position_mean=tracker_position_mean,
+        tracker_position_scale=tracker_position_scale,
         config=IKInpaintingConfig(
             tracker_confidence_warmup=tracker_confidence_warmup,
             fabrik_iterations=fabrik_iterations,
@@ -116,7 +132,7 @@ def build_sampling_inpainting_condition(
             position_solved_quality=ik_position_solved_quality,
         ),
     )
-    return condition
+    return condition, current_joint_condition
 
 
 def build_projection_fn(
@@ -160,8 +176,7 @@ def reconstruct_batch(
         REALTIME_POSE_TARGET_DIM,
     ):
         raise ValueError(f"sample 应为 [B,11,144]，实际为 {tuple(reference.shape)}")
-    model_kwargs = build_sampling_model_kwargs(model, batch, device)
-    inpainting = build_sampling_inpainting_condition(
+    inpainting, current_joint_condition = build_sampling_current_conditions(
         model,
         batch,
         device,
@@ -171,6 +186,12 @@ def reconstruct_batch(
         ik_direction_only_quality=ik_direction_only_quality,
         ik_residual_scale=ik_residual_scale,
         ik_position_solved_quality=ik_position_solved_quality,
+    )
+    model_kwargs = build_sampling_model_kwargs(
+        model,
+        batch,
+        device,
+        current_joint_condition,
     )
     projection_fn = build_projection_fn(batch, device, normalizer)
     # 离线入口也显式创建条件噪声；完整 DDIM 轨迹由 diffusion 复用同一张量。

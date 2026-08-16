@@ -5,6 +5,13 @@ import pytest
 import torch
 
 from data_loaders.realtime_pose_ik import INHERITED, RealtimePoseIKResult
+from data_loaders.sensor_masking import (
+    CURRENT_JOINT_CONSTRAINT_TYPE_START,
+    CURRENT_JOINT_IK_CONFIDENCE_INDEX,
+    CURRENT_JOINT_IK_VALID_INDEX,
+    CURRENT_JOINT_TRACKER_POSITION_VALID_INDEX,
+    TRACKER_TO_JOINT,
+)
 from diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     LossType,
@@ -14,6 +21,7 @@ from diffusion.gaussian_diffusion import (
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
     apply_realtime_pose_inpainting,
+    build_current_joint_condition,
     build_realtime_pose_inpainting_condition,
     confidence_to_release_level,
     validate_realtime_pose_inpainting_condition,
@@ -62,6 +70,83 @@ def test_condition_only_populates_current_frame_and_normalizes_it():
     torch.testing.assert_close(
         condition.release_level[:, 0], confidence_to_release_level(confidence)
     )
+
+
+def test_current_joint_condition_has_fixed_layout_and_tracker_joint_scatter():
+    confidence = torch.zeros(1, 24)
+    confidence[0, :2] = torch.tensor([0.8, 0.4])
+    result = _ik_result(confidence)
+    tracker = torch.zeros(1, 6, 13)
+    tracker[0, :, :3] = torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0
+    configured = torch.tensor([[True, True, True, False, False, False]])
+    measured = configured.clone()
+    current = build_current_joint_condition(
+        ik_result=result,
+        current_tracker_raw=tracker,
+        configured=configured,
+        measured_valid=measured,
+        tracker_position_mean=torch.ones(6, 3),
+        tracker_position_scale=torch.full((6, 3), 2.0),
+    )
+
+    assert current.shape == (1, 24, 10)
+    assert torch.isfinite(current).all()
+    mapped = torch.as_tensor(TRACKER_TO_JOINT)
+    expected_positions = (tracker[0, :3, :3] - 1.0) / 2.0
+    torch.testing.assert_close(current[0, mapped[:3], :3], expected_positions)
+    torch.testing.assert_close(
+        current[0, mapped[3:], :3],
+        torch.zeros(3, 3),
+    )
+    assert current[0, mapped[:3], CURRENT_JOINT_TRACKER_POSITION_VALID_INDEX].all()
+    assert not current[0, mapped[3:], CURRENT_JOINT_TRACKER_POSITION_VALID_INDEX].any()
+    torch.testing.assert_close(
+        current[0, :, CURRENT_JOINT_IK_VALID_INDEX],
+        result.updated_mask[0].float(),
+    )
+    torch.testing.assert_close(
+        current[0, :, CURRENT_JOINT_IK_CONFIDENCE_INDEX],
+        result.confidence[0],
+    )
+    torch.testing.assert_close(
+        current[0, :, CURRENT_JOINT_CONSTRAINT_TYPE_START:].sum(dim=-1),
+        torch.ones(24),
+    )
+
+    six_valid = torch.ones(1, 6, dtype=torch.bool)
+    six = build_current_joint_condition(
+        ik_result=result,
+        current_tracker_raw=tracker,
+        configured=six_valid,
+        measured_valid=six_valid,
+        tracker_position_mean=None,
+        tracker_position_scale=None,
+    )
+    expected_position_valid = torch.zeros(24, dtype=torch.bool)
+    expected_position_valid[mapped] = True
+    torch.testing.assert_close(
+        six[0, :, CURRENT_JOINT_TRACKER_POSITION_VALID_INDEX].bool(),
+        expected_position_valid,
+    )
+
+
+def test_current_joint_condition_disabled_normalizer_keeps_head_reference_meters():
+    result = _ik_result(torch.zeros(1, 24))
+    tracker = torch.zeros(1, 6, 13)
+    tracker[0, 0, :3] = torch.tensor([1.0, 2.0, 3.0])
+    valid = torch.tensor([[True, False, False, False, False, False]])
+    raw = build_current_joint_condition(
+        result,
+        tracker,
+        valid,
+        valid,
+        tracker_position_mean=None,
+        tracker_position_scale=None,
+    )
+    torch.testing.assert_close(raw[0, TRACKER_TO_JOINT[0], :3], tracker[0, 0, :3])
+    inherited = ~result.updated_mask[0]
+    assert not raw[0, inherited, CURRENT_JOINT_IK_VALID_INDEX].any()
+    assert not raw[0, inherited, CURRENT_JOINT_IK_CONFIDENCE_INDEX].any()
 
 
 def test_release_level_uses_physical_noise_coordinate_only():

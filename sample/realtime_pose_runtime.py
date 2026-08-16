@@ -40,7 +40,7 @@ from data_loaders.tracker_reliability import (
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from diffusion.realtime_pose_inpainting import (
-    build_current_realtime_pose_ik_and_inpainting_condition,
+    build_current_realtime_pose_conditions,
 )
 
 
@@ -363,6 +363,21 @@ class RealtimePoseRuntime:
             self.normalizer.pose_scale.to(self.device),
         )
 
+    def _normalizer_tracker_position_stats(
+        self,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """返回与离线训练一致的六 Tracker position mean/scale。"""
+
+        if self.normalizer is None:
+            return None, None
+        if self.normalizer.tracker_mean is None or self.normalizer.tracker_std is None:
+            self.normalizer.load()
+        return (
+            self.normalizer.tracker_mean[:, :3].to(self.device),
+            self.normalizer.tracker_std[:, :3].to(self.device)
+            + float(self.normalizer.eps),
+        )
+
     def _normalize_pose_numpy(self, value: np.ndarray) -> np.ndarray:
         return value if self.normalizer is None else np.asarray(self.normalizer.normalize_pose(value), dtype=np.float32)
 
@@ -581,16 +596,6 @@ def step_realtime_pose_batch(
         name: torch.cat([step.conditioning[name] for step in prepared_steps], dim=0)
         for name in prepared_steps[0].conditioning
     }
-    model_impl = getattr(first.model, "module", first.model)
-    # 历史编码在整个 DDIM 采样中复用，且评测时不保留计算图。
-    with torch.no_grad():
-        prepared_conditioning = model_impl.prepare_conditioning(
-            conditioning["history_pose_observation"],
-            conditioning["head_path_window"],
-            conditioning["history_region_confidence"],
-            conditioning["window_valid_mask"],
-            conditioning["frame_offsets"],
-        )
     tracker_window_tensor = torch.as_tensor(
         np.stack([step.tracker_window_raw for step in prepared_steps]),
         device=first.device,
@@ -612,7 +617,14 @@ def step_realtime_pose_batch(
     )
     with torch.no_grad():
         mean, scale = first._normalizer_pose_stats()
-        ik_result, inpainting = build_current_realtime_pose_ik_and_inpainting_condition(
+        tracker_position_mean, tracker_position_scale = (
+            first._normalizer_tracker_position_stats()
+        )
+        (
+            ik_result,
+            inpainting,
+            current_joint_condition,
+        ) = build_current_realtime_pose_conditions(
             previous_pose_raw=previous_pose_raw,
             previous_pose_valid=previous_pose_valid,
             current_tracker_raw=tracker_window_tensor[:, -1],
@@ -645,7 +657,19 @@ def step_realtime_pose_batch(
             ),
             pose_mean=mean,
             pose_scale=scale,
+            tracker_position_mean=tracker_position_mean,
+            tracker_position_scale=tracker_position_scale,
             config=first.ik_inpainting_config,
+        )
+        model_impl = getattr(first.model, "module", first.model)
+        # 当前 Tracker 条件与历史条件一起只编码一次，并在完整 DDIM 轨迹复用。
+        prepared_conditioning = model_impl.prepare_conditioning(
+            conditioning["history_pose_observation"],
+            conditioning["head_path_window"],
+            conditioning["history_region_confidence"],
+            conditioning["window_valid_mask"],
+            conditioning["frame_offsets"],
+            current_joint_condition,
         )
     sampling_shape = (
         batch_size,

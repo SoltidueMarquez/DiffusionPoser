@@ -42,6 +42,7 @@ class _RecordingModel(torch.nn.Module):
         history_region_confidence,
         window_valid_mask,
         frame_offsets,
+        current_joint_condition,
     ):
         batch_size = int(history_pose_observation.shape[0])
         assert history_pose_observation.shape == (batch_size, 10, 144)
@@ -49,6 +50,7 @@ class _RecordingModel(torch.nn.Module):
         assert history_region_confidence.shape == (batch_size, 10, 5)
         assert window_valid_mask.shape == (batch_size, 11)
         assert frame_offsets.shape == (batch_size, 21)
+        assert current_joint_condition.shape == (batch_size, 24, 10)
         self.history_valid_counts.extend(
             int(value) for value in window_valid_mask[:, :-1].sum(dim=1).cpu().tolist()
         )
@@ -325,3 +327,40 @@ def test_legacy_single_frame_checkpoint_is_rejected_explicitly(tmp_path):
     torch.save(state, path)
     with pytest.raises(RuntimeError, match="单帧 checkpoint 与联合 11 帧模型不兼容"):
         load_checkpoint_model(model, path, device=torch.device("cpu"), use_ema=False)
+
+
+def test_checkpoint_requires_lightweight_current_tracker_encoder(tmp_path):
+    model = RealtimePoseSpatioTemporalDiT(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        max_seq_len=21,
+    )
+    complete_path = tmp_path / "model000000001.pt"
+    torch.save(model.state_dict(), complete_path)
+    loaded, source = load_checkpoint_model(
+        RealtimePoseSpatioTemporalDiT(
+            latent_dim=32,
+            num_layers=1,
+            num_heads=4,
+            max_seq_len=21,
+        ),
+        complete_path,
+        device=torch.device("cpu"),
+        use_ema=False,
+    )
+    assert source == "model"
+    assert isinstance(loaded.current_joint_condition_input, torch.nn.Linear)
+
+    legacy_state = model.state_dict()
+    legacy_state.pop("current_joint_condition_input.weight")
+    legacy_state.pop("current_joint_condition_input.bias")
+    legacy_path = tmp_path / "model000000002.pt"
+    torch.save(legacy_state, legacy_path)
+    with pytest.raises(RuntimeError, match="缺少轻量 Tracker 条件编码器"):
+        load_checkpoint_model(
+            model,
+            legacy_path,
+            device=torch.device("cpu"),
+            use_ema=False,
+        )

@@ -141,13 +141,16 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 
 Dataset 不返回 `source_path`，也不接受 `folder_path` 过滤。需要按数据集或序列筛选时，应使用 split 或单独的 Task Store 目录。
 
-训练与 Runtime 使用同一套当前帧 IK 条件构造逻辑，并在模型调用前构造两个动态张量：
+训练与 Runtime 使用同一套当前帧 IK 条件构造逻辑，并在模型调用前构造以下动态条件：
 
 | 字段 | 形状 | 语义 |
 |---|---:|---|
 | `inpaint_pose` | `[B,11,144]` | 索引 0 为当前 IK Pose；第一轮未来 1..10 严格为零 |
 | `inpaint_valid` | `[B,11,24]` | 索引 0 等于 IK `updated_mask`；第一轮未来 1..10 严格为 `False` |
 | `release_level` | `[B,11,24]` | 当前逐关节在物理噪声坐标中的释放阈值，范围 `[0,1]` |
+| `current_joint_condition` | `[B,24,10]` | 当前逐关节 Tracker position、有效性、IK confidence 与约束类型；只加到 current token |
+
+`current_joint_condition` 的通道固定为：`0:3` 是归一化 Tracker position，`3` 是 position valid，`4` 是 IK updated valid，`5` 是 IK confidence，`6:10` 是四种 constraint type 的 one-hot。六个 Tracker position 只 scatter 到 Head、双 Wrist、Pelvis、双 Foot；无效位置在归一化后重新清零。position 使用现有 `tracker_mean/std[:,0:3]`，禁用 normalizer 时保留 Head-yaw 参考系下的米制数值。
 
 当前 DDPM/DDIM 步的 active mask 由 `inpaint_valid`、实际 `alpha_bar_t` 和 `release_level` 局部计算，不进入 DiT。模型 diffusion state、模型输出和扩散采样结果均为 `[B,11,144]`。`history_pose_observation: [B,10,144]` 是固定条件，不进入 diffusion Markov chain。`RuntimeStepResult` 继续返回 `raw_pred_pose_horizon/deployed_pred_pose_horizon: [11,144]` 和诊断用 `inpaint_confidence: [11,24]`；后者只有 horizon 0 可非零。Runtime 只解析 horizon 0 并追加到密集历史。
 
@@ -205,14 +208,15 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 ## 时空 DiT 与投影
 
 - 模型 token 网格为 `[B,21,24,D]`：`0:10` 是历史 Pose 条件，`10:21` 是当前与未来 10 帧的带噪目标；
-- Tracker position 先经 IK 转换成同一 144D Pose 状态；DiT 不再实例化或执行 Tracker state/position/rotation cross-attention；
+- Tracker position 一路经 IK 转换成 144D Pose state，另一路以逐关节 10D 轻量条件保留端点几何；DiT 不实例化或执行 Tracker cross-attention；
 - 每层只执行 24 关节 Spatial Self-Attention 与同关节 21 槽 Temporal Self-Attention；
 - 模型只维护 `token_valid_mask: [B,21]`。冷启动无效历史不能作为 attention key；11 个目标 token 始终有效；
 - Temporal Attention 的历史 query 只能读取有效历史 key，不能读取任何目标 token；目标 query 可读取全部有效历史和全部 11 个目标，目标窗口内部双向 attention；
 - 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测与 Loss 从同一份条件和监督数据读取，不在顶层重复条件字段；
-- 历史 Pose 与 Head 路径由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
+- 历史 Pose、Head 路径与当前 10D joint condition 由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
 - 历史和目标使用独立输入投影；共享一个 diffusion timestep embedding，21 个 frame-offset embedding 区分帧位置；
-- DiT 不接收 `inpaint_confidence` 或 `inpaint_kind`，不存在 constraint/confidence embedding；置信度只在模型调用前决定哪些 `x_t` 关节被条件覆盖；
+- 当前 joint condition 只经过 `Linear(10, latent_dim)` 并加到 token 10；不直接写入未来 token，未来只能通过 temporal self-attention 读取当前条件；
+- DiT 不接收旧的 `inpaint_confidence` 或 `inpaint_kind` 字段。soft inpainting 仍由 `release_level` 外部控制，模型仅通过 10D joint condition 看到 confidence 与 constraint type 的语义副本；
 - 解码最后 11 个槽，输出 `[B,11,144]`；`contact_head` 只读取当前目标槽，不存在 `future_leg_head`；
 - SO(3) projection 先合法化 `[B,11,144]` 的所有 rotation6D，再只对 horizon 0 中处于 hard 状态的 Tracker 关节覆盖实测旋转；
 - DDIM 的 state、初始 noise 和每步更新均为 `[B,11,144]`。每个实时帧另采样一份 `known_noise: [B,11,144]` 并在完整去噪轨迹复用；
@@ -252,4 +256,4 @@ conda run -n diffusionposer5070 python -m eval.calibrate_realtime_pose_ik --data
 - 长序列结果同时保存 `reference_pose_horizon_raw`、`raw_pred_pose_horizon_raw`、`deployed_pred_pose_horizon_raw: [N,T,11,144]` 和 `pose_horizon_valid_mask: [N,T,11]`；序列尾部缺少的未来参考帧填 NaN；
 - 当前 MPJRE/MPJPE/MPJVE/Jitter/contact 等指标继续从 horizon 0 计算；另外报告 raw/deployed 的 horizon 0 到 10 全身 MPJRE，以及未来 1:10 宏平均。当前阶段不计算未来 MPJPE 或未来 root 位置误差；
 - 长序列评估 metadata 继续记录 rolling-prior 开关和 decay，但第一轮有效运行的开关只能为 `False`；`rp1g<decay>` 命名仅保留给第三轮重新实现后使用；
-- 旧 Task Store、旧单帧 checkpoint/args 和联合 11 帧模型的 Unity/Sentis 导出均明确拒绝。Unity runtime schema 仍保持旧单帧接口，不生成联合模型 ONNX。
+- Task Store 无需重建；新增 `current_joint_condition_input` 后，缺少该权重的旧 checkpoint 明确拒绝加载，必须从头训练。联合 11 帧模型的 Unity/Sentis 导出仍拒绝；Unity runtime schema 保持旧单帧接口，不生成联合模型 ONNX。

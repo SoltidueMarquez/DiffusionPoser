@@ -12,6 +12,7 @@ from data_loaders.realtime_pose_config import (
 )
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
+    CURRENT_JOINT_CONDITION_DIM,
     REALTIME_POSE_CONDITION_WINDOW_LENGTH,
     REALTIME_POSE_HISTORY_ANCHOR_COUNT,
     REALTIME_POSE_MODEL_TOKEN_LENGTH,
@@ -169,6 +170,12 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         self.num_heads = int(num_heads)
         self.joint_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.history_pose_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
+        # 当前 Tracker 条件已与 24 个关节对齐，只需一次线性投影到 token 空间。
+        # 它不新增 token 或 attention，也不会重复编码已由 IK 注入的 rotation。
+        self.current_joint_condition_input = nn.Linear(
+            CURRENT_JOINT_CONDITION_DIM,
+            latent_dim,
+        )
         self.head_path_encoder = nn.Sequential(
             nn.Linear(5, latent_dim), nn.SiLU(), nn.Linear(latent_dim, latent_dim)
         )
@@ -211,6 +218,7 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         history_region_confidence: torch.Tensor,
         window_valid_mask: torch.Tensor,
         frame_offsets: torch.Tensor,
+        current_joint_condition: torch.Tensor,
     ) -> PreparedSpatioTemporalConditioning:
         batch_size = history_pose_observation.shape[0]
         if tuple(history_pose_observation.shape) != (
@@ -238,6 +246,14 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             raise ValueError("window_valid_mask 必须为 [B,11]。")
         if not torch.all(window_valid_mask[:, -1]):
             raise ValueError("当前帧必须始终有效。")
+        if tuple(current_joint_condition.shape) != (
+            batch_size,
+            SMPL_JOINT_COUNT,
+            CURRENT_JOINT_CONDITION_DIM,
+        ):
+            raise ValueError("current_joint_condition 必须为 [B,24,10]。")
+        if not bool(torch.isfinite(current_joint_condition).all()):
+            raise ValueError("current_joint_condition 必须为有限数值。")
 
         history = history_pose_observation.reshape(
             batch_size,
@@ -293,6 +309,13 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             batch_size, REALTIME_POSE_MODEL_TOKEN_LENGTH, self.latent_dim
         )
         static_condition = history_tokens + head_tokens + offset_tokens[:, :, None]
+        # 10 个历史槽之后的第一个目标槽就是 current。未来条件不直接复制，
+        # 后续 10 帧只能通过 temporal self-attention 读取当前 Tracker 影响。
+        current_index = REALTIME_POSE_HISTORY_ANCHOR_COUNT
+        static_condition[:, current_index] = (
+            static_condition[:, current_index]
+            + self.current_joint_condition_input(current_joint_condition)
+        )
         target_valid = torch.ones(
             batch_size,
             REALTIME_POSE_TARGET_LENGTH,
@@ -324,6 +347,7 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         history_region_confidence: Optional[torch.Tensor] = None,
         window_valid_mask: Optional[torch.Tensor] = None,
         frame_offsets: Optional[torch.Tensor] = None,
+        current_joint_condition: Optional[torch.Tensor] = None,
         prepared_conditioning: Optional[PreparedSpatioTemporalConditioning] = None,
         y: Optional[dict] = None,
         return_aux_outputs: bool = False,
@@ -360,12 +384,18 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             frame_offsets = (
                 frame_offsets if frame_offsets is not None else values.get("frame_offsets")
             )
+            current_joint_condition = (
+                current_joint_condition
+                if current_joint_condition is not None
+                else values.get("current_joint_condition")
+            )
             required = (
                 history_pose_observation,
                 head_path_window,
                 history_region_confidence,
                 window_valid_mask,
                 frame_offsets,
+                current_joint_condition,
             )
             if any(value is None for value in required):
                 raise ValueError("时空 DiT 缺少窗口条件字段。")

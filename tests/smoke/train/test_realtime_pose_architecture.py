@@ -53,6 +53,7 @@ def _conditioning(batch_size: int = 2, cold_start: bool = False) -> dict[str, to
         "history_region_confidence": confidence,
         "window_valid_mask": valid,
         "frame_offsets": FRAME_OFFSETS,
+        "current_joint_condition": torch.zeros(batch_size, 24, 10),
     }
 
 
@@ -109,8 +110,11 @@ def test_history_and_current_use_independent_input_projections_once():
     }
 
 
-def test_model_has_no_inpainting_kind_or_confidence_embeddings():
+def test_model_has_one_lightweight_current_condition_projection():
     model = _model()
+    assert isinstance(model.current_joint_condition_input, torch.nn.Linear)
+    assert model.current_joint_condition_input.in_features == 10
+    assert model.current_joint_condition_input.out_features == model.latent_dim
     assert not hasattr(model, "constraint_kind_embedding")
     assert not hasattr(model, "confidence_projection")
 
@@ -135,6 +139,36 @@ def test_head_path_and_history_pose_are_independent_conditions():
     torch.testing.assert_close(
         values["history_pose_observation"], changed["history_pose_observation"]
     )
+
+
+def test_current_joint_condition_only_changes_current_static_slot():
+    model = _model()
+    values = _conditioning(batch_size=1)
+    first = model.prepare_conditioning(**_static_conditioning(values))
+    changed = {name: value.clone() for name, value in values.items()}
+    changed["current_joint_condition"][0, 10, 0] = 1.0
+    second = model.prepare_conditioning(**_static_conditioning(changed))
+
+    difference = second.static_pose_condition - first.static_pose_condition
+    assert torch.linalg.norm(difference[:, 10, 10]) > 0.0
+    torch.testing.assert_close(difference[:, :10], torch.zeros_like(difference[:, :10]))
+    torch.testing.assert_close(difference[:, 11:], torch.zeros_like(difference[:, 11:]))
+
+
+def test_future_outputs_receive_gradient_from_current_joint_condition():
+    model = _model().train()
+    values = _conditioning(batch_size=1)
+    condition = values["current_joint_condition"].clone().requires_grad_(True)
+    values["current_joint_condition"] = condition
+    with torch.no_grad():
+        latent_dim = model.latent_dim
+        model.blocks[0].adaln_modulation[-1].bias[
+            5 * latent_dim : 6 * latent_dim
+        ].fill_(1.0)
+    output = model(torch.randn(1, 11, 144), torch.ones(1), **values)
+    output[:, [1, 5, 10]].square().mean().backward()
+    assert condition.grad is not None and torch.isfinite(condition.grad).all()
+    assert torch.linalg.norm(condition.grad) > 0.0
 
 
 def test_temporal_mask_is_prefix_bidirectional_and_ignores_padding_keys():
@@ -332,7 +366,12 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "contact_target": torch.zeros(1, 2),
     }
 
-    model_kwargs = loop.mask_manager(batch, sample)
+    current_joint_condition = torch.zeros(1, 24, 10)
+    model_kwargs = loop.mask_manager(
+        batch,
+        sample,
+        current_joint_condition=current_joint_condition,
+    )
 
     assert set(model_kwargs) == {"y"}
     assert "tracker_window" not in model_kwargs["y"]
@@ -344,6 +383,7 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         "hard_rotation_state_window"
     ]
     assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
+    assert model_kwargs["y"]["current_joint_condition"] is current_joint_condition
 
 
 def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
@@ -366,7 +406,7 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
     loop._prepare_history_observation = lambda batch: batch[
         "history_pose_observation"
     ]
-    loop.mask_manager = lambda batch, sample, history_observation=None: {
+    loop.mask_manager = lambda batch, sample, current_joint_condition, history_observation=None: {
         "y": {"history_pose_observation": batch["history_pose_observation"]}
     }
     sample_window = torch.randn(2, 11, 144)
@@ -375,8 +415,11 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
         valid=torch.zeros(2, 11, 24, dtype=torch.bool),
         release_level=torch.ones(2, 11, 24),
     )
-    loop.build_training_inpainting_condition = (
-        lambda batch, history_observation, sample: condition
+    loop.build_training_current_conditions = (
+        lambda batch, history_observation, sample: (
+            condition,
+            torch.zeros(sample.shape[0], 24, 10),
+        )
     )
     batch = {
         "x": sample_window.clone(),

@@ -40,10 +40,11 @@ from diffusion.realtime_pose_losses import (
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
     apply_realtime_pose_inpainting,
-    build_current_realtime_pose_ik_and_inpainting_condition,
+    build_current_realtime_pose_conditions,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
+from sample.reconstruct_stream import build_sampling_current_conditions
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 from train.training_loop import TrainLoop
 
@@ -218,8 +219,10 @@ def _model_and_kwargs(batch):
         "frame_offsets",
     )
     kwargs = {name: batch[name] for name in condition_names}
+    kwargs["current_joint_condition"] = torch.zeros(batch["x"].shape[0], 24, 10)
     kwargs["y"] = {
         **batch,
+        "current_joint_condition": kwargs["current_joint_condition"],
         "previous_pose_target": batch["history_pose_observation"][:, -1],
     }
     return model, kwargs
@@ -281,6 +284,8 @@ def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
     loop.device = torch.device("cpu")
     loop.pose_mean = torch.linspace(-0.2, 0.2, 144)
     loop.pose_scale = torch.linspace(0.5, 1.5, 144)
+    loop.tracker_position_mean = None
+    loop.tracker_position_scale = None
     loop.ik_inpainting_config = IKInpaintingConfig(
         direction_only_quality=0.4,
         residual_scale=0.1,
@@ -289,16 +294,16 @@ def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
     second_history = first_history.clone()
     second_history[:, -1] += 100.0
 
-    first = loop.build_training_inpainting_condition(
+    first, first_joint_condition = loop.build_training_current_conditions(
         batch, first_history, batch["x"].float()
     )
-    second = loop.build_training_inpainting_condition(
+    second, second_joint_condition = loop.build_training_current_conditions(
         batch, second_history, batch["x"].float()
     )
     pose_mean, pose_scale = loop.pose_mean, loop.pose_scale
     loop.pose_mean = None
     loop.pose_scale = None
-    raw = loop.build_training_inpainting_condition(
+    raw, raw_joint_condition = loop.build_training_current_conditions(
         batch, first_history, batch["x"].float()
     )
 
@@ -310,6 +315,8 @@ def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
     assert torch.isfinite(first.pose).all()
     torch.testing.assert_close(first.pose[:, 1:], torch.zeros_like(first.pose[:, 1:]))
     assert not first.valid[:, 1:].any()
+    torch.testing.assert_close(first_joint_condition, second_joint_condition)
+    torch.testing.assert_close(first_joint_condition, raw_joint_condition)
 
 
 def test_training_and_runtime_builder_produce_the_same_current_condition():
@@ -323,11 +330,13 @@ def test_training_and_runtime_builder_produce_the_same_current_condition():
     loop.device = torch.device("cpu")
     loop.pose_mean = None
     loop.pose_scale = None
+    loop.tracker_position_mean = None
+    loop.tracker_position_scale = None
     loop.ik_inpainting_config = config
-    training_condition = loop.build_training_inpainting_condition(
+    training_condition, training_joint_condition = loop.build_training_current_conditions(
         batch, history, batch["x"].float()
     )
-    _, runtime_condition = build_current_realtime_pose_ik_and_inpainting_condition(
+    _, runtime_condition, runtime_joint_condition = build_current_realtime_pose_conditions(
         previous_pose_raw=history[:, -1],
         previous_pose_valid=batch["window_valid_mask"][:, -2].bool(),
         current_tracker_raw=batch["tracker_window_raw"][:, -1].float(),
@@ -338,13 +347,27 @@ def test_training_and_runtime_builder_produce_the_same_current_condition():
         joint_rest_local_rotations_6d=batch["joint_rest_local_rotations_6d"].float(),
         pose_mean=None,
         pose_scale=None,
+        tracker_position_mean=None,
+        tracker_position_scale=None,
         config=config,
+    )
+    offline_condition, offline_joint_condition = build_sampling_current_conditions(
+        model=None,
+        batch=batch,
+        device=torch.device("cpu"),
+        normalizer=None,
+        ik_direction_only_quality=0.4,
+        ik_residual_scale=0.1,
     )
     torch.testing.assert_close(training_condition.pose, runtime_condition.pose)
     torch.testing.assert_close(training_condition.valid, runtime_condition.valid)
     torch.testing.assert_close(
         training_condition.release_level, runtime_condition.release_level
     )
+    torch.testing.assert_close(training_joint_condition, runtime_joint_condition)
+    torch.testing.assert_close(training_condition.pose, offline_condition.pose)
+    torch.testing.assert_close(training_condition.valid, offline_condition.valid)
+    torch.testing.assert_close(training_joint_condition, offline_joint_condition)
 
 
 class _RecordingTrainingModel(torch.nn.Module):

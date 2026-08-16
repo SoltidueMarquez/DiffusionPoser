@@ -24,7 +24,7 @@ from data_loaders.sensor_masking import (
 from diffusion import logger
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    build_current_realtime_pose_ik_and_inpainting_condition,
+    build_current_realtime_pose_conditions,
 )
 from utils import dist_util
 
@@ -133,7 +133,12 @@ class TrainLoop:
             logger.log(f"cuda device name: {torch.cuda.get_device_name(self.device)}")
 
         self.feature_w = self._load_feature_weights(args)
-        self.pose_mean, self.pose_scale = self._read_dataset_normalizer_stats(data)
+        (
+            self.pose_mean,
+            self.pose_scale,
+            self.tracker_position_mean,
+            self.tracker_position_scale,
+        ) = self._read_dataset_normalizer_stats(data)
         self._load_and_sync_parameters()
 
         self.amp_dtype = self._select_amp_dtype()
@@ -182,12 +187,20 @@ class TrainLoop:
         dataset = getattr(data, "dataset", None)
         normalizer = getattr(dataset, "normalizer", None)
         if normalizer is None or getattr(normalizer, "disable", False):
-            return None, None
+            return None, None, None, None
         mean = getattr(normalizer, "pose_mean", None)
         scale = getattr(normalizer, "pose_scale", None)
-        if mean is None or scale is None:
-            return None, None
-        return mean.detach().float().clone(), scale.detach().float().clone()
+        tracker_mean = getattr(normalizer, "tracker_mean", None)
+        tracker_std = getattr(normalizer, "tracker_std", None)
+        if any(value is None for value in (mean, scale, tracker_mean, tracker_std)):
+            raise ValueError("启用 normalizer 时必须同时提供 Pose 与 Tracker 统计。")
+        tracker_eps = float(getattr(normalizer, "eps", 0.0))
+        return (
+            mean.detach().float().clone(),
+            scale.detach().float().clone(),
+            tracker_mean[:, :3].detach().float().clone(),
+            tracker_std[:, :3].detach().float().clone() + tracker_eps,
+        )
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint(
@@ -205,6 +218,13 @@ class TrainLoop:
         missing_keys = list(incompatible_keys.missing_keys)
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if missing_keys or unexpected_keys:
+            if any(
+                key.startswith("current_joint_condition_input.") for key in missing_keys
+            ):
+                raise RuntimeError(
+                    "旧 checkpoint 缺少轻量 Tracker 条件编码器；"
+                    "本结构必须从头训练，不提供兼容恢复。"
+                )
             if (
                 "joint_diffusion_horizon_length" in missing_keys
                 or any("future_leg_head" in key for key in unexpected_keys)
@@ -422,15 +442,19 @@ class TrainLoop:
             )
         feature_w = self._feature_weights_for_batch(x_start.shape[0])
         history_observation = self._prepare_history_observation(batch)
+        (
+            inpaint_condition,
+            current_joint_condition,
+        ) = self.build_training_current_conditions(
+            batch,
+            history_observation,
+            x_start,
+        )
         model_kwargs = self.mask_manager(
             batch,
             x_start,
             history_observation=history_observation,
-        )
-        inpaint_condition = self.build_training_inpainting_condition(
-            batch,
-            history_observation,
-            x_start,
+            current_joint_condition=current_joint_condition,
         )
         # 两条噪声流彼此独立：noise 生成普通 x_t，known_noise 只生成已知 IK 状态。
         noise = torch.randn_like(x_start)
@@ -480,13 +504,13 @@ class TrainLoop:
                 )
         return history_observation
 
-    def build_training_inpainting_condition(
+    def build_training_current_conditions(
         self,
         batch: dict,
         history_observation: torch.Tensor,
         sample: torch.Tensor,
-    ) -> RealtimePoseInpaintingCondition:
-        """在历史扰动之后构造与 runtime 相同的当前帧 IK 条件。"""
+    ) -> tuple[RealtimePoseInpaintingCondition, torch.Tensor]:
+        """在历史扰动后一次构造 inpainting 与 `[B,24,10]` 模型条件。"""
 
         pose_mean = pose_scale = None
         if self.pose_mean is not None and self.pose_scale is not None:
@@ -495,8 +519,21 @@ class TrainLoop:
         previous_pose_raw = history_observation[:, -1].float()
         if pose_mean is not None and pose_scale is not None:
             previous_pose_raw = previous_pose_raw * pose_scale + pose_mean
+        tracker_position_mean = tracker_position_scale = None
+        if (
+            self.tracker_position_mean is not None
+            and self.tracker_position_scale is not None
+        ):
+            tracker_position_mean = self.tracker_position_mean.to(
+                device=sample.device,
+                dtype=torch.float32,
+            )
+            tracker_position_scale = self.tracker_position_scale.to(
+                device=sample.device,
+                dtype=torch.float32,
+            )
         with autocast(device_type=self.device.type, enabled=False):
-            _, condition = build_current_realtime_pose_ik_and_inpainting_condition(
+            _, condition, current_joint_condition = build_current_realtime_pose_conditions(
                 previous_pose_raw=previous_pose_raw,
                 previous_pose_valid=batch["window_valid_mask"][:, -2].bool(),
                 current_tracker_raw=batch["tracker_window_raw"][:, -1].float(),
@@ -509,14 +546,17 @@ class TrainLoop:
                 ].float(),
                 pose_mean=pose_mean,
                 pose_scale=pose_scale,
+                tracker_position_mean=tracker_position_mean,
+                tracker_position_scale=tracker_position_scale,
                 config=self.ik_inpainting_config,
             )
-            return condition
+            return condition, current_joint_condition
 
     def mask_manager(
         self,
         batch: dict,
         sample: torch.Tensor,
+        current_joint_condition: torch.Tensor,
         history_observation: torch.Tensor | None = None,
     ) -> dict:
         window_valid_mask = batch["window_valid_mask"].bool()
@@ -539,6 +579,7 @@ class TrainLoop:
             "history_region_confidence": batch["history_region_confidence"],
             "window_valid_mask": window_valid_mask,
             "frame_offsets": batch["frame_offsets"],
+            "current_joint_condition": current_joint_condition,
         }
         y = {
             **conditions,

@@ -25,7 +25,8 @@ def load_checkpoint_model(model, model_path: str | Path, device, use_ema: bool =
                 ema.load_state_dict(torch.load(ema_path, map_location="cpu"))
             except (RuntimeError, KeyError) as exc:
                 raise RuntimeError(
-                    "单帧 checkpoint 与联合 11 帧模型不兼容，无法加载 EMA 权重。"
+                    "checkpoint 模型结构不兼容，无法加载 EMA 权重；"
+                    "新增轻量 Tracker 条件编码器后必须使用新训练权重。"
                 ) from exc
             inference_model = ema.ema_model
             inference_model.to(device)
@@ -37,6 +38,13 @@ def load_checkpoint_model(model, model_path: str | Path, device, use_ema: bool =
     missing_keys = list(incompatible_keys.missing_keys)
     unexpected_keys = list(incompatible_keys.unexpected_keys)
     if missing_keys or unexpected_keys:
+        if any(
+            key.startswith("current_joint_condition_input.") for key in missing_keys
+        ):
+            raise RuntimeError(
+                "旧 checkpoint 缺少轻量 Tracker 条件编码器；"
+                "请使用新结构从头训练得到的权重。"
+            )
         if (
             "joint_diffusion_horizon_length" in missing_keys
             or any("future_leg_head" in key for key in unexpected_keys)
