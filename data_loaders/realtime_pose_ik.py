@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 
+from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_geometry import pelvis_relative_joint_positions_torch
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
@@ -24,6 +27,25 @@ from data_loaders.sensor_masking import (
     TRACKER_MEASURED_VALID_OFFSET,
     TRACKER_TO_JOINT,
 )
+from data_loaders.tracker_reliability import compute_ik_joint_confidence_torch
+
+
+DIRECT_ROTATION = 0
+POSITION_SOLVED = 1
+DIRECTION_ONLY = 2
+INHERITED = 3
+
+
+@dataclass(frozen=True)
+class RealtimePoseIKResult:
+    """当前帧部分 IK 结果；所有逐关节张量的关节轴均为 24。"""
+
+    pose: torch.Tensor  # [B,24,6]
+    updated_mask: torch.Tensor  # [B,24]
+    direct_rotation_mask: torch.Tensor  # [B,24]
+    constraint_type: torch.Tensor  # [B,24]
+    position_residual: torch.Tensor  # [B,24]
+    confidence: torch.Tensor  # [B,24]
 
 _TORSO_CHAIN = (
     JOINT_INDEX["spine1"],
@@ -56,23 +78,24 @@ _RIGHT_LEG_CHAIN = (
 )
 
 
-def build_current_ik_pose(
+def build_current_ik(
     previous_pose_raw: torch.Tensor,
     previous_pose_valid: torch.Tensor,
     current_tracker_raw: torch.Tensor,
+    tracker_source_reliability: torch.Tensor,
     joint_offsets_parent: torch.Tensor,
     joint_rest_local_rotations_6d: torch.Tensor,
-    fabrik_iterations: int = 2,
-) -> torch.Tensor:
-    """用上一帧 Pose 和当前 Tracker 构造 `[B,144]` IK 姿态初值。
+    config: IKInpaintingConfig,
+) -> RealtimePoseIKResult:
+    """用初始化 Pose 和当前 Tracker 构造 `[B,24,6]` 部分 IK 结果。
 
     输入 Pose 与 Tracker 都必须已经表达在当前 Head-yaw 参考系中。函数只把
-    Tracker 覆盖的骨链更新为当前测量；其他关节保留上一帧或 rest pose。IK 结果
-    允许存在误差，逐关节置信度由独立的 Tracker 区域 mapping 决定。
+    Tracker 真正约束的骨链标为已更新；上一帧/rest pose 只负责初始化，绝不会
+    自动变为 inpainting 条件。当前 FABRIK 只确定骨骼方向，因此所有非直接更新
+    都属于 DIRECTION_ONLY，不产生 POSITION_SOLVED。
     """
 
-    if int(fabrik_iterations) <= 0:
-        raise ValueError("fabrik_iterations 必须大于 0。")
+    cfg = config.validate()
     batch_size = previous_pose_raw.shape[0]
     if tuple(previous_pose_raw.shape) != (batch_size, SMPL_JOINT_COUNT * 6):
         raise ValueError("previous_pose_raw 必须为 [B,144]。")
@@ -84,6 +107,8 @@ def build_current_ik_pose(
         TRACKER_FEATURE_DIM,
     ):
         raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
+    if tuple(tracker_source_reliability.shape) != (batch_size, TRACKER_COUNT):
+        raise ValueError("tracker_source_reliability 必须为 [B,6]。")
     if tuple(joint_offsets_parent.shape) != (batch_size, SMPL_JOINT_COUNT, 3):
         raise ValueError("joint_offsets_parent 必须为 [B,24,3]。")
     if tuple(joint_rest_local_rotations_6d.shape) != (
@@ -99,6 +124,23 @@ def build_current_ik_pose(
     global_rotations = torch.where(
         previous_pose_valid[:, None, None, None], previous_global, rest_global
     )
+    updated_mask = torch.zeros(
+        batch_size, SMPL_JOINT_COUNT, device=global_rotations.device, dtype=torch.bool
+    )
+    direct_rotation_mask = torch.zeros_like(updated_mask)
+    constraint_type = torch.full(
+        (batch_size, SMPL_JOINT_COUNT),
+        INHERITED,
+        device=global_rotations.device,
+        dtype=torch.long,
+    )
+    position_residual = torch.zeros(
+        batch_size,
+        SMPL_JOINT_COUNT,
+        device=global_rotations.device,
+        dtype=global_rotations.dtype,
+    )
+    chain_length = build_ik_joint_chain_length(joint_offsets_parent)
 
     configured = current_tracker_raw[..., TRACKER_CONFIGURED_OFFSET] > 0.5
     measured = current_tracker_raw[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
@@ -114,6 +156,13 @@ def build_current_ik_pose(
             tracker_rotations[:, tracker_index],
             global_rotations[:, joint_index],
         )
+        updated_mask[:, joint_index] |= active
+        direct_rotation_mask[:, joint_index] |= active
+        constraint_type[:, joint_index] = torch.where(
+            active,
+            torch.full_like(constraint_type[:, joint_index], DIRECT_ROTATION),
+            constraint_type[:, joint_index],
+        )
 
     # 有 Hip 时用其位置对齐整棵骨架；否则只以始终有效的 Head 对齐上一帧形状。
     joints = _aligned_joint_positions(
@@ -128,10 +177,16 @@ def build_current_ik_pose(
         joints[:, _TORSO_CHAIN],
         tracker_positions[:, HEAD_TRACKER_INDEX],
         torso_active,
-        iterations=fabrik_iterations,
+        iterations=cfg.fabrik_iterations,
     )
     global_rotations = _apply_chain_directions(
         global_rotations, joints[:, _TORSO_CHAIN], solved, _TORSO_CHAIN, torso_active
+    )
+    _mark_direction_only_chain(
+        updated_mask,
+        constraint_type,
+        _TORSO_CHAIN,
+        torso_active,
     )
     joints = _aligned_joint_positions(
         global_rotations,
@@ -149,10 +204,16 @@ def build_current_ik_pose(
             joints[:, chain],
             tracker_positions[:, tracker_index],
             active,
-            iterations=fabrik_iterations,
+            iterations=cfg.fabrik_iterations,
         )
         global_rotations = _apply_chain_directions(
             global_rotations, joints[:, chain], solved, chain, active
+        )
+        _mark_direction_only_chain(
+            updated_mask,
+            constraint_type,
+            chain,
+            active,
         )
 
     for chain, tracker_index in (
@@ -164,10 +225,16 @@ def build_current_ik_pose(
             joints[:, chain],
             tracker_positions[:, tracker_index],
             active,
-            iterations=fabrik_iterations,
+            iterations=cfg.fabrik_iterations,
         )
         global_rotations = _apply_chain_directions(
             global_rotations, joints[:, chain], solved, chain, active
+        )
+        _mark_direction_only_chain(
+            updated_mask,
+            constraint_type,
+            chain,
+            active,
         )
 
     # 内部 IK 更新完成后再次覆盖直接 Tracker，保证叶节点旋转不会被任何链路修改。
@@ -179,7 +246,157 @@ def build_current_ik_pose(
             global_rotations[:, joint_index],
         )
 
-    return rotation_6d_forward_up_torch(global_rotations).reshape(batch_size, -1)
+    final_joints = _aligned_joint_positions(
+        global_rotations,
+        joint_offsets_parent,
+        tracker_positions,
+        tracker_valid[:, HIP_TRACKER_INDEX],
+    )
+    for chain, tracker_index, active in (
+        (_TORSO_CHAIN, HEAD_TRACKER_INDEX, torso_active),
+        (_LEFT_ARM_CHAIN, LEFT_HAND_TRACKER_INDEX, tracker_valid[:, LEFT_HAND_TRACKER_INDEX]),
+        (_RIGHT_ARM_CHAIN, RIGHT_HAND_TRACKER_INDEX, tracker_valid[:, RIGHT_HAND_TRACKER_INDEX]),
+        (
+            _LEFT_LEG_CHAIN,
+            LEFT_FOOT_TRACKER_INDEX,
+            tracker_valid[:, HIP_TRACKER_INDEX] & tracker_valid[:, LEFT_FOOT_TRACKER_INDEX],
+        ),
+        (
+            _RIGHT_LEG_CHAIN,
+            RIGHT_FOOT_TRACKER_INDEX,
+            tracker_valid[:, HIP_TRACKER_INDEX] & tracker_valid[:, RIGHT_FOOT_TRACKER_INDEX],
+        ),
+    ):
+        chain_points = final_joints[:, chain]
+        endpoint_residual = torch.linalg.norm(
+            chain_points[:, -1] - tracker_positions[:, tracker_index], dim=-1
+        )
+        for joint_index in chain:
+            position_residual[:, joint_index] = torch.where(
+                active, endpoint_residual, position_residual[:, joint_index]
+            )
+
+    joint_source_reliability = build_ik_joint_source_reliability(
+        tracker_source_reliability=tracker_source_reliability,
+        constraint_type=constraint_type,
+    )
+    confidence = compute_ik_joint_confidence_torch(
+        joint_source_reliability=joint_source_reliability,
+        constraint_type=constraint_type,
+        updated_mask=updated_mask,
+        position_residual=position_residual,
+        chain_length=chain_length,
+        direction_only_quality=float(cfg.direction_only_quality),
+        residual_scale=float(cfg.residual_scale),
+        position_solved_quality=cfg.position_solved_quality,
+    )
+    if bool((constraint_type == POSITION_SOLVED).any()):
+        raise RuntimeError("当前 shortest-arc FABRIK 不应产生 POSITION_SOLVED。")
+    if bool((updated_mask[constraint_type == INHERITED]).any()):
+        raise RuntimeError("INHERITED 关节不得标记为已更新。")
+    return RealtimePoseIKResult(
+        pose=rotation_6d_forward_up_torch(global_rotations),
+        updated_mask=updated_mask,
+        direct_rotation_mask=direct_rotation_mask,
+        constraint_type=constraint_type,
+        position_residual=position_residual,
+        confidence=confidence,
+    )
+
+
+def build_ik_joint_chain_length(joint_offsets_parent: torch.Tensor) -> torch.Tensor:
+    """按当前五条 FABRIK 链返回 `[B,24]` 可动链总长。"""
+
+    if joint_offsets_parent.ndim != 3 or tuple(joint_offsets_parent.shape[1:]) != (
+        SMPL_JOINT_COUNT,
+        3,
+    ):
+        raise ValueError("joint_offsets_parent 必须为 [B,24,3]。")
+    result = torch.zeros(
+        joint_offsets_parent.shape[0],
+        SMPL_JOINT_COUNT,
+        device=joint_offsets_parent.device,
+        dtype=joint_offsets_parent.dtype,
+    )
+    offset_lengths = torch.linalg.norm(joint_offsets_parent, dim=-1)
+    for chain in (
+        _TORSO_CHAIN,
+        _LEFT_ARM_CHAIN,
+        _RIGHT_ARM_CHAIN,
+        _LEFT_LEG_CHAIN,
+        _RIGHT_LEG_CHAIN,
+    ):
+        total_length = offset_lengths[:, list(chain[1:])].sum(dim=-1)
+        result[:, list(chain)] = total_length[:, None]
+    return result
+
+
+def build_ik_joint_source_reliability(
+    tracker_source_reliability: torch.Tensor,
+    constraint_type: torch.Tensor,
+) -> torch.Tensor:
+    """按真实约束依赖把 `[B,6]` Tracker 来源可靠度映射到 `[B,24]`。"""
+
+    batch_size = tracker_source_reliability.shape[0]
+    if tuple(tracker_source_reliability.shape) != (batch_size, TRACKER_COUNT):
+        raise ValueError("tracker_source_reliability 必须为 [B,6]。")
+    if tuple(constraint_type.shape) != (batch_size, SMPL_JOINT_COUNT):
+        raise ValueError("constraint_type 必须为 [B,24]。")
+    source = tracker_source_reliability.float()
+    if not bool(torch.isfinite(source).all()) or bool(
+        ((source < 0.0) | (source > 1.0)).any()
+    ):
+        raise ValueError("tracker_source_reliability 必须为有限的 [0,1] 数值。")
+    result = torch.zeros(
+        batch_size,
+        SMPL_JOINT_COUNT,
+        device=source.device,
+        dtype=source.dtype,
+    )
+    for tracker_index, joint_index in enumerate(TRACKER_TO_JOINT):
+        result[:, joint_index] = torch.where(
+            constraint_type[:, joint_index] == DIRECT_ROTATION,
+            source[:, tracker_index],
+            result[:, joint_index],
+        )
+    chain_sources = (
+        (_TORSO_CHAIN, torch.minimum(source[:, HEAD_TRACKER_INDEX], source[:, HIP_TRACKER_INDEX])),
+        (_LEFT_ARM_CHAIN, source[:, LEFT_HAND_TRACKER_INDEX]),
+        (_RIGHT_ARM_CHAIN, source[:, RIGHT_HAND_TRACKER_INDEX]),
+        (
+            _LEFT_LEG_CHAIN,
+            torch.minimum(source[:, HIP_TRACKER_INDEX], source[:, LEFT_FOOT_TRACKER_INDEX]),
+        ),
+        (
+            _RIGHT_LEG_CHAIN,
+            torch.minimum(source[:, HIP_TRACKER_INDEX], source[:, RIGHT_FOOT_TRACKER_INDEX]),
+        ),
+    )
+    for chain, chain_source in chain_sources:
+        for joint_index in chain[:-1]:
+            result[:, joint_index] = torch.where(
+                constraint_type[:, joint_index] == DIRECTION_ONLY,
+                chain_source,
+                result[:, joint_index],
+            )
+    return result
+
+
+def _mark_direction_only_chain(
+    updated_mask: torch.Tensor,
+    constraint_type: torch.Tensor,
+    chain: tuple[int, ...],
+    active: torch.Tensor,
+) -> None:
+    """只标记 FABRIK 实际旋转的父关节；链末端旋转仍由 Tracker 直接提供。"""
+
+    for joint_index in chain[:-1]:
+        updated_mask[:, joint_index] |= active
+        constraint_type[:, joint_index] = torch.where(
+            active,
+            torch.full_like(constraint_type[:, joint_index], DIRECTION_ONLY),
+            constraint_type[:, joint_index],
+        )
 
 
 def _rest_local_to_global_rotations(rest_local_6d: torch.Tensor) -> torch.Tensor:

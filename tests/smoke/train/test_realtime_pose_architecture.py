@@ -372,7 +372,8 @@ def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
     sample_window = torch.randn(2, 11, 144)
     condition = RealtimePoseInpaintingCondition(
         pose=torch.zeros_like(sample_window),
-        confidence=torch.zeros(2, 11, 24),
+        valid=torch.zeros(2, 11, 24, dtype=torch.bool),
+        release_level=torch.ones(2, 11, 24),
     )
     loop.build_training_inpainting_condition = (
         lambda batch, history_observation, sample: condition

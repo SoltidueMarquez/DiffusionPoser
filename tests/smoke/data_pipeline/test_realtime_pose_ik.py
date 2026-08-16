@@ -12,15 +12,26 @@ from data_loaders.realtime_pose_geometry import (
     pelvis_relative_joint_positions_torch,
 )
 from data_loaders.realtime_pose_ik import (
-    build_current_ik_pose,
+    DIRECT_ROTATION,
+    DIRECTION_ONLY,
+    INHERITED,
+    build_current_ik,
     shortest_arc_rotation,
     solve_fabrik_chain,
 )
 from data_loaders.realtime_pose_kinematics import (
+    JOINT_INDEX,
     rotation_6d_to_matrix_np,
     rotation_6d_to_matrix_torch,
 )
-from data_loaders.sensor_masking import LEFT_HAND_TRACKER_INDEX
+from data_loaders.realtime_pose_config import IKInpaintingConfig
+from data_loaders.sensor_masking import (
+    HEAD_TRACKER_INDEX,
+    LEFT_HAND_TRACKER_INDEX,
+    RIGHT_HAND_TRACKER_INDEX,
+    TRACKER_CONFIGURED_OFFSET,
+    TRACKER_MEASURED_VALID_OFFSET,
+)
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
 
@@ -116,24 +127,44 @@ def _toy_ik_inputs():
     return source, previous_pose, tracker_raw
 
 
-def test_current_ik_pose_is_finite_when_a_chain_tracker_is_missing():
-    source, previous_pose, tracker_raw = _toy_ik_inputs()
-    tracker_raw[0, LEFT_HAND_TRACKER_INDEX, 10] = 0.0
-    tracker_raw[0, LEFT_HAND_TRACKER_INDEX, :9] = 0.0
-    current_pose = build_current_ik_pose(
+def _ik_config() -> IKInpaintingConfig:
+    return IKInpaintingConfig(
+        tracker_confidence_warmup=1,
+        fabrik_iterations=2,
+        direction_only_quality=0.4,
+        residual_scale=0.1,
+    )
+
+
+def _build_toy_ik(source, previous_pose, tracker_raw):
+    tracker_valid = (
+        (tracker_raw[..., TRACKER_CONFIGURED_OFFSET] > 0.5)
+        & (tracker_raw[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5)
+    )
+    return build_current_ik(
         previous_pose_raw=torch.from_numpy(previous_pose),
         previous_pose_valid=torch.tensor([True]),
         current_tracker_raw=torch.from_numpy(tracker_raw),
+        tracker_source_reliability=torch.from_numpy(tracker_valid.astype(np.float32)),
         joint_offsets_parent=torch.from_numpy(source["joint_offsets_parent"])[None],
         joint_rest_local_rotations_6d=torch.from_numpy(
             source["joint_rest_local_rotations_6d"]
         )[None],
+        config=_ik_config(),
     )
 
-    assert current_pose.shape == (1, 144)
+
+def test_current_ik_pose_is_finite_when_a_chain_tracker_is_missing():
+    source, previous_pose, tracker_raw = _toy_ik_inputs()
+    tracker_raw[0, LEFT_HAND_TRACKER_INDEX, 10] = 0.0
+    tracker_raw[0, LEFT_HAND_TRACKER_INDEX, :9] = 0.0
+    result = _build_toy_ik(source, previous_pose, tracker_raw)
+    current_pose = result.pose
+
+    assert current_pose.shape == (1, 24, 6)
     assert torch.isfinite(current_pose).all()
 
-    rotations = rotation_6d_to_matrix_torch(current_pose.reshape(1, 24, 6))
+    rotations = rotation_6d_to_matrix_torch(current_pose)
     joints = pelvis_relative_joint_positions_torch(
         rotations, torch.from_numpy(source["joint_offsets_parent"])[None]
     )
@@ -141,3 +172,52 @@ def test_current_ik_pose_is_finite_when_a_chain_tracker_is_missing():
         joints[:, 1:] - joints[:, :-1], dim=-1
     )
     assert torch.isfinite(lengths).all()
+
+
+def test_three_point_configuration_only_marks_direct_and_arm_direction_constraints():
+    source, previous_pose, tracker_raw = _toy_ik_inputs()
+    keep = (HEAD_TRACKER_INDEX, LEFT_HAND_TRACKER_INDEX, RIGHT_HAND_TRACKER_INDEX)
+    tracker_raw[..., TRACKER_CONFIGURED_OFFSET] = 0.0
+    tracker_raw[..., TRACKER_MEASURED_VALID_OFFSET] = 0.0
+    tracker_raw[:, keep, TRACKER_CONFIGURED_OFFSET] = 1.0
+    tracker_raw[:, keep, TRACKER_MEASURED_VALID_OFFSET] = 1.0
+    result = _build_toy_ik(source, previous_pose, tracker_raw)
+
+    direct = {JOINT_INDEX[name] for name in ("head", "left_wrist", "right_wrist")}
+    direction = {
+        JOINT_INDEX[name]
+        for name in ("left_shoulder", "left_elbow", "right_shoulder", "right_elbow")
+    }
+    assert set(torch.where(result.direct_rotation_mask[0])[0].tolist()) == direct
+    assert set(torch.where(result.constraint_type[0] == DIRECTION_ONLY)[0].tolist()) == direction
+    assert result.constraint_type[0, JOINT_INDEX["pelvis"]] == INHERITED
+    for name in ("spine1", "spine2", "spine3", "neck", "left_hip", "right_hip"):
+        assert result.constraint_type[0, JOINT_INDEX[name]] == INHERITED
+    assert not result.updated_mask[0, JOINT_INDEX["left_collar"]]
+    assert not result.updated_mask[0, JOINT_INDEX["left_hand"]]
+    assert torch.all(result.confidence[result.constraint_type == INHERITED] == 0.0)
+
+
+def test_six_point_configuration_marks_only_direct_trackers_and_updated_chain_parents():
+    source, previous_pose, tracker_raw = _toy_ik_inputs()
+    result = _build_toy_ik(source, previous_pose, tracker_raw)
+
+    direct_names = ("head", "left_wrist", "right_wrist", "pelvis", "left_foot", "right_foot")
+    direction_names = (
+        "spine1", "spine2", "spine3", "neck",
+        "left_shoulder", "left_elbow", "right_shoulder", "right_elbow",
+        "left_hip", "left_knee", "left_ankle",
+        "right_hip", "right_knee", "right_ankle",
+    )
+    assert set(torch.where(result.constraint_type[0] == DIRECT_ROTATION)[0].tolist()) == {
+        JOINT_INDEX[name] for name in direct_names
+    }
+    assert set(torch.where(result.constraint_type[0] == DIRECTION_ONLY)[0].tolist()) == {
+        JOINT_INDEX[name] for name in direction_names
+    }
+    inherited_names = ("left_collar", "right_collar", "left_hand", "right_hand")
+    for name in inherited_names:
+        assert result.constraint_type[0, JOINT_INDEX[name]] == INHERITED
+        assert not result.updated_mask[0, JOINT_INDEX[name]]
+    assert not bool((result.constraint_type == 1).any())
+    assert torch.isfinite(result.position_residual).all()

@@ -7,10 +7,8 @@ from ema_pytorch import EMA
 
 from data_loaders.generate_realtime_pose_tasks import compute_source_joint_rotations_world
 from data_loaders.realtime_pose_geometry import (
-    build_pose_target_np,
     extract_rotation_heading_np,
 )
-from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from sample.realtime_pose_runtime import (
@@ -95,6 +93,8 @@ def _step(runtime, source, frame, valid):
 
 
 def _runtime(model, diffusion, source, **kwargs) -> RealtimePoseRuntime:
+    kwargs.setdefault("ik_direction_only_quality", 0.4)
+    kwargs.setdefault("ik_residual_scale", 0.1)
     return RealtimePoseRuntime(
         model,
         diffusion,
@@ -119,7 +119,6 @@ def test_runtime_uses_60_dense_frames_and_synchronized_anchors():
     assert len(runtime.tracker_history) == 60
     assert not (results[0].inpaint_confidence[1:] > 0.0).any()
     assert not (results[1].inpaint_confidence[1:] > 0.0).any()
-    assert runtime.previous_deployed_horizon_world is None
     current_head_path = model.head_paths[-1][0, -1]
     torch.testing.assert_close(current_head_path[:2], torch.zeros(2))
     torch.testing.assert_close(current_head_path[3:], torch.tensor([0.0, 1.0]))
@@ -131,13 +130,7 @@ def test_runtime_can_seed_sixty_ground_truth_frames_without_sampling():
     source = build_toy_realtime_source(frame_count=61)
     rotations = compute_source_joint_rotations_world(source)
     model = _RecordingModel()
-    runtime = RealtimePoseRuntime(
-        model,
-        _OneStepProjectedDiffusion(),
-        torch.device("cpu"),
-        source["joint_offsets_parent"],
-        source["joint_rest_local_rotations_6d"],
-    )
+    runtime = _runtime(model, _OneStepProjectedDiffusion(), source)
     valid = np.ones(6, dtype=bool)
     for frame_index in range(60):
         runtime.append_ground_truth_frame(
@@ -185,65 +178,15 @@ def test_runtime_dropout_and_reconnect_preserve_duration_semantics():
     assert runtime.previous_d_on[[1, 3]].tolist() == [1, 1]
 
 
-def test_runtime_separates_previous_deployed_pose_from_future_rolling_prior():
+def test_runtime_rejects_future_rolling_prior_in_first_round():
     source = build_toy_realtime_source(frame_count=1)
-    runtime = _runtime(
-        _RecordingModel(),
-        _OneStepProjectedDiffusion(),
-        source,
-        use_future_rolling_prior=True,
-    )
-    deployed_world = np.tile(
-        make_yaw_rotation_np(np.asarray([0.2]))[0], (24, 1, 1)
-    ).astype(np.float32)
-    runtime.pose_history.append(
-        WorldPoseState(
-            joint_rotations_world=deployed_world,
-            root_yaw_world=0.2,
-            hip_height=1.0,
-            root_position_world=np.zeros(3, dtype=np.float32),
+    with pytest.raises(ValueError, match="显式禁用"):
+        _runtime(
+            _RecordingModel(),
+            _OneStepProjectedDiffusion(),
+            source,
+            use_future_rolling_prior=True,
         )
-    )
-    horizon_yaws = np.linspace(0.0, 0.5, REALTIME_POSE_TARGET_LENGTH)
-    horizon_world = np.stack(
-        [
-            np.tile(make_yaw_rotation_np(np.asarray([yaw]))[0], (24, 1, 1))
-            for yaw in horizon_yaws
-        ]
-    ).astype(np.float32)
-    runtime.previous_deployed_horizon_world = horizon_world
-
-    previous_raw, previous_valid = runtime._previous_pose_for_ik(0.37)
-    expected_previous = build_pose_target_np(deployed_world[None], 0.37)[0]
-    future_raw, future_valid = runtime._future_rolling_prior(0.37)
-    assert previous_valid
-    np.testing.assert_allclose(previous_raw, expected_previous, atol=1e-6)
-    assert future_valid
-    np.testing.assert_allclose(
-        future_raw,
-        build_pose_target_np(horizon_world[2:], 0.37),
-        atol=1e-6,
-    )
-    assert future_raw.shape == (9, 144)
-
-
-def test_runtime_future_rolling_prior_starts_on_second_prediction_only():
-    source = build_toy_realtime_source(frame_count=2)
-    runtime = _runtime(
-        _RecordingModel(),
-        _OneStepProjectedDiffusion(),
-        source,
-        use_future_rolling_prior=True,
-        future_confidence_decay=0.9,
-    )
-    valid = np.ones(6, dtype=bool)
-    first = _step(runtime, source, 0, valid)
-    second = _step(runtime, source, 1, valid)
-
-    assert not (first.inpaint_confidence[1:] > 0.0).any()
-    assert (second.inpaint_confidence[1:-1] > 0.0).any()
-    assert not (second.inpaint_confidence[-1] > 0.0).any()
-    assert runtime.previous_deployed_horizon_world is not None
 
 
 def test_runtime_uses_linear_tracker_warmup_for_current_joint_confidence():

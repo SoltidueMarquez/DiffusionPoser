@@ -76,6 +76,9 @@ class TrainEntrypointTest(unittest.TestCase):
 
         self.assertEqual(args.tracker_confidence_warmup, 15)
         self.assertEqual(args.fabrik_iterations, 2)
+        self.assertIsNone(args.ik_direction_only_quality)
+        self.assertIsNone(args.ik_residual_scale)
+        self.assertIsNone(args.ik_position_solved_quality)
         self.assertFalse(args.use_future_rolling_prior)
         self.assertEqual(args.future_confidence_decay, 0.9)
         enabled = parser.parse_args(

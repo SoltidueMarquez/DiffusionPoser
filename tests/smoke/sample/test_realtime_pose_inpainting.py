@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from data_loaders.realtime_pose_ik import INHERITED, RealtimePoseIKResult
 from diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     LossType,
@@ -12,180 +13,198 @@ from diffusion.gaussian_diffusion import (
 )
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    add_future_rolling_prior_to_condition,
     apply_realtime_pose_inpainting,
     build_realtime_pose_inpainting_condition,
-    confidence_to_t_soft,
+    confidence_to_release_level,
     validate_realtime_pose_inpainting_condition,
 )
 
 
-def _current_pose_raw() -> torch.Tensor:
-    return torch.zeros(1, 144)
+def _ik_result(confidence: torch.Tensor, updated_mask: torch.Tensor | None = None):
+    batch_size = confidence.shape[0]
+    if updated_mask is None:
+        updated_mask = confidence > 0.0
+    constraint_type = torch.full((batch_size, 24), INHERITED, dtype=torch.long)
+    constraint_type[updated_mask] = 2
+    return RealtimePoseIKResult(
+        pose=torch.arange(batch_size * 24 * 6, dtype=torch.float32).reshape(
+            batch_size, 24, 6
+        ),
+        updated_mask=updated_mask,
+        direct_rotation_mask=torch.zeros_like(updated_mask),
+        constraint_type=constraint_type,
+        position_residual=torch.zeros(batch_size, 24),
+        confidence=confidence,
+    )
 
 
 def _condition(confidence: torch.Tensor) -> RealtimePoseInpaintingCondition:
-    horizon_confidence = torch.zeros(1, 11, 24)
-    horizon_confidence[:, 0] = confidence
-    return RealtimePoseInpaintingCondition(
-        pose=torch.zeros(1, 11, 144),
-        confidence=horizon_confidence,
+    return build_realtime_pose_inpainting_condition(
+        ik_result=_ik_result(confidence),
+        pose_mean=None,
+        pose_scale=None,
     )
 
 
 def test_condition_only_populates_current_frame_and_normalizes_it():
-    current_confidence = torch.zeros(1, 24)
-    current_confidence[0, 0] = 1.0
-    current_confidence[0, 1] = 0.5
-    current_pose = torch.arange(144, dtype=torch.float32).reshape(1, 144)
+    confidence = torch.zeros(1, 24)
+    confidence[0, :2] = torch.tensor([1.0, 0.5])
+    result = _ik_result(confidence)
     mean = torch.ones(144)
     scale = torch.full((144,), 2.0)
-    condition = build_realtime_pose_inpainting_condition(
-        current_pose_raw=current_pose,
-        current_confidence=current_confidence,
-        pose_mean=mean,
-        pose_scale=scale,
-    )
+    condition = build_realtime_pose_inpainting_condition(result, mean, scale)
+
+    current_pose = result.pose.reshape(1, 144)
     torch.testing.assert_close(condition.pose[:, 0], (current_pose - mean) / scale)
     torch.testing.assert_close(condition.pose[:, 1:], torch.zeros(1, 10, 144))
-    torch.testing.assert_close(condition.confidence[:, 0], current_confidence)
-    torch.testing.assert_close(condition.confidence[:, 1:], torch.zeros(1, 10, 24))
-
-
-def test_first_runtime_step_has_no_future_inpainting():
-    condition = build_realtime_pose_inpainting_condition(
-        current_pose_raw=_current_pose_raw(),
-        current_confidence=torch.ones(1, 24),
-        pose_mean=None,
-        pose_scale=None,
-    )
-    assert torch.all(condition.confidence[:, 0] == 1.0)
-    assert not (condition.confidence[:, 1:] > 0.0).any()
-
-
-def test_future_rolling_prior_only_fills_aligned_horizon_one_to_nine():
-    current_confidence = torch.zeros(2, 24)
-    current_confidence[:, 0] = 1.0
-    current = build_realtime_pose_inpainting_condition(
-        current_pose_raw=torch.zeros(2, 144),
-        current_confidence=current_confidence,
-        pose_mean=torch.ones(144),
-        pose_scale=torch.full((144,), 2.0),
-    )
-    aligned_prior = torch.stack(
-        [torch.full((2, 144), float(index)) for index in range(2, 11)],
-        dim=1,
-    )
-    condition = add_future_rolling_prior_to_condition(
-        current_condition=current,
-        aligned_future_prior_raw=aligned_prior,
-        future_prior_valid=torch.tensor([True, False]),
-        pose_mean=torch.ones(144),
-        pose_scale=torch.full((144,), 2.0),
-        confidence_decay=0.9,
-    )
-
+    torch.testing.assert_close(condition.valid[:, 0], result.updated_mask)
+    assert not condition.valid[:, 1:].any()
     torch.testing.assert_close(
-        condition.pose[0, 1:-1], (aligned_prior[0] - 1.0) / 2.0
+        condition.release_level[:, 0], confidence_to_release_level(confidence)
     )
-    torch.testing.assert_close(condition.pose[1, 1:], torch.zeros(10, 144))
-    expected_decay = torch.tensor([0.9**index for index in range(1, 10)])
-    torch.testing.assert_close(condition.confidence[0, 1:-1, 0], expected_decay)
-    torch.testing.assert_close(condition.confidence[1, 1:], torch.zeros(10, 24))
-    torch.testing.assert_close(condition.pose[:, -1], torch.zeros(2, 144))
-    torch.testing.assert_close(condition.confidence[:, -1], torch.zeros(2, 24))
-    x_t = torch.full((2, 11, 144), 7.0)
-    injected, _ = apply_realtime_pose_inpainting(
+
+
+def test_release_level_uses_physical_noise_coordinate_only():
+    confidence = torch.tensor([1.0, 0.5, 0.0])
+    release = confidence_to_release_level(confidence)
+    torch.testing.assert_close(
+        release,
+        torch.tensor([0.0, np.sqrt(0.5), 1.0], dtype=torch.float32),
+    )
+    torch.testing.assert_close(release, confidence_to_release_level(confidence.clone()))
+
+
+def test_same_alpha_bar_produces_same_active_mask_at_different_local_indices():
+    confidence = torch.zeros(1, 24)
+    confidence[0, 0] = 0.5
+    condition = _condition(confidence)
+    x_t = torch.randn(1, 11, 144)
+    known_noise = torch.randn_like(x_t)
+
+    _, first_active = apply_realtime_pose_inpainting(
         x_t=x_t,
-        t=torch.full((2,), 9, dtype=torch.long),
+        t=torch.tensor([1]),
         condition=condition,
-        known_noise=torch.zeros_like(x_t),
-        alphas_cumprod=np.linspace(0.99, 0.1, 10),
+        known_noise=known_noise,
+        alphas_cumprod=np.asarray([0.99, 0.49, 0.1]),
     )
-    assert not torch.equal(injected[0, 1:-1], x_t[0, 1:-1])
-    torch.testing.assert_close(injected[:, -1], x_t[:, -1])
-    with pytest.raises(ValueError, match="current-only"):
-        validate_realtime_pose_inpainting_condition(
-            condition,
-            require_current_only=True,
+    _, second_active = apply_realtime_pose_inpainting(
+        x_t=x_t,
+        t=torch.tensor([3]),
+        condition=condition,
+        known_noise=known_noise,
+        alphas_cumprod=np.asarray([0.999, 0.9, 0.7, 0.49, 0.1]),
+    )
+    torch.testing.assert_close(first_active, second_active)
+    assert first_active[0, 0, 0]
+
+
+def test_ddim_five_ten_twenty_steps_keep_the_same_confidence_semantics():
+    confidence = torch.zeros(1, 24)
+    confidence[0, 0] = 0.5
+    condition = _condition(confidence)
+    x_t = torch.zeros(1, 11, 144)
+    known_noise = torch.zeros_like(x_t)
+    masks = []
+    for step_count in (5, 10, 20):
+        # 把同一个实际 alpha_bar 放在不同局部索引，模拟不同 DDIM respacing。
+        alphas = np.linspace(0.99, 0.1, step_count)
+        local_index = step_count // 2
+        alphas[local_index] = 0.49
+        _, active = apply_realtime_pose_inpainting(
+            x_t=x_t,
+            t=torch.tensor([local_index]),
+            condition=condition,
+            known_noise=known_noise,
+            alphas_cumprod=alphas,
         )
+        masks.append(active)
+    torch.testing.assert_close(masks[0], masks[1])
+    torch.testing.assert_close(masks[1], masks[2])
 
 
-def test_t_soft_is_linear_without_rounding_or_square_mapping():
-    confidence = torch.tensor([1.0, 0.9, 0.5, 0.0])
-    t_soft = confidence_to_t_soft(confidence, max_timestep=9)
-    torch.testing.assert_close(t_soft, torch.tensor([0.0, 0.9, 4.5, 9.0]))
-
-
-def test_c_one_inpaints_until_final_step_c_zero_never_inpaints_and_soft_releases():
-    confidence = torch.zeros(24)
-    confidence[0] = 1.0
-    confidence[1] = 0.5
+def test_invalid_joints_are_bitwise_unchanged_and_mid_confidence_releases():
+    confidence = torch.zeros(1, 24)
+    confidence[0, :2] = torch.tensor([1.0, 0.5])
     condition = _condition(confidence)
     x_t = torch.full((1, 11, 144), 7.0)
     known_noise = torch.ones_like(x_t)
-    alphas_cumprod = np.linspace(0.99, 0.1, 10)
+    alphas = np.asarray([0.99, 0.8, 0.49, 0.1])
 
-    active, t_soft = apply_realtime_pose_inpainting(
+    injected, active = apply_realtime_pose_inpainting(
         x_t=x_t,
-        t=torch.tensor([5]),
+        t=torch.tensor([2]),
         condition=condition,
         known_noise=known_noise,
-        alphas_cumprod=alphas_cumprod,
+        alphas_cumprod=alphas,
     )
-    assert t_soft[0, 0, 0] == 0.0
-    assert t_soft[0, 0, 1] == 4.5
-    assert t_soft[0, 0, 2] == 9.0
-    expected = float(np.sqrt(1.0 - alphas_cumprod[5]))
-    torch.testing.assert_close(active[0, 0, :12], torch.full((12,), expected))
-    torch.testing.assert_close(active[0, 0, 12:], x_t[0, 0, 12:])
+    assert active[0, 0, 0] and active[0, 0, 1]
+    feature_valid = condition.valid.repeat_interleave(6, dim=-1)
+    torch.testing.assert_close(injected[~feature_valid], x_t[~feature_valid])
 
-    released, _ = apply_realtime_pose_inpainting(
+    released, active = apply_realtime_pose_inpainting(
         x_t=x_t,
-        t=torch.tensor([4]),
+        t=torch.tensor([1]),
         condition=condition,
         known_noise=known_noise,
-        alphas_cumprod=alphas_cumprod,
+        alphas_cumprod=alphas,
     )
-    assert not torch.equal(released[0, 0, :6], x_t[0, 0, :6])
-    torch.testing.assert_close(released[0, 0, 6:], x_t[0, 0, 6:])
+    assert active[0, 0, 0]
+    assert not active[0, 0, 1]
+    torch.testing.assert_close(released[0, 0, 6:12], x_t[0, 0, 6:12])
 
-    final, _ = apply_realtime_pose_inpainting(
+
+def test_full_confidence_remains_active_at_t_zero_without_special_release():
+    confidence = torch.zeros(1, 24)
+    confidence[0, 0] = 1.0
+    condition = _condition(confidence)
+    x_t = torch.full((1, 11, 144), 7.0)
+    injected, active = apply_realtime_pose_inpainting(
         x_t=x_t,
         t=torch.tensor([0]),
         condition=condition,
-        known_noise=known_noise,
-        alphas_cumprod=alphas_cumprod,
+        known_noise=torch.zeros_like(x_t),
+        alphas_cumprod=np.asarray([0.99, 0.5]),
     )
-    torch.testing.assert_close(final, x_t)
+    assert active[0, 0, 0]
+    assert not torch.equal(injected[0, 0, :6], x_t[0, 0, :6])
 
 
-def test_zero_confidence_is_exactly_equivalent_to_plain_x_t():
-    x_t = torch.randn(2, 11, 144)
-    pose = torch.zeros_like(x_t)
-    pose[:, 0] = torch.randn(2, 144)
-    condition = RealtimePoseInpaintingCondition(
-        pose=pose,
-        confidence=torch.zeros(2, 11, 24),
-    )
-    x_model, _ = apply_realtime_pose_inpainting(
-        x_t=x_t,
-        t=torch.tensor([1, 7]),
-        condition=condition,
-        known_noise=torch.randn_like(x_t),
-        alphas_cumprod=np.linspace(0.99, 0.1, 10),
-    )
-    torch.testing.assert_close(x_model, x_t)
+def test_validation_rejects_future_condition_in_first_round():
+    condition = _condition(torch.ones(1, 24))
+    future_valid = condition.valid.clone()
+    future_valid[:, 1] = True
+    with pytest.raises(ValueError, match="未来帧"):
+        validate_realtime_pose_inpainting_condition(
+            RealtimePoseInpaintingCondition(
+                pose=condition.pose,
+                valid=future_valid,
+                release_level=condition.release_level,
+            )
+        )
 
 
-def test_projected_ddim_reuses_one_known_noise_for_every_step(monkeypatch):
-    diffusion = GaussianDiffusion(
-        betas=np.asarray([0.01, 0.02, 0.03], dtype=np.float64),
+def _diffusion(step_count: int = 3) -> GaussianDiffusion:
+    return GaussianDiffusion(
+        betas=np.linspace(0.01, 0.03, step_count, dtype=np.float64),
         model_mean_type=ModelMeanType.START_X,
         model_var_type=ModelVarType.FIXED_SMALL,
         loss_type=LossType.MSE,
     )
-    condition = _condition(torch.ones(24))
+
+
+class _IdentityModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, value, _timestep, **_kwargs):
+        return value + self.anchor
+
+
+def test_projected_ddim_reuses_one_known_noise_for_every_step(monkeypatch):
+    diffusion = _diffusion(3)
+    condition = _condition(torch.ones(1, 24))
     calls: list[int] = []
     from diffusion import gaussian_diffusion as diffusion_module
 
@@ -196,17 +215,8 @@ def test_projected_ddim_reuses_one_known_noise_for_every_step(monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(diffusion_module, "apply_realtime_pose_inpainting", recording_apply)
-
-    class IdentityModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.anchor = torch.nn.Parameter(torch.zeros(()))
-
-        def forward(self, value, _timestep, **_kwargs):
-            return value + self.anchor
-
     diffusion.projected_ddim_sample_loop(
-        IdentityModel(),
+        _IdentityModel(),
         shape=(1, 11, 144),
         projection_fn=lambda value: value,
         model_kwargs={},
@@ -219,109 +229,36 @@ def test_projected_ddim_reuses_one_known_noise_for_every_step(monkeypatch):
 
 
 def test_projected_ddim_requires_explicit_known_noise():
-    diffusion = GaussianDiffusion(
-        betas=np.asarray([0.01, 0.02], dtype=np.float64),
-        model_mean_type=ModelMeanType.START_X,
-        model_var_type=ModelVarType.FIXED_SMALL,
-        loss_type=LossType.MSE,
-    )
-
-    class IdentityModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.anchor = torch.nn.Parameter(torch.zeros(()))
-
-        def forward(self, value, _timestep, **_kwargs):
-            return value + self.anchor
-
     with pytest.raises(ValueError, match="known_noise"):
-        diffusion.projected_ddim_sample_loop(
-            IdentityModel(),
+        _diffusion(2).projected_ddim_sample_loop(
+            _IdentityModel(),
             shape=(1, 11, 144),
             projection_fn=lambda value: value,
-            inpaint_condition=_condition(torch.full((24,), 0.5)),
+            inpaint_condition=_condition(torch.full((1, 24), 0.5)),
             device=torch.device("cpu"),
         )
 
 
-def test_wrong_ik_pose_at_full_confidence_is_released_for_final_correction():
-    diffusion = GaussianDiffusion(
-        betas=np.asarray([0.01, 0.02], dtype=np.float64),
-        model_mean_type=ModelMeanType.START_X,
-        model_var_type=ModelVarType.FIXED_SMALL,
-        loss_type=LossType.MSE,
-    )
-    wrong_ik_pose = torch.full((1, 144), 123.0)
-    condition = build_realtime_pose_inpainting_condition(
-        current_pose_raw=wrong_ik_pose,
-        current_confidence=torch.ones(1, 24),
-        pose_mean=None,
-        pose_scale=None,
-    )
-
-    class CorrectThenPreserveModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.anchor = torch.nn.Parameter(torch.zeros(()))
-            self.final_input: torch.Tensor | None = None
-
-        def forward(self, value, timestep, **_kwargs):
-            final_step = (timestep == 0).view(-1, 1, 1)
-            if bool(final_step.all()):
-                self.final_input = value.detach().clone()
-            corrected = torch.zeros_like(value) + self.anchor
-            return torch.where(final_step, value, corrected)
-
-    model = CorrectThenPreserveModel()
-    result = diffusion.projected_ddim_sample_loop(
-        model,
-        shape=(1, 11, 144),
-        projection_fn=lambda value: value,
-        noise=torch.zeros(1, 11, 144),
-        known_noise=torch.zeros(1, 11, 144),
-        inpaint_condition=condition,
-        device=torch.device("cpu"),
-    )["sample"]
-
-    assert model.final_input is not None
-    torch.testing.assert_close(result, model.final_input)
-    assert not torch.equal(result[:, 0], wrong_ik_pose)
-
-
 def test_explicit_initial_and_inpaint_noise_fully_control_sampling():
-    diffusion = GaussianDiffusion(
-        betas=np.asarray([0.01, 0.02, 0.03], dtype=np.float64),
-        model_mean_type=ModelMeanType.START_X,
-        model_var_type=ModelVarType.FIXED_SMALL,
-        loss_type=LossType.MSE,
-    )
-    condition = _condition(torch.full((24,), 0.5))
-
-    class IdentityModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.anchor = torch.nn.Parameter(torch.zeros(()))
-
-        def forward(self, value, _timestep, **_kwargs):
-            return value + self.anchor
-
-    model = IdentityModel()
+    diffusion = _diffusion(3)
+    condition = _condition(torch.full((1, 24), 0.99))
+    model = _IdentityModel()
     initial_noise = torch.zeros(1, 11, 144)
-    known_noise = torch.ones_like(initial_noise)
 
-    def sample(value: torch.Tensor) -> torch.Tensor:
+    def sample(known_noise: torch.Tensor) -> torch.Tensor:
         return diffusion.projected_ddim_sample_loop(
             model,
             shape=(1, 11, 144),
             projection_fn=lambda output: output,
             noise=initial_noise,
-            known_noise=value,
+            known_noise=known_noise,
             inpaint_condition=condition,
             device=torch.device("cpu"),
         )["sample"]
 
-    first = sample(known_noise)
-    second = sample(known_noise.clone())
-    changed = sample(torch.zeros_like(known_noise))
+    first_noise = torch.ones_like(initial_noise)
+    first = sample(first_noise)
+    second = sample(first_noise.clone())
+    changed = sample(torch.zeros_like(first_noise))
     torch.testing.assert_close(first, second)
     assert not torch.equal(first, changed)

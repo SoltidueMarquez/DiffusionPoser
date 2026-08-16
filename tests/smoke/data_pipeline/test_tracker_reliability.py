@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
-from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS, TrackerReliabilityConfig
+from data_loaders.realtime_pose_config import TrackerReliabilityConfig
+from data_loaders.realtime_pose_ik import (
+    DIRECTION_ONLY,
+    INHERITED,
+    build_ik_joint_source_reliability,
+)
+from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
+    HIP_TRACKER_INDEX,
+    LEFT_FOOT_TRACKER_INDEX,
     LEFT_HAND_TRACKER_INDEX,
     REALTIME_POSE_TARGET_START,
     RIGHT_HAND_TRACKER_INDEX,
@@ -22,7 +31,7 @@ from data_loaders.tracker_reliability import (
     compute_tracker_online_confidence_np,
     compute_tracker_online_confidence_torch,
     compute_tracker_reliability_np,
-    map_tracker_confidence_to_joints_torch,
+    compute_ik_joint_confidence_torch,
 )
 from data_loaders.tracker_timeline import (
     build_isolated_condition_timeline,
@@ -33,6 +42,7 @@ from data_loaders.tracker_timeline import (
     isolated_condition_eval_mask,
     materialize_task_configurations,
 )
+from eval.calibrate_realtime_pose_ik import fit_direction_confidence_parameters
 
 
 def test_five_scenarios_and_two_point_dropout_contract():
@@ -108,16 +118,85 @@ def test_inpaint_tracker_confidence_uses_validity_and_warmup_only():
     torch.testing.assert_close(actual_torch, torch.from_numpy(expected))
 
 
-def test_inpaint_joint_mapping_uses_region_max_without_noisy_or():
-    tracker_confidence = torch.tensor([[0.5, 0.2, 0.3, 0.5, 0.4, 0.6]])
-    joint_confidence = map_tracker_confidence_to_joints_torch(tracker_confidence)
-    expected_by_region = torch.tensor([0.5, 0.2, 0.3, 0.4, 0.6])
+def test_ik_confidence_uses_constraint_quality_and_normalized_residual():
+    source = torch.ones(1, 24) * 0.8
+    constraint = torch.full((1, 24), 3, dtype=torch.long)
+    constraint[:, :3] = torch.tensor([0, 2, 2])
+    updated = torch.zeros(1, 24, dtype=torch.bool)
+    updated[:, :3] = True
+    residual = torch.zeros(1, 24)
+    residual[:, :3] = torch.tensor([100.0, 0.01, 0.10])
+    chain_length = torch.zeros(1, 24)
+    chain_length[:, 1:3] = 1.0
+    confidence = compute_ik_joint_confidence_torch(
+        joint_source_reliability=source,
+        constraint_type=constraint,
+        updated_mask=updated,
+        position_residual=residual,
+        chain_length=chain_length,
+        direction_only_quality=0.5,
+        residual_scale=0.1,
+    )
 
-    region_indices = torch.from_numpy(TARGET_JOINT_REGIONS.copy())
-    torch.testing.assert_close(joint_confidence[0], expected_by_region[region_indices])
-    # Torso 同时收到两个 0.5 Tracker 时仍为 0.5，可排除 noisy-or 的 0.75。
-    torso_mask = torch.from_numpy((TARGET_JOINT_REGIONS == 0).copy())
-    assert torch.all(joint_confidence[0, torso_mask] == 0.5)
+    # 直接 rotation 忽略位置残差，同来源下严格高于方向约束。
+    assert confidence[0, 0] == 0.8
+    assert confidence[0, 0] > confidence[0, 1] > confidence[0, 2]
+    expected = 0.8 * 0.5 * torch.exp(torch.tensor(-0.1))
+    torch.testing.assert_close(confidence[0, 1], expected)
+
+
+def test_ik_confidence_forces_inherited_or_unupdated_joints_to_zero():
+    constraint = torch.full((1, 24), 3, dtype=torch.long)
+    constraint[:, :3] = torch.tensor([3, 0, 2])
+    updated = torch.zeros(1, 24, dtype=torch.bool)
+    updated[:, 2] = True
+    chain_length = torch.zeros(1, 24)
+    chain_length[:, 2] = 1.0
+    confidence = compute_ik_joint_confidence_torch(
+        joint_source_reliability=torch.ones(1, 24),
+        constraint_type=constraint,
+        updated_mask=updated,
+        position_residual=torch.zeros(1, 24),
+        chain_length=chain_length,
+        direction_only_quality=0.4,
+        residual_scale=0.1,
+    )
+    torch.testing.assert_close(confidence[0, :2], torch.zeros(2))
+
+
+def test_multitracker_chain_source_reliability_uses_minimum():
+    tracker_source = torch.tensor([[0.8, 0.6, 0.7, 0.3, 0.2, 0.9]])
+    constraint = torch.full((1, 24), INHERITED, dtype=torch.long)
+    for name in ("spine1", "left_shoulder", "left_hip"):
+        constraint[:, JOINT_INDEX[name]] = DIRECTION_ONLY
+    joint_source = build_ik_joint_source_reliability(tracker_source, constraint)
+
+    assert joint_source[0, JOINT_INDEX["spine1"]] == torch.minimum(
+        tracker_source[0, HEAD_TRACKER_INDEX], tracker_source[0, HIP_TRACKER_INDEX]
+    )
+    assert joint_source[0, JOINT_INDEX["left_shoulder"]] == tracker_source[
+        0, LEFT_HAND_TRACKER_INDEX
+    ]
+    assert joint_source[0, JOINT_INDEX["left_hip"]] == torch.minimum(
+        tracker_source[0, HIP_TRACKER_INDEX],
+        tracker_source[0, LEFT_FOOT_TRACKER_INDEX],
+    )
+
+
+def test_offline_ik_calibration_recovers_synthetic_parameters():
+    source = np.linspace(0.4, 1.0, 200)
+    residual_ratio = np.linspace(0.001, 0.2, 200)
+    expected_quality = 0.4
+    expected_scale = 0.08
+    target = source * expected_quality * np.exp(-residual_ratio / expected_scale)
+    rotation_error = 2.0 * np.arccos(np.sqrt(target))
+    fitted = fit_direction_confidence_parameters(
+        source,
+        residual_ratio,
+        rotation_error,
+    )
+    assert fitted["direction_only_quality"] == pytest.approx(expected_quality, rel=0.03)
+    assert fitted["residual_scale"] == pytest.approx(expected_scale, rel=0.03)
 
 
 def test_hard_rotation_uses_validity_and_recovery_duration_only():

@@ -44,6 +44,9 @@ def _clone_runtime_state(runtime: RealtimePoseRuntime) -> RealtimePoseRuntime:
         normalizer=runtime.normalizer,
         tracker_confidence_warmup=runtime.ik_inpainting_config.tracker_confidence_warmup,
         fabrik_iterations=runtime.ik_inpainting_config.fabrik_iterations,
+        ik_direction_only_quality=runtime.ik_inpainting_config.direction_only_quality,
+        ik_residual_scale=runtime.ik_inpainting_config.residual_scale,
+        ik_position_solved_quality=runtime.ik_inpainting_config.position_solved_quality,
         use_future_rolling_prior=runtime.future_rolling_prior_config.enabled,
         future_confidence_decay=runtime.future_rolling_prior_config.confidence_decay,
     )
@@ -52,11 +55,6 @@ def _clone_runtime_state(runtime: RealtimePoseRuntime) -> RealtimePoseRuntime:
     cloned.previous_d_off = runtime.previous_d_off.copy()
     cloned.previous_d_on = runtime.previous_d_on.copy()
     cloned.previous_head_yaw = runtime.previous_head_yaw
-    cloned.previous_deployed_horizon_world = (
-        None
-        if runtime.previous_deployed_horizon_world is None
-        else runtime.previous_deployed_horizon_world.copy()
-    )
     return cloned
 
 
@@ -246,6 +244,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         normalizer=normalizer,
         tracker_confidence_warmup=int(args.tracker_confidence_warmup),
         fabrik_iterations=int(args.fabrik_iterations),
+        ik_direction_only_quality=args.ik_direction_only_quality,
+        ik_residual_scale=args.ik_residual_scale,
+        ik_position_solved_quality=args.ik_position_solved_quality,
         use_future_rolling_prior=bool(args.use_future_rolling_prior),
         future_confidence_decay=float(args.future_confidence_decay),
     )

@@ -1507,10 +1507,7 @@ class GaussianDiffusion:
                 raise ValueError("没有 inpaint_condition 时不得单独提供 known_noise。")
             x_model = x_t
         else:
-            validate_realtime_pose_inpainting_condition(
-                inpaint_condition,
-                require_current_only=True,
-            )
+            validate_realtime_pose_inpainting_condition(inpaint_condition)
             if known_noise is None:
                 raise ValueError("训练 IK Inpainting 必须显式提供独立 known_noise。")
             x_model, _ = apply_realtime_pose_inpainting(

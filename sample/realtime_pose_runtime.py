@@ -40,8 +40,7 @@ from data_loaders.tracker_reliability import (
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from diffusion.realtime_pose_inpainting import (
-    add_future_rolling_prior_to_condition,
-    build_current_realtime_pose_inpainting_condition,
+    build_current_realtime_pose_ik_and_inpainting_condition,
 )
 
 
@@ -127,6 +126,9 @@ class RealtimePoseRuntime:
         normalizer=None,
         tracker_confidence_warmup: int = 15,
         fabrik_iterations: int = 2,
+        ik_direction_only_quality: float | None = None,
+        ik_residual_scale: float | None = None,
+        ik_position_solved_quality: float | None = None,
         use_future_rolling_prior: bool = False,
         future_confidence_decay: float = 0.9,
     ):
@@ -138,9 +140,16 @@ class RealtimePoseRuntime:
         self.ik_inpainting_config = IKInpaintingConfig(
             tracker_confidence_warmup=int(tracker_confidence_warmup),
             fabrik_iterations=int(fabrik_iterations),
+            direction_only_quality=ik_direction_only_quality,
+            residual_scale=ik_residual_scale,
+            position_solved_quality=ik_position_solved_quality,
         ).validate()
+        if bool(use_future_rolling_prior):
+            raise ValueError(
+                "第一轮显式禁用 future rolling prior；请勿传入 --use_future_rolling_prior。"
+            )
         self.future_rolling_prior_config = FutureRollingPriorConfig(
-            enabled=bool(use_future_rolling_prior),
+            enabled=False,
             confidence_decay=float(future_confidence_decay),
         ).validate()
         self.joint_offsets_parent = np.asarray(joint_offsets_parent, dtype=np.float32).reshape(24, 3)
@@ -152,8 +161,6 @@ class RealtimePoseRuntime:
         self.previous_d_off = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
         self.previous_head_yaw: float | None = None
-        # 只在开启推理消融时保存模型上一轮 deployed horizon；它不进入训练数据。
-        self.previous_deployed_horizon_world: np.ndarray | None = None
 
     def step(
         self,
@@ -378,26 +385,6 @@ class RealtimePoseRuntime:
             previous_pose_valid = False
         return previous_pose_raw, previous_pose_valid
 
-    def _future_rolling_prior(
-        self,
-        current_head_yaw: float,
-    ) -> tuple[np.ndarray, bool]:
-        """返回与新 horizon 1..9 严格对齐的旧 horizon 2..10。"""
-
-        shape = (
-            REALTIME_POSE_TARGET_LENGTH - 2,
-            REALTIME_POSE_TARGET_DIM,
-        )
-        if (
-            not self.future_rolling_prior_config.enabled
-            or self.previous_deployed_horizon_world is None
-        ):
-            return np.zeros(shape, dtype=np.float32), False
-        aligned_world = self.previous_deployed_horizon_world[2:]
-        if tuple(aligned_world.shape[:1]) != (REALTIME_POSE_TARGET_LENGTH - 2,):
-            raise RuntimeError("上一轮 deployed horizon 必须包含完整 11 帧。")
-        return build_pose_target_np(aligned_world, current_head_yaw), True
-
     def _prepare_step(
         self,
         tracker_pos_world: np.ndarray,
@@ -490,18 +477,6 @@ class RealtimePoseRuntime:
             self.joint_offsets_parent,
             self.joint_rest_local_rotations_6d,
         )
-        if self.future_rolling_prior_config.enabled:
-            horizon_head_rotations, _ = decode_target_head_rotations_np(
-                deployed_pose_horizon
-            )
-            yaw_rotation = make_yaw_rotation_np(
-                np.asarray([prepared.head_yaw], dtype=np.float64)
-            )[0]
-            self.previous_deployed_horizon_world = np.einsum(
-                "ij,tajk->taik",
-                yaw_rotation,
-                horizon_head_rotations,
-            ).astype(np.float32)
         self._append_history_state(prepared, resolved.as_world_state())
         return RuntimeStepResult(
             resolved_pose=resolved,
@@ -637,7 +612,7 @@ def step_realtime_pose_batch(
     )
     with torch.no_grad():
         mean, scale = first._normalizer_pose_stats()
-        inpainting = build_current_realtime_pose_inpainting_condition(
+        ik_result, inpainting = build_current_realtime_pose_ik_and_inpainting_condition(
             previous_pose_raw=previous_pose_raw,
             previous_pose_valid=previous_pose_valid,
             current_tracker_raw=tracker_window_tensor[:, -1],
@@ -672,29 +647,6 @@ def step_realtime_pose_batch(
             pose_scale=scale,
             config=first.ik_inpainting_config,
         )
-        if first.future_rolling_prior_config.enabled:
-            future_inputs = [
-                runtime._future_rolling_prior(step.head_yaw)
-                for runtime, step in zip(runtimes, prepared_steps)
-            ]
-            inpainting = add_future_rolling_prior_to_condition(
-                current_condition=inpainting,
-                aligned_future_prior_raw=torch.as_tensor(
-                    np.stack([value[0] for value in future_inputs]),
-                    device=first.device,
-                    dtype=torch.float32,
-                ),
-                future_prior_valid=torch.as_tensor(
-                    np.asarray([value[1] for value in future_inputs]),
-                    device=first.device,
-                    dtype=torch.bool,
-                ),
-                pose_mean=mean,
-                pose_scale=scale,
-                confidence_decay=(
-                    first.future_rolling_prior_config.confidence_decay
-                ),
-            )
     sampling_shape = (
         batch_size,
         REALTIME_POSE_TARGET_LENGTH,
@@ -744,13 +696,21 @@ def step_realtime_pose_batch(
     deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])
     auxiliary = sample.get("auxiliary_outputs", {})
     contact_logits = _batch_auxiliary_numpy(auxiliary.get("contact_logits"), batch_size)
+    inpaint_confidence = torch.zeros(
+        batch_size,
+        REALTIME_POSE_TARGET_LENGTH,
+        24,
+        device=first.device,
+        dtype=ik_result.confidence.dtype,
+    )
+    inpaint_confidence[:, 0] = ik_result.confidence
     return [
         runtime._finish_step(
             prepared_steps[index],
             raw_targets[index],
             deployed_targets[index],
             None if contact_logits is None else contact_logits[index],
-            inpainting.confidence[index].detach().cpu().numpy(),
+            inpaint_confidence[index].detach().cpu().numpy(),
         )
         for index, runtime in enumerate(runtimes)
     ]

@@ -4,7 +4,6 @@ import numpy as np
 import torch
 
 from data_loaders.realtime_pose_config import (
-    INPAINT_JOINT_COVERAGE,
     POSITION_COVERAGE,
     ROTATION_COVERAGE,
     TrackerReliabilityConfig,
@@ -74,26 +73,80 @@ def compute_tracker_online_confidence_torch(
     )
 
 
-def map_tracker_confidence_to_joints_torch(
-    tracker_confidence: torch.Tensor,
+def compute_ik_joint_confidence_torch(
+    joint_source_reliability: torch.Tensor,
+    constraint_type: torch.Tensor,
+    updated_mask: torch.Tensor,
+    position_residual: torch.Tensor,
+    chain_length: torch.Tensor,
+    direction_only_quality: float,
+    residual_scale: float,
+    position_solved_quality: float | None = None,
 ) -> torch.Tensor:
-    """用固定区域 mapping 将 `[B,6]` Tracker 置信度映射为 `[B,24]`。"""
+    """由 IK 的真实约束来源、类型和残差计算 `[B,24]` 置信度。
 
-    confidence = tracker_confidence.float()
-    if confidence.ndim != 2 or confidence.shape[1] != TRACKER_COUNT:
-        raise ValueError("tracker_confidence 必须为 [B,6]。")
-    if not bool(torch.isfinite(confidence).all()) or bool(
-        ((confidence < 0.0) | (confidence > 1.0)).any()
+    `position_residual` 使用骨架坐标系中的长度，`chain_length` 是相同单位的
+    对应可动骨链总长。直接 Tracker rotation 不依赖位置残差；其余已求解类型
+    使用归一化残差指数衰减。约束编号遵循 realtime_pose_ik 中的固定契约：
+    0=direct、1=position solved、2=direction only、3=inherited。
+    """
+
+    source = joint_source_reliability.float()
+    expected_shape = source.shape
+    values = (constraint_type, updated_mask, position_residual, chain_length)
+    if source.ndim != 2 or source.shape[1] != 24:
+        raise ValueError("joint_source_reliability 必须为 [B,24]。")
+    if any(value.shape != expected_shape for value in values):
+        raise ValueError("IK confidence 的所有逐关节输入必须同为 [B,24]。")
+    if not bool(torch.isfinite(source).all()) or bool(
+        ((source < 0.0) | (source > 1.0)).any()
     ):
-        raise ValueError("tracker_confidence 必须为有限的 [0,1] 数值。")
-    coverage = torch.tensor(
-        INPAINT_JOINT_COVERAGE.copy(),
-        device=confidence.device,
-        dtype=confidence.dtype,
+        raise ValueError("joint_source_reliability 必须为有限的 [0,1] 数值。")
+    if not bool(torch.isfinite(position_residual).all()) or bool(
+        (position_residual < 0.0).any()
+    ):
+        raise ValueError("position_residual 必须为有限非负数。")
+    if not bool(torch.isfinite(chain_length).all()) or bool((chain_length < 0.0).any()):
+        raise ValueError("chain_length 必须为有限非负数。")
+    if not 0.0 < float(direction_only_quality) < 1.0:
+        raise ValueError("direction_only_quality 必须位于 (0,1)。")
+    if float(residual_scale) <= 0.0:
+        raise ValueError("residual_scale 必须大于 0。")
+
+    constraint = constraint_type.to(dtype=torch.long)
+    if bool(((constraint < 0) | (constraint > 3)).any()):
+        raise ValueError("constraint_type 只能取 0、1、2、3。")
+    position_solved = constraint == 1
+    if bool(position_solved.any()) and position_solved_quality is None:
+        raise ValueError("出现 POSITION_SOLVED 时必须提供 position_solved_quality。")
+    if position_solved_quality is not None and not 0.0 < float(
+        position_solved_quality
+    ) < 1.0:
+        raise ValueError("position_solved_quality 必须位于 (0,1)。")
+
+    quality = torch.zeros_like(source)
+    quality = torch.where(constraint == 0, torch.ones_like(quality), quality)
+    if position_solved_quality is not None:
+        quality = torch.where(
+            position_solved,
+            torch.full_like(quality, float(position_solved_quality)),
+            quality,
+        )
+    quality = torch.where(
+        constraint == 2,
+        torch.full_like(quality, float(direction_only_quality)),
+        quality,
     )
-    # 每个关节只取所有覆盖 Tracker 中的最大置信度；禁止使用平均、noisy-or
-    # 或骨链 min，确保公式与部署约定 c[j]=max_t(A[j,t]w_t) 完全一致。
-    return (confidence[:, None, :] * coverage[None]).amax(dim=-1)
+
+    residual_constrained = updated_mask.bool() & ((constraint == 1) | (constraint == 2))
+    if bool((residual_constrained & (chain_length <= 0.0)).any()):
+        raise ValueError("位置/方向 IK 约束必须具有正的 chain_length。")
+    residual_ratio = position_residual / chain_length.clamp_min(1e-8)
+    residual_quality = torch.exp(-residual_ratio / float(residual_scale))
+    # 直接测得的是旋转本身，端点位置误差不能降低这条旋转测量的可信度。
+    residual_quality = torch.where(constraint == 0, torch.ones_like(source), residual_quality)
+    confidence = (source * quality * residual_quality).clamp(0.0, 1.0)
+    return torch.where(updated_mask.bool(), confidence, torch.zeros_like(confidence))
 
 
 def compute_region_coverage_np(

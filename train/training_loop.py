@@ -24,7 +24,7 @@ from data_loaders.sensor_masking import (
 from diffusion import logger
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    build_current_realtime_pose_inpainting_condition,
+    build_current_realtime_pose_ik_and_inpainting_condition,
 )
 from utils import dist_util
 
@@ -91,6 +91,11 @@ class TrainLoop:
                 getattr(args, "tracker_confidence_warmup", 15)
             ),
             fabrik_iterations=int(getattr(args, "fabrik_iterations", 2)),
+            direction_only_quality=getattr(args, "ik_direction_only_quality", None),
+            residual_scale=getattr(args, "ik_residual_scale", None),
+            position_solved_quality=getattr(
+                args, "ik_position_solved_quality", None
+            ),
         ).validate()
         self.save_dir = Path(args.save_dir)
         self.step = 0
@@ -491,7 +496,7 @@ class TrainLoop:
         if pose_mean is not None and pose_scale is not None:
             previous_pose_raw = previous_pose_raw * pose_scale + pose_mean
         with autocast(device_type=self.device.type, enabled=False):
-            return build_current_realtime_pose_inpainting_condition(
+            _, condition = build_current_realtime_pose_ik_and_inpainting_condition(
                 previous_pose_raw=previous_pose_raw,
                 previous_pose_valid=batch["window_valid_mask"][:, -2].bool(),
                 current_tracker_raw=batch["tracker_window_raw"][:, -1].float(),
@@ -506,6 +511,7 @@ class TrainLoop:
                 pose_scale=pose_scale,
                 config=self.ik_inpainting_config,
             )
+            return condition
 
     def mask_manager(
         self,

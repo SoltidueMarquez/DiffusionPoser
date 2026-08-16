@@ -126,6 +126,24 @@ def add_ik_inpainting_options(parser: ArgumentParser):
     group = parser.add_argument_group("ik inpainting")
     group.add_argument("--tracker_confidence_warmup", default=15, type=int)
     group.add_argument("--fabrik_iterations", default=2, type=int)
+    group.add_argument(
+        "--ik_direction_only_quality",
+        default=None,
+        type=float,
+        help="离线 IK 校准得到的 DIRECTION_ONLY 约束质量；无默认值。",
+    )
+    group.add_argument(
+        "--ik_residual_scale",
+        default=None,
+        type=float,
+        help="离线 IK 校准得到的归一化端点残差尺度；无默认值。",
+    )
+    group.add_argument(
+        "--ik_position_solved_quality",
+        default=None,
+        type=float,
+        help="预留给未来 POSITION_SOLVED 求解器；当前可不提供。",
+    )
 
 
 def add_future_rolling_prior_options(parser: ArgumentParser):

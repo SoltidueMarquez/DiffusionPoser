@@ -23,6 +23,22 @@ from tests.smoke.sample.test_realtime_pose_runtime import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _inject_calibrated_ik_parameters(monkeypatch):
+    """长序列测试显式使用固定测试参数，不把它们冒充生产校准默认值。"""
+
+    original_init = longseq.RealtimePoseRuntime.__init__
+
+    def calibrated_init(self, *args, **kwargs):
+        if kwargs.get("ik_direction_only_quality") is None:
+            kwargs["ik_direction_only_quality"] = 0.4
+        if kwargs.get("ik_residual_scale") is None:
+            kwargs["ik_residual_scale"] = 0.1
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(longseq.RealtimePoseRuntime, "__init__", calibrated_init)
+
+
 def _timeline(configured: np.ndarray, measured: np.ndarray) -> TrackerTimeline:
     shape = configured.shape
     return TrackerTimeline(
@@ -291,7 +307,7 @@ def test_ground_truth_history_is_the_only_previous_pose_prior(monkeypatch):
     )[0]
     assert second_prior[2]
     np.testing.assert_allclose(second_prior[1], expected_previous, atol=1e-6)
-    assert runtime.previous_deployed_horizon_world is None
+    assert not hasattr(runtime, "previous_deployed_horizon_world")
     assert not (payload["inpaint_confidence"][0, 1, 1:] > 0.0).any()
 
 

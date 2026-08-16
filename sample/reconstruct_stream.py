@@ -20,7 +20,7 @@ from data_loaders.sensor_masking import (
 )
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
-    build_current_realtime_pose_inpainting_condition,
+    build_current_realtime_pose_ik_and_inpainting_condition,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from sample.realtime_pose_runtime import decode_and_resolve_pose
@@ -79,6 +79,9 @@ def build_sampling_inpainting_condition(
     normalizer=None,
     tracker_confidence_warmup: int = 15,
     fabrik_iterations: int = 2,
+    ik_direction_only_quality: float | None = None,
+    ik_residual_scale: float | None = None,
+    ik_position_solved_quality: float | None = None,
 ) -> RealtimePoseInpaintingCondition:
     """离线单 batch 按首次 runtime 语义构造条件：当前做 IK，未来不偷看 GT。"""
 
@@ -92,7 +95,7 @@ def build_sampling_inpainting_condition(
         scale = normalizer.pose_scale.to(device).float()
         previous_pose = previous_pose * scale + mean
     current_tracker = batch["tracker_window_raw"][:, -1].to(device).float()
-    return build_current_realtime_pose_inpainting_condition(
+    _, condition = build_current_realtime_pose_ik_and_inpainting_condition(
         previous_pose_raw=previous_pose,
         previous_pose_valid=batch["window_valid_mask"][:, -2].to(device).bool(),
         current_tracker_raw=current_tracker,
@@ -108,8 +111,12 @@ def build_sampling_inpainting_condition(
         config=IKInpaintingConfig(
             tracker_confidence_warmup=tracker_confidence_warmup,
             fabrik_iterations=fabrik_iterations,
+            direction_only_quality=ik_direction_only_quality,
+            residual_scale=ik_residual_scale,
+            position_solved_quality=ik_position_solved_quality,
         ),
     )
+    return condition
 
 
 def build_projection_fn(
@@ -143,6 +150,9 @@ def reconstruct_batch(
     normalizer=None,
     tracker_confidence_warmup: int = 15,
     fabrik_iterations: int = 2,
+    ik_direction_only_quality: float | None = None,
+    ik_residual_scale: float | None = None,
+    ik_position_solved_quality: float | None = None,
 ) -> dict[str, torch.Tensor]:
     reference = batch["x"].to(device)
     if reference.ndim != 3 or tuple(reference.shape[1:]) != (
@@ -158,6 +168,9 @@ def reconstruct_batch(
         normalizer=normalizer,
         tracker_confidence_warmup=tracker_confidence_warmup,
         fabrik_iterations=fabrik_iterations,
+        ik_direction_only_quality=ik_direction_only_quality,
+        ik_residual_scale=ik_residual_scale,
+        ik_position_solved_quality=ik_position_solved_quality,
     )
     projection_fn = build_projection_fn(batch, device, normalizer)
     # 离线入口也显式创建条件噪声；完整 DDIM 轨迹由 diffusion 复用同一张量。
@@ -364,6 +377,9 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         normalizer=dataset.normalizer,
         tracker_confidence_warmup=args.tracker_confidence_warmup,
         fabrik_iterations=args.fabrik_iterations,
+        ik_direction_only_quality=args.ik_direction_only_quality,
+        ik_residual_scale=args.ik_residual_scale,
+        ik_position_solved_quality=args.ik_position_solved_quality,
     )
     output_dir = Path(args.output_dir or "output/realtime_pose_144d").resolve()
     output_path = output_dir / "realtime_pose_reconstruction.npz"

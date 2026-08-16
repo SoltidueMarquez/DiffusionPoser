@@ -40,6 +40,7 @@ from diffusion.realtime_pose_losses import (
 from diffusion.realtime_pose_inpainting import (
     RealtimePoseInpaintingCondition,
     apply_realtime_pose_inpainting,
+    build_current_realtime_pose_ik_and_inpainting_condition,
 )
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
@@ -237,9 +238,11 @@ def test_current_training_uses_same_final_hard_tracker_projection():
     )
     inpaint_condition = RealtimePoseInpaintingCondition(
         pose=torch.zeros_like(batch["x"], dtype=torch.float32),
-        confidence=torch.cat(
-            [torch.ones(1, 1, 24), torch.zeros(1, 10, 24)], dim=1
+        valid=torch.cat(
+            [torch.ones(1, 1, 24, dtype=torch.bool), torch.zeros(1, 10, 24, dtype=torch.bool)],
+            dim=1,
         ),
+        release_level=torch.zeros(1, 11, 24),
     )
     terms = diffusion.training_losses(
         model,
@@ -278,7 +281,10 @@ def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
     loop.device = torch.device("cpu")
     loop.pose_mean = torch.linspace(-0.2, 0.2, 144)
     loop.pose_scale = torch.linspace(0.5, 1.5, 144)
-    loop.ik_inpainting_config = IKInpaintingConfig()
+    loop.ik_inpainting_config = IKInpaintingConfig(
+        direction_only_quality=0.4,
+        residual_scale=0.1,
+    )
     first_history = torch.randn_like(batch["history_pose_observation"].float())
     second_history = first_history.clone()
     second_history[:, -1] += 100.0
@@ -303,8 +309,41 @@ def test_training_cold_start_uses_rest_pose_and_normalizes_current_only():
     )
     assert torch.isfinite(first.pose).all()
     torch.testing.assert_close(first.pose[:, 1:], torch.zeros_like(first.pose[:, 1:]))
+    assert not first.valid[:, 1:].any()
+
+
+def test_training_and_runtime_builder_produce_the_same_current_condition():
+    batch = _training_batch()
+    history = batch["history_pose_observation"].float()
+    config = IKInpaintingConfig(
+        direction_only_quality=0.4,
+        residual_scale=0.1,
+    )
+    loop = object.__new__(TrainLoop)
+    loop.device = torch.device("cpu")
+    loop.pose_mean = None
+    loop.pose_scale = None
+    loop.ik_inpainting_config = config
+    training_condition = loop.build_training_inpainting_condition(
+        batch, history, batch["x"].float()
+    )
+    _, runtime_condition = build_current_realtime_pose_ik_and_inpainting_condition(
+        previous_pose_raw=history[:, -1],
+        previous_pose_valid=batch["window_valid_mask"][:, -2].bool(),
+        current_tracker_raw=batch["tracker_window_raw"][:, -1].float(),
+        configured=batch["configured"][:, -1].bool(),
+        measured_valid=batch["measured_valid"][:, -1].bool(),
+        d_on=batch["d_on"][:, -1].float(),
+        joint_offsets_parent=batch["joint_offsets_parent"].float(),
+        joint_rest_local_rotations_6d=batch["joint_rest_local_rotations_6d"].float(),
+        pose_mean=None,
+        pose_scale=None,
+        config=config,
+    )
+    torch.testing.assert_close(training_condition.pose, runtime_condition.pose)
+    torch.testing.assert_close(training_condition.valid, runtime_condition.valid)
     torch.testing.assert_close(
-        first.confidence[:, 1:], torch.zeros_like(first.confidence[:, 1:])
+        training_condition.release_level, runtime_condition.release_level
     )
 
 
@@ -333,11 +372,12 @@ def test_training_inpainting_uses_x_model_for_forward_and_epsilon_target():
     x_start = batch["x"].float()
     noise = torch.zeros_like(x_start)
     known_noise = torch.ones_like(x_start)
-    confidence = torch.zeros(1, 11, 24)
-    confidence[:, 0, 0] = 1.0
+    valid = torch.zeros(1, 11, 24, dtype=torch.bool)
+    valid[:, 0, 0] = True
     condition = RealtimePoseInpaintingCondition(
         pose=torch.zeros_like(x_start),
-        confidence=confidence,
+        valid=valid,
+        release_level=torch.zeros(1, 11, 24),
     )
     timestep = torch.ones(1, dtype=torch.long)
     x_t = diffusion.q_sample(x_start, timestep, noise=noise)
@@ -360,7 +400,7 @@ def test_training_inpainting_uses_x_model_for_forward_and_epsilon_target():
     )
 
     torch.testing.assert_close(model.seen_input, expected_x_model)
-    # 未来 confidence 恒零，因此未来帧仍是普通 q_sample 的 x_t。
+    # 未来 valid 恒 False，因此未来帧仍是普通 q_sample 的 x_t。
     torch.testing.assert_close(model.seen_input[:, 1:], x_t[:, 1:])
     expected_target = diffusion._predict_eps_from_xstart(
         expected_x_model, timestep, x_start
@@ -375,7 +415,8 @@ def test_training_inpainting_requires_independent_known_noise():
     model, model_kwargs = _model_and_kwargs(batch)
     condition = RealtimePoseInpaintingCondition(
         pose=torch.zeros_like(batch["x"], dtype=torch.float32),
-        confidence=torch.zeros(1, 11, 24),
+        valid=torch.zeros(1, 11, 24, dtype=torch.bool),
+        release_level=torch.ones(1, 11, 24),
     )
     diffusion = GaussianDiffusion(
         betas=np.asarray([0.01, 0.02], dtype=np.float64),
@@ -397,10 +438,14 @@ def test_training_rejects_inference_only_future_rolling_prior():
     batch = _training_batch()
     model, model_kwargs = _model_and_kwargs(batch)
     pose = torch.zeros_like(batch["x"], dtype=torch.float32)
-    confidence = torch.zeros(1, 11, 24)
+    valid = torch.zeros(1, 11, 24, dtype=torch.bool)
     pose[:, 1] = 1.0
-    confidence[:, 1] = 0.5
-    condition = RealtimePoseInpaintingCondition(pose=pose, confidence=confidence)
+    valid[:, 1] = True
+    condition = RealtimePoseInpaintingCondition(
+        pose=pose,
+        valid=valid,
+        release_level=torch.ones(1, 11, 24),
+    )
     diffusion = GaussianDiffusion(
         betas=np.asarray([0.01, 0.02], dtype=np.float64),
         model_mean_type=ModelMeanType.START_X,
@@ -408,7 +453,7 @@ def test_training_rejects_inference_only_future_rolling_prior():
         loss_type=LossType.MSE,
     )
 
-    with pytest.raises(ValueError, match="current-only"):
+    with pytest.raises(ValueError, match="未来帧"):
         diffusion.training_losses(
             model,
             batch["x"].float(),
