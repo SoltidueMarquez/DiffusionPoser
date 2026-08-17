@@ -3,6 +3,7 @@ import numpy as np
 from eval.evaluate_realtime_pose import (
     _sequence_macro_stats,
     compute_predicted_joint_jitter,
+    count_root_yaw_flips,
     evaluate_file,
     summarize,
 )
@@ -61,6 +62,17 @@ def test_sequence_macro_stats_does_not_give_long_sequences_more_weight():
     stats = _sequence_macro_stats(values, mask)
 
     assert stats == {"sum": 4.0, "count": 2}
+
+
+def test_root_yaw_flip_count_uses_wrapped_adjacent_changes_and_gt_guard():
+    reference = np.radians(np.asarray([[0.0, 5.0, 40.0, 45.0]]))
+    predicted = np.radians(np.asarray([[179.0, -179.0, 10.0, 170.0]]))
+    valid = np.ones_like(reference, dtype=bool)
+
+    count = count_root_yaw_flips(reference, predicted, valid)
+
+    # 179 -> -179 只是 2° 的数值跨界；第二步 GT 同时变化 35°；只有最后一步计数。
+    assert count == 1
 
 
 def test_eval_reads_raw_deployed_and_new_reconnect_buckets(tmp_path):

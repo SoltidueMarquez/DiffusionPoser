@@ -12,7 +12,11 @@ from data_loaders.realtime_pose_history_noise import (
 )
 from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_torch
 from diffusion.realtime_pose_inpainting import RealtimePoseInpaintingCondition
-from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
+from model.realtime_pose_spatiotemporal_dit import (
+    HEAD_MOTION_FEATURE_DIM,
+    RealtimePoseSpatioTemporalDiT,
+    build_head_motion_summary,
+)
 from train.training_loop import (
     TRAIN_DEVICE_FIELDS,
     TrainLoop,
@@ -117,6 +121,104 @@ def test_model_has_one_lightweight_current_condition_projection():
     assert model.current_joint_condition_input.out_features == model.latent_dim
     assert not hasattr(model, "constraint_kind_embedding")
     assert not hasattr(model, "confidence_projection")
+
+
+def test_head_motion_summary_uses_real_multiscale_time_and_validity():
+    offsets = FRAME_OFFSETS.unsqueeze(0)
+    valid = torch.ones(1, 11, dtype=torch.bool)
+    path = torch.zeros(1, 11, 5)
+    horizontal_velocity = torch.tensor([2.0, -1.0])
+    vertical_velocity = 0.3
+    yaw_rate = math.pi / 2.0
+    current_height = 1.7
+    path[:, -1, 2] = current_height
+    path[:, -1, 4] = 1.0
+    for anchor_index, frame_offset in ((9, -1), (8, -8), (0, -60)):
+        delta_seconds = -frame_offset / 60.0
+        path[:, anchor_index, :2] = -horizontal_velocity * delta_seconds
+        path[:, anchor_index, 2] = current_height - vertical_velocity * delta_seconds
+        old_yaw = -yaw_rate * delta_seconds
+        path[:, anchor_index, 3] = math.sin(old_yaw)
+        path[:, anchor_index, 4] = math.cos(old_yaw)
+
+    summary = build_head_motion_summary(path, valid, offsets)
+
+    assert summary.shape == (1, HEAD_MOTION_FEATURE_DIM)
+    torch.testing.assert_close(
+        summary[0],
+        torch.tensor(
+            [
+                2.0,
+                -1.0,
+                2.0,
+                -1.0,
+                2.0,
+                -1.0,
+                0.5,
+                0.5,
+                current_height,
+                vertical_velocity,
+                vertical_velocity,
+                1.0,
+                1.0,
+                1.0,
+            ]
+        ),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    invalid = valid.clone()
+    invalid[:, 0] = False
+    first = build_head_motion_summary(path, invalid, offsets)
+    changed = path.clone()
+    changed[:, 0] = 10_000.0
+    second = build_head_motion_summary(changed, invalid, offsets)
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first[0, [4, 5, 7, 10, 13]], torch.zeros(5))
+
+
+def test_head_motion_summary_wraps_yaw_across_pi():
+    path = torch.zeros(1, 11, 5)
+    valid = torch.ones(1, 11, dtype=torch.bool)
+    current_yaw = math.radians(-179.0)
+    old_yaw = math.radians(179.0)
+    path[..., 4] = 1.0
+    path[:, -1, 3:5] = torch.tensor(
+        [math.sin(current_yaw), math.cos(current_yaw)]
+    )
+    path[:, 8, 3:5] = torch.tensor([math.sin(old_yaw), math.cos(old_yaw)])
+
+    summary = build_head_motion_summary(path, valid, FRAME_OFFSETS)
+
+    expected = math.radians(2.0) / (8.0 / 60.0) / math.pi
+    assert summary[0, 6].item() == pytest.approx(expected, abs=1e-6)
+
+
+def test_head_motion_adapter_only_changes_current_pelvis_token():
+    model = _model()
+    values = _conditioning(batch_size=1)
+    with torch.no_grad():
+        for parameter in model.head_path_encoder.parameters():
+            parameter.zero_()
+        model.pelvis_head_motion_input.weight.fill_(1.0)
+        model.pelvis_head_motion_input.bias.zero_()
+    first_values = {name: value.clone() for name, value in values.items()}
+    second_values = {name: value.clone() for name, value in values.items()}
+    first_values["head_path_window"].zero_()
+    second_values["head_path_window"].zero_()
+    first_values["head_path_window"][:, -1, 4] = 1.0
+    second_values["head_path_window"][:, -1, 4] = 1.0
+    second_values["head_path_window"][:, 9, 0] = -1.0 / 60.0
+
+    first = model.prepare_conditioning(**first_values)
+    second = model.prepare_conditioning(**second_values)
+    difference = second.static_pose_condition - first.static_pose_condition
+
+    assert torch.linalg.norm(difference[:, 10, 0]) > 0.0
+    difference[:, 10, 0] = 0.0
+    torch.testing.assert_close(difference, torch.zeros_like(difference))
+    assert model.pelvis_head_motion_input.in_features == HEAD_MOTION_FEATURE_DIM
 
 
 def test_tracker_cross_attention_and_constraint_tokens_are_removed():
@@ -361,6 +463,7 @@ def test_training_model_kwargs_use_y_as_the_only_condition_source():
         ).reshape(1, 1, 6).expand(1, 24, 6).clone(),
         "target_root_position_head_ref": torch.zeros(1, 3),
         "target_root_yaw_world": torch.zeros(1),
+        "target_hip_height": torch.zeros(1),
         "current_head_yaw_world": torch.zeros(1),
         "previous_contact_target": torch.zeros(1, 2),
         "contact_target": torch.zeros(1, 2),

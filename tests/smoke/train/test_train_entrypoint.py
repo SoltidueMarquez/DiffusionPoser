@@ -16,10 +16,58 @@ from utils.parser_util import (
     add_model_options,
     add_sampling_options,
     add_training_options,
+    apply_ik_calibration,
 )
 
 
 class TrainEntrypointTest(unittest.TestCase):
+    def test_ik_calibration_report_fills_missing_training_parameters(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calibration_path = Path(tmp_dir) / "ik_calibration.json"
+            calibration_path.write_text(
+                """{
+                    "recommended_parameters": {
+                        "ik_direction_only_quality": 0.42,
+                        "ik_residual_scale": 0.08
+                    }
+                }""",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                ik_calibration_path=str(calibration_path),
+                ik_direction_only_quality=None,
+                ik_residual_scale=None,
+            )
+
+            resolved = apply_ik_calibration(args)
+
+            self.assertEqual(resolved.ik_direction_only_quality, 0.42)
+            self.assertEqual(resolved.ik_residual_scale, 0.08)
+            self.assertEqual(resolved.ik_calibration_path, str(calibration_path.resolve()))
+
+    def test_explicit_ik_parameter_can_override_calibration_report(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calibration_path = Path(tmp_dir) / "ik_calibration.json"
+            calibration_path.write_text(
+                """{
+                    "recommended_parameters": {
+                        "ik_direction_only_quality": 0.42,
+                        "ik_residual_scale": 0.08
+                    }
+                }""",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                ik_calibration_path=str(calibration_path),
+                ik_direction_only_quality=0.6,
+                ik_residual_scale=None,
+            )
+
+            resolved = apply_ik_calibration(args)
+
+            self.assertEqual(resolved.ik_direction_only_quality, 0.6)
+            self.assertEqual(resolved.ik_residual_scale, 0.08)
+
     def test_model_factory_does_not_attach_runtime_reliability_configuration(self):
         args = Namespace(
             input_feats=144,
@@ -113,6 +161,7 @@ class TrainEntrypointTest(unittest.TestCase):
         self.assertEqual(args.tracker_pos_loss_weight, 10.0)
         self.assertEqual(args.tracker_pos_huber_beta, 0.05)
         self.assertEqual(args.head_ref_joint_distance_loss_weight, 1.0)
+        self.assertEqual(args.hip_height_loss_weight, 1.0)
         self.assertEqual(args.contact_slide_loss_weight, 0.1)
         self.assertNotIn(
             "--temporal_rotation_loss_weight", parser._option_string_actions

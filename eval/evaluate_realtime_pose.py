@@ -129,6 +129,43 @@ def compute_predicted_joint_jitter(
     return jitter
 
 
+def count_root_yaw_flips(
+    reference_yaw: np.ndarray,
+    predicted_yaw: np.ndarray,
+    frame_mask: np.ndarray,
+) -> int:
+    """统计预测跳变超过 90°、而 GT 同步变化小于 30° 的相邻帧事件。"""
+
+    reference = np.asarray(reference_yaw, dtype=np.float64)
+    predicted = np.asarray(predicted_yaw, dtype=np.float64)
+    valid = np.asarray(frame_mask, dtype=bool)
+    if reference.shape != predicted.shape or reference.shape != valid.shape:
+        raise ValueError("Root yaw 与 frame_mask 必须形状一致。")
+    if reference.ndim != 2:
+        raise ValueError("Root yaw 必须为 [N,T]。")
+    if reference.shape[1] < 2:
+        return 0
+    reference_delta = np.abs(
+        np.arctan2(
+            np.sin(np.diff(reference, axis=1)),
+            np.cos(np.diff(reference, axis=1)),
+        )
+    )
+    predicted_delta = np.abs(
+        np.arctan2(
+            np.sin(np.diff(predicted, axis=1)),
+            np.cos(np.diff(predicted, axis=1)),
+        )
+    )
+    pair_valid = valid[:, 1:] & valid[:, :-1]
+    flips = (
+        pair_valid
+        & (predicted_delta > np.radians(90.0))
+        & (reference_delta < np.radians(30.0))
+    )
+    return int(flips.sum())
+
+
 def _group_metrics(
     frame_mask: np.ndarray,
     metric_values: dict[str, np.ndarray],
@@ -353,6 +390,11 @@ def evaluate_file(path: Path) -> dict[str, object]:
         )
     metric_scales = {"mpjpe_cm": 100.0, "mpjve_cm_s": 100.0, "mpjae_cm_s2": 100.0}
     result = _group_metrics(eval_mask, metric_values, metric_scales)
+    result["root_yaw_flip_count"] = count_root_yaw_flips(
+        root_yaw_ref,
+        root_yaw_pred,
+        eval_mask,
+    )
     result.update(
         path=str(path),
         sequences=sequence_count,
@@ -454,6 +496,9 @@ def summarize(results: list[dict[str, object]]) -> dict[str, object]:
     if not results:
         raise ValueError("没有可汇总的评估结果。")
     summary = _summarize_metric_stats(results)
+    summary["root_yaw_flip_count"] = sum(
+        int(result.get("root_yaw_flip_count", 0)) for result in results
+    )
     summary["aggregation"] = "sequence_macro"
     summary["sequences"] = sum(int(result.get("sequences", 0)) for result in results)
     for group_name in (

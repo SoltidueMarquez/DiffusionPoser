@@ -71,6 +71,10 @@ model frame offsets    = [-60, -53, -47, -40, -34, -27, -21, -14, -8, -1,
 - `joint_rest_local_rotations_6d: [24,6]`
 - `stationary_prob_5: [T,5]`
 
+`stationary_prob_5` 只表示 5 个候选关节的世界空间静止概率，不直接作为脚部
+地面接触真值。Task 和长序列评估取左右脚通道后，再乘以脚高软门控：脚高相对
+`floor_y` 不超过 5cm 时完整保留，5cm 到 10cm 线性衰减，达到 10cm 时归零。
+
 source key 由 `.npz` 相对 source 根目录的路径产生，`.npy/.npz` 后缀在 split 匹配时忽略；`M/` 首级目录表示镜像。source 文件不要求内嵌 metadata。
 
 ## Task Store
@@ -86,7 +90,7 @@ Task Store 是 task 生成阶段写入磁盘的未归一化数据。设样本数
 | `configured` / `measured_valid` | `[M,5,61,6]` | 五套场景的密集 61 帧 Tracker 状态 |
 | `target_joints_head_ref` | `[M,24,3]` | 当前帧关节位置监督 |
 | `target_root_position_head_ref` | `[M,3]` | 当前 Root 在当前 Head 参考系中的位置 |
-| `target_root_yaw_world` | `[M]` | 当前 Pelvis forward 世界 yaw |
+| `target_root_yaw_world` | `[M]` | 在完整 Source 上因果展开的 Pelvis 世界 Y-twist heading；退化帧沿用上一可靠值 |
 | `target_hip_height` | `[M]` | 当前 Pelvis 世界高度 |
 | `current_head_yaw_world` | `[M]` | 当前 Head 世界 yaw |
 | `current_head_position_world` | `[M,3]` | 当前 Head 世界位置 |
@@ -126,7 +130,7 @@ Dataset 从 Task Store 选择一套 Tracker 场景，按虚拟会话起点重新
 | `joint_rest_local_rotations_6d` | `[B,24,6]` | 目标骨架 rest local rotation6D |
 | `target_joints_head_ref` | `[B,24,3]` | 当前帧关节位置监督 |
 | `target_root_position_head_ref` | `[B,3]` | 当前 Root 在 `C_n` 下的位置监督 |
-| `target_root_yaw_world` | `[B]` | 当前 Pelvis forward 世界 yaw 监督 |
+| `target_root_yaw_world` | `[B]` | 在完整 Source 上因果展开的 Pelvis 世界 Y-twist heading 监督 |
 | `target_hip_height` | `[B]` | 当前 Pelvis 世界高度监督 |
 | `current_head_yaw_world` | `[B]` | 当前 Head 世界 yaw |
 | `current_head_position_world` | `[B,3]` | 当前 Head 世界位置 |
@@ -214,6 +218,7 @@ Head 路径的 XZ 与高度分别归一化，sin/cos 保持原值。normalizer �
 - Temporal Attention 的历史 query 只能读取有效历史 key，不能读取任何目标 token；目标 query 可读取全部有效历史和全部 11 个目标，目标窗口内部双向 attention；
 - 训练时 `model_kwargs` 只传递一个 `y` 字典，模型预测与 Loss 从同一份条件和监督数据读取，不在顶层重复条件字段；
 - 历史 Pose、Head 路径与当前 10D joint condition 由 `prepare_conditioning()` 每个目标帧编码一次，在 DDIM 步间复用；
+- 保留逐锚点 Head 路径编码；另从归一化 Head 路径按真实 `-1/-8/-60/0` 帧偏移确定性构造 14D 运动摘要，通道固定为 `[vx_1,vz_1,vx_8,vz_8,vx_60,vz_60,yaw_rate_8,yaw_rate_60,current_height,vertical_velocity_8,vertical_velocity_60,valid_1,valid_8,valid_60]`，经单层线性投影后只加到当前 Pelvis token；
 - 历史和目标使用独立输入投影；共享一个 diffusion timestep embedding，21 个 frame-offset embedding 区分帧位置；
 - 当前 joint condition 只经过 `Linear(10, latent_dim)` 并加到 token 10；不直接写入未来 token，未来只能通过 temporal self-attention 读取当前条件；
 - DiT 不接收旧的 `inpaint_confidence` 或 `inpaint_kind` 字段。soft inpainting 仍由 `release_level` 外部控制，模型仅通过 10D joint condition 看到 confidence 与 constraint type 的语义副本；
@@ -251,9 +256,9 @@ conda run -n diffusionposer5070 python -m eval.calibrate_realtime_pose_ik --data
 
 - diffusion reconstruction、global rotation、local rotation 和 rotation velocity loss 作用于全部 11 帧；
 - rotation velocity 比较相邻目标帧 `R_h^T R_(h+1)` 的 SO(3) 夹角，共 10 组，默认权重为 `1.0`；
-- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、contact 和 contact-slide 只作用于 horizon 0；`deployed_pred_xstart` 在全 horizon SO(3) 合法化后，仅对 horizon 0 的 hard Tracker 旋转执行覆盖；Head 始终 hard，其他 Tracker 仅在 configured、measured_valid 且 `d_on >= d_hard` 时 hard；
+- Tracker rotation/position、FK、Head-reference joint、root yaw、Head-to-Root XZ、Hip height、contact 和 contact-slide 只作用于 horizon 0；root yaw 使用 Pelvis 旋转的最近世界 Y-twist heading，按 15° 尺度的二维 circular loss 监督，XZ 与 Hip height 使用 5cm 尺度的 Huber loss；`deployed_pred_xstart` 在全 horizon SO(3) 合法化后，仅对 horizon 0 的 hard Tracker 旋转执行覆盖；Head 始终 hard，其他 Tracker 仅在 configured、measured_valid 且 `d_on >= d_hard` 时 hard；
 - `previous_pose_target` 是未扰动的最后一个历史 Pose；cold-start contact-slide 由最后历史槽有效性屏蔽；
 - 长序列结果同时保存 `reference_pose_horizon_raw`、`raw_pred_pose_horizon_raw`、`deployed_pred_pose_horizon_raw: [N,T,11,144]` 和 `pose_horizon_valid_mask: [N,T,11]`；序列尾部缺少的未来参考帧填 NaN；
 - 当前 MPJRE/MPJPE/MPJVE/Jitter/contact 等指标继续从 horizon 0 计算；另外报告 raw/deployed 的 horizon 0 到 10 全身 MPJRE，以及未来 1:10 宏平均。当前阶段不计算未来 MPJPE 或未来 root 位置误差；
 - 长序列评估 metadata 继续记录 rolling-prior 开关和 decay，但第一轮有效运行的开关只能为 `False`；`rp1g<decay>` 命名仅保留给第三轮重新实现后使用；
-- Task Store 无需重建；新增 `current_joint_condition_input` 后，缺少该权重的旧 checkpoint 明确拒绝加载，必须从头训练。联合 11 帧模型的 Unity/Sentis 导出仍拒绝；Unity runtime schema 保持旧单帧接口，不生成联合模型 ONNX。
+- `target_root_yaw_world` 的标签语义已经变化，因此 Task Store 必须重新生成，配套 normalizer 也必须从新 Task Store 重算；新增 `pelvis_head_motion_input` 后不提供旧 checkpoint 兼容迁移，必须从头训练。联合 11 帧模型的 Unity/Sentis 导出仍拒绝；Unity runtime schema 保持旧单帧接口，不生成联合模型 ONNX。

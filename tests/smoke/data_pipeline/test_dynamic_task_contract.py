@@ -15,8 +15,15 @@ from data_loaders.realtime_pose_dataset import (
     RealtimePoseTaskDataset,
     TaskRequest,
 )
-from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_forward_yaw_np
-from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_geometry import (
+    build_pose_target_np,
+    extract_continuous_rotation_heading_np,
+    extract_forward_yaw_np,
+)
+from data_loaders.realtime_pose_kinematics import (
+    derive_foot_contact_prob_2,
+    rotation_6d_to_matrix_np,
+)
 from data_loaders.realtime_pose_task_store import ShardWriter
 from data_loaders.realtime_pose_validation import validate_realtime_task_arrays
 from data_loaders.sensor_masking import TRACKER_FEATURE_DIM, TRACKER_PATTERN_CATEGORIES
@@ -29,10 +36,15 @@ def _build_row():
     joint_rotations = compute_source_joint_rotations_world(source)
     tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
     head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
+    root_yaws = extract_continuous_rotation_heading_np(
+        joint_rotations[:, 0],
+        initial_yaw=float(head_yaws[0]),
+    )
     row = build_task_bundle_row(
         source=source,
         joint_rotations_world=joint_rotations,
         head_yaws=head_yaws,
+        root_yaws_world=root_yaws,
         start_frame=0,
         task_seed=0,
         config_plans=build_task_config_plan("toy", global_seed=10, max_rollout_steps=1),
@@ -50,13 +62,18 @@ def test_task_bundle_materializes_synchronized_spatiotemporal_window():
     assert row["measured_valid"].shape == (5, 61, 6)
     assert row["previous_contact_target"].shape == (2,)
     assert row["contact_target"].shape == (2,)
+    expected_contact = derive_foot_contact_prob_2(
+        stationary_prob_5=_source["stationary_prob_5"][59:61],
+        joints_world=_source["joints_world"][59:61],
+        floor_y=_source["root_pos_world"][59:61, 1],
+    )
     np.testing.assert_allclose(
         row["previous_contact_target"],
-        _source["stationary_prob_5"][59, 1:3],
+        expected_contact[0],
     )
     np.testing.assert_allclose(
         row["contact_target"],
-        _source["stationary_prob_5"][60, 1:3],
+        expected_contact[1],
     )
     np.testing.assert_allclose(row["head_path_window"][-1, :2], 0.0, atol=1e-7)
     np.testing.assert_allclose(row["head_path_window"][-1, 3:], [0.0, 1.0], atol=1e-7)
@@ -83,11 +100,16 @@ def test_task_bundle_requires_ten_future_frames_and_accepts_71_frame_boundary():
     head_yaws = extract_forward_yaw_np(
         rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])[:, 0]
     )
+    root_yaws = extract_continuous_rotation_heading_np(
+        rotations[:, 0],
+        initial_yaw=float(head_yaws[0]),
+    )
     with pytest.raises(ValueError, match=r"current_absolute \+ 10 < frame_count"):
         build_task_bundle_row(
             source,
             rotations,
             head_yaws,
+            root_yaws,
             start_frame=0,
             task_seed=0,
             config_plans=build_task_config_plan("too-short", 10, 1),

@@ -30,7 +30,40 @@ def build_train_arg_parser() -> ArgumentParser:
 
 
 def train_args(argv: list[str] | None = None):
-    return build_train_arg_parser().parse_args(argv)
+    args = build_train_arg_parser().parse_args(argv)
+    return apply_ik_calibration(args)
+
+
+def apply_ik_calibration(args):
+    """从离线校准报告补齐 IK 参数，同时保留显式 CLI 数值的优先级。"""
+
+    calibration_path = str(getattr(args, "ik_calibration_path", "") or "").strip()
+    if not calibration_path:
+        return args
+    if (
+        getattr(args, "ik_direction_only_quality", None) is not None
+        and getattr(args, "ik_residual_scale", None) is not None
+    ):
+        return args
+
+    path = Path(calibration_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"IK 校准报告不存在：{path}")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        recommended = report["recommended_parameters"]
+        direction_only_quality = float(recommended["ik_direction_only_quality"])
+        residual_scale = float(recommended["ik_residual_scale"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"IK 校准报告格式无效：{path}") from exc
+
+    # 命令行显式数值允许覆盖报告中的单个参数，便于做受控消融实验。
+    if getattr(args, "ik_direction_only_quality", None) is None:
+        args.ik_direction_only_quality = direction_only_quality
+    if getattr(args, "ik_residual_scale", None) is None:
+        args.ik_residual_scale = residual_scale
+    args.ik_calibration_path = str(path)
+    return args
 
 
 def str2bool(value):
@@ -48,10 +81,10 @@ def parse_and_load_from_model(parser: ArgumentParser, argv: list[str] | None = N
     args = parser.parse_args(argv)
     model_path = getattr(args, "model_path", "")
     if not model_path:
-        return args
+        return apply_ik_calibration(args)
     checkpoint_args = load_args_json(Path(model_path))
     if not checkpoint_args:
-        return args
+        return apply_ik_calibration(args)
     if (
         int(checkpoint_args.get("max_seq_len", -1)) != REALTIME_POSE_MODEL_TOKEN_LENGTH
         or "future_leg_loss_weight" in checkpoint_args
@@ -68,7 +101,7 @@ def parse_and_load_from_model(parser: ArgumentParser, argv: list[str] | None = N
             default_value = None
         if getattr(args, key) == default_value:
             setattr(args, key, value)
-    return args
+    return apply_ik_calibration(args)
 
 
 def add_base_options(parser: ArgumentParser):
@@ -124,6 +157,12 @@ def add_ik_inpainting_options(parser: ArgumentParser):
     """注册训练与采样必须一致的当前帧 IK 参数。"""
 
     group = parser.add_argument_group("ik inpainting")
+    group.add_argument(
+        "--ik_calibration_path",
+        default="",
+        type=str,
+        help="离线 IK 校准报告 JSON；仅用于补齐未显式传入的校准参数。",
+    )
     group.add_argument("--tracker_confidence_warmup", default=15, type=int)
     group.add_argument("--fabrik_iterations", default=2, type=int)
     group.add_argument(
@@ -216,6 +255,7 @@ def add_training_options(parser: ArgumentParser):
         type=float,
     )
     group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
+    group.add_argument("--hip_height_loss_weight", default=_LOSS_DEFAULTS.hip_height, type=float)
     group.add_argument(
         "--rotation_velocity_loss_weight",
         default=_LOSS_DEFAULTS.rotation_velocity,

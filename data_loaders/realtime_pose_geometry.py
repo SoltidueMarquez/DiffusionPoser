@@ -28,6 +28,7 @@ from data_loaders.sensor_masking import (
 
 
 HEAD_YAW_HORIZONTAL_EPS = 1e-4
+ROOT_HEADING_OBSERVABILITY_EPS = 1e-4
 
 
 def extract_forward_yaw_np(
@@ -192,33 +193,89 @@ def assemble_tracker_features_np(
     return result
 
 
-def extract_rotation_heading_np(rotations: np.ndarray) -> np.ndarray:
-    """从任意前导形状的旋转 forward 轴提取水平 heading。"""
+def extract_rotation_heading_components_np(
+    rotations: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """返回最近纯 Yaw 分解的 `(cos尺度, sin尺度, 可观测强度)`。"""
 
     matrices = np.asarray(rotations, dtype=np.float64)
     if matrices.shape[-2:] != (3, 3):
         raise ValueError(f"rotations 尾部必须为 [3,3]，实际为 {matrices.shape}")
-    forward = matrices[..., :, 2]
-    right = matrices[..., :, 0]
-    forward_norm = np.linalg.norm(forward[..., [0, 2]], axis=-1)
-    use_forward = forward_norm >= HEAD_YAW_HORIZONTAL_EPS
-    heading_x = np.where(use_forward, forward[..., 0], -right[..., 2])
-    heading_z = np.where(use_forward, forward[..., 2], right[..., 0])
-    return np.arctan2(heading_x, heading_z).astype(np.float32)
+    cosine_scale = matrices[..., 0, 0] + matrices[..., 2, 2]
+    sine_scale = matrices[..., 0, 2] - matrices[..., 2, 0]
+    observability = np.sqrt(np.square(cosine_scale) + np.square(sine_scale))
+    return cosine_scale, sine_scale, observability
 
 
-def extract_rotation_heading_torch(rotations: torch.Tensor) -> torch.Tensor:
-    """Torch 版水平 heading 提取，保持 pelvis FK 路径可微。"""
+def extract_rotation_heading_np(
+    rotations: np.ndarray,
+    observability_eps: float = ROOT_HEADING_OBSERVABILITY_EPS,
+) -> np.ndarray:
+    """从任意前导形状的旋转提取最近纯 Yaw；退化值安全回落为零。"""
+
+    cosine_scale, sine_scale, observability = extract_rotation_heading_components_np(
+        rotations
+    )
+    reliable = observability >= float(observability_eps)
+    safe_cosine = np.where(reliable, cosine_scale, 1.0)
+    safe_sine = np.where(reliable, sine_scale, 0.0)
+    return np.arctan2(safe_sine, safe_cosine).astype(np.float32)
+
+
+def extract_continuous_rotation_heading_np(
+    rotations: np.ndarray,
+    initial_yaw: float = 0.0,
+    observability_eps: float = ROOT_HEADING_OBSERVABILITY_EPS,
+) -> np.ndarray:
+    """沿时间因果提取连续 Yaw；真实退化帧沿用上一可靠 heading。"""
+
+    matrices = np.asarray(rotations, dtype=np.float64)
+    if matrices.ndim != 3 or matrices.shape[1:] != (3, 3):
+        raise ValueError(f"rotations 必须为 [T,3,3]，实际为 {matrices.shape}")
+    cosine_scale, sine_scale, observability = extract_rotation_heading_components_np(
+        matrices
+    )
+    result = np.empty(matrices.shape[0], dtype=np.float64)
+    previous = float(initial_yaw)
+    for frame_index in range(matrices.shape[0]):
+        if observability[frame_index] >= float(observability_eps):
+            measured = math.atan2(
+                float(sine_scale[frame_index]),
+                float(cosine_scale[frame_index]),
+            )
+            # 每一帧选择最接近上一帧的 2pi 等价角，避免数值边界产生假翻转。
+            delta = (measured - previous + math.pi) % (2.0 * math.pi) - math.pi
+            previous += delta
+        result[frame_index] = previous
+    return result.astype(np.float32)
+
+
+def extract_rotation_heading_components_torch(
+    rotations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch 版最近纯 Yaw 分解分量，供 circular loss 直接使用。"""
 
     if tuple(rotations.shape[-2:]) != (3, 3):
         raise ValueError(f"rotations 尾部必须为 [3,3]，实际为 {tuple(rotations.shape)}")
-    forward = rotations[..., :, 2]
-    right = rotations[..., :, 0]
-    forward_norm = torch.linalg.norm(forward[..., [0, 2]], dim=-1)
-    use_forward = forward_norm >= HEAD_YAW_HORIZONTAL_EPS
-    heading_x = torch.where(use_forward, forward[..., 0], -right[..., 2])
-    heading_z = torch.where(use_forward, forward[..., 2], right[..., 0])
-    return torch.atan2(heading_x, heading_z)
+    cosine_scale = rotations[..., 0, 0] + rotations[..., 2, 2]
+    sine_scale = rotations[..., 0, 2] - rotations[..., 2, 0]
+    observability = torch.sqrt(cosine_scale.square() + sine_scale.square())
+    return cosine_scale, sine_scale, observability
+
+
+def extract_rotation_heading_torch(
+    rotations: torch.Tensor,
+    observability_eps: float = ROOT_HEADING_OBSERVABILITY_EPS,
+) -> torch.Tensor:
+    """可微 heading 提取；退化帧使用安全零 yaw，避免 `atan2(0,0)`。"""
+
+    cosine_scale, sine_scale, observability = extract_rotation_heading_components_torch(
+        rotations
+    )
+    reliable = observability >= float(observability_eps)
+    safe_cosine = torch.where(reliable, cosine_scale, torch.ones_like(cosine_scale))
+    safe_sine = torch.where(reliable, sine_scale, torch.zeros_like(sine_scale))
+    return torch.atan2(safe_sine, safe_cosine)
 
 
 def decode_target_head_rotations_np(

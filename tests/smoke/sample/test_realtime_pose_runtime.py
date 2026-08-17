@@ -9,11 +9,17 @@ from data_loaders.generate_realtime_pose_tasks import compute_source_joint_rotat
 from data_loaders.realtime_pose_geometry import (
     extract_rotation_heading_np,
 )
-from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM, REALTIME_POSE_TARGET_LENGTH
+from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_np
+from data_loaders.sensor_masking import (
+    REALTIME_POSE_TARGET_DIM,
+    REALTIME_POSE_TARGET_LENGTH,
+    TRACKER_FEATURE_DIM,
+)
 from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
 from sample.realtime_pose_runtime import (
     RealtimePoseRuntime,
     WorldPoseState,
+    decode_and_resolve_pose,
     step_realtime_pose_batch,
 )
 from sample.utils import load_checkpoint_model
@@ -161,6 +167,58 @@ def test_runtime_can_seed_sixty_ground_truth_frames_without_sampling():
     _step(runtime, source, 60, valid)
     assert model.history_valid_counts == [10]
     assert len(runtime.pose_history) == 60
+
+
+def test_runtime_root_yaw_unwraps_and_falls_back_at_true_singularity():
+    source = build_toy_realtime_source(frame_count=1)
+    rotations = np.repeat(np.eye(3, dtype=np.float64)[None], 24, axis=0)
+    yaw = np.radians(-179.0)
+    rotations[0] = np.asarray(
+        [
+            [np.cos(yaw), 0.0, np.sin(yaw)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(yaw), 0.0, np.cos(yaw)],
+        ]
+    )
+    target = rotation_6d_forward_up_np(rotations).reshape(-1).astype(np.float32)
+    tracker = np.zeros((6, TRACKER_FEATURE_DIM), dtype=np.float32)
+    tracker[0, 1] = 1.7
+
+    unwrapped = decode_and_resolve_pose(
+        target,
+        tracker,
+        current_head_yaw_world=0.0,
+        current_head_position_world=np.zeros(3, dtype=np.float32),
+        floor_y=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
+        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
+        previous_root_yaw_world=np.radians(179.0),
+    )
+    assert np.degrees(unwrapped.root_yaw_world) == pytest.approx(181.0, abs=1e-4)
+
+    rotations[0] = np.diag([1.0, -1.0, -1.0])
+    singular_target = rotation_6d_forward_up_np(rotations).reshape(-1).astype(np.float32)
+    fallback = decode_and_resolve_pose(
+        singular_target,
+        tracker,
+        current_head_yaw_world=0.4,
+        current_head_position_world=np.zeros(3, dtype=np.float32),
+        floor_y=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
+        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
+        previous_root_yaw_world=1.2,
+    )
+    first_frame = decode_and_resolve_pose(
+        singular_target,
+        tracker,
+        current_head_yaw_world=0.4,
+        current_head_position_world=np.zeros(3, dtype=np.float32),
+        floor_y=0.0,
+        joint_offsets_parent=source["joint_offsets_parent"],
+        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
+    )
+    assert fallback.root_yaw_world == pytest.approx(1.2)
+    assert first_frame.root_yaw_world == pytest.approx(0.4)
 
 
 def test_runtime_dropout_and_reconnect_preserve_duration_semantics():

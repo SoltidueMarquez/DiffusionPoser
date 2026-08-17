@@ -23,7 +23,15 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
 )
-from data_loaders.realtime_pose_geometry import build_pose_target_np, extract_rotation_heading_np
+from data_loaders.realtime_pose_geometry import (
+    build_pose_target_np,
+    extract_continuous_rotation_heading_np,
+    extract_forward_yaw_np,
+)
+from data_loaders.realtime_pose_kinematics import (
+    derive_foot_contact_prob_2,
+    rotation_6d_to_matrix_np,
+)
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     REALTIME_POSE_HISTORY_LENGTH,
@@ -161,6 +169,7 @@ def rollout_long_sequence_source(
     if frame_count <= 0:
         raise ValueError("长序列 source 不能为空。")
     joint_rotations_world = compute_source_joint_rotations_world(source)
+    root_yaws_world = _continuous_source_root_yaws(source, joint_rotations_world)
     runtime = RealtimePoseRuntime(
         model,
         diffusion,
@@ -182,7 +191,12 @@ def rollout_long_sequence_source(
     )
     for frame_index in range(warmup_frames):
         runtime.append_ground_truth_frame(
-            _ground_truth_world_pose_state(source, joint_rotations_world, frame_index),
+            _ground_truth_world_pose_state(
+                source,
+                joint_rotations_world,
+                root_yaws_world,
+                frame_index,
+            ),
             source["tracker_pos_world"][frame_index],
             source["tracker_rot_world_6d"][frame_index],
             timeline.configured[frame_index],
@@ -224,6 +238,7 @@ def rollout_long_sequence_source(
             timeline=timeline,
             runtime=runtime,
             joint_rotations_world=joint_rotations_world,
+            root_yaws_world=root_yaws_world,
             frame_index=frame_index,
             history_length=history_length,
             step=step,
@@ -315,6 +330,10 @@ def rollout_long_sequence_sources(
         raise ValueError("timeline 帧数必须与对应 source 一致。")
 
     joint_rotations = [compute_source_joint_rotations_world(source) for source in sources]
+    root_yaws = [
+        _continuous_source_root_yaws(source, rotations)
+        for source, rotations in zip(sources, joint_rotations)
+    ]
     warmup_counts = [
         _validate_gt_history_warmup_frames(gt_history_warmup_frames, frame_count)
         for frame_count in frame_counts
@@ -337,16 +356,22 @@ def rollout_long_sequence_sources(
         )
         for source in sources
     ]
-    for source, timeline, rotations, runtime, warmup_count in zip(
+    for source, timeline, rotations, root_yaw, runtime, warmup_count in zip(
         sources,
         timelines,
         joint_rotations,
+        root_yaws,
         runtimes,
         warmup_counts,
     ):
         for frame_index in range(warmup_count):
             runtime.append_ground_truth_frame(
-                _ground_truth_world_pose_state(source, rotations, frame_index),
+                _ground_truth_world_pose_state(
+                    source,
+                    rotations,
+                    root_yaw,
+                    frame_index,
+                ),
                 source["tracker_pos_world"][frame_index],
                 source["tracker_rot_world_6d"][frame_index],
                 timeline.configured[frame_index],
@@ -453,6 +478,7 @@ def rollout_long_sequence_sources(
                 timeline=timelines[sequence_index],
                 runtime=runtimes[sequence_index],
                 joint_rotations_world=joint_rotations[sequence_index],
+                root_yaws_world=root_yaws[sequence_index],
                 frame_index=frame_index,
                 history_length=history_lengths[active_offset],
                 step=steps[active_offset],
@@ -467,6 +493,7 @@ def rollout_long_sequence_sources(
                     _ground_truth_world_pose_state(
                         source,
                         joint_rotations[sequence_index],
+                        root_yaws[sequence_index],
                         frame_index,
                     )
                 )
@@ -505,6 +532,7 @@ def _validate_gt_history_warmup_frames(value: int, frame_count: int) -> int:
 def _ground_truth_world_pose_state(
     source: dict[str, np.ndarray],
     joint_rotations_world: np.ndarray,
+    root_yaws_world: np.ndarray,
     frame_index: int,
 ) -> WorldPoseState:
     """构造 runtime history 使用的单帧 GT 世界状态。"""
@@ -512,11 +540,25 @@ def _ground_truth_world_pose_state(
     rotations = np.asarray(joint_rotations_world[frame_index], dtype=np.float32)
     return WorldPoseState(
         joint_rotations_world=rotations.copy(),
-        root_yaw_world=float(extract_rotation_heading_np(rotations[0])),
+        root_yaw_world=float(root_yaws_world[frame_index]),
         hip_height=float(source["pelvis_height"][frame_index, 0]),
         root_position_world=np.asarray(
             source["root_pos_world"][frame_index], dtype=np.float32
         ).copy(),
+    )
+
+
+def _continuous_source_root_yaws(
+    source: dict[str, np.ndarray],
+    joint_rotations_world: np.ndarray,
+) -> np.ndarray:
+    """以首帧 Head yaw 为退化初值，统一构造完整 Source 的 pelvis heading。"""
+
+    tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
+    head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
+    return extract_continuous_rotation_heading_np(
+        joint_rotations_world[:, 0],
+        initial_yaw=float(head_yaws[0]),
     )
 
 
@@ -566,6 +608,7 @@ def _append_rollout_frame(
     timeline: TrackerTimeline,
     runtime: RealtimePoseRuntime,
     joint_rotations_world: np.ndarray,
+    root_yaws_world: np.ndarray,
     frame_index: int,
     history_length: int,
     step: RuntimeStepResult,
@@ -594,9 +637,7 @@ def _append_rollout_frame(
     values["predicted_joints_world"].append(resolved.joints_world)
     values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
     values["predicted_root_position_world"].append(resolved.root_position_world)
-    values["reference_root_yaw_world"].append(
-        float(extract_rotation_heading_np(joint_rotations_world[frame_index, 0]))
-    )
+    values["reference_root_yaw_world"].append(float(root_yaws_world[frame_index]))
     values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
     values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
     values["predicted_hip_height"].append(resolved.hip_height)
@@ -610,7 +651,13 @@ def _append_rollout_frame(
     values["hard_rotation_state"].append(step.hard_rotation_state)
     values["inpaint_confidence"].append(step.inpaint_confidence)
     values["history_length"].append(history_length)
-    values["contact_target"].append(source["stationary_prob_5"][frame_index, 1:3])
+    values["contact_target"].append(
+        derive_foot_contact_prob_2(
+            stationary_prob_5=source["stationary_prob_5"][frame_index],
+            joints_world=source["joints_world"][frame_index],
+            floor_y=source["root_pos_world"][frame_index, 1],
+        )
+    )
     values["contact_logits"].append(
         np.full(2, np.nan, dtype=np.float32)
         if step.contact_logits is None

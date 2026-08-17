@@ -9,7 +9,7 @@ from pathlib import Path
 from data_loaders.sensor_masking import REALTIME_POSE_TARGET_DIM
 
 
-PIPELINE_STAGES = ("convert", "tasks", "normalizer", "train")
+PIPELINE_STAGES = ("convert", "tasks", "calibrate", "normalizer", "train")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -36,6 +36,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     paths.add_argument("--split_dir", default="data_loaders/splits", type=str)
     paths.add_argument("--save_dir", required=True, type=str)
+    paths.add_argument(
+        "--ik_calibration_path",
+        default="output/ik_calibration.json",
+        type=str,
+    )
 
     pipeline = parser.add_argument_group("pipeline")
     pipeline.add_argument("--start_at", default="convert", choices=PIPELINE_STAGES)
@@ -59,6 +64,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     normalizer = parser.add_argument_group("normalizer")
     normalizer.add_argument("--skip_normalizer", action="store_true")
     normalizer.add_argument("--normalizer_split", default="train", type=str)
+
+    calibration = parser.add_argument_group("IK calibration")
+    calibration.add_argument("--skip_calibrate", action="store_true")
+    calibration.add_argument("--calibration_split", default="train", type=str)
+    calibration.add_argument("--calibration_max_samples", default=20_000, type=int)
+    calibration.add_argument("--calibration_batch_size", default=256, type=int)
+    calibration.add_argument("--calibration_seed", default=10, type=int)
+    calibration.add_argument("--tracker_confidence_warmup", default=15, type=int)
+    calibration.add_argument("--fabrik_iterations", default=2, type=int)
 
     tasks = parser.add_argument_group("tasks")
     tasks.add_argument("--skip_tasks", action="store_true")
@@ -109,6 +123,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--head_ref_joint_distance_loss_weight", default=1.0, type=float
     )
     train.add_argument("--head_to_root_xz_loss_weight", default=1.0, type=float)
+    train.add_argument("--hip_height_loss_weight", default=1.0, type=float)
     train.add_argument("--rotation_velocity_loss_weight", default=1.0, type=float)
     train.add_argument("--contact_loss_weight", default=0.1, type=float)
     train.add_argument("--contact_slide_loss_weight", default=0.1, type=float)
@@ -181,6 +196,8 @@ def build_stage_args(stage: str, args: argparse.Namespace) -> tuple[str, list[st
         return "data_converter.amass_to_realtime_pose", build_convert_args(args)
     if stage == "tasks":
         return "data_loaders.generate_realtime_pose_tasks", build_task_args(args)
+    if stage == "calibrate":
+        return "eval.calibrate_realtime_pose_ik", build_calibration_args(args)
     if stage == "normalizer":
         return "data_loaders.compute_realtime_pose_normalizer", build_normalizer_args(args)
     if stage == "train":
@@ -224,6 +241,21 @@ def build_normalizer_args(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def build_calibration_args(args: argparse.Namespace) -> list[str]:
+    """使用已经物化的 train task 生成训练和采样共享的 IK 参数。"""
+
+    return [
+        "--data_dir", normalize_path(args.task_dir),
+        "--split", args.calibration_split,
+        "--output", normalize_path(args.ik_calibration_path),
+        "--max_samples", str(args.calibration_max_samples),
+        "--batch_size", str(args.calibration_batch_size),
+        "--seed", str(args.calibration_seed),
+        "--tracker_confidence_warmup", str(args.tracker_confidence_warmup),
+        "--fabrik_iterations", str(args.fabrik_iterations),
+    ]
+
+
 def build_task_args(args: argparse.Namespace) -> list[str]:
     command = [
         "--source_dir", normalize_path(args.source_dir),
@@ -245,6 +277,9 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--data_dir", normalize_path(args.task_dir),
         "--data_split", "train",
         "--normalizer_dir", normalize_path(args.normalizer_dir),
+        "--ik_calibration_path", normalize_path(args.ik_calibration_path),
+        "--tracker_confidence_warmup", str(args.tracker_confidence_warmup),
+        "--fabrik_iterations", str(args.fabrik_iterations),
         "--save_dir", normalize_path(args.save_dir),
         "--run_name", args.run_name,
         "--batch_size", str(args.train_batch_size),
@@ -275,6 +310,7 @@ def build_train_args(args: argparse.Namespace) -> list[str]:
         "--head_ref_joint_distance_loss_weight",
         str(args.head_ref_joint_distance_loss_weight),
         "--head_to_root_xz_loss_weight", str(args.head_to_root_xz_loss_weight),
+        "--hip_height_loss_weight", str(args.hip_height_loss_weight),
         "--rotation_velocity_loss_weight", str(args.rotation_velocity_loss_weight),
         "--contact_loss_weight", str(args.contact_loss_weight),
         "--contact_slide_loss_weight", str(args.contact_slide_loss_weight),

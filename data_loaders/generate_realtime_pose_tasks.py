@@ -16,13 +16,14 @@ from data_loaders.realtime_pose_geometry import (
     build_head_path_window_np,
     build_pose_target_np,
     build_tracker_measurements_np,
+    extract_continuous_rotation_heading_np,
     extract_forward_yaw_np,
-    extract_rotation_heading_np,
 )
 from data_loaders.realtime_pose_kinematics import (
     SMPL_JOINT_NAMES,
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
+    derive_foot_contact_prob_2,
     rotation_6d_to_matrix_np,
 )
 from data_loaders.realtime_pose_task_store import (
@@ -342,7 +343,10 @@ def materialize_split(
     split_dir = output_dir / split_plan.split
     split_dir.mkdir(parents=True, exist_ok=False)
     source_lookup = {str(source["stablemotion_split_key"]): source for source in split_plan.sources}
-    source_cache: dict[str, tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]] = {}
+    source_cache: dict[
+        str,
+        tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray],
+    ] = {}
 
     fields = shard_fields()
     for shard_index, first in enumerate(range(0, len(split_plan.tasks), int(shard_size))):
@@ -372,13 +376,18 @@ def materialize_split(
                 joint_rotations = compute_source_joint_rotations_world(source)
                 tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
                 head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
-                cached = (source, joint_rotations, head_yaws)
+                root_yaws_world = extract_continuous_rotation_heading_np(
+                    joint_rotations[:, 0],
+                    initial_yaw=float(head_yaws[0]),
+                )
+                cached = (source, joint_rotations, head_yaws, root_yaws_world)
                 source_cache.clear()
                 source_cache[source_id] = cached
             row = build_task_bundle_row(
                 source=cached[0],
                 joint_rotations_world=cached[1],
                 head_yaws=cached[2],
+                root_yaws_world=cached[3],
                 start_frame=int(task["start_frame"]),
                 task_seed=int(task["task_seed"]),
                 config_plans=task["configs"],
@@ -472,6 +481,7 @@ def build_task_bundle_row(
     source: dict[str, np.ndarray],
     joint_rotations_world: np.ndarray,
     head_yaws: np.ndarray,
+    root_yaws_world: np.ndarray,
     start_frame: int,
     task_seed: int,
     config_plans: list[dict],
@@ -485,6 +495,11 @@ def build_task_bundle_row(
     )
     current_absolute = int(start_frame) + REALTIME_POSE_TARGET_START
     frame_count = int(joint_rotations_world.shape[0])
+    root_yaws = np.asarray(root_yaws_world, dtype=np.float32)
+    if root_yaws.shape != (frame_count,):
+        raise ValueError(
+            f"root_yaws_world 必须为 [{frame_count}]，实际为 {root_yaws.shape}"
+        )
     if current_absolute < 0 or current_absolute + REALTIME_POSE_TARGET_LENGTH > frame_count:
         raise ValueError(
             "Task 起点必须保证 current_absolute + 10 < frame_count；"
@@ -550,6 +565,14 @@ def build_task_bundle_row(
     root_head = yaw_inv @ (
         source["root_pos_world"][current_absolute].astype(np.float64) - origin
     )
+    contact_absolute = np.asarray(
+        [current_absolute - 1, current_absolute], dtype=np.int64
+    )
+    contact_probability = derive_foot_contact_prob_2(
+        stationary_prob_5=source["stationary_prob_5"][contact_absolute],
+        joints_world=source["joints_world"][contact_absolute],
+        floor_y=source["root_pos_world"][contact_absolute, 1],
+    )
     return {
         "history_pose_clean": history_pose.astype(np.float32),
         "pose_target_horizon_clean": pose_target_horizon.astype(np.float32),
@@ -559,22 +582,17 @@ def build_task_bundle_row(
         "measured_valid": states.measured_valid.astype(np.uint8),
         "target_joints_head_ref": target_joints_head,
         "target_root_position_head_ref": root_head.astype(np.float32),
-        # 评估比较 pelvis forward 朝向；source root_yaw 是 actor heading，语义不同。
-        "target_root_yaw_world": np.float32(
-            extract_rotation_heading_np(joint_rotations_world[current_absolute, 0])
-        ),
+        # 监督使用完整 Source 上因果展开的 pelvis Y-twist；source root_yaw 是
+        # actor heading，二者语义不同，不能在单个 task 内重新独立提取。
+        "target_root_yaw_world": np.float32(root_yaws[current_absolute]),
         "target_hip_height": np.float32(
             source["pelvis_height"][current_absolute, 0]
         ),
         "current_head_yaw_world": np.float32(current_head_yaw),
         "current_head_position_world": current_head_position,
         "floor_y": np.float32(floor_y),
-        "previous_contact_target": source["stationary_prob_5"][
-            current_absolute - 1, 1:3
-        ].astype(np.float32),
-        "contact_target": source["stationary_prob_5"][
-            current_absolute, 1:3
-        ].astype(np.float32),
+        "previous_contact_target": contact_probability[0],
+        "contact_target": contact_probability[1],
         "joint_offsets_parent": source["joint_offsets_parent"].astype(np.float32),
         "joint_rest_local_rotations_6d": source[
             "joint_rest_local_rotations_6d"

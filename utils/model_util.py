@@ -44,6 +44,7 @@ def create_gaussian_diffusion(args):
             args, "head_ref_joint_distance_loss_weight", 1.0
         ),
         head_to_root_xz_loss_weight=getattr(args, "head_to_root_xz_loss_weight", 1.0),
+        hip_height_loss_weight=getattr(args, "hip_height_loss_weight", 1.0),
         rotation_velocity_loss_weight=getattr(
             args, "rotation_velocity_loss_weight", 1.0
         ),

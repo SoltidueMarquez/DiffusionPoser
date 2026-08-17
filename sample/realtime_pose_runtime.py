@@ -17,7 +17,9 @@ from data_loaders.realtime_pose_geometry import (
     build_tracker_measurements_np,
     decode_target_head_rotations_np,
     extract_forward_yaw_np,
+    extract_rotation_heading_components_np,
     global_head_rotations_to_local_delta_6d_np,
+    ROOT_HEADING_OBSERVABILITY_EPS,
     resolve_root_head_reference_np,
 )
 from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
@@ -491,6 +493,11 @@ class RealtimePoseRuntime:
             prepared.floor_y,
             self.joint_offsets_parent,
             self.joint_rest_local_rotations_6d,
+            previous_root_yaw_world=(
+                None
+                if not self.pose_history
+                else self.pose_history[-1].root_yaw_world
+            ),
         )
         self._append_history_state(prepared, resolved.as_world_state())
         return RuntimeStepResult(
@@ -760,15 +767,39 @@ def decode_and_resolve_pose(
     floor_y: float,
     joint_offsets_parent: np.ndarray,
     joint_rest_local_rotations_6d: np.ndarray,
+    previous_root_yaw_world: float | None = None,
 ) -> ResolvedPose:
     """执行一次 Head-Anchored Resolver；Tracker 强度只由 inpainting 置信度控制。"""
 
     target = np.asarray(target_raw, dtype=np.float32).reshape(REALTIME_POSE_TARGET_DIM)
     tracker = np.asarray(current_tracker_raw, dtype=np.float32).reshape(TRACKER_COUNT, TRACKER_FEATURE_DIM)
-    rotations_head, root_yaw_head = decode_target_head_rotations_np(target)
+    rotations_head, measured_root_yaw_head = decode_target_head_rotations_np(target)
+    _, _, root_heading_observability = extract_rotation_heading_components_np(
+        rotations_head[0]
+    )
+    candidate_root_yaw_world = float(
+        current_head_yaw_world + float(measured_root_yaw_head)
+    )
+    if float(root_heading_observability) < ROOT_HEADING_OBSERVABILITY_EPS:
+        # 真正的 swing-twist 奇异点没有可观测 heading；在线时沿用历史，
+        # 首帧则令 pelvis 与当前 Head yaw 对齐。
+        root_yaw_world = (
+            float(current_head_yaw_world)
+            if previous_root_yaw_world is None
+            else float(previous_root_yaw_world)
+        )
+    elif previous_root_yaw_world is None:
+        root_yaw_world = candidate_root_yaw_world
+    else:
+        previous_yaw = float(previous_root_yaw_world)
+        wrapped_delta = (
+            candidate_root_yaw_world - previous_yaw + np.pi
+        ) % (2.0 * np.pi) - np.pi
+        root_yaw_world = previous_yaw + float(wrapped_delta)
+    root_yaw_head = root_yaw_world - float(current_head_yaw_world)
     root_head, hip_height, joints_head = resolve_root_head_reference_np(
         rotations_head,
-        float(root_yaw_head),
+        root_yaw_head,
         joint_offsets_parent,
         observed_head_height=float(tracker[HEAD_TRACKER_INDEX, 1]),
     )
@@ -791,7 +822,7 @@ def decode_and_resolve_pose(
         target_raw=target,
         joint_rotations_world=rotations_world.astype(np.float32),
         body_local_delta_6d=local_delta.astype(np.float32),
-        root_yaw_world=float(current_head_yaw_world + float(root_yaw_head)),
+        root_yaw_world=float(root_yaw_world),
         hip_height=float(hip_height),
         root_position_world=root_world.astype(np.float32),
         joints_world=joints_world.astype(np.float32),

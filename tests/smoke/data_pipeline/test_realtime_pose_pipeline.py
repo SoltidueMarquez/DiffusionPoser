@@ -57,6 +57,7 @@ def test_pipeline_passes_joint_horizon_training_args(tmp_path):
         "--history_noise_prob", "0.7",
         "--rotation_velocity_loss_weight", "1.5",
         "--contact_slide_loss_weight", "0.2",
+        "--hip_height_loss_weight", "0.7",
         "--scenario_weights", "5", "4", "3", "2", "1",
     )
     task_args = pipeline.build_task_args(args)
@@ -66,6 +67,29 @@ def test_pipeline_passes_joint_horizon_training_args(tmp_path):
     assert train_args[train_args.index("--history_noise_prob") + 1] == "0.7"
     assert train_args[train_args.index("--rotation_velocity_loss_weight") + 1] == "1.5"
     assert train_args[train_args.index("--contact_slide_loss_weight") + 1] == "0.2"
+    assert train_args[train_args.index("--hip_height_loss_weight") + 1] == "0.7"
+    assert train_args[train_args.index("--ik_calibration_path") + 1] == "output/ik_calibration.json"
     assert "--future_leg_loss_weight" not in train_args
     weights = train_args.index("--scenario_weights")
     assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]
+
+
+def test_pipeline_inserts_ik_calibration_between_tasks_and_normalizer(tmp_path):
+    args = _args(
+        tmp_path,
+        "--ik_calibration_path", str(tmp_path / "ik_calibration.json"),
+        "--calibration_max_samples", "123",
+        "--calibration_batch_size", "16",
+    )
+    assert pipeline.selected_stages("tasks", "normalizer") == (
+        "tasks",
+        "calibrate",
+        "normalizer",
+    )
+    module, calibration_args = pipeline.build_stage_args("calibrate", args)
+    assert module == "eval.calibrate_realtime_pose_ik"
+    assert calibration_args[calibration_args.index("--output") + 1] == str(
+        tmp_path / "ik_calibration.json"
+    )
+    assert calibration_args[calibration_args.index("--max_samples") + 1] == "123"
+    assert calibration_args[calibration_args.index("--batch_size") + 1] == "16"

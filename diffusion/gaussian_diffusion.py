@@ -144,6 +144,7 @@ class GaussianDiffusion:
         root_loss_weight=1.0,
         head_ref_joint_distance_loss_weight=1.0,
         head_to_root_xz_loss_weight=1.0,
+        hip_height_loss_weight=1.0,
         rotation_velocity_loss_weight=1.0,
         contact_loss_weight=0.1,
         contact_slide_loss_weight=0.1,
@@ -167,6 +168,7 @@ class GaussianDiffusion:
             head_ref_joint_distance_loss_weight
         )
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
+        self.hip_height_loss_weight = float(hip_height_loss_weight)
         self.rotation_velocity_loss_weight = float(rotation_velocity_loss_weight)
         self.contact_loss_weight = float(contact_loss_weight)
         self.contact_slide_loss_weight = float(contact_slide_loss_weight)
@@ -1596,6 +1598,7 @@ class GaussianDiffusion:
             + self.head_ref_joint_distance_loss_weight
             * terms["head_ref_joint_distance_loss"]
             + self.head_to_root_xz_loss_weight * terms["head_to_root_xz_loss"]
+            + self.hip_height_loss_weight * terms["hip_height_loss"]
             + self.rotation_velocity_loss_weight
             * terms["rotation_velocity_loss"]
             + self.contact_loss_weight * terms["contact_loss"]

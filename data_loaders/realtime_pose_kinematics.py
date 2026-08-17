@@ -42,6 +42,8 @@ SMPL_PARENTS = np.array(
     [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21],
     dtype=np.int64,
 )
+FOOT_CONTACT_FULL_HEIGHT_M = 0.05
+FOOT_CONTACT_NO_HEIGHT_M = 0.10
 TRACKER_JOINT_INDICES = np.array(
     [
         JOINT_INDEX["head"],
@@ -166,6 +168,63 @@ def derive_stationary_prob_5(
     smoothed_speed = median_filter_time(speed, window=int(median_window))
     stationary_prob = np.clip(1.0 - smoothed_speed / float(speed_full_motion), 0.0, 1.0)
     return stationary_prob.astype(np.float32)
+
+
+def derive_foot_contact_prob_2(
+    stationary_prob_5: np.ndarray,
+    joints_world: np.ndarray,
+    floor_y: np.ndarray | float,
+    height_full_contact: float = FOOT_CONTACT_FULL_HEIGHT_M,
+    height_no_contact: float = FOOT_CONTACT_NO_HEIGHT_M,
+) -> np.ndarray:
+    """用脚部静止概率与离地高度派生左右脚接触概率 ``[...,2]``。
+
+    脚高不超过 ``height_full_contact`` 时保留原静止概率，达到
+    ``height_no_contact`` 时将接触概率压到零，中间区间线性过渡。这样既排除
+    “悬空但静止”的脚，也避免硬高度阈值在边界处产生标签跳变。
+    """
+
+    stationary = np.asarray(stationary_prob_5, dtype=np.float64)
+    joints = np.asarray(joints_world, dtype=np.float64)
+    if stationary.ndim < 1 or stationary.shape[-1] != STATIONARY_PROB_DIM:
+        raise ValueError(
+            f"stationary_prob_5 最后一维必须为 {STATIONARY_PROB_DIM}，"
+            f"实际为 {stationary.shape}"
+        )
+    expected_joint_shape = (*stationary.shape[:-1], 24, 3)
+    if joints.shape != expected_joint_shape:
+        raise ValueError(
+            f"joints_world 应为 {expected_joint_shape}，实际为 {joints.shape}"
+        )
+
+    full_height = float(height_full_contact)
+    no_height = float(height_no_contact)
+    if not math.isfinite(full_height) or not math.isfinite(no_height):
+        raise ValueError("脚接触高度阈值必须为有限数。")
+    if no_height <= full_height:
+        raise ValueError("height_no_contact 必须大于 height_full_contact。")
+
+    leading_shape = stationary.shape[:-1]
+    try:
+        floor = np.broadcast_to(np.asarray(floor_y, dtype=np.float64), leading_shape)
+    except ValueError as exc:
+        raise ValueError(
+            f"floor_y 必须能广播到前导维 {leading_shape}，实际为 "
+            f"{np.asarray(floor_y).shape}"
+        ) from exc
+
+    foot_indices = np.asarray(
+        [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
+        dtype=np.int64,
+    )
+    foot_height = joints[..., foot_indices, 1] - floor[..., None]
+    height_probability = np.clip(
+        (no_height - foot_height) / (no_height - full_height),
+        0.0,
+        1.0,
+    )
+    foot_stationary = np.clip(stationary[..., 1:3], 0.0, 1.0)
+    return (foot_stationary * height_probability).astype(np.float32)
 
 
 def median_filter_time(values: np.ndarray, window: int) -> np.ndarray:

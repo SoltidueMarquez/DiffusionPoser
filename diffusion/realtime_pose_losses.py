@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from data_loaders.realtime_pose_geometry import (
     decode_target_head_rotations_torch,
+    extract_rotation_heading_components_torch,
+    ROOT_HEADING_OBSERVABILITY_EPS,
     resolve_root_head_reference_torch,
 )
 from data_loaders.realtime_pose_kinematics import (
@@ -23,6 +25,8 @@ from data_loaders.sensor_masking import (
 
 
 CONTACT_SLIDE_HUBER_BETA_MPS = 0.1
+ROOT_YAW_TOLERANCE_RADIANS = math.radians(15.0)
+ROOT_POSITION_TOLERANCE_METERS = 0.05
 
 
 def compute_raw_deployed_losses(
@@ -71,7 +75,7 @@ def compute_raw_deployed_losses(
 
     offsets = batch["joint_offsets_parent"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     tracker_pos = current_tracker[..., :3]
-    deployed_root_position, _, deployed_joints = resolve_root_head_reference_torch(
+    deployed_root_position, deployed_hip_height, deployed_joints = resolve_root_head_reference_torch(
         deployed_current_global,
         deployed_current_root_yaw,
         offsets,
@@ -98,16 +102,25 @@ def compute_raw_deployed_losses(
     target_root = batch["target_root_position_head_ref"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     current_head_yaw = batch["current_head_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     target_root_yaw = batch["target_root_yaw_world"].to(device=raw_pred.device, dtype=raw_pred.dtype)
-    root_yaw_error = torch.remainder(
-        deployed_current_root_yaw + current_head_yaw - target_root_yaw + math.pi,
-        2.0 * math.pi,
-    ) - math.pi
+    target_root_yaw_head = target_root_yaw - current_head_yaw
     # Actor Root 的 Y 固定在 floor；root_loss 只监督 yaw，避免与下面的
     # Head-to-Root 水平几何项重复惩罚同一个 XZ 偏移。
-    root_loss = root_yaw_error.square()
-    head_to_root_xz_loss = torch.square(
-        predicted_root[:, [0, 2]] - target_root[:, [0, 2]]
+    root_loss = _root_yaw_circular_loss(
+        deployed_current_global[:, JOINT_INDEX["pelvis"]],
+        target_root_yaw_head,
+    )
+    head_to_root_xz_loss = _scaled_huber_loss(
+        predicted_root[:, [0, 2]] - target_root[:, [0, 2]],
+        tolerance=ROOT_POSITION_TOLERANCE_METERS,
     ).mean(dim=-1)
+    target_hip_height = batch["target_hip_height"].to(
+        device=raw_pred.device,
+        dtype=raw_pred.dtype,
+    )
+    hip_height_loss = _scaled_huber_loss(
+        deployed_hip_height - target_hip_height,
+        tolerance=ROOT_POSITION_TOLERANCE_METERS,
+    )
 
     contact_weight = batch["contact_target"].to(
         device=raw_pred.device, dtype=raw_pred.dtype
@@ -178,6 +191,7 @@ def compute_raw_deployed_losses(
         "root_loss": root_loss,
         "head_ref_joint_distance_loss": head_ref_joint_distance_loss,
         "head_to_root_xz_loss": head_to_root_xz_loss,
+        "hip_height_loss": hip_height_loss,
         "contact_loss": contact_loss,
         "contact_slide_loss": contact_slide_loss,
     }
@@ -236,6 +250,48 @@ def _radial_huber_loss(distance: torch.Tensor, beta: float) -> torch.Tensor:
         distance < beta_tensor,
         0.5 * distance.square() / beta_tensor,
         distance - 0.5 * beta_tensor,
+    )
+
+
+def _scaled_huber_loss(error: torch.Tensor, tolerance: float) -> torch.Tensor:
+    """把物理误差按容差无量纲化，再应用 `beta=1` 的 Huber。"""
+
+    scale = float(tolerance)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Huber 物理容差必须是有限正数。")
+    normalized_error = error / scale
+    return F.smooth_l1_loss(
+        normalized_error,
+        torch.zeros_like(normalized_error),
+        beta=1.0,
+        reduction="none",
+    )
+
+
+def _root_yaw_circular_loss(
+    pelvis_rotation: torch.Tensor,
+    target_yaw: torch.Tensor,
+) -> torch.Tensor:
+    """用二维 heading 比较 yaw，天然跨越 `-pi/pi` 数值边界。"""
+
+    cosine_scale, sine_scale, _ = extract_rotation_heading_components_torch(
+        pelvis_rotation
+    )
+    predicted_heading = F.normalize(
+        torch.stack((cosine_scale, sine_scale), dim=-1),
+        dim=-1,
+        eps=ROOT_HEADING_OBSERVABILITY_EPS,
+    )
+    target_heading = torch.stack(
+        (torch.cos(target_yaw), torch.sin(target_yaw)),
+        dim=-1,
+    )
+    heading_similarity = (predicted_heading * target_heading).sum(dim=-1).clamp(
+        -1.0,
+        1.0,
+    )
+    return (1.0 - heading_similarity) / (
+        1.0 - math.cos(ROOT_YAW_TOLERANCE_RADIANS)
     )
 
 

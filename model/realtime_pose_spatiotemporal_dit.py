@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,7 +15,9 @@ from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
     CURRENT_JOINT_CONDITION_DIM,
     REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+    REALTIME_POSE_FPS,
     REALTIME_POSE_HISTORY_ANCHOR_COUNT,
+    REALTIME_POSE_HISTORY_FRAME_OFFSETS,
     REALTIME_POSE_MODEL_TOKEN_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     REALTIME_POSE_TARGET_LENGTH,
@@ -22,6 +25,14 @@ from data_loaders.sensor_masking import (
     SMPL_JOINT_COUNT,
 )
 from model.timestep_embedding import SinusoidalTimestepEmbedding
+
+
+HEAD_MOTION_FEATURE_DIM = 14
+HEAD_MOTION_ANCHOR_OFFSETS = (-1, -8, -60)
+HEAD_MOTION_ANCHOR_INDICES = tuple(
+    REALTIME_POSE_HISTORY_FRAME_OFFSETS.index(offset)
+    for offset in HEAD_MOTION_ANCHOR_OFFSETS
+)
 
 
 @dataclass
@@ -37,6 +48,92 @@ def _modulate(
     scale: torch.Tensor,
 ) -> torch.Tensor:
     return value * (1.0 + scale[:, None]) + shift[:, None]
+
+
+def build_head_motion_summary(
+    head_path_window: torch.Tensor,
+    window_valid_mask: torch.Tensor,
+    frame_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """从稀疏 Head 路径构造 `[B,14]` 多尺度运动摘要。
+
+    `head_path_window` 的布局为 `[x,z,height,sin(yaw),cos(yaw)]`。XZ 与高度
+    已做仿射归一化，因此差分会自动消除均值；再除以真实秒数后，仍保留
+    速度方向与各尺度间的物理比例，只差一个由原 normalizer 决定的固定尺度。
+    """
+
+    if head_path_window.ndim != 3 or tuple(head_path_window.shape[1:]) != (
+        REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+        5,
+    ):
+        raise ValueError("head_path_window 必须为 [B,11,5]。")
+    batch_size = head_path_window.shape[0]
+    if tuple(window_valid_mask.shape) != (
+        batch_size,
+        REALTIME_POSE_CONDITION_WINDOW_LENGTH,
+    ):
+        raise ValueError("window_valid_mask 必须为 [B,11]。")
+    if frame_offsets.ndim == 1:
+        frame_offsets = frame_offsets[None].expand(batch_size, -1)
+    if tuple(frame_offsets.shape) != (batch_size, REALTIME_POSE_MODEL_TOKEN_LENGTH):
+        raise ValueError("frame_offsets 必须为 [21] 或 [B,21]。")
+
+    condition_offsets = frame_offsets[:, :REALTIME_POSE_CONDITION_WINDOW_LENGTH]
+    current_index = REALTIME_POSE_CONDITION_WINDOW_LENGTH - 1
+    expected_offsets = (*HEAD_MOTION_ANCHOR_OFFSETS, 0)
+    actual_offsets = torch.stack(
+        [
+            condition_offsets[:, anchor_index]
+            for anchor_index in HEAD_MOTION_ANCHOR_INDICES
+        ]
+        + [condition_offsets[:, current_index]],
+        dim=-1,
+    )
+    expected = actual_offsets.new_tensor(expected_offsets)[None].expand_as(actual_offsets)
+    if not bool(torch.equal(actual_offsets, expected)):
+        raise ValueError("Head 运动摘要要求 frame_offsets 包含固定的 -1/-8/-60/0 锚点。")
+
+    current = head_path_window[:, current_index]
+    anchors = head_path_window[:, HEAD_MOTION_ANCHOR_INDICES]
+    scale_valid = (
+        window_valid_mask[:, current_index, None]
+        & window_valid_mask[:, HEAD_MOTION_ANCHOR_INDICES]
+    )
+    scale_weight = scale_valid.to(dtype=head_path_window.dtype)
+    delta_seconds = (
+        condition_offsets[:, current_index, None]
+        - condition_offsets[:, HEAD_MOTION_ANCHOR_INDICES]
+    ).to(dtype=head_path_window.dtype) / float(REALTIME_POSE_FPS)
+
+    # `[B,3,2]` 依次对应 1/8/60 帧尺度；无效历史必须在进入 adapter 前清零。
+    horizontal_velocity = (
+        current[:, None, :2] - anchors[:, :, :2]
+    ) / delta_seconds[..., None]
+    vertical_velocity = (current[:, None, 2] - anchors[:, :, 2]) / delta_seconds
+
+    current_sin = current[:, None, 3]
+    current_cos = current[:, None, 4]
+    anchor_sin = anchors[:, :, 3]
+    anchor_cos = anchors[:, :, 4]
+    sin_delta = current_sin * anchor_cos - current_cos * anchor_sin
+    cos_delta = current_cos * anchor_cos + current_sin * anchor_sin
+    yaw_rate = torch.atan2(sin_delta, cos_delta) / delta_seconds / math.pi
+
+    horizontal_velocity = horizontal_velocity * scale_weight[..., None]
+    vertical_velocity = vertical_velocity * scale_weight
+    yaw_rate = yaw_rate * scale_weight
+    return torch.cat(
+        [
+            horizontal_velocity[:, 0],
+            horizontal_velocity[:, 1],
+            horizontal_velocity[:, 2],
+            yaw_rate[:, 1:3],
+            current[:, 2:3],
+            vertical_velocity[:, 1:3],
+            scale_weight,
+        ],
+        dim=-1,
+    )
 
 
 class SpatioTemporalDiTBlock(nn.Module):
@@ -179,6 +276,11 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         self.head_path_encoder = nn.Sequential(
             nn.Linear(5, latent_dim), nn.SiLU(), nn.Linear(latent_dim, latent_dim)
         )
+        # Head 的完整轨迹仍走原路径；这里只把可解释的速度/高度摘要直达 pelvis。
+        self.pelvis_head_motion_input = nn.Linear(
+            HEAD_MOTION_FEATURE_DIM,
+            latent_dim,
+        )
         self.joint_identity = nn.Embedding(SMPL_JOINT_COUNT, latent_dim)
         self.region_identity = nn.Embedding(5, latent_dim)
         self.diffusion_time_embedding = SinusoidalTimestepEmbedding(latent_dim)
@@ -277,6 +379,18 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             ],
             dim=1,
         )
+        if frame_offsets.ndim == 1:
+            frame_offsets = frame_offsets[None].expand(batch_size, -1)
+        if tuple(frame_offsets.shape) != (
+            batch_size,
+            REALTIME_POSE_MODEL_TOKEN_LENGTH,
+        ):
+            raise ValueError("frame_offsets 必须为 [21] 或 [B,21]。")
+        head_motion_summary = build_head_motion_summary(
+            head_path_window,
+            window_valid_mask,
+            frame_offsets,
+        )
         head_tokens = self.head_path_encoder(head_path_window)
         head_multiplier = self.head_path_multipliers.index_select(
             0, self.joint_regions
@@ -298,13 +412,6 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
             dim=1,
         )
 
-        if frame_offsets.ndim == 1:
-            frame_offsets = frame_offsets[None].expand(batch_size, -1)
-        if tuple(frame_offsets.shape) != (
-            batch_size,
-            REALTIME_POSE_MODEL_TOKEN_LENGTH,
-        ):
-            raise ValueError("frame_offsets 必须为 [21] 或 [B,21]。")
         offset_tokens = self.frame_offset_embedding(frame_offsets.reshape(-1)).reshape(
             batch_size, REALTIME_POSE_MODEL_TOKEN_LENGTH, self.latent_dim
         )
@@ -315,6 +422,11 @@ class RealtimePoseSpatioTemporalDiT(nn.Module):
         static_condition[:, current_index] = (
             static_condition[:, current_index]
             + self.current_joint_condition_input(current_joint_condition)
+        )
+        pelvis_index = JOINT_INDEX["pelvis"]
+        static_condition[:, current_index, pelvis_index] = (
+            static_condition[:, current_index, pelvis_index]
+            + self.pelvis_head_motion_input(head_motion_summary)
         )
         target_valid = torch.ones(
             batch_size,

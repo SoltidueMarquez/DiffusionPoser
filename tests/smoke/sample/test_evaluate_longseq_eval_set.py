@@ -137,9 +137,11 @@ def test_longseq_has_no_projected_ddim_ablation_arguments():
             return super().projected_ddim_sample_loop(*args, **kwargs)
 
     source = build_toy_realtime_source(frame_count=1)
+    source["stationary_prob_5"][0, 1:3] = 1.0
+    source["joints_world"][0, 10:12, 1] = [0.20, 0.025]
     configured = np.ones((1, 6), dtype=bool)
     diffusion = RecordingDiffusion()
-    longseq.rollout_long_sequence_source(
+    payload = longseq.rollout_long_sequence_source(
         _RecordingModel(),
         diffusion,
         source,
@@ -149,6 +151,7 @@ def test_longseq_has_no_projected_ddim_ablation_arguments():
     )
     assert "projection_mode" not in diffusion.calls[-1]
     assert "late_steps" not in diffusion.calls[-1]
+    np.testing.assert_allclose(payload["contact_target"][0, 0], [0.0, 1.0])
 
 
 def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
@@ -195,8 +198,9 @@ def test_longseq_runtime_cold_starts_and_emits_new_eval_contract(tmp_path):
     )
     assert np.isnan(payload["reference_pose_horizon_raw"][0, -1, 1:]).all()
     assert "current_trajectory" not in payload
-    reference_pelvis_yaw = longseq.extract_rotation_heading_np(
-        longseq.compute_source_joint_rotations_world(source)[:, 0]
+    reference_pelvis_yaw = longseq._continuous_source_root_yaws(
+        source,
+        longseq.compute_source_joint_rotations_world(source),
     )
     np.testing.assert_allclose(
         payload["reference_root_yaw_world"][0],

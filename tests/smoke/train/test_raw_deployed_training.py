@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -9,7 +11,11 @@ from data_loaders.generate_realtime_pose_tasks import (
     build_task_bundle_row,
     compute_source_joint_rotations_world,
 )
-from data_loaders.realtime_pose_geometry import assemble_tracker_features_np, extract_forward_yaw_np
+from data_loaders.realtime_pose_geometry import (
+    assemble_tracker_features_np,
+    extract_continuous_rotation_heading_np,
+    extract_forward_yaw_np,
+)
 from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_np,
     rotation_6d_to_matrix_torch,
@@ -34,7 +40,9 @@ from diffusion.realtime_pose_losses import (
     _adjacent_contact_weight,
     _contact_slide_loss,
     _radial_huber_loss,
+    _root_yaw_circular_loss,
     _rotation_angle,
+    _scaled_huber_loss,
     compute_raw_deployed_losses,
 )
 from diffusion.realtime_pose_inpainting import (
@@ -102,6 +110,39 @@ def test_tracker_position_radial_huber_values_and_gradients():
         _radial_huber_loss(torch.tensor([0.1]), beta=0.0)
 
 
+def test_root_physical_huber_and_circular_yaw_have_interpretable_scales():
+    error = torch.tensor([0.0, 0.05, 0.10])
+    torch.testing.assert_close(
+        _scaled_huber_loss(error, tolerance=0.05),
+        torch.tensor([0.0, 0.5, 1.5]),
+    )
+
+    yaw = math.radians(179.0)
+    rotation = torch.tensor(
+        [
+            [math.cos(yaw), 0.0, math.sin(yaw)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(yaw), 0.0, math.cos(yaw)],
+        ],
+        requires_grad=True,
+    )
+    loss = _root_yaw_circular_loss(
+        rotation.unsqueeze(0),
+        torch.tensor([math.radians(-179.0)]),
+    )
+    expected = (1.0 - math.cos(math.radians(2.0))) / (
+        1.0 - math.cos(math.radians(15.0))
+    )
+    assert loss.item() == pytest.approx(expected, abs=1e-6)
+    loss.sum().backward()
+    assert rotation.grad is not None and torch.isfinite(rotation.grad).all()
+
+    singular = torch.diag(torch.tensor([1.0, -1.0, -1.0])).requires_grad_(True)
+    singular_loss = _root_yaw_circular_loss(singular.unsqueeze(0), torch.zeros(1))
+    singular_loss.sum().backward()
+    assert singular.grad is not None and torch.isfinite(singular.grad).all()
+
+
 def test_contact_slide_loss_uses_soft_contact_and_previous_valid_mask():
     previous = torch.zeros(1, 2, 3)
     predicted = previous.clone()
@@ -156,10 +197,15 @@ def _training_batch() -> dict[str, torch.Tensor]:
     head_yaws = extract_forward_yaw_np(
         rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])[:, 0]
     )
+    root_yaws = extract_continuous_rotation_heading_np(
+        joint_rotations[:, 0],
+        initial_yaw=float(head_yaws[0]),
+    )
     row = build_task_bundle_row(
         source,
         joint_rotations,
         head_yaws,
+        root_yaws,
         0,
         0,
         build_task_config_plan("raw-deployed", 10, 1),
@@ -200,6 +246,7 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "joint_rest_local_rotations_6d": source["joint_rest_local_rotations_6d"],
         "target_root_position_head_ref": row["target_root_position_head_ref"],
         "target_root_yaw_world": row["target_root_yaw_world"],
+        "target_hip_height": row["target_hip_height"],
         "current_head_yaw_world": row["current_head_yaw_world"],
         "previous_contact_target": row["previous_contact_target"],
         "contact_target": row["contact_target"],
@@ -578,7 +625,50 @@ def test_future_only_rotation_changes_horizon_losses_but_not_current_losses():
         "head_ref_joint_distance_loss",
         "root_loss",
         "head_to_root_xz_loss",
+        "hip_height_loss",
         "contact_loss",
         "contact_slide_loss",
     ):
         torch.testing.assert_close(future_error[name], exact[name])
+
+
+def test_root_yaw_xz_and_height_targets_only_change_their_own_losses():
+    batch = _training_batch()
+    batch["previous_pose_target"] = batch["history_pose_observation"][:, -1]
+    target = batch["x"].float()
+    auxiliary = {"contact_logits": torch.zeros(1, 2)}
+
+    def losses(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return compute_raw_deployed_losses(
+            target,
+            target,
+            target,
+            values,
+            auxiliary,
+            tracker_pos_huber_beta=0.05,
+        )
+
+    exact = losses(batch)
+    yaw_batch = {name: value.clone() for name, value in batch.items()}
+    yaw_batch["target_root_yaw_world"] += math.radians(10.0)
+    xz_batch = {name: value.clone() for name, value in batch.items()}
+    xz_batch["target_root_position_head_ref"][:, 0] += 0.05
+    height_batch = {name: value.clone() for name, value in batch.items()}
+    height_batch["target_hip_height"] += 0.05
+
+    yaw = losses(yaw_batch)
+    xz = losses(xz_batch)
+    height = losses(height_batch)
+
+    assert yaw["root_loss"].item() > exact["root_loss"].item()
+    torch.testing.assert_close(yaw["head_to_root_xz_loss"], exact["head_to_root_xz_loss"])
+    torch.testing.assert_close(yaw["hip_height_loss"], exact["hip_height_loss"])
+    assert xz["head_to_root_xz_loss"].item() > exact["head_to_root_xz_loss"].item()
+    torch.testing.assert_close(xz["root_loss"], exact["root_loss"])
+    torch.testing.assert_close(xz["hip_height_loss"], exact["hip_height_loss"])
+    assert height["hip_height_loss"].item() > exact["hip_height_loss"].item()
+    torch.testing.assert_close(height["root_loss"], exact["root_loss"])
+    torch.testing.assert_close(
+        height["head_to_root_xz_loss"],
+        exact["head_to_root_xz_loss"],
+    )
