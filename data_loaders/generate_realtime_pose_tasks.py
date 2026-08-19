@@ -25,7 +25,6 @@ from data_loaders.realtime_pose_kinematics import (
     SMPL_JOINT_NAMES,
     SMPL_PARENTS,
     TRACKER_JOINT_INDICES,
-    derive_foot_contact_prob_2,
     rotation_6d_to_matrix_np,
 )
 from data_loaders.realtime_pose_predictor_features import build_predictor_step_features_np
@@ -371,10 +370,6 @@ def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
             (REALTIME_POSE_TARGET_DIM,),
             np.dtype("float32"),
         ),
-        "previous_head_position_current_ref": (
-            (3,),
-            np.dtype("float32"),
-        ),
         "target_joints_head_ref": ((24, 3), np.dtype("float32")),
         "target_root_position_head_ref": ((3,), np.dtype("float32")),
         "target_root_yaw_world": ((), np.dtype("float32")),
@@ -382,8 +377,6 @@ def shard_fields() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "current_head_yaw_world": ((), np.dtype("float32")),
         "current_head_position_world": ((3,), np.dtype("float32")),
         "floor_y": ((), np.dtype("float32")),
-        "previous_contact_target": ((2,), np.dtype("float32")),
-        "contact_target": ((2,), np.dtype("float32")),
         "joint_offsets_parent": ((24, 3), np.dtype("float32")),
         "joint_rest_local_rotations_6d": ((24, 6), np.dtype("float32")),
         "task_seed": ((), np.dtype("uint64")),
@@ -440,14 +433,6 @@ def build_task_bundle_row(
         floor_y,
         current_head_yaw,
     )[0]
-    previous_head = build_tracker_measurements_np(
-        source["tracker_pos_world"][current - 1 : current],
-        source["tracker_rot_world_6d"][current - 1 : current],
-        current_head_position,
-        floor_y,
-        current_head_yaw,
-    )[0, 0, :3]
-
     cos_yaw = np.cos(current_head_yaw)
     sin_yaw = np.sin(current_head_yaw)
     yaw_inverse = np.asarray(
@@ -470,11 +455,6 @@ def build_task_bundle_row(
     target_root_head = yaw_inverse @ (
         source["root_pos_world"][current].astype(np.float64) - origin
     )
-    contacts = derive_foot_contact_prob_2(
-        stationary_prob_5=source["stationary_prob_5"][[current - 1, current]],
-        joints_world=source["joints_world"][[current - 1, current]],
-        floor_y=source["root_pos_world"][[current - 1, current], 1],
-    )
     return {
         "motion_context_clean": predictor_features.motion_context.astype(np.float32),
         "core_tracker_context_clean": predictor_features.core_tracker_context.astype(
@@ -483,7 +463,6 @@ def build_task_bundle_row(
         "current_pose_target_clean": current_pose.astype(np.float32),
         "current_tracker_continuous": current_tracker.astype(np.float32),
         "previous_pose_target_clean": previous_pose.astype(np.float32),
-        "previous_head_position_current_ref": previous_head.astype(np.float32),
         "target_joints_head_ref": target_joints_head,
         "target_root_position_head_ref": target_root_head.astype(np.float32),
         "target_root_yaw_world": np.float32(root_yaws_world[current]),
@@ -491,8 +470,6 @@ def build_task_bundle_row(
         "current_head_yaw_world": np.float32(current_head_yaw),
         "current_head_position_world": current_head_position,
         "floor_y": np.float32(floor_y),
-        "previous_contact_target": contacts[0],
-        "contact_target": contacts[1],
         "joint_offsets_parent": source["joint_offsets_parent"].astype(np.float32),
         "joint_rest_local_rotations_6d": source[
             "joint_rest_local_rotations_6d"

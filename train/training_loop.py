@@ -9,7 +9,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 
 from data_loaders.realtime_pose_config import IKInpaintingConfig
-from diffusion.realtime_pose_inpainting import build_current_realtime_pose_conditions
+from diffusion.realtime_pose_inpainting import (
+    build_current_realtime_pose_conditions,
+    gate_realtime_pose_residual,
+)
 from utils.model_util import load_realtime_pose_predictor
 from utils.normalizer import RealtimePoseNormalizer
 from utils.training_precision import TrainingPrecision
@@ -40,21 +43,25 @@ class TrainLoop:
         self.pose_scale = (
             None if self.normalizer.disable else self.normalizer.pose_scale.to(self.device)
         )
-        self.tracker_position_mean = (
+        self.tracker_mean = (
             None
             if self.normalizer.disable
-            else self.normalizer.tracker_mean[:, :3].to(self.device)
+            else self.normalizer.tracker_mean.to(self.device)
         )
-        self.tracker_position_scale = (
+        self.tracker_scale = (
             None
             if self.normalizer.disable
-            else (self.normalizer.tracker_std[:, :3] + self.normalizer.eps).to(self.device)
+            else (self.normalizer.tracker_std + self.normalizer.eps).to(self.device)
         )
         self.ik_config = IKInpaintingConfig(
             fabrik_iterations=int(args.fabrik_iterations),
             direction_only_quality=args.ik_direction_only_quality,
             residual_scale=args.ik_residual_scale,
             position_solved_quality=args.ik_position_solved_quality,
+            gap_low=args.ik_gap_low,
+            gap_high=args.ik_gap_high,
+            direction_support=args.ik_direction_support,
+            untracked_strength=args.ik_untracked_strength,
         ).validate()
         self.predictor = load_realtime_pose_predictor(
             args.predictor_model_path, self.device
@@ -157,15 +164,15 @@ class TrainLoop:
                 motion_context, batch["core_tracker_context"]
             )
         initial_pose_raw = self._inverse_pose(predictor_pose_horizon[:, 0])
-        _, inpaint_condition, current_joint_condition = (
+        _, ik_condition, tracker_geometry = (
             build_current_realtime_pose_conditions(
                 initial_pose_raw=initial_pose_raw,
                 current_tracker_raw=batch["current_tracker_raw"],
                 joint_offsets_parent=batch["joint_offsets_parent"],
                 pose_mean=self.pose_mean,
                 pose_scale=self.pose_scale,
-                tracker_position_mean=self.tracker_position_mean,
-                tracker_position_scale=self.tracker_position_scale,
+                tracker_mean=self.tracker_mean,
+                tracker_scale=self.tracker_scale,
                 config=self.ik_config,
             )
         )
@@ -182,9 +189,20 @@ class TrainLoop:
         model_kwargs = {
             "motion_context": motion_context,
             "predictor_pose_horizon": predictor_pose_horizon,
-            "current_joint_condition": current_joint_condition,
+            "tracker_geometry": tracker_geometry,
+            "tracker_available": batch["tracker_available"].bool(),
+            "ik_residual": ik_condition.ik_residual,
+            "ik_gap": ik_condition.ik_gap,
+            "ik_confidence": ik_condition.ik_confidence,
+            "denoise_strength": ik_condition.denoise_strength,
+            "constraint_type": ik_condition.constraint_type,
             "y": loss_batch,
         }
+        predictor_current = predictor_pose_horizon[:, 0]
+        diffusion_target = gate_realtime_pose_residual(
+            batch["x"] - predictor_current,
+            ik_condition.denoise_strength,
+        )
         model = self.model if model_override is None else model_override
         # diffusion 只看到 FP32 输出，BF16 的数值边界严格限制在 DiT forward。
         def model_forward(*model_args, **model_kwargs):
@@ -194,10 +212,10 @@ class TrainLoop:
 
         return self.diffusion.training_losses(
             model_forward,
-            batch["x"],
+            diffusion_target,
             timestep,
             model_kwargs=model_kwargs,
-            inpaint_condition=inpaint_condition,
+            predictor_current=predictor_current,
             feature_w=self.feature_w,
             snr_gamma=float(self.args.snr_gamma),
             use_l1=bool(self.args.l1_loss),

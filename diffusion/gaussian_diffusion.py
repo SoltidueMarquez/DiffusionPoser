@@ -19,10 +19,6 @@ from data_loaders.sensor_masking import (
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
 from diffusion.realtime_pose_losses import compute_raw_deployed_losses
-from diffusion.realtime_pose_inpainting import (
-    apply_realtime_pose_inpainting,
-    validate_realtime_pose_inpainting_condition,
-)
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 
 
@@ -144,8 +140,6 @@ class GaussianDiffusion:
         head_to_root_xz_loss_weight=1.0,
         hip_height_loss_weight=1.0,
         rotation_velocity_loss_weight=1.0,
-        contact_loss_weight=0.0,
-        contact_slide_loss_weight=0.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -168,8 +162,6 @@ class GaussianDiffusion:
         self.head_to_root_xz_loss_weight = float(head_to_root_xz_loss_weight)
         self.hip_height_loss_weight = float(hip_height_loss_weight)
         self.rotation_velocity_loss_weight = float(rotation_velocity_loss_weight)
-        self.contact_loss_weight = float(contact_loss_weight)
-        self.contact_slide_loss_weight = float(contact_slide_loss_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -848,67 +840,55 @@ class GaussianDiffusion:
         x,
         t,
         projection_fn,
+        predictor_current,
+        is_final_step: bool,
         clip_denoised=False,
         model_kwargs=None,
         eta=0.0,
-        inpaint_condition=None,
     ):
-        """在模型前注入 IK 条件，并用最终 deployed x0 重算 epsilon。"""
+        """在 residual 空间执行一步 DDIM，最终步投影恢复后的绝对姿态。"""
 
         if model_kwargs is None:
             model_kwargs = {}
-        x_model = x
-        if inpaint_condition is not None:
-            x_model, _ = apply_realtime_pose_inpainting(
-                x_t=x,
-                t=t,
-                condition=inpaint_condition,
-                alphas_cumprod=self.alphas_cumprod,
-            )
-        step_model_kwargs = dict(model_kwargs)
-        if bool(torch.all(t == 0)):
-            step_model_kwargs["return_aux_outputs"] = True
         out = self.p_mean_variance(
             model,
-            x_model,
+            x,
             t,
             clip_denoised=clip_denoised,
-            model_kwargs=step_model_kwargs,
+            model_kwargs=model_kwargs,
         )
-        raw_pred_xstart = out["pred_xstart"]
-        # 置信度只通过 inpainting 生效；最终步额外执行一次 Tracker hard projection。
-        should_project = t == 0
-        if bool(should_project.any()):
-            projected = projection_fn(raw_pred_xstart)
-            selector = should_project.view(-1, *([1] * (x.ndim - 1)))
-            deployed_pred_xstart = torch.where(selector, projected, raw_pred_xstart)
+        raw_pred_residual = out["pred_xstart"]
+        raw_pred_pose = predictor_current + raw_pred_residual
+        # 门控已经包含在模型输出中；最终步只负责 SO(3) 与直接 Tracker 投影。
+        if is_final_step:
+            deployed_pred_pose = projection_fn(raw_pred_pose)
         else:
-            # 早期步骤保持 raw x0，禁止提前覆盖 hard Tracker。
-            deployed_pred_xstart = raw_pred_xstart
-        eps = self._predict_eps_from_xstart(x_model, t, deployed_pred_xstart)
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x_model.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x_model.shape)
+            deployed_pred_pose = raw_pred_pose
+        deployed_pred_residual = deployed_pred_pose - predictor_current
+        eps = self._predict_eps_from_xstart(x, t, deployed_pred_residual)
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         sigma = (
             eta
             * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
             * th.sqrt(1 - alpha_bar / alpha_bar_prev)
         )
         mean_pred = (
-            deployed_pred_xstart * th.sqrt(alpha_bar_prev)
+            deployed_pred_residual * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
         )
         nonzero_mask = (t != 0).float().view(-1, *([1] * (x.ndim - 1)))
         sample = mean_pred + nonzero_mask * sigma * th.randn_like(x)
         # 最终步无条件返回 deployed pose，保证 late/final ablation 也遵守部署契约。
-        sample = torch.where(nonzero_mask.bool(), sample, deployed_pred_xstart)
+        sample = torch.where(nonzero_mask.bool(), sample, deployed_pred_residual)
         result = {
             "sample": sample,
-            "pred_xstart": deployed_pred_xstart,
-            "raw_pred_xstart": raw_pred_xstart,
-            "deployed_pred_xstart": deployed_pred_xstart,
+            "pred_xstart": deployed_pred_residual,
+            "raw_pred_residual": raw_pred_residual,
+            "deployed_pred_residual": deployed_pred_residual,
+            "raw_pred_pose": raw_pred_pose,
+            "deployed_pred_pose": deployed_pred_pose,
         }
-        if "auxiliary_outputs" in out:
-            result["auxiliary_outputs"] = out["auxiliary_outputs"]
         return result
 
     def projected_ddim_sample_loop(
@@ -916,21 +896,22 @@ class GaussianDiffusion:
         model,
         shape,
         projection_fn,
+        predictor_current,
         noise=None,
         clip_denoised=False,
         model_kwargs=None,
         device=None,
         eta=0.0,
         progress=False,
-        inpaint_condition=None,
     ):
-        """执行完整 IK-Inpainting DDIM，并保留最终 raw/deployed x0。"""
+        """执行完整 residual DDIM，并保留最终 residual 与绝对姿态。"""
 
         if device is None:
             device = next(model.parameters()).device
+        if tuple(predictor_current.shape) != tuple(shape):
+            raise ValueError("predictor_current 必须与 residual diffusion shape 相同。")
+        predictor_current = predictor_current.to(device=device, dtype=torch.float32)
         image = noise if noise is not None else th.randn(*shape, device=device)
-        if inpaint_condition is not None:
-            validate_realtime_pose_inpainting_condition(inpaint_condition)
         indices = list(range(self.num_timesteps))[::-1]
         if progress:
             from tqdm.auto import tqdm
@@ -945,10 +926,11 @@ class GaussianDiffusion:
                     image,
                     timestep,
                     projection_fn=projection_fn,
+                    predictor_current=predictor_current,
+                    is_final_step=index == 0,
                     clip_denoised=clip_denoised,
                     model_kwargs=model_kwargs,
                     eta=eta,
-                    inpaint_condition=inpaint_condition,
                 )
             image = final["sample"]
         if final is None:
@@ -1102,7 +1084,7 @@ class GaussianDiffusion:
         """
         if dump_steps is not None:
             raise NotImplementedError()
-        if const_noise == True:
+        if const_noise:
             raise NotImplementedError()
 
         final = None
@@ -1238,7 +1220,6 @@ class GaussianDiffusion:
             eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
             return eps, out, out_orig
 
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         eps, out, out_orig = get_model_output(x, t)
 
@@ -1439,7 +1420,7 @@ class GaussianDiffusion:
         t,
         model_kwargs=None,
         noise=None,
-        inpaint_condition=None,
+        predictor_current=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
@@ -1455,7 +1436,7 @@ class GaussianDiffusion:
             t=t,
             model_kwargs=model_kwargs,
             noise=noise,
-            inpaint_condition=inpaint_condition,
+            predictor_current=predictor_current,
             feature_w=feature_w,
             snr_gamma=snr_gamma,
             use_l1=use_l1,
@@ -1469,54 +1450,39 @@ class GaussianDiffusion:
         t,
         model_kwargs,
         noise=None,
-        inpaint_condition=None,
+        predictor_current=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """只对当前 144D Pose 加噪，并显式分离 raw/deployed x0 路径。"""
+        """只对门控 Predictor residual 加噪，并恢复绝对姿态计算辅助损失。"""
 
         if x_start.ndim != 2 or x_start.shape[1] != REALTIME_POSE_TARGET_DIM:
-            raise ValueError("RealtimePose diffusion target 必须为 [B,144]。")
+            raise ValueError("RealtimePose residual diffusion target 必须为 [B,144]。")
+        if self.model_mean_type != ModelMeanType.START_X:
+            raise ValueError("Predictor residual diffusion 固定要求 predict_xstart=True。")
+        if predictor_current is None or tuple(predictor_current.shape) != tuple(
+            x_start.shape
+        ):
+            raise ValueError("训练必须提供与 residual 同形的 predictor_current。")
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
-        if inpaint_condition is None:
-            x_model = x_t
-        else:
-            validate_realtime_pose_inpainting_condition(inpaint_condition)
-            x_model, _ = apply_realtime_pose_inpainting(
-                x_t=x_t,
-                t=t,
-                condition=inpaint_condition,
-                alphas_cumprod=self.alphas_cumprod,
-            )
         batch = model_kwargs.get("y", model_kwargs)
-        call_kwargs = dict(model_kwargs)
-        call_kwargs["return_aux_outputs"] = True
-        model_result = model(x_model, self._scale_timesteps(t), **call_kwargs)
-        if not isinstance(model_result, tuple) or len(model_result) != 2:
-            raise TypeError("RealtimePose 模型训练时必须返回 (raw_output, auxiliary_outputs)。")
-        model_output, auxiliary_outputs = model_result
-        target = (
-            x_start
-            if self.model_mean_type == ModelMeanType.START_X
-            else self._predict_eps_from_xstart(x_model, t, x_start)
-        )
+        model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+        target = x_start
         if model_output.shape != target.shape:
             raise ValueError("模型输出、diffusion target 和 x_start 必须同形。")
-        raw_pred_xstart = (
-            model_output
-            if self.model_mean_type == ModelMeanType.START_X
-            else self._predict_xstart_from_eps(x_t=x_model, t=t, eps=model_output)
-        )
-        deployed_pred_xstart = project_realtime_pose_xstart(
-            pred_xstart=raw_pred_xstart,
+        raw_pred_residual = model_output
+        raw_pred_pose = predictor_current + raw_pred_residual
+        deployed_pred_pose = project_realtime_pose_xstart(
+            pred_xstart=raw_pred_pose,
             current_tracker_raw=batch["current_tracker_raw"],
             pose_mean=batch.get("pose_mean"),
             pose_scale=batch.get("pose_scale"),
         )
+        deployed_pred_residual = deployed_pred_pose - predictor_current
         # 单帧分支遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。
         elementwise_loss = (
@@ -1550,11 +1516,10 @@ class GaussianDiffusion:
         terms = {"simple_loss": simple_loss}
         terms.update(
             compute_raw_deployed_losses(
-                raw_pred_xstart,
-                deployed_pred_xstart,
-                x_start,
+                raw_pred_pose,
+                deployed_pred_pose,
+                batch["x"],
                 batch,
-                auxiliary_outputs,
                 tracker_pos_huber_beta=self.tracker_pos_huber_beta,
             )
         )
@@ -1571,15 +1536,15 @@ class GaussianDiffusion:
             + self.hip_height_loss_weight * terms["hip_height_loss"]
             + self.rotation_velocity_loss_weight
             * terms["rotation_velocity_loss"]
-            + self.contact_loss_weight * terms["contact_loss"]
-            + self.contact_slide_loss_weight * terms["contact_slide_loss"]
         )
         terms["aux_loss"] = auxiliary_loss
         terms["loss"] = self.diffusion_loss_weight * simple_loss + self.aux_loss_weight * auxiliary_loss
         if return_pred_xstart:
-            terms["raw_pred_xstart"] = raw_pred_xstart
-            terms["deployed_pred_xstart"] = deployed_pred_xstart
-            terms["pred_xstart"] = deployed_pred_xstart
+            terms["raw_pred_residual"] = raw_pred_residual
+            terms["deployed_pred_residual"] = deployed_pred_residual
+            terms["pred_xstart"] = deployed_pred_residual
+            terms["raw_pred_pose"] = raw_pred_pose
+            terms["deployed_pred_pose"] = deployed_pred_pose
         return terms
 
     def _prior_bpd(self, x_start):

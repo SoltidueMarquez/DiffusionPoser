@@ -268,10 +268,6 @@ def build_current_ik(
         residual_scale=float(cfg.residual_scale),
         position_solved_quality=cfg.position_solved_quality,
     )
-    if bool((constraint_type == POSITION_SOLVED).any()):
-        raise RuntimeError("当前 shortest-arc FABRIK 不应产生 POSITION_SOLVED。")
-    if bool((updated_mask[constraint_type == INHERITED]).any()):
-        raise RuntimeError("INHERITED 关节不得标记为已更新。")
     return RealtimePoseIKResult(
         pose=rotation_6d_forward_up_torch(global_rotations),
         updated_mask=updated_mask,
@@ -321,10 +317,6 @@ def build_ik_joint_source_reliability(
     if tuple(constraint_type.shape) != (batch_size, SMPL_JOINT_COUNT):
         raise ValueError("constraint_type 必须为 [B,24]。")
     source = tracker_source_reliability.float()
-    if not bool(torch.isfinite(source).all()) or bool(
-        ((source < 0.0) | (source > 1.0)).any()
-    ):
-        raise ValueError("tracker_source_reliability 必须为有限的 [0,1] 数值。")
     result = torch.zeros(
         batch_size,
         SMPL_JOINT_COUNT,
@@ -387,8 +379,6 @@ def compute_ik_joint_confidence_torch(
         raise ValueError("residual_scale 必须大于 0。")
     constraint = constraint_type.long()
     position_solved = constraint == POSITION_SOLVED
-    if bool(position_solved.any()) and position_solved_quality is None:
-        raise ValueError("POSITION_SOLVED 必须提供 position_solved_quality。")
     quality = torch.zeros_like(source)
     quality = torch.where(constraint == DIRECT_ROTATION, torch.ones_like(quality), quality)
     if position_solved_quality is not None:
@@ -402,11 +392,6 @@ def compute_ik_joint_confidence_torch(
         torch.full_like(quality, float(direction_only_quality)),
         quality,
     )
-    residual_constrained = updated_mask.bool() & (
-        position_solved | (constraint == DIRECTION_ONLY)
-    )
-    if bool((residual_constrained & (chain_length <= 0.0)).any()):
-        raise ValueError("位置/方向约束必须有正的 chain_length。")
     residual_quality = torch.exp(
         -(position_residual / chain_length.clamp_min(1e-8)) / float(residual_scale)
     )

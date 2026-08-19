@@ -51,10 +51,19 @@ def apply_ik_calibration(args):
     path = Path(calibration).expanduser().resolve()
     report = json.loads(path.read_text(encoding="utf-8"))
     recommended = report["recommended_parameters"]
-    if getattr(args, "ik_direction_only_quality", None) is None:
-        args.ik_direction_only_quality = float(recommended["ik_direction_only_quality"])
-    if getattr(args, "ik_residual_scale", None) is None:
-        args.ik_residual_scale = float(recommended["ik_residual_scale"])
+    for argument_name in (
+        "ik_direction_only_quality",
+        "ik_residual_scale",
+        "ik_gap_low",
+        "ik_gap_high",
+    ):
+        if getattr(args, argument_name, None) is not None:
+            continue
+        if argument_name not in recommended:
+            raise ValueError(
+                f"IK 校准文件缺少 recommended_parameters.{argument_name}：{path}"
+            )
+        setattr(args, argument_name, float(recommended[argument_name]))
     args.ik_calibration_path = str(path)
     return args
 
@@ -71,7 +80,14 @@ def parse_and_load_from_model(
     if not model_path:
         return apply_ik_calibration(args)
     checkpoint_args = load_args_json(Path(model_path))
-    ignored = set(ignore_keys or set()) | {"predictor_model_path", "dit_model_path", "model_path"}
+    # `ts_respace` 是采样策略而非 checkpoint 结构；不能让训练 args.json 中的
+    # 空值覆盖 runtime 的默认 10-step 或用户显式指定的消融步数。
+    ignored = set(ignore_keys or set()) | {
+        "predictor_model_path",
+        "dit_model_path",
+        "model_path",
+        "ts_respace",
+    }
     for key, value in checkpoint_args.items():
         if key in ignored or not hasattr(args, key):
             continue
@@ -106,11 +122,10 @@ def add_data_options(parser: ArgumentParser) -> None:
 def add_model_options(parser: ArgumentParser) -> None:
     group = parser.add_argument_group("model")
     group.add_argument("--model_arch", default="current_dit", choices=("current_dit",))
-    group.add_argument("--layers", default=6, type=int)
-    group.add_argument("--heads", default=8, type=int)
-    group.add_argument("--latent_dim", default=384, type=int)
+    group.add_argument("--layers", default=4, type=int)
+    group.add_argument("--heads", default=6, type=int)
+    group.add_argument("--latent_dim", default=192, type=int)
     group.add_argument("--dropout", default=0.0, type=float)
-    group.add_argument("--zero_init", action="store_true")
     group.add_argument("--max_seq_len", default=REALTIME_POSE_MODEL_TOKEN_LENGTH, type=int)
 
 
@@ -130,6 +145,10 @@ def add_ik_inpainting_options(parser: ArgumentParser) -> None:
     group.add_argument("--ik_direction_only_quality", default=None, type=float)
     group.add_argument("--ik_residual_scale", default=None, type=float)
     group.add_argument("--ik_position_solved_quality", default=None, type=float)
+    group.add_argument("--ik_gap_low", default=None, type=float)
+    group.add_argument("--ik_gap_high", default=None, type=float)
+    group.add_argument("--ik_direction_support", default=0.35, type=float)
+    group.add_argument("--ik_untracked_strength", default=0.05, type=float)
 
 
 def add_sampling_options(parser: ArgumentParser) -> None:
@@ -141,6 +160,8 @@ def add_sampling_options(parser: ArgumentParser) -> None:
     group.add_argument("--visualize_fps", default=20.0, type=float)
     group.add_argument("--use_ema", default=True, type=str2bool)
     add_ik_inpainting_options(parser)
+    # 训练仍使用 50 个基础 timestep；采样入口默认构造确定性的 10-step DDIM。
+    parser.set_defaults(ts_respace="10")
 
 
 def add_training_options(parser: ArgumentParser) -> None:
@@ -177,8 +198,6 @@ def add_training_options(parser: ArgumentParser) -> None:
     group.add_argument("--head_to_root_xz_loss_weight", default=_LOSS_DEFAULTS.head_to_root_xz, type=float)
     group.add_argument("--hip_height_loss_weight", default=_LOSS_DEFAULTS.hip_height, type=float)
     group.add_argument("--rotation_velocity_loss_weight", default=_LOSS_DEFAULTS.rotation_velocity, type=float)
-    group.add_argument("--contact_loss_weight", default=_LOSS_DEFAULTS.contact, type=float)
-    group.add_argument("--contact_slide_loss_weight", default=_LOSS_DEFAULTS.contact_slide, type=float)
     group.add_argument("--model_ema_decay", default=0.995, type=float)
     group.add_argument("--eval_during_training", action="store_true")
     group.add_argument("--eval_split", default="test")

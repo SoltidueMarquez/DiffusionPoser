@@ -22,6 +22,8 @@ def _required(tmp_path):
         "--save_dir", str(tmp_path / "runs"),
         "--ik_direction_only_quality", "0.8",
         "--ik_residual_scale", "0.5",
+        "--ik_gap_low", "0.1",
+        "--ik_gap_high", "0.5",
     ]
 
 
@@ -36,10 +38,11 @@ def test_training_parser_exposes_two_model_boundary_without_cold_start(tmp_path)
     assert not hasattr(args, "history_noise_min_deg")
     assert not hasattr(args, "history_noise_max_deg")
     assert not hasattr(args, "history_noise_temporal_rho")
-    assert args.latent_dim == 384
-    assert args.layers == 6
-    assert args.contact_loss_weight == 0.0
-    assert args.contact_slide_loss_weight == 0.0
+    assert args.latent_dim == 192
+    assert args.layers == 4
+    assert args.heads == 6
+    assert not hasattr(args, "contact_loss_weight")
+    assert not hasattr(args, "contact_slide_loss_weight")
     assert args.log_interval == 10
     assert args.precision == "fp32"
 
@@ -106,22 +109,34 @@ def test_ik_calibration_fills_missing_values(tmp_path):
     calibration = tmp_path / "ik.json"
     calibration.write_text(
         json.dumps(
-            {"recommended_parameters": {"ik_direction_only_quality": 0.7, "ik_residual_scale": 0.2}}
+            {
+                "recommended_parameters": {
+                    "ik_direction_only_quality": 0.7,
+                    "ik_residual_scale": 0.2,
+                    "ik_gap_low": 0.12,
+                    "ik_gap_high": 0.62,
+                }
+            }
         ),
         encoding="utf-8",
     )
-    args = train_args(_required(tmp_path)[:-4] + ["--ik_calibration_path", str(calibration)])
+    args = train_args(
+        _required(tmp_path)[:-8] + ["--ik_calibration_path", str(calibration)]
+    )
     assert args.ik_direction_only_quality == 0.7
     assert args.ik_residual_scale == 0.2
+    assert args.ik_gap_low == 0.12
+    assert args.ik_gap_high == 0.62
 
 
 def test_model_factory_creates_current_dit(tmp_path):
     args = train_args(_required(tmp_path) + ["--latent_dim", "32", "--layers", "1", "--heads", "4", "--diffusion_steps", "2"])
     model, diffusion = create_model_and_diffusion(args)
     assert model.__class__.__name__ == "RealtimePoseCurrentDiT"
+    assert not hasattr(model, "contact_head")
     assert diffusion.num_timesteps == 2
-    assert diffusion.contact_loss_weight == 0.0
-    assert diffusion.contact_slide_loss_weight == 0.0
+    assert not hasattr(diffusion, "contact_loss_weight")
+    assert not hasattr(diffusion, "contact_slide_loss_weight")
 
 
 def test_parser_model_token_length_is_21():

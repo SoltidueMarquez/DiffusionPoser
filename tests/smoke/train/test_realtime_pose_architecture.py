@@ -22,6 +22,21 @@ from train.predictor_training_loop import (
 from utils.normalizer import RealtimePoseNormalizer
 
 
+def _dit_conditions(batch_size: int) -> dict[str, torch.Tensor]:
+    available = torch.tensor(
+        [[True, True, True, False, False, False]]
+    ).repeat(batch_size, 1)
+    return {
+        "tracker_geometry": torch.randn(batch_size, 6, 9),
+        "tracker_available": available,
+        "ik_residual": torch.randn(batch_size, 24, 6),
+        "ik_gap": torch.rand(batch_size, 24),
+        "ik_confidence": torch.rand(batch_size, 24),
+        "denoise_strength": torch.ones(batch_size, 24),
+        "constraint_type": torch.full((batch_size, 24), 3, dtype=torch.long),
+    }
+
+
 def test_predictor_transformer_contract():
     model = RealtimePosePredictor(
         latent_dim=64, num_layers=1, num_heads=4, feedforward_dim=128
@@ -57,17 +72,94 @@ def test_current_dit_contract_and_predictor_future_changes_output():
     # AdaLN gate 默认零初始化；打开 temporal gate 后验证 future 确实位于 forward 路径。
     with torch.no_grad():
         model.blocks[0].adaln_modulation[-1].bias[5 * 64 : 6 * 64] = 1.0
+        model.joint_output.weight.normal_(std=0.02)
     x = torch.randn(2, 144)
     timestep = torch.tensor([1, 2])
     motion = torch.randn(2, 10, 144)
     predictor = torch.randn(2, 11, 144)
-    joint_condition = torch.randn(2, 24, 10)
-    first = model(x, timestep, motion, predictor, joint_condition)
+    conditions = _dit_conditions(2)
+    first = model(
+        x,
+        timestep,
+        motion_context=motion,
+        predictor_pose_horizon=predictor,
+        **conditions,
+    )
     changed = predictor.clone()
     changed[:, 1:] += 2.0
-    second = model(x, timestep, motion, changed, joint_condition)
+    second = model(
+        x,
+        timestep,
+        motion_context=motion,
+        predictor_pose_horizon=changed,
+        **conditions,
+    )
     assert first.shape == (2, 144)
     assert not torch.allclose(first, second)
+
+    changed_history = motion.clone()
+    changed_history[:, -1] += 2.0
+    third = model(
+        x,
+        timestep,
+        motion_context=changed_history,
+        predictor_pose_horizon=predictor,
+        **conditions,
+    )
+    assert not torch.allclose(first, third)
+
+    prepared = model.prepare_conditioning(
+        motion_context=motion,
+        predictor_pose_horizon=predictor,
+        **conditions,
+    )
+    assert prepared.temporal_context.shape == (2, 24, 20, 64)
+    assert model.context_frame_offsets.tolist() == [
+        *range(-10, 0),
+        *range(1, 11),
+    ]
+
+
+def test_masked_tracker_tokens_do_not_change_output_and_model_is_under_5m():
+    torch.manual_seed(5)
+    model = RealtimePoseCurrentDiT(
+        latent_dim=64, num_layers=1, num_heads=4, dropout=0.0
+    ).eval()
+    with torch.no_grad():
+        model.joint_output.weight.normal_(std=0.02)
+    motion = torch.randn(1, 10, 144)
+    predictor = torch.randn(1, 11, 144)
+    conditions = _dit_conditions(1)
+    x = torch.randn(1, 144)
+    first = model(
+        x,
+        torch.tensor([1]),
+        motion_context=motion,
+        predictor_pose_horizon=predictor,
+        **conditions,
+    )
+    changed = dict(conditions)
+    changed["tracker_geometry"] = conditions["tracker_geometry"].clone()
+    changed["tracker_geometry"][:, 3:] += 10_000.0
+    second = model(
+        x,
+        torch.tensor([1]),
+        motion_context=motion,
+        predictor_pose_horizon=predictor,
+        **changed,
+    )
+    torch.testing.assert_close(first, second)
+    blocked = dict(conditions)
+    blocked["denoise_strength"] = torch.zeros(1, 24)
+    blocked_output = model(
+        x,
+        torch.tensor([1]),
+        motion_context=motion,
+        predictor_pose_horizon=predictor,
+        **blocked,
+    )
+    torch.testing.assert_close(blocked_output, torch.zeros_like(blocked_output))
+    assert RealtimePoseCurrentDiT().num_parameters() < 5_000_000
 
 
 def test_dit_backward_does_not_create_predictor_gradients():
@@ -81,11 +173,11 @@ def test_dit_backward_does_not_create_predictor_gradients():
     output = dit(
         torch.randn(1, 144),
         torch.tensor([1]),
-        motion,
-        horizon,
-        torch.randn(1, 24, 10),
+        motion_context=motion,
+        predictor_pose_horizon=horizon,
+        **_dit_conditions(1),
     )
-    output.square().mean().backward()
+    output.sum().backward()
     assert all(parameter.grad is None for parameter in predictor.parameters())
     assert any(parameter.grad is not None for parameter in dit.parameters())
 

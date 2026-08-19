@@ -23,7 +23,10 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.realtime_pose_predictor_dataset import RealtimePosePredictorSequenceDataset
 from data_loaders.realtime_pose_predictor_features import build_predictor_sparse_features_np
-from data_loaders.sensor_masking import TRAIN_TRACKER_ENDPOINTS
+from data_loaders.sensor_masking import (
+    STATIC_OPTIONAL_TRACKER_MASKS,
+    TRAIN_TRACKER_ENDPOINTS,
+)
 from tests.smoke.realtime_pose_fixtures import (
     build_toy_realtime_source,
     write_toy_source_dataset,
@@ -77,19 +80,17 @@ def test_predictor_54d_feature_order_and_so3_relative_rotation():
     )
 
 
-def test_training_sampler_has_only_two_endpoint_masks():
-    assert TRAIN_TRACKER_ENDPOINTS == (
-        (True, True, True, False, False, False),
-        (True, True, True, True, True, True),
-    )
+def test_training_sampler_uses_all_eight_optional_tracker_masks():
+    assert TRAIN_TRACKER_ENDPOINTS == STATIC_OPTIONAL_TRACKER_MASKS
+    assert len(TRAIN_TRACKER_ENDPOINTS) == 8
 
 
-def test_training_sampler_produces_exactly_half_each_endpoint():
+def test_training_sampler_produces_all_eight_masks_equally():
     class _Dataset:
-        indices_by_shard = [list(range(12))]
+        indices_by_shard = [list(range(16))]
 
         def __len__(self):
-            return 12
+            return 16
 
     sampler = RealtimePoseBatchSampler(
         _Dataset(), batch_size=4, seed=10, shuffle=True, drop_last=True
@@ -97,8 +98,8 @@ def test_training_sampler_produces_exactly_half_each_endpoint():
     config_indices = [
         request.config_index for batch in sampler for request in batch
     ]
-    assert set(config_indices) == {0, 1}
-    assert config_indices.count(0) == config_indices.count(1) == 6
+    assert set(config_indices) == set(range(8))
+    assert all(config_indices.count(index) == 2 for index in range(8))
 
 
 def test_materialized_task_normalizer_and_predictor_sequence_contract(

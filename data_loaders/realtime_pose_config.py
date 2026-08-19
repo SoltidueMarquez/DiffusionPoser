@@ -9,12 +9,16 @@ from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 
 @dataclass(frozen=True)
 class IKInpaintingConfig:
-    """训练与采样共享的当前帧 IK Inpainting 超参数。"""
+    """训练与采样共享的 IK 可信度与 Predictor residual 门控参数。"""
 
     fabrik_iterations: int = 2
     direction_only_quality: float | None = None
     residual_scale: float | None = None
     position_solved_quality: float | None = None
+    gap_low: float | None = None
+    gap_high: float | None = None
+    direction_support: float = 0.35
+    untracked_strength: float = 0.05
 
     def validate(self) -> "IKInpaintingConfig":
         if int(self.fabrik_iterations) <= 0:
@@ -35,6 +39,18 @@ class IKInpaintingConfig:
             self.position_solved_quality
         ) < 1.0:
             raise ValueError("position_solved_quality 必须位于 (0,1)。")
+        if self.gap_low is None or self.gap_high is None:
+            raise ValueError(
+                "IK/Predictor gap 尚未校准；请显式提供 gap_low 与 gap_high。"
+            )
+        if float(self.gap_low) < 0.0:
+            raise ValueError("gap_low 必须为非负弧度值。")
+        if float(self.gap_high) - float(self.gap_low) < 1e-4:
+            raise ValueError("gap_high 必须至少比 gap_low 大 1e-4 弧度。")
+        if not 0.0 < float(self.direction_support) < 1.0:
+            raise ValueError("direction_support 必须位于 (0,1)。")
+        if not 0.0 <= float(self.untracked_strength) < 1.0:
+            raise ValueError("untracked_strength 必须位于 [0,1)。")
         return self
 
     def to_dict(self) -> dict[str, float | int | None]:
@@ -53,10 +69,6 @@ class RealtimePoseLossWeights:
     head_to_root_xz: float = 1.0
     hip_height: float = 1.0
     rotation_velocity: float = 1.0
-    # 暂时关闭接触分类和脚底滑动监督，但保留 loss 字段与模型输出，
-    # 后续恢复实验时只需重新设置权重，不需要改变 checkpoint 接口。
-    contact: float = 0.0
-    contact_slide: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)

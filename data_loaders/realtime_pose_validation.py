@@ -42,14 +42,11 @@ TASK_SHAPES = {
     "current_tracker_raw": (TRACKER_COUNT, TRACKER_FEATURE_DIM),
     "tracker_available": (TRACKER_COUNT,),
     "previous_pose_target": (REALTIME_POSE_TARGET_DIM,),
-    "previous_head_position_current_ref": (3,),
     "target_joints_head_ref": (24, 3),
     "target_root_position_head_ref": (3,),
     "current_head_position_world": (3,),
     "joint_offsets_parent": (24, 3),
     "joint_rest_local_rotations_6d": (24, 6),
-    "previous_contact_target": (2,),
-    "contact_target": (2,),
 }
 
 TASK_SCALAR_FIELDS = (

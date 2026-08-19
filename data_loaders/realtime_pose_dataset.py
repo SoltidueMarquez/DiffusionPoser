@@ -29,7 +29,6 @@ TASK_SHARD_FIELDS = (
     "current_pose_target_clean",
     "current_tracker_continuous",
     "previous_pose_target_clean",
-    "previous_head_position_current_ref",
     "target_joints_head_ref",
     "target_root_position_head_ref",
     "target_root_yaw_world",
@@ -37,8 +36,6 @@ TASK_SHARD_FIELDS = (
     "current_head_yaw_world",
     "current_head_position_world",
     "floor_y",
-    "previous_contact_target",
-    "contact_target",
     "joint_offsets_parent",
     "joint_rest_local_rotations_6d",
     "task_seed",
@@ -99,7 +96,9 @@ class RealtimePoseTaskDataset(Dataset):
             task_index = int(request)
             config_index = 0
         if not 0 <= config_index < len(TRAIN_TRACKER_ENDPOINTS):
-            raise IndexError("config_index 必须为 0（核心三点）或 1（全部六点）。")
+            raise IndexError(
+                f"config_index 必须位于 [0,{len(TRAIN_TRACKER_ENDPOINTS) - 1}]。"
+            )
         shard_index, row_index = self.locations[task_index]
         return self._item(
             shard=self.reader.get(shard_index),
@@ -165,9 +164,6 @@ class RealtimePoseTaskDataset(Dataset):
             "previous_pose_target": torch.from_numpy(
                 np.asarray(previous, dtype=np.float32)
             ).float(),
-            "previous_head_position_current_ref": _tensor_field(
-                shard, "previous_head_position_current_ref", row_index
-            ),
             "target_joints_head_ref": _tensor_field(
                 shard, "target_joints_head_ref", row_index
             ),
@@ -192,10 +188,6 @@ class RealtimePoseTaskDataset(Dataset):
             "floor_y": torch.tensor(
                 float(shard["floor_y"][row_index]), dtype=torch.float32
             ),
-            "previous_contact_target": _tensor_field(
-                shard, "previous_contact_target", row_index
-            ),
-            "contact_target": _tensor_field(shard, "contact_target", row_index),
             "joint_offsets_parent": _tensor_field(
                 shard, "joint_offsets_parent", row_index
             ),
@@ -220,7 +212,7 @@ class RealtimePoseTaskDataset(Dataset):
 
 
 class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
-    """按 shard 打乱任务，并以 1:1 采样核心三点和全部六点。"""
+    """按 shard 打乱任务，并等概率轮换全部 8 种 Tracker 配置。"""
 
     def __init__(
         self,
@@ -271,9 +263,11 @@ class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):
                 break
             requests: list[TaskRequest] = []
             for local_index, task_index in enumerate(indices):
-                # 以全局样本序号交替 endpoint，偶数样本集可得到严格 50/50；
-                # epoch 奇偶翻转，避免奇数样本集长期偏向同一配置。
-                config_index = int((first + local_index + self.epoch) % 2)
+                # 用全局样本序号与 epoch 共同轮换配置；无需额外随机状态即可在
+                # 长期训练中得到确定、均匀且可复现的 8 种 availability 分布。
+                config_index = int(
+                    (first + local_index + self.epoch) % len(TRAIN_TRACKER_ENDPOINTS)
+                )
                 requests.append(TaskRequest(task_index, config_index))
             yield requests
 

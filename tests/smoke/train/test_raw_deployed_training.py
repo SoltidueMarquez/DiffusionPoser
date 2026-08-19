@@ -18,6 +18,7 @@ def _batch(batch_size=2):
     offsets = torch.zeros(batch_size, 24, 3)
     offsets[:, 1:, 1] = 0.1
     return {
+        "x": IDENTITY.repeat(batch_size, 1),
         "current_tracker_raw": tracker,
         "joint_offsets_parent": offsets,
         "target_joints_head_ref": torch.zeros(batch_size, 24, 3),
@@ -25,10 +26,7 @@ def _batch(batch_size=2):
         "target_root_yaw_world": torch.zeros(batch_size),
         "target_hip_height": torch.zeros(batch_size),
         "current_head_yaw_world": torch.zeros(batch_size),
-        "previous_contact_target": torch.zeros(batch_size, 2),
-        "contact_target": torch.zeros(batch_size, 2),
         "previous_pose_target": IDENTITY.repeat(batch_size, 1),
-        "previous_head_position_current_ref": torch.zeros(batch_size, 3),
     }
 
 
@@ -41,23 +39,34 @@ def test_diffusion_training_accepts_only_single_frame_and_has_no_gt_future_condi
         loss_type=LossType.MSE,
     )
     batch = _batch()
-    x = IDENTITY.repeat(2, 1)
+    predictor_current = IDENTITY.repeat(2, 1)
+    diffusion_target = torch.zeros(2, 144)
     model_kwargs = {
-        "motion_context": x[:, None].repeat(1, 10, 1),
-        "predictor_pose_horizon": x[:, None].repeat(1, 11, 1),
-        "current_joint_condition": torch.zeros(2, 24, 10),
+        "motion_context": predictor_current[:, None].repeat(1, 10, 1),
+        "predictor_pose_horizon": predictor_current[:, None].repeat(1, 11, 1),
+        "tracker_geometry": batch["current_tracker_raw"][..., :9],
+        "tracker_available": batch["current_tracker_raw"][..., 9].bool(),
+        "ik_residual": torch.zeros(2, 24, 6),
+        "ik_gap": torch.zeros(2, 24),
+        "ik_confidence": torch.ones(2, 24),
+        "denoise_strength": torch.full((2, 24), 0.05),
+        "constraint_type": torch.full((2, 24), 3, dtype=torch.long),
         "y": batch,
     }
     assert "future_target" not in model_kwargs
     losses = diffusion.training_losses(
         model,
-        x,
+        diffusion_target,
         torch.tensor([0, 1]),
         model_kwargs=model_kwargs,
+        predictor_current=predictor_current,
         return_pred_xstart=True,
     )
-    assert losses["raw_pred_xstart"].shape == (2, 144)
+    assert losses["raw_pred_residual"].shape == (2, 144)
+    assert losses["raw_pred_pose"].shape == (2, 144)
+    torch.testing.assert_close(losses["raw_pred_pose"], predictor_current)
     assert torch.isfinite(losses["loss"]).all()
+    assert not any("contact" in name for name in losses)
     losses["loss"].mean().backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
 
@@ -76,4 +85,5 @@ def test_diffusion_rejects_horizon_state():
             torch.zeros(1, 11, 144),
             torch.tensor([0]),
             model_kwargs={},
+            predictor_current=torch.zeros(1, 144),
         )

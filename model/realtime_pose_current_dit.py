@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS
-from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import (
-    CURRENT_JOINT_CONDITION_DIM,
+    CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
     REALTIME_POSE_HISTORY_FRAME_OFFSETS,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
@@ -16,6 +16,8 @@ from data_loaders.sensor_masking import (
     PREDICTOR_FUTURE_FRAME_COUNT,
     PREDICTOR_POSE_HORIZON_LENGTH,
     SMPL_JOINT_COUNT,
+    TRACKER_CONTINUOUS_DIM,
+    TRACKER_COUNT,
 )
 from model.timestep_embedding import SinusoidalTimestepEmbedding
 
@@ -24,14 +26,18 @@ CURRENT_DIT_CONTEXT_OFFSETS = (
     *REALTIME_POSE_HISTORY_FRAME_OFFSETS,
     *tuple(range(1, PREDICTOR_FUTURE_FRAME_COUNT + 1)),
 )
+IK_SCALAR_CONDITION_DIM = 3 + CURRENT_JOINT_CONSTRAINT_TYPE_COUNT
 
 
 @dataclass(frozen=True)
 class PreparedCurrentConditioning:
-    """可在 DDIM 轨迹内复用的单帧 DiT 条件 token。"""
+    """可在完整 DDIM 轨迹中复用的静态条件。"""
 
-    current_tokens: torch.Tensor  # [B,24,D]
+    joint_condition_tokens: torch.Tensor  # [B,24,D]
     temporal_context: torch.Tensor  # [B,24,20,D]
+    tracker_tokens: torch.Tensor  # [B,6,D]
+    tracker_available: torch.Tensor  # [B,6]
+    denoise_strength: torch.Tensor  # [B,24]
 
 
 def _modulate(
@@ -43,7 +49,7 @@ def _modulate(
 
 
 class CurrentDiTBlock(nn.Module):
-    """当前关节空间注意力 + 同关节 20 帧上下文 cross-attention。"""
+    """24 关节空间注意力 + 同关节过去/未来 20 帧 cross-attention。"""
 
     def __init__(self, latent_dim: int, num_heads: int, dropout: float):
         super().__init__()
@@ -128,38 +134,50 @@ class CurrentDiTBlock(nn.Module):
 
 
 class RealtimePoseCurrentDiT(nn.Module):
-    """仅扩散当前 `[B,144]`，并读取过去 10 帧与 Predictor 未来 10 帧。"""
+    """以 Predictor 为 prior，去噪当前 144D 门控 residual。"""
 
     def __init__(
         self,
         input_feats: int = REALTIME_POSE_TARGET_DIM,
-        latent_dim: int = 384,
-        num_layers: int = 6,
-        num_heads: int = 8,
+        latent_dim: int = 192,
+        num_layers: int = 4,
+        num_heads: int = 6,
         dropout: float = 0.0,
-        zero_init: bool = False,
         max_seq_len: int = 21,
     ):
         super().__init__()
         if int(input_feats) != REALTIME_POSE_TARGET_DIM:
-            raise ValueError("单帧 DiT 的 Pose 必须为 144D。")
+            raise ValueError("单帧 DiT residual 必须为 144D。")
         if int(max_seq_len) != 21:
-            raise ValueError("max_seq_len 固定为 21（过去 10、当前 1、Predictor 未来 10）。")
+            raise ValueError("max_seq_len 固定为 21（过去 10、当前 1、未来 10）。")
+        if int(latent_dim) % int(num_heads) != 0:
+            raise ValueError("latent_dim 必须能被 num_heads 整除。")
         self.input_feats = int(input_feats)
         self.output_feats = int(input_feats)
         self.latent_dim = int(latent_dim)
-        self.joint_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
+
+        self.residual_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.history_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.predictor_current_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
         self.predictor_future_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
-        self.current_joint_condition_input = nn.Linear(
-            CURRENT_JOINT_CONDITION_DIM, latent_dim
-        )
+        self.ik_residual_input = nn.Linear(ROTATION_6D_DIM, latent_dim)
+        self.ik_scalar_input = nn.Linear(IK_SCALAR_CONDITION_DIM, latent_dim)
+        self.tracker_input = nn.Linear(TRACKER_CONTINUOUS_DIM, latent_dim)
+
         self.joint_identity = nn.Embedding(SMPL_JOINT_COUNT, latent_dim)
         self.region_identity = nn.Embedding(5, latent_dim)
+        self.tracker_identity = nn.Embedding(TRACKER_COUNT, latent_dim)
         self.history_role = nn.Parameter(torch.zeros(latent_dim))
         self.predictor_current_role = nn.Parameter(torch.zeros(latent_dim))
         self.predictor_future_role = nn.Parameter(torch.zeros(latent_dim))
+        self.tracker_role = nn.Parameter(torch.zeros(latent_dim))
+
+        self.tracker_query_norm = nn.LayerNorm(latent_dim)
+        self.tracker_context_norm = nn.LayerNorm(latent_dim)
+        self.tracker_cross_attention = nn.MultiheadAttention(
+            latent_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.tracker_output_norm = nn.LayerNorm(latent_dim)
         self.diffusion_time_embedding = SinusoidalTimestepEmbedding(latent_dim)
         self.frame_offset_embedding = SinusoidalTimestepEmbedding(latent_dim)
         self.blocks = nn.ModuleList(
@@ -170,7 +188,6 @@ class RealtimePoseCurrentDiT(nn.Module):
         )
         self.output_norm = nn.LayerNorm(latent_dim)
         self.joint_output = nn.Linear(latent_dim, ROTATION_6D_DIM)
-        self.contact_head = nn.Linear(latent_dim * 2, 2)
         self.register_buffer(
             "joint_regions",
             torch.tensor(TARGET_JOINT_REGIONS.copy(), dtype=torch.long),
@@ -180,9 +197,9 @@ class RealtimePoseCurrentDiT(nn.Module):
             torch.tensor(CURRENT_DIT_CONTEXT_OFFSETS, dtype=torch.float32),
             persistent=False,
         )
-        if zero_init:
-            nn.init.zeros_(self.joint_output.weight)
-            nn.init.zeros_(self.joint_output.bias)
+        # 门控 residual 的零输出严格等于 Predictor prior，因此输出头始终零初始化。
+        nn.init.zeros_(self.joint_output.weight)
+        nn.init.zeros_(self.joint_output.bias)
 
     def num_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
@@ -191,7 +208,13 @@ class RealtimePoseCurrentDiT(nn.Module):
         self,
         motion_context: torch.Tensor,
         predictor_pose_horizon: torch.Tensor,
-        current_joint_condition: torch.Tensor,
+        tracker_geometry: torch.Tensor,
+        tracker_available: torch.Tensor,
+        ik_residual: torch.Tensor,
+        ik_gap: torch.Tensor,
+        ik_confidence: torch.Tensor,
+        denoise_strength: torch.Tensor,
+        constraint_type: torch.Tensor,
     ) -> PreparedCurrentConditioning:
         batch_size = motion_context.shape[0]
         if tuple(motion_context.shape) != (
@@ -206,15 +229,30 @@ class RealtimePoseCurrentDiT(nn.Module):
             REALTIME_POSE_TARGET_DIM,
         ):
             raise ValueError("predictor_pose_horizon 必须为 [B,11,144]。")
-        if tuple(current_joint_condition.shape) != (
+        if tuple(tracker_geometry.shape) != (
+            batch_size,
+            TRACKER_COUNT,
+            TRACKER_CONTINUOUS_DIM,
+        ):
+            raise ValueError("tracker_geometry 必须为 [B,6,9]。")
+        if tuple(tracker_available.shape) != (batch_size, TRACKER_COUNT):
+            raise ValueError("tracker_available 必须为 [B,6]。")
+        if tracker_available.dtype != torch.bool:
+            raise ValueError("tracker_available 必须为 bool。")
+        if tuple(ik_residual.shape) != (
             batch_size,
             SMPL_JOINT_COUNT,
-            CURRENT_JOINT_CONDITION_DIM,
+            ROTATION_6D_DIM,
         ):
-            raise ValueError("current_joint_condition 必须为 [B,24,10]。")
-        values = (motion_context, predictor_pose_horizon, current_joint_condition)
-        if not all(bool(torch.isfinite(value).all()) for value in values):
-            raise ValueError("单帧 DiT 条件中包含 NaN 或 Inf。")
+            raise ValueError("ik_residual 必须为 [B,24,6]。")
+        joint_shape = (batch_size, SMPL_JOINT_COUNT)
+        if any(
+            tuple(value.shape) != joint_shape
+            for value in (ik_gap, ik_confidence, denoise_strength, constraint_type)
+        ):
+            raise ValueError("IK gap/confidence/strength/type 必须同为 [B,24]。")
+        if constraint_type.dtype != torch.long:
+            raise ValueError("constraint_type 必须为 torch.long。")
 
         history = motion_context.reshape(
             batch_size,
@@ -228,28 +266,50 @@ class RealtimePoseCurrentDiT(nn.Module):
             SMPL_JOINT_COUNT,
             ROTATION_6D_DIM,
         )
+        identity = self.joint_identity.weight + self.region_identity(self.joint_regions)
         history_tokens = self.history_input(history) + self.history_role
-        future_tokens = self.predictor_future_input(predictor[:, 1:]) + self.predictor_future_role
+        future_tokens = (
+            self.predictor_future_input(predictor[:, 1:])
+            + self.predictor_future_role
+        )
         context = torch.cat([history_tokens, future_tokens], dim=1)
-        frame_tokens = self.frame_offset_embedding(
+        context = context + self.frame_offset_embedding(
             self.context_frame_offsets.to(context.device)
-        )
-        context = context + frame_tokens[None, :, None]
-        identity = (
-            self.joint_identity.weight + self.region_identity(self.joint_regions)
-        )
+        )[None, :, None]
         context = context + identity[None, None]
         temporal_context = context.permute(0, 2, 1, 3).contiguous()
 
-        current_tokens = (
+        one_hot = F.one_hot(
+            constraint_type,
+            num_classes=CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
+        ).to(predictor.dtype)
+        ik_scalars = torch.cat(
+            [
+                ik_gap[..., None],
+                ik_confidence[..., None],
+                denoise_strength[..., None],
+                one_hot,
+            ],
+            dim=-1,
+        )
+        joint_condition_tokens = (
             self.predictor_current_input(predictor[:, 0])
             + self.predictor_current_role
-            + self.current_joint_condition_input(current_joint_condition)
+            + self.ik_residual_input(ik_residual)
+            + self.ik_scalar_input(ik_scalars)
             + identity[None]
         )
+        tracker_tokens = (
+            self.tracker_input(tracker_geometry)
+            + self.tracker_identity.weight[None]
+            + self.tracker_role
+        )
         return PreparedCurrentConditioning(
-            current_tokens=current_tokens,
+            joint_condition_tokens=joint_condition_tokens,
             temporal_context=temporal_context,
+            tracker_tokens=tracker_tokens,
+            tracker_available=tracker_available,
+            denoise_strength=denoise_strength,
         )
 
     def forward(
@@ -258,48 +318,59 @@ class RealtimePoseCurrentDiT(nn.Module):
         timestep: torch.Tensor,
         motion_context: torch.Tensor | None = None,
         predictor_pose_horizon: torch.Tensor | None = None,
-        current_joint_condition: torch.Tensor | None = None,
+        tracker_geometry: torch.Tensor | None = None,
+        tracker_available: torch.Tensor | None = None,
+        ik_residual: torch.Tensor | None = None,
+        ik_gap: torch.Tensor | None = None,
+        ik_confidence: torch.Tensor | None = None,
+        denoise_strength: torch.Tensor | None = None,
+        constraint_type: torch.Tensor | None = None,
         prepared_conditioning: PreparedCurrentConditioning | None = None,
         y: dict | None = None,
-        return_aux_outputs: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         if tuple(hidden_states.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
-            raise ValueError("hidden_states 必须为单帧 diffusion state [B,144]。")
-        values = y or {}
+            raise ValueError("hidden_states 必须为 residual diffusion state [B,144]。")
         if prepared_conditioning is None:
-            motion_context = (
-                motion_context
-                if motion_context is not None
-                else values.get("motion_context")
-            )
-            predictor_pose_horizon = (
-                predictor_pose_horizon
-                if predictor_pose_horizon is not None
-                else values.get("predictor_pose_horizon")
-            )
-            current_joint_condition = (
-                current_joint_condition
-                if current_joint_condition is not None
-                else values.get("current_joint_condition")
-            )
-            if any(
-                value is None
-                for value in (
-                    motion_context,
-                    predictor_pose_horizon,
-                    current_joint_condition,
-                )
-            ):
-                raise ValueError("单帧 DiT 缺少 motion/Predictor/joint condition。")
-            prepared_conditioning = self.prepare_conditioning(
-                motion_context, predictor_pose_horizon, current_joint_condition
-            )
+            values = y or {}
+            arguments = {
+                "motion_context": motion_context,
+                "predictor_pose_horizon": predictor_pose_horizon,
+                "tracker_geometry": tracker_geometry,
+                "tracker_available": tracker_available,
+                "ik_residual": ik_residual,
+                "ik_gap": ik_gap,
+                "ik_confidence": ik_confidence,
+                "denoise_strength": denoise_strength,
+                "constraint_type": constraint_type,
+            }
+            arguments = {
+                name: value if value is not None else values.get(name)
+                for name, value in arguments.items()
+            }
+            if any(value is None for value in arguments.values()):
+                missing = [name for name, value in arguments.items() if value is None]
+                raise ValueError(f"单帧 DiT 缺少条件：{missing}")
+            prepared_conditioning = self.prepare_conditioning(**arguments)
 
-        joint_values = hidden_states.reshape(
-            batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM
+        current = self.residual_input(
+            hidden_states.reshape(
+                batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM
+            )
+        ) + prepared_conditioning.joint_condition_tokens
+        tracker_query = self.tracker_query_norm(current)
+        tracker_context = self.tracker_context_norm(
+            prepared_conditioning.tracker_tokens
         )
-        current = self.joint_input(joint_values) + prepared_conditioning.current_tokens
+        tracker_value = self.tracker_cross_attention(
+            tracker_query,
+            tracker_context,
+            tracker_context,
+            key_padding_mask=~prepared_conditioning.tracker_available,
+            need_weights=False,
+        )[0]
+        current = self.tracker_output_norm(current + tracker_value)
+
         diffusion_time = self.diffusion_time_embedding(timestep)
         for block in self.blocks:
             current = block(
@@ -308,18 +379,7 @@ class RealtimePoseCurrentDiT(nn.Module):
                 diffusion_time,
             )
         current = self.output_norm(current)
-        output = self.joint_output(current).reshape(
-            batch_size, REALTIME_POSE_TARGET_DIM
-        )
-        if not return_aux_outputs:
-            return output
-        feet = torch.as_tensor(
-            [JOINT_INDEX["left_foot"], JOINT_INDEX["right_foot"]],
-            device=current.device,
-        )
-        auxiliary = {
-            "contact_logits": self.contact_head(
-                current.index_select(1, feet).flatten(1)
-            )
-        }
-        return output, auxiliary
+        raw_output = self.joint_output(current)
+        return (
+            raw_output * prepared_conditioning.denoise_strength.to(raw_output)[..., None]
+        ).reshape(batch_size, REALTIME_POSE_TARGET_DIM)

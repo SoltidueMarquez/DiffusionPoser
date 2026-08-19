@@ -92,7 +92,6 @@ conda run -n diffusionposer5070 python -m train.train_diffusionposer `
   --ik_calibration_path artifacts/predictor/ik_calibration.json `
   --save_dir artifacts/predictor/runs/dit `
   --latent_dim 384 --layers 6 `
-  --contact_loss_weight 0 --contact_slide_loss_weight 0 `
   --log_interval 10 `
   --precision bf16 --batch_size 512 --num_workers 4 `
   --gradient_clip

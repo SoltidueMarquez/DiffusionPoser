@@ -63,14 +63,12 @@ Task Store 保存原始物理值，不保存归一化结果。设 shard 样本�
 |---|---:|---|
 | `motion_context_clean` | `[M,10,144]` | 当前 `C_n` 下的过去 10 帧 Pose |
 | `core_tracker_context_clean` | `[M,11,54]` | 核心三点过去 10 帧与当前 sparse 特征 |
-| `current_pose_target_clean` | `[M,144]` | 当前帧 diffusion target |
+| `current_pose_target_clean` | `[M,144]` | 当前帧 GT Pose；Dataset 加载后用于构造 residual target |
 | `current_tracker_continuous` | `[M,6,9]` | 当前六点 position + rotation6D |
 | `previous_pose_target_clean` | `[M,144]` | 当前 `C_n` 下上一帧 GT Pose |
-| `previous_head_position_current_ref` | `[M,3]` | 上一 Head 在当前 `C_n` 的位置 |
 | `target_joints_head_ref` | `[M,24,3]` | 当前几何监督 |
 | `target_root_position_head_ref` | `[M,3]` | 当前 Root 几何监督 |
 | `target_root_yaw_world` / `target_hip_height` | `[M]` | Root 监督 |
-| `previous_contact_target` / `contact_target` | `[M,2]` | 接触监督 |
 | `joint_offsets_parent` | `[M,24,3]` | 骨架 offset |
 | `joint_rest_local_rotations_6d` | `[M,24,6]` | rest local rotation |
 | `task_seed` / `current_frame` | `[M]` | 稳定任务标识和绝对当前帧 |
@@ -86,8 +84,8 @@ tracker_available       [B,6]
 ```
 
 `current_tracker_raw` 通道为 position `0:3`、rotation6D `3:9`、available `9`。
-不可用 Tracker 的前 9 维为零。训练 sampler 只以 1:1 产生核心三点和全部六点，
-模型不接收全局 scenario id。
+不可用 Tracker 的前 9 维为零。训练 sampler 对 Hip、LeftFoot、RightFoot 的所有
+开关组合做确定性轮换，长期等概率覆盖全部 8 种配置；模型不接收 scenario id。
 
 ## Normalizer
 
@@ -117,20 +115,48 @@ horizon 0，最后一步恢复训练模式并反传。30Hz 下的 30 步闭环�
 `model_latest.pt` 固定写入最新 EMA 推理权重，不参与清理。`--resume_checkpoint
 latest` 从最近的带步号 `model*.pt` 恢复模型、optimizer、EMA 与 step。
 
-## 单帧 DiT 与冻结边界
+## Predictor residual diffusion 与冻结边界
 
-DiT diffusion state、普通 noise、模型输出和 sample 均为 `[B,144]`。公开条件：
+令 `p = predictor_pose_horizon[:,0]`，完整 normalized rotation6D residual 为
+`r = GT - p`，逐关节门控为 `m [B,24]`。DiT diffusion state、noise、target、
+模型输出和 sample 均为 `[B,144]` residual：
 
 ```text
-motion_context           [B,10,144]
-predictor_pose_horizon         [B,11,144]
-current_joint_condition  [B,24,10]
+x_start = broadcast6(m) * r
+raw_pred_pose = p + predicted_residual
 ```
 
-`predictor_pose_horizon[:,0]` 是 Predictor current prior，`[:,1:]` 是未来 10 帧条件。每层
-只更新当前 24 个 joint token：先做 spatial self-attention，再由每个当前关节
-对该关节的 `[-10..-1,1..10]` 20 帧上下文做 temporal cross-attention，最后
-执行 timestep AdaLN MLP。输出 Pose `[B,144]` 和 contact logits `[B,2]`。
+扩散基础 schedule 默认使用 50 个 timestep，并固定 `predict_xstart=True`。训练使用
+完整 50 步 schedule；采样默认从该 schedule respacing 到 10 步，亦可用同一新
+checkpoint 做 50/20/10/8/5-step 消融。
+
+DiT 公开条件：
+
+```text
+motion_context          [B,10,144]
+predictor_current       [B,24,6]       # 由 horizon[:,0] 提供
+predictor_future        [B,10,24,6]    # 由 horizon[:,1:11] 提供
+tracker_geometry        [B,6,9]
+tracker_available       [B,6] bool
+ik_residual             [B,24,6]
+ik_gap                  [B,24]
+ik_confidence           [B,24]
+denoise_strength        [B,24]
+constraint_type         [B,24]
+```
+
+实现接口使用完整 `predictor_pose_horizon [B,11,144]` 传递 current 与 future。
+历史与未来分别经过不同 Linear 和 role embedding，加入共同 joint/region identity
+及固定 frame offset，拼成 `temporal_context [B,24,20,D]`，顺序严格为
+`[-10,...,-1,+1,...,+10]`。
+
+当前 24 个 joint query 先执行一次 Tracker cross-attention。K/V 物理形状固定为
+`[B,6,D]`，但 `key_padding_mask = ~tracker_available` 会把缺失 Tracker 从
+attention logits 中排除，因此逻辑 K/V 长度是 3～6；只把缺失 token 置零不能替代
+这个 mask。随后进入 4 个 block，每层依次执行 24 关节 spatial self-attention、
+同关节 20 帧 temporal cross-attention 和 timestep AdaLN MLP。固定模型配置为
+`D=192, layers=4, heads=6, mlp_ratio=4, dropout=0, max_seq_len=21`，参数量小于
+5M。`LayerNorm → Linear(D,6)` 输出头零初始化，并再次乘 `m`。
 
 DiT 训练中的 Predictor 始终 `eval()`、`requires_grad=False` 且在 `torch.no_grad()`
 中执行。DiT optimizer、EMA 和 checkpoint 不含 Predictor 权重；`args.json` 记录
@@ -138,26 +164,29 @@ DiT 训练中的 Predictor 始终 `eval()`、`requires_grad=False` 且在 `torch
 完整的 10 帧历史，不添加人工历史扰动。部署历史的时间累积误差由 Predictor
 单阶段训练中的 0～30 步闭环回填建模。
 
-## IK-Inpainting
+## IK residual 与去噪门控
 
 IK 从反归一化的 `predictor_pose_horizon[:,0]` 初始化。Head、双手始终 available；
 直接 Tracker 旋转先写入 IK。双臂始终求解；有 Hip 时求解躯干；Hip 与对应
 Foot 同时 available 时才求解该腿。Foot available 但 Hip unavailable 时只写入
-Foot 直接旋转并提供 Foot position condition。
+Foot 直接旋转并提供 Foot position condition。`ik_residual = normalized(IK) - p`
+只作为 DiT joint condition，不注入 diffusion state。
 
-单帧 inpainting：
+Predictor/IK gap 使用原始旋转的 SO(3) geodesic angle，单位为弧度：
 
 ```text
-pose           [B,144]
-valid          [B,24]
-release_level  [B,24]
-known_noise    [B,144]
+d_j = ||log((R_predictor_j)^T R_ik_j)||_2
+u_j = clamp((d_j - gap_low) / (gap_high - gap_low), 0, 1)
+demand_j = 3*u_j^2 - 2*u_j^3
+m_j = 0.05 + 0.95 * support_j * ik_confidence_j * demand_j
 ```
 
-available Tracker 的 source reliability 固定为 1。中间 IK 关节按约束类型、
-FABRIK residual 与校准值计算 confidence；`release_level =
-sin((1-confidence)*pi/2)`。普通 diffusion noise 与 known noise 独立，known noise
-在完整 DDIM 轨迹中固定。
+`support` 固定为直接旋转 `1.0`、方向/位置骨链约束 `0.35`、继承未约束 `0.0`。
+因此未约束关节只保留 5% 修正余量，直接 Tracker 且 gap 达到 high、confidence=1
+时允许完整修正。校准在全部 8 种 Tracker 配置的 `updated_mask=True` 关节上统计
+Predictor/IK gap，全局 P25/P90 分别写入 `ik_gap_low/high`；两者相差小于
+`1e-4` 弧度时校准失败。校准 JSON 同时保留 `ik_direction_only_quality` 与
+`ik_residual_scale`。训练和采样缺少 gap 校准值时 fail fast。
 
 最终 projection 先把全部 rotation6D 投影到 SO(3)，再仅对所有 available Tracker
 的直接关节旋转执行硬覆盖。IK 中间关节不硬覆盖。
@@ -166,7 +195,8 @@ sin((1-confidence)*pi/2)`。普通 diffusion noise 与 known noise 独立，know
 
 Runtime 固定每秒调用 30 次。初始化必须提供 10 帧完整 world/deployed Pose history，以及核心三点
 offset `-11..-1` 的 11 帧 Tracker；也接受已经包含当前 offset 0 的 12 帧形式。
-每步只读取当前六点 Tracker，依次执行 Predictor、IK、单帧 DDIM、hard projection、
+每步只读取当前六点 Tracker，依次执行 Predictor、IK、10-step deterministic DDIM
+（`eta=0`）、hard projection、
 Head-anchored resolver，并把 deployed 当前 Pose 追加到 history。60/90Hz 显示插值由
 Python 模型输出之后的客户端完成。
 
@@ -176,8 +206,9 @@ Python 模型输出之后的客户端完成。
 predictor_pose_horizon    [11,144]
 raw_pred_pose       [144]
 deployed_pred_pose  [144]
-inpaint_confidence  [24]
-contact_logits      [2]
+ik_gap              [24]
+ik_confidence       [24]
+denoise_strength    [24]
 current_head_yaw_world scalar
 ```
 
@@ -191,10 +222,11 @@ parent-local axis-angle MPJRE、世界关节 MPJPE、MPJVE、预测 Jitter 与 G
 4 帧时 Jitter 为 `null`。11 帧 horizon rotation 以及前 30/30 帧后的闭环误差仅作为
 Predictor 诊断。组合评估的静态配置覆盖 core only、
 core+Hip、core+单脚、core+双脚、core+Hip+单脚和 all six 共 8 种，并分别报告
-DiT raw 与 DiT deployed 的同组 RPM-P2/MC 指标；全局 Predictor-only 基线只计算一次。core only 与 all six
-标记为训练见过的配置。`--tracker_configs` 可选择评估子集；基础报告只运行
-core only 与 all six，正式完整报告运行全部 8 种。
+DiT raw 与 DiT deployed 的同组 RPM-P2/MC 指标；全局 Predictor-only 基线只计算一次。
+全部 8 种配置都属于训练分布。`--tracker_configs` 可选择评估子集；正式报告运行
+全部 8 种，并同时报告 Tracker error 与端到端延迟。
 
 `predictor_sparse_*` 统计键、`predictor_sparse_mean.pt/std.pt`、模型参数名与
-`predictor_pose_horizon` 都是当前唯一契约；旧 `rpm_*` Task Store、normalizer、
-checkpoint 和 DiT checkpoint 不兼容，需要按当前链路重新生成或重新训练。
+`predictor_pose_horizon` 都是当前唯一契约。已有 Predictor checkpoint、当前 Task Store
+及 Pose/Tracker normalizer 可直接复用；绝对 Pose diffusion/旧 IK trajectory 条件的
+DiT checkpoint 与本 residual 架构不兼容，不提供兼容加载路径，必须重新训练 DiT。

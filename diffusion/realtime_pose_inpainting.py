@@ -2,74 +2,115 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 from data_loaders.realtime_pose_config import IKInpaintingConfig
-from data_loaders.realtime_pose_ik import RealtimePoseIKResult, build_current_ik
+from data_loaders.realtime_pose_ik import (
+    DIRECT_ROTATION,
+    DIRECTION_ONLY,
+    POSITION_SOLVED,
+    RealtimePoseIKResult,
+    build_current_ik,
+)
+from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_torch
 from data_loaders.sensor_masking import (
-    CURRENT_JOINT_CONDITION_DIM,
-    CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
     REALTIME_POSE_TARGET_DIM,
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
     TRACKER_AVAILABLE_OFFSET,
+    TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
-    TRACKER_TO_JOINT,
 )
 
 
 @dataclass(frozen=True)
 class RealtimePoseInpaintingCondition:
-    """单帧 IK-inpainting 条件；known noise 在整条 DDIM 轨迹中保持不变。"""
+    """由 IK 生成的 Predictor residual 方向与逐关节去噪门控。"""
 
-    pose: torch.Tensor  # [B,144]
-    valid: torch.Tensor  # [B,24]
-    release_level: torch.Tensor  # [B,24]
-    known_noise: torch.Tensor  # [B,144]
-
-
-def confidence_to_release_level(confidence: torch.Tensor) -> torch.Tensor:
-    """高 confidence 对应更低释放阈值，因此能在更长的去噪区间保持约束。"""
-
-    corruption = 1.0 - confidence.clamp(0.0, 1.0)
-    return torch.sin(corruption * torch.pi * 0.5)
+    ik_residual: torch.Tensor  # [B,24,6]，normalized IK - Predictor
+    ik_gap: torch.Tensor  # [B,24]，SO(3) geodesic angle，单位为弧度
+    ik_confidence: torch.Tensor  # [B,24]
+    denoise_strength: torch.Tensor  # [B,24]
+    constraint_type: torch.Tensor  # [B,24]
 
 
 def build_realtime_pose_inpainting_condition(
     ik_result: RealtimePoseIKResult,
+    initial_pose_raw: torch.Tensor,
     pose_mean: torch.Tensor | None,
     pose_scale: torch.Tensor | None,
-    known_noise: torch.Tensor | None = None,
+    config: IKInpaintingConfig,
 ) -> RealtimePoseInpaintingCondition:
-    batch_size = ik_result.pose.shape[0]
+    """比较 Predictor prior 与 IK，生成可解释的逐关节 residual 门控。"""
+
+    cfg = config
+    batch_size = initial_pose_raw.shape[0]
+    if tuple(initial_pose_raw.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+        raise ValueError("initial_pose_raw 必须为 [B,144]。")
     if tuple(ik_result.pose.shape) != (
         batch_size,
         SMPL_JOINT_COUNT,
         ROTATION_6D_DIM,
     ):
         raise ValueError("ik_result.pose 必须为 [B,24,6]。")
-    if tuple(ik_result.updated_mask.shape) != (batch_size, SMPL_JOINT_COUNT):
-        raise ValueError("ik_result.updated_mask 必须为 [B,24]。")
-    pose_raw = ik_result.pose.reshape(batch_size, REALTIME_POSE_TARGET_DIM)
-    if pose_mean is None or pose_scale is None:
-        pose = pose_raw
-    else:
-        mean = pose_mean.to(pose_raw)
-        scale = pose_scale.to(pose_raw)
-        pose = (pose_raw - mean) / scale
-    if known_noise is None:
-        known_noise = torch.randn_like(pose)
-    condition = RealtimePoseInpaintingCondition(
-        pose=pose,
-        valid=ik_result.updated_mask.bool(),
-        release_level=confidence_to_release_level(ik_result.confidence),
-        known_noise=known_noise,
+
+    predictor_pose = initial_pose_raw.reshape(
+        batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM
     )
-    validate_realtime_pose_inpainting_condition(condition)
-    return condition
+    ik_pose = ik_result.pose
+    predictor_rotation = rotation_6d_to_matrix_torch(predictor_pose)
+    ik_rotation = rotation_6d_to_matrix_torch(ik_pose)
+    relative = predictor_rotation.transpose(-1, -2) @ ik_rotation
+    cosine = (
+        (relative.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5
+    ).clamp(-1.0, 1.0)
+    ik_gap = torch.acos(cosine)
+
+    predictor_normalized = _normalize_pose(initial_pose_raw, pose_mean, pose_scale)
+    ik_normalized = _normalize_pose(
+        ik_pose.reshape(batch_size, REALTIME_POSE_TARGET_DIM),
+        pose_mean,
+        pose_scale,
+    )
+    ik_residual = (ik_normalized - predictor_normalized).reshape(
+        batch_size,
+        SMPL_JOINT_COUNT,
+        ROTATION_6D_DIM,
+    )
+
+    constraint_type = ik_result.constraint_type.long()
+    support = torch.zeros_like(ik_gap)
+    support = torch.where(
+        constraint_type == DIRECT_ROTATION,
+        torch.ones_like(support),
+        support,
+    )
+    indirect = (constraint_type == DIRECTION_ONLY) | (
+        constraint_type == POSITION_SOLVED
+    )
+    support = torch.where(
+        indirect,
+        torch.full_like(support, float(cfg.direction_support)),
+        support,
+    )
+    gap_low = float(cfg.gap_low)
+    gap_high = float(cfg.gap_high)
+    normalized_gap = ((ik_gap - gap_low) / (gap_high - gap_low)).clamp(0.0, 1.0)
+    correction_demand = normalized_gap.square() * (3.0 - 2.0 * normalized_gap)
+    floor = float(cfg.untracked_strength)
+    denoise_strength = floor + (1.0 - floor) * (
+        support * ik_result.confidence * correction_demand
+    )
+    denoise_strength = denoise_strength.clamp(floor, 1.0)
+
+    return RealtimePoseInpaintingCondition(
+        ik_residual=ik_residual,
+        ik_gap=ik_gap,
+        ik_confidence=ik_result.confidence,
+        denoise_strength=denoise_strength,
+        constraint_type=constraint_type,
+    )
 
 
 def build_current_realtime_pose_conditions(
@@ -78,12 +119,11 @@ def build_current_realtime_pose_conditions(
     joint_offsets_parent: torch.Tensor,
     pose_mean: torch.Tensor | None,
     pose_scale: torch.Tensor | None,
-    tracker_position_mean: torch.Tensor | None,
-    tracker_position_scale: torch.Tensor | None,
+    tracker_mean: torch.Tensor | None,
+    tracker_scale: torch.Tensor | None,
     config: IKInpaintingConfig,
-    known_noise: torch.Tensor | None = None,
 ) -> tuple[RealtimePoseIKResult, RealtimePoseInpaintingCondition, torch.Tensor]:
-    """由 Predictor current 与当前 Tracker 构造 IK、inpainting 和 joint condition。"""
+    """由 Predictor current 与当前 Tracker 构造 IK、门控和 Tracker K/V 几何。"""
 
     ik_result = build_current_ik(
         initial_pose_raw=initial_pose_raw,
@@ -93,151 +133,73 @@ def build_current_realtime_pose_conditions(
     )
     condition = build_realtime_pose_inpainting_condition(
         ik_result=ik_result,
+        initial_pose_raw=initial_pose_raw,
         pose_mean=pose_mean,
         pose_scale=pose_scale,
-        known_noise=known_noise,
+        config=config,
     )
-    current_joint_condition = build_current_joint_condition(
-        ik_result=ik_result,
+    tracker_geometry = build_tracker_geometry_condition(
         current_tracker_raw=current_tracker_raw,
-        tracker_position_mean=tracker_position_mean,
-        tracker_position_scale=tracker_position_scale,
+        tracker_mean=tracker_mean,
+        tracker_scale=tracker_scale,
     )
-    return ik_result, condition, current_joint_condition
+    return ik_result, condition, tracker_geometry
 
 
-def build_current_joint_condition(
-    ik_result: RealtimePoseIKResult,
+def build_tracker_geometry_condition(
     current_tracker_raw: torch.Tensor,
-    tracker_position_mean: torch.Tensor | None,
-    tracker_position_scale: torch.Tensor | None,
+    tracker_mean: torch.Tensor | None,
+    tracker_scale: torch.Tensor | None,
 ) -> torch.Tensor:
-    """把当前逐 Tracker 几何与 IK 语义对齐为 `[B,24,10]`。"""
+    """返回供 cross-attention 使用的当前 Tracker normalized 9D 几何。"""
 
-    batch_size = ik_result.pose.shape[0]
+    batch_size = current_tracker_raw.shape[0]
     if tuple(current_tracker_raw.shape) != (
         batch_size,
         TRACKER_COUNT,
         TRACKER_FEATURE_DIM,
     ):
         raise ValueError("current_tracker_raw 必须为 [B,6,10]。")
-    if (tracker_position_mean is None) != (tracker_position_scale is None):
-        raise ValueError("Tracker position mean 与 scale 必须同时提供或同时省略。")
-    tracker_positions = current_tracker_raw[..., :3]
-    if tracker_position_mean is not None:
-        mean = tracker_position_mean.to(tracker_positions)
-        scale = tracker_position_scale.to(tracker_positions)
-        if tuple(mean.shape) != (TRACKER_COUNT, 3) or tuple(scale.shape) != (
-            TRACKER_COUNT,
-            3,
-        ):
-            raise ValueError("Tracker position normalizer 必须为 [6,3]。")
-        tracker_positions = (tracker_positions - mean) / scale
-
+    if (tracker_mean is None) != (tracker_scale is None):
+        raise ValueError("Tracker mean 与 scale 必须同时提供或同时省略。")
+    geometry = current_tracker_raw[..., :TRACKER_CONTINUOUS_DIM]
+    if tracker_mean is not None:
+        mean = tracker_mean.to(geometry)
+        scale = tracker_scale.to(geometry)
+        if tuple(mean.shape) != (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM):
+            raise ValueError("Tracker mean 必须为 [6,9]。")
+        if tuple(scale.shape) != tuple(mean.shape):
+            raise ValueError("Tracker scale 必须为 [6,9]。")
+        geometry = (geometry - mean) / scale
     available = current_tracker_raw[..., TRACKER_AVAILABLE_OFFSET] > 0.5
-    tracker_positions = torch.where(
-        available[..., None], tracker_positions, torch.zeros_like(tracker_positions)
-    )
-    tracker_joint_indices = torch.as_tensor(
-        TRACKER_TO_JOINT,
-        device=current_tracker_raw.device,
-        dtype=torch.long,
-    )
-    joint_positions = tracker_positions.new_zeros(
-        batch_size, SMPL_JOINT_COUNT, 3
-    )
-    joint_position_valid = tracker_positions.new_zeros(
-        batch_size, SMPL_JOINT_COUNT, 1
-    )
-    joint_positions[:, tracker_joint_indices] = tracker_positions
-    joint_position_valid[:, tracker_joint_indices, 0] = available.to(
-        tracker_positions.dtype
-    )
-
-    constraint_type = ik_result.constraint_type
-    if bool(
-        (
-            (constraint_type < 0)
-            | (constraint_type >= CURRENT_JOINT_CONSTRAINT_TYPE_COUNT)
-        ).any()
-    ):
-        raise ValueError("constraint_type 必须位于 [0,3]。")
-    constraint_one_hot = F.one_hot(
-        constraint_type,
-        num_classes=CURRENT_JOINT_CONSTRAINT_TYPE_COUNT,
-    ).to(tracker_positions.dtype)
-    result = torch.cat(
-        [
-            joint_positions,
-            joint_position_valid,
-            ik_result.updated_mask[..., None].to(tracker_positions.dtype),
-            ik_result.confidence[..., None].to(tracker_positions.dtype),
-            constraint_one_hot,
-        ],
-        dim=-1,
-    )
-    if tuple(result.shape) != (
-        batch_size,
-        SMPL_JOINT_COUNT,
-        CURRENT_JOINT_CONDITION_DIM,
-    ):
-        raise RuntimeError("current_joint_condition 内部布局错误。")
-    if not bool(torch.isfinite(result).all()):
-        raise ValueError("current_joint_condition 包含 NaN 或 Inf。")
-    return result
+    geometry = torch.where(available[..., None], geometry, torch.zeros_like(geometry))
+    return geometry
 
 
-def apply_realtime_pose_inpainting(
-    x_t: torch.Tensor,
-    t: torch.Tensor,
-    condition: RealtimePoseInpaintingCondition,
-    alphas_cumprod: np.ndarray,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """按当前噪声水平注入单帧条件，返回 `[B,144]` 与 `[B,24]` active mask。"""
+def gate_realtime_pose_residual(
+    residual: torch.Tensor,
+    denoise_strength: torch.Tensor,
+) -> torch.Tensor:
+    """把 `[B,24]` 门控广播到 normalized rotation6D residual。"""
 
-    batch_size = x_t.shape[0]
-    if tuple(x_t.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
-        raise ValueError("x_t 必须为 [B,144]。")
-    if tuple(t.shape) != (batch_size,):
-        raise ValueError("t 必须为 [B]。")
-    validate_realtime_pose_inpainting_condition(condition, check_values=False)
-    alpha_values = torch.as_tensor(
-        alphas_cumprod, device=x_t.device, dtype=x_t.dtype
-    )
-    alpha_bar_scalar = alpha_values.index_select(0, t.long())
-    alpha_bar = alpha_bar_scalar[:, None, None]
-    pose = condition.pose.to(x_t).reshape(
-        batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM
-    )
-    known_noise = condition.known_noise.to(x_t).reshape_as(pose)
-    condition_at_t = alpha_bar.sqrt() * pose + (1.0 - alpha_bar).sqrt() * known_noise
-    noise_level = torch.sqrt(1.0 - alpha_bar_scalar)[:, None]
-    active = condition.valid.to(x_t.device) & (
-        noise_level >= condition.release_level.to(x_t)
-    )
-    state = x_t.reshape_as(pose)
-    return torch.where(active[..., None], condition_at_t, state).reshape_as(x_t), active
+    batch_size = residual.shape[0]
+    if tuple(residual.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+        raise ValueError("residual 必须为 [B,144]。")
+    if tuple(denoise_strength.shape) != (batch_size, SMPL_JOINT_COUNT):
+        raise ValueError("denoise_strength 必须为 [B,24]。")
+    return (
+        residual.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
+        * denoise_strength.to(residual)[..., None]
+    ).reshape_as(residual)
 
 
-def validate_realtime_pose_inpainting_condition(
-    condition: RealtimePoseInpaintingCondition,
-    check_values: bool = True,
-) -> None:
-    batch_size = condition.pose.shape[0]
-    if tuple(condition.pose.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
-        raise ValueError("inpaint pose 必须为 [B,144]。")
-    if tuple(condition.valid.shape) != (batch_size, SMPL_JOINT_COUNT):
-        raise ValueError("inpaint valid 必须为 [B,24]。")
-    if condition.valid.dtype != torch.bool:
-        raise ValueError("inpaint valid 必须为 bool。")
-    if tuple(condition.release_level.shape) != tuple(condition.valid.shape):
-        raise ValueError("release_level 必须为 [B,24]。")
-    if tuple(condition.known_noise.shape) != tuple(condition.pose.shape):
-        raise ValueError("known_noise 必须为 [B,144]。")
-    if check_values:
-        tensors = (condition.pose, condition.release_level, condition.known_noise)
-        if not all(bool(torch.isfinite(value).all()) for value in tensors):
-            raise ValueError("inpainting condition 包含 NaN 或 Inf。")
-        release = condition.release_level
-        if bool(((release < 0.0) | (release > 1.0)).any()):
-            raise ValueError("release_level 必须位于 [0,1]。")
+def _normalize_pose(
+    value: torch.Tensor,
+    mean: torch.Tensor | None,
+    scale: torch.Tensor | None,
+) -> torch.Tensor:
+    if (mean is None) != (scale is None):
+        raise ValueError("Pose mean 与 scale 必须同时提供或同时省略。")
+    if mean is None:
+        return value
+    return (value - mean.to(value)) / scale.to(value)

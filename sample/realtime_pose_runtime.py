@@ -26,7 +26,6 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
     PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH,
-    PREDICTOR_POSE_HORIZON_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     validate_tracker_available,
@@ -67,8 +66,9 @@ class RuntimeStepResult:
     predictor_pose_horizon: np.ndarray  # [11,144]，原始物理值
     raw_pred_pose: np.ndarray  # [144]
     deployed_pred_pose: np.ndarray  # [144]
-    inpaint_confidence: np.ndarray  # [24]
-    contact_logits: np.ndarray  # [2]
+    ik_gap: np.ndarray  # [24]，弧度
+    ik_confidence: np.ndarray  # [24]
+    denoise_strength: np.ndarray  # [24]
     resolved_pose: ResolvedPose
     current_tracker_raw: np.ndarray  # [6,10]
     current_head_yaw_world: float
@@ -113,6 +113,10 @@ class RealtimePoseRuntime:
         ik_direction_only_quality: float | None = None,
         ik_residual_scale: float | None = None,
         ik_position_solved_quality: float | None = None,
+        ik_gap_low: float | None = None,
+        ik_gap_high: float | None = None,
+        ik_direction_support: float = 0.35,
+        ik_untracked_strength: float = 0.05,
     ):
         self.predictor_model = predictor_model.eval().requires_grad_(False)
         self.dit_model = dit_model.eval().requires_grad_(False)
@@ -124,6 +128,10 @@ class RealtimePoseRuntime:
             direction_only_quality=ik_direction_only_quality,
             residual_scale=ik_residual_scale,
             position_solved_quality=ik_position_solved_quality,
+            gap_low=ik_gap_low,
+            gap_high=ik_gap_high,
+            direction_support=ik_direction_support,
+            untracked_strength=ik_untracked_strength,
         ).validate()
         self.joint_offsets_parent = np.asarray(
             joint_offsets_parent, dtype=np.float32
@@ -202,7 +210,6 @@ class RealtimePoseRuntime:
         tracker_available: np.ndarray,
         floor_y: float,
         noise: torch.Tensor | None = None,
-        known_noise: torch.Tensor | None = None,
     ) -> RuntimeStepResult:
         return step_realtime_pose_batch(
             [self],
@@ -211,7 +218,6 @@ class RealtimePoseRuntime:
             np.asarray(tracker_available, dtype=bool)[None],
             np.asarray([floor_y], dtype=np.float32),
             noise=noise,
-            known_noise=known_noise,
         )[0]
 
     def _prepare_step(
@@ -292,8 +298,9 @@ class RealtimePoseRuntime:
         predictor_pose_horizon: np.ndarray,
         raw_pred_pose: np.ndarray,
         deployed_pred_pose: np.ndarray,
-        inpaint_confidence: np.ndarray,
-        contact_logits: np.ndarray | None,
+        ik_gap: np.ndarray,
+        ik_confidence: np.ndarray,
+        denoise_strength: np.ndarray,
     ) -> RuntimeStepResult:
         resolved = decode_and_resolve_pose(
             deployed_pred_pose,
@@ -318,17 +325,13 @@ class RealtimePoseRuntime:
                 )
             )
         self.tracker_history = self.tracker_history[-12:]
-        logits = (
-            np.zeros(2, dtype=np.float32)
-            if contact_logits is None
-            else np.asarray(contact_logits, dtype=np.float32).reshape(2)
-        )
         return RuntimeStepResult(
             predictor_pose_horizon=np.asarray(predictor_pose_horizon, dtype=np.float32).reshape(11, 144),
             raw_pred_pose=np.asarray(raw_pred_pose, dtype=np.float32).reshape(144),
             deployed_pred_pose=np.asarray(deployed_pred_pose, dtype=np.float32).reshape(144),
-            inpaint_confidence=np.asarray(inpaint_confidence, dtype=np.float32).reshape(24),
-            contact_logits=logits,
+            ik_gap=np.asarray(ik_gap, dtype=np.float32).reshape(24),
+            ik_confidence=np.asarray(ik_confidence, dtype=np.float32).reshape(24),
+            denoise_strength=np.asarray(denoise_strength, dtype=np.float32).reshape(24),
             resolved_pose=resolved,
             current_tracker_raw=prepared.current_tracker_raw.copy(),
             current_head_yaw_world=float(prepared.head_yaw_world),
@@ -342,7 +345,6 @@ def step_realtime_pose_batch(
     tracker_available: np.ndarray,
     floor_y: np.ndarray,
     noise: torch.Tensor | None = None,
-    known_noise: torch.Tensor | None = None,
 ) -> list[RuntimeStepResult]:
     if not runtimes:
         raise ValueError("批处理至少需要一个 runtime。")
@@ -378,28 +380,32 @@ def step_realtime_pose_batch(
         dtype=torch.float32,
     )
     mean, scale = _normalizer_pose_stats(first)
-    tracker_mean, tracker_scale = _normalizer_tracker_position_stats(first)
-    if known_noise is not None:
-        if tuple(known_noise.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
-            raise ValueError("known_noise 必须为 [B,144]。")
-        known_noise = known_noise.to(first.device, dtype=torch.float32)
+    tracker_mean, tracker_scale = _normalizer_tracker_stats(first)
     with torch.no_grad():
         predictor_normalized = first.predictor_model(motion_tensor, sparse_tensor)
         predictor_current_raw = _inverse_pose_tensor(first.normalizer, predictor_normalized[:, 0])
-        ik_result, inpainting, joint_condition = build_current_realtime_pose_conditions(
+        _, ik_condition, tracker_geometry = build_current_realtime_pose_conditions(
             initial_pose_raw=predictor_current_raw,
             current_tracker_raw=tracker_tensor,
             joint_offsets_parent=offsets_tensor,
             pose_mean=mean,
             pose_scale=scale,
-            tracker_position_mean=tracker_mean,
-            tracker_position_scale=tracker_scale,
+            tracker_mean=tracker_mean,
+            tracker_scale=tracker_scale,
             config=first.ik_inpainting_config,
-            known_noise=known_noise,
         )
+        tracker_available_tensor = tracker_tensor[..., 9] > 0.5
         dit_impl = getattr(first.dit_model, "module", first.dit_model)
         prepared_conditioning = dit_impl.prepare_conditioning(
-            motion_tensor, predictor_normalized, joint_condition
+            motion_context=motion_tensor,
+            predictor_pose_horizon=predictor_normalized,
+            tracker_geometry=tracker_geometry,
+            tracker_available=tracker_available_tensor,
+            ik_residual=ik_condition.ik_residual,
+            ik_gap=ik_condition.ik_gap,
+            ik_confidence=ik_condition.ik_confidence,
+            denoise_strength=ik_condition.denoise_strength,
+            constraint_type=ik_condition.constraint_type,
         )
     sampling_shape = (batch_size, REALTIME_POSE_TARGET_DIM)
     if noise is not None:
@@ -409,6 +415,7 @@ def step_realtime_pose_batch(
     sample = first.diffusion.projected_ddim_sample_loop(
         first.dit_model,
         shape=sampling_shape,
+        predictor_current=predictor_normalized[:, 0],
         projection_fn=lambda value: project_realtime_pose_xstart(
             value,
             tracker_tensor,
@@ -419,24 +426,25 @@ def step_realtime_pose_batch(
         clip_denoised=False,
         model_kwargs={"prepared_conditioning": prepared_conditioning},
         device=first.device,
-        inpaint_condition=inpainting,
+        eta=0.0,
     )
     predictor_raw = _inverse_pose_tensor(first.normalizer, predictor_normalized).cpu().numpy()
-    raw = _inverse_pose_tensor(first.normalizer, sample["raw_pred_xstart"]).cpu().numpy()
+    raw = _inverse_pose_tensor(first.normalizer, sample["raw_pred_pose"]).cpu().numpy()
     deployed = _inverse_pose_tensor(
-        first.normalizer, sample["deployed_pred_xstart"]
+        first.normalizer, sample["deployed_pred_pose"]
     ).cpu().numpy()
-    contact = sample.get("auxiliary_outputs", {}).get("contact_logits")
-    contact_np = None if contact is None else contact.detach().cpu().numpy()
-    confidence = ik_result.confidence.detach().cpu().numpy()
+    gaps = ik_condition.ik_gap.detach().cpu().numpy()
+    confidence = ik_condition.ik_confidence.detach().cpu().numpy()
+    strengths = ik_condition.denoise_strength.detach().cpu().numpy()
     return [
         runtime._finish_step(
             prepared[index],
             predictor_raw[index],
             raw[index],
             deployed[index],
+            gaps[index],
             confidence[index],
-            None if contact_np is None else contact_np[index],
+            strengths[index],
         )
         for index, runtime in enumerate(runtimes)
     ]
@@ -451,12 +459,12 @@ def _normalizer_pose_stats(runtime: RealtimePoseRuntime):
     )
 
 
-def _normalizer_tracker_position_stats(runtime: RealtimePoseRuntime):
+def _normalizer_tracker_stats(runtime: RealtimePoseRuntime):
     if runtime.normalizer is None or runtime.normalizer.disable:
         return None, None
     return (
-        runtime.normalizer.tracker_mean[:, :3].to(runtime.device),
-        (runtime.normalizer.tracker_std[:, :3] + runtime.normalizer.eps).to(runtime.device),
+        runtime.normalizer.tracker_mean.to(runtime.device),
+        (runtime.normalizer.tracker_std + runtime.normalizer.eps).to(runtime.device),
     )
 
 

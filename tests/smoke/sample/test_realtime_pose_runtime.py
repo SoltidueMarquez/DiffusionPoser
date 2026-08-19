@@ -41,6 +41,8 @@ def _runtime(source, rotations, models):
         fabrik_iterations=1,
         ik_direction_only_quality=0.8,
         ik_residual_scale=0.5,
+        ik_gap_low=0.1,
+        ik_gap_high=0.5,
     )
     runtime.initialize_history(
         [
@@ -85,7 +87,6 @@ def test_stationary_tracker_values_still_advance_runtime_history():
         STATIC_OPTIONAL_TRACKER_MASKS[0],
         0.0,
         noise=torch.zeros(1, 144),
-        known_noise=torch.zeros(1, 144),
     )
     assert len(runtime.tracker_history) == 12
     assert runtime._preloaded_current_pending is False
@@ -99,14 +100,12 @@ def test_single_and_batch_runtime_match_and_output_contract():
     single = _runtime(source, rotations, models)
     batch_runtime = _runtime(source, rotations, models)
     noise = torch.randn(1, 144)
-    known = torch.randn(1, 144)
     single_result = single.step(
         source["tracker_pos_world"][11],
         source["tracker_rot_world_6d"][11],
         STATIC_OPTIONAL_TRACKER_MASKS[-1],
         0.0,
         noise=noise,
-        known_noise=known,
     )
     batch_result = step_realtime_pose_batch(
         [batch_runtime],
@@ -115,13 +114,14 @@ def test_single_and_batch_runtime_match_and_output_contract():
         np.asarray(STATIC_OPTIONAL_TRACKER_MASKS[-1])[None],
         np.asarray([0.0]),
         noise=noise,
-        known_noise=known,
     )[0]
     np.testing.assert_allclose(single_result.deployed_pred_pose, batch_result.deployed_pred_pose)
     assert single_result.predictor_pose_horizon.shape == (11, 144)
     assert single_result.raw_pred_pose.shape == (144,)
-    assert single_result.inpaint_confidence.shape == (24,)
-    assert single_result.contact_logits.shape == (2,)
+    assert single_result.ik_gap.shape == (24,)
+    assert single_result.ik_confidence.shape == (24,)
+    assert single_result.denoise_strength.shape == (24,)
+    assert not hasattr(single_result, "contact_logits")
     assert np.isfinite(single_result.current_head_yaw_world)
 
 
@@ -138,7 +138,6 @@ def test_all_eight_static_tracker_combinations_run():
         np.asarray(STATIC_OPTIONAL_TRACKER_MASKS),
         np.zeros(count, dtype=np.float32),
         noise=torch.zeros(count, 144),
-        known_noise=torch.zeros(count, 144),
     )
     assert len(results) == 8
     assert all(np.isfinite(result.deployed_pred_pose).all() for result in results)

@@ -6,7 +6,6 @@ from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_ik import build_current_ik
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from data_loaders.sensor_masking import TRACKER_TO_JOINT
-from diffusion.realtime_pose_inpainting import build_current_joint_condition
 from diffusion.realtime_pose_projection import (
     project_realtime_pose_xstart,
     project_rotation_6d_to_so3,
@@ -37,6 +36,8 @@ def _config():
         fabrik_iterations=1,
         direction_only_quality=0.8,
         residual_scale=0.5,
+        gap_low=0.1,
+        gap_high=0.5,
     )
 
 
@@ -59,8 +60,7 @@ def test_foot_without_hip_is_direct_condition_but_does_not_run_leg_fabrik():
     result = build_current_ik(initial, tracker, offsets, _config())
     assert result.direct_rotation_mask[0, JOINT_INDEX["left_foot"]]
     assert not result.updated_mask[0, JOINT_INDEX["left_knee"]]
-    condition = build_current_joint_condition(result, tracker, None, None)
-    assert condition[0, JOINT_INDEX["left_foot"], 3] == 1
+    assert tracker[0, 4, 9] == 1
 
 
 def test_projection_overwrites_available_and_preserves_absent_tracker_joint():

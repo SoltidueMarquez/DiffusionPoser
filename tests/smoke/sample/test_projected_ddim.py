@@ -38,12 +38,9 @@ class _Constant(nn.Module):
         super().__init__()
         self.register_buffer("value", value)
 
-    def forward(self, x, timestep, return_aux_outputs=False, **kwargs):
+    def forward(self, x, timestep, **kwargs):
         del timestep, kwargs
-        value = self.value.expand_as(x)
-        if return_aux_outputs:
-            return value, {"contact_logits": torch.ones(x.shape[0], 2)}
-        return value
+        return self.value.expand_as(x)
 
 
 def test_projected_ddim_is_single_frame_and_projects_only_final_step():
@@ -58,8 +55,12 @@ def test_projected_ddim_is_single_frame_and_projects_only_final_step():
         _Constant(torch.zeros(1, 144)),
         shape=(1, 144),
         projection_fn=lambda value: calls.append(1) or value,
+        predictor_current=IDENTITY_6D.repeat(24)[None],
         device=torch.device("cpu"),
     )
     assert result["sample"].shape == (1, 144)
-    assert result["auxiliary_outputs"]["contact_logits"].shape == (1, 2)
+    torch.testing.assert_close(result["sample"], torch.zeros(1, 144))
+    torch.testing.assert_close(
+        result["raw_pred_pose"], IDENTITY_6D.repeat(24)[None]
+    )
     assert len(calls) == 1

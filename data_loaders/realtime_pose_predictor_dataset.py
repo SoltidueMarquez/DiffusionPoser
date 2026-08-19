@@ -159,7 +159,7 @@ class RealtimePosePredictorSequenceDataset(Dataset):
 
 
 def _load_predictor_fk_source(path: Path) -> tuple[dict[str, np.ndarray], int]:
-    """每个所需字段只解压一次，不读取 Predictor 训练未使用的 joints/contact。"""
+    """每个所需字段只解压一次，不读取 Predictor 训练未使用的 joints 等字段。"""
 
     with np.load(path, allow_pickle=False) as payload:
         missing = [key for key in _PREDICTOR_FK_SOURCE_FIELDS if key not in payload.files]

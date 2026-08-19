@@ -55,16 +55,25 @@ def calibrate(args) -> dict:
     )
     angle_values = []
     residual_ratios = []
+    predictor_ik_gaps = []
+    observed_tracker_masks: set[tuple[bool, ...]] = set()
     consumed = 0
     config = IKInpaintingConfig(
         fabrik_iterations=args.fabrik_iterations,
         direction_only_quality=0.8,
         residual_scale=1.0,
+        # gap 本身正是本脚本的校准目标；此处仅提供合法占位值以运行 IK。
+        gap_low=0.0,
+        gap_high=1.0,
     )
     mean = normalizer.pose_mean.to(device)
     scale = normalizer.pose_scale.to(device)
     for batch in loader:
         batch = move_batch_to_device(batch, device)
+        observed_tracker_masks.update(
+            tuple(bool(value) for value in row)
+            for row in batch["tracker_available"].detach().cpu().tolist()
+        )
         horizon = predictor(batch["motion_context"], batch["core_tracker_context"])
         initial = horizon[:, 0] * scale + mean
         result = build_current_ik(
@@ -75,31 +84,52 @@ def calibrate(args) -> dict:
         )
         target = batch["x"] * scale + mean
         predicted_rot = rotation_6d_to_matrix_torch(result.pose)
+        predictor_rot = rotation_6d_to_matrix_torch(initial.reshape(-1, 24, 6))
         target_rot = rotation_6d_to_matrix_torch(target.reshape(-1, 24, 6))
         angles = _rotation_angle(predicted_rot, target_rot)
+        gaps = _rotation_angle(predictor_rot, predicted_rot)
         direction_mask = result.constraint_type == DIRECTION_ONLY
         angle_values.extend(angles[direction_mask].cpu().tolist())
         chain_length = build_ik_joint_chain_length(batch["joint_offsets_parent"])
         ratios = result.position_residual / chain_length.clamp_min(1e-8)
         residual_ratios.extend(ratios[direction_mask].cpu().tolist())
+        predictor_ik_gaps.extend(gaps[result.updated_mask].cpu().tolist())
         consumed += int(target.shape[0])
         if consumed >= args.max_samples:
             break
     if not angle_values or not residual_ratios:
         raise RuntimeError("校准样本没有产生 DIRECTION_ONLY IK 约束。")
+    if not predictor_ik_gaps:
+        raise RuntimeError("校准样本没有产生 updated_mask=True 的 IK 关节。")
+    if len(observed_tracker_masks) != 8:
+        raise RuntimeError(
+            "IK gap 校准必须覆盖全部 8 种 Tracker 配置，"
+            f"本次只观察到 {len(observed_tracker_masks)} 种。"
+        )
     median_angle = float(np.median(angle_values))
     direction_quality = float(np.clip(np.exp(-median_angle), 0.05, 0.99))
     residual_scale = float(max(np.median(residual_ratios), 1e-3))
+    gap_low = float(np.percentile(predictor_ik_gaps, 25.0))
+    gap_high = float(np.percentile(predictor_ik_gaps, 90.0))
+    if gap_high - gap_low < 1e-4:
+        raise RuntimeError(
+            "IK gap 校准失败：全局 P90 与 P25 相差不足 1e-4 弧度。"
+        )
     return {
         "sample_count": min(consumed, int(args.max_samples)),
         "predictor_model_path": str(Path(args.predictor_model_path).resolve()),
         "recommended_parameters": {
             "ik_direction_only_quality": direction_quality,
             "ik_residual_scale": residual_scale,
+            "ik_gap_low": gap_low,
+            "ik_gap_high": gap_high,
         },
         "diagnostics": {
             "median_direction_rotation_error_deg": float(np.degrees(median_angle)),
             "median_endpoint_residual_ratio": float(np.median(residual_ratios)),
+            "ik_gap_unit": "radian",
+            "updated_joint_gap_count": len(predictor_ik_gaps),
+            "tracker_configuration_count": len(observed_tracker_masks),
         },
     }
 

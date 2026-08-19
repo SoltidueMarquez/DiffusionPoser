@@ -21,16 +21,17 @@ def create_model_and_diffusion(args):
         num_layers=args.layers,
         num_heads=args.heads,
         dropout=args.dropout,
-        zero_init=args.zero_init,
         max_seq_len=args.max_seq_len,
     )
     return model, create_gaussian_diffusion(args)
 
 
 def create_gaussian_diffusion(args):
-    """创建只恢复当前 144D Pose 的扩散过程。"""
+    """创建只恢复当前 144D Predictor residual 的扩散过程。"""
 
     steps = int(args.diffusion_steps)
+    if not bool(args.predict_xstart):
+        raise ValueError("Predictor residual diffusion 固定要求 --predict_xstart 1。")
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
     betas = gd.get_named_beta_schedule(args.noise_schedule, steps, scale_betas=1.0)
     return SpacedDiffusion(
@@ -56,8 +57,6 @@ def create_gaussian_diffusion(args):
         rotation_velocity_loss_weight=getattr(
             args, "rotation_velocity_loss_weight", 1.0
         ),
-        contact_loss_weight=getattr(args, "contact_loss_weight", 0.0),
-        contact_slide_loss_weight=getattr(args, "contact_slide_loss_weight", 0.0),
     )
 
 
