@@ -1,424 +1,144 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import torch
-from ema_pytorch import EMA
 
 from data_loaders.generate_realtime_pose_tasks import compute_source_joint_rotations_world
-from data_loaders.realtime_pose_geometry import (
-    extract_rotation_heading_np,
-)
-from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_np
-from data_loaders.sensor_masking import (
-    REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_LENGTH,
-    TRACKER_FEATURE_DIM,
-)
-from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
-from sample.realtime_pose_runtime import (
-    RealtimePoseRuntime,
-    WorldPoseState,
-    decode_and_resolve_pose,
-    step_realtime_pose_batch,
-)
-from sample.utils import load_checkpoint_model
-from tests.smoke.realtime_pose_fixtures import (
-    IDENTITY_6D,
-    build_toy_realtime_source,
-)
+from data_loaders.sensor_masking import STATIC_OPTIONAL_TRACKER_MASKS
+from diffusion.gaussian_diffusion import GaussianDiffusion, LossType, ModelMeanType, ModelVarType
+from model.realtime_pose_current_dit import RealtimePoseCurrentDiT
+from model.realtime_pose_predictor import RealtimePosePredictor
+from sample.realtime_pose_runtime import RealtimePoseRuntime, WorldPoseState, step_realtime_pose_batch
+from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 
 
-class _RecordingModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.anchor = torch.nn.Parameter(torch.zeros(()))
-        self.history_valid_counts: list[int] = []
-        self.batch_sizes: list[int] = []
-        self.prepare_grad_enabled: list[bool] = []
-        self.head_paths: list[torch.Tensor] = []
-
-    def forward(self, value, *_args, **_kwargs):
-        return value + self.anchor
-
-    def prepare_conditioning(
-        self,
-        history_pose_observation,
-        head_path_window,
-        history_region_confidence,
-        window_valid_mask,
-        frame_offsets,
-        current_joint_condition,
-    ):
-        batch_size = int(history_pose_observation.shape[0])
-        assert history_pose_observation.shape == (batch_size, 10, 144)
-        assert head_path_window.shape == (batch_size, 11, 5)
-        assert history_region_confidence.shape == (batch_size, 10, 5)
-        assert window_valid_mask.shape == (batch_size, 11)
-        assert frame_offsets.shape == (batch_size, 21)
-        assert current_joint_condition.shape == (batch_size, 24, 10)
-        self.history_valid_counts.extend(
-            int(value) for value in window_valid_mask[:, :-1].sum(dim=1).cpu().tolist()
-        )
-        self.batch_sizes.append(batch_size)
-        self.prepare_grad_enabled.append(torch.is_grad_enabled())
-        self.head_paths.append(head_path_window.detach().cpu().clone())
-        return {"batch_size": batch_size}
-
-
-class _OneStepProjectedDiffusion:
-    def projected_ddim_sample_loop(
-        self,
-        model,
-        shape,
-        projection_fn,
-        model_kwargs,
-        device,
-        **kwargs,
-    ):
-        del model, model_kwargs, kwargs
-        assert shape[1:] == (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
-        frame = torch.as_tensor(
-            np.tile(IDENTITY_6D, 24), device=device, dtype=torch.float32
-        )
-        raw = frame.reshape(1, 1, REALTIME_POSE_TARGET_DIM).expand(*shape).clone()
-        deployed = projection_fn(raw)
-        return {
-            "sample": deployed,
-            "raw_pred_xstart": raw,
-            "deployed_pred_xstart": deployed,
-        }
-
-
-def _step(runtime, source, frame, valid):
-    return runtime.step(
-        source["tracker_pos_world"][frame],
-        source["tracker_rot_world_6d"][frame],
-        np.ones(6, dtype=bool),
-        valid,
-        float(source["root_pos_world"][frame, 1]),
+def _models():
+    predictor = RealtimePosePredictor(
+        latent_dim=32, num_layers=1, num_heads=4, feedforward_dim=64, dropout=0.0
+    ).eval()
+    dit = RealtimePoseCurrentDiT(
+        latent_dim=32, num_layers=1, num_heads=4, dropout=0.0
+    ).eval()
+    diffusion = GaussianDiffusion(
+        betas=np.asarray([0.1, 0.2], dtype=np.float64),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
     )
+    return predictor, dit, diffusion
 
 
-def _runtime(model, diffusion, source, **kwargs) -> RealtimePoseRuntime:
-    kwargs.setdefault("ik_direction_only_quality", 0.4)
-    kwargs.setdefault("ik_residual_scale", 0.1)
-    return RealtimePoseRuntime(
-        model,
+def _runtime(source, rotations, models):
+    predictor, dit, diffusion = models
+    runtime = RealtimePoseRuntime(
+        predictor,
+        dit,
         diffusion,
         torch.device("cpu"),
         source["joint_offsets_parent"],
         source["joint_rest_local_rotations_6d"],
-        **kwargs,
+        normalizer=None,
+        fabrik_iterations=1,
+        ik_direction_only_quality=0.8,
+        ik_residual_scale=0.5,
     )
-
-
-def test_runtime_uses_60_dense_frames_and_synchronized_anchors():
-    source = build_toy_realtime_source(frame_count=65)
-    model = _RecordingModel()
-    runtime = _runtime(model, _OneStepProjectedDiffusion(), source)
-    valid = np.ones(6, dtype=bool)
-    results = [_step(runtime, source, frame, valid) for frame in range(61)]
-    assert model.history_valid_counts[0] == 0
-    assert model.history_valid_counts[1] == 1
-    assert model.history_valid_counts[59] == 9
-    assert model.history_valid_counts[60] == 10
-    assert len(runtime.pose_history) == 60
-    assert len(runtime.tracker_history) == 60
-    assert not (results[0].inpaint_confidence[1:] > 0.0).any()
-    assert not (results[1].inpaint_confidence[1:] > 0.0).any()
-    current_head_path = model.head_paths[-1][0, -1]
-    torch.testing.assert_close(current_head_path[:2], torch.zeros(2))
-    torch.testing.assert_close(current_head_path[3:], torch.tensor([0.0, 1.0]))
-    assert results[-1].raw_pred_pose_horizon.shape == (11, 144)
-    assert results[-1].deployed_pred_pose_horizon.shape == (11, 144)
-
-
-def test_runtime_can_seed_sixty_ground_truth_frames_without_sampling():
-    source = build_toy_realtime_source(frame_count=61)
-    rotations = compute_source_joint_rotations_world(source)
-    model = _RecordingModel()
-    runtime = _runtime(model, _OneStepProjectedDiffusion(), source)
-    valid = np.ones(6, dtype=bool)
-    for frame_index in range(60):
-        runtime.append_ground_truth_frame(
-            WorldPoseState(
-                joint_rotations_world=rotations[frame_index],
-                root_yaw_world=float(
-                    extract_rotation_heading_np(rotations[frame_index, 0])
-                ),
-                hip_height=float(source["pelvis_height"][frame_index, 0]),
-                root_position_world=source["root_pos_world"][frame_index],
-            ),
-            source["tracker_pos_world"][frame_index],
-            source["tracker_rot_world_6d"][frame_index],
-            valid,
-            valid,
-            float(source["root_pos_world"][frame_index, 1]),
-        )
-
-    assert model.batch_sizes == []
-    assert len(runtime.pose_history) == 60
-    np.testing.assert_allclose(
-        runtime.pose_history[-1].joint_rotations_world,
-        rotations[59],
-        atol=1e-6,
-    )
-    _step(runtime, source, 60, valid)
-    assert model.history_valid_counts == [10]
-    assert len(runtime.pose_history) == 60
-
-
-def test_runtime_root_yaw_unwraps_and_falls_back_at_true_singularity():
-    source = build_toy_realtime_source(frame_count=1)
-    rotations = np.repeat(np.eye(3, dtype=np.float64)[None], 24, axis=0)
-    yaw = np.radians(-179.0)
-    rotations[0] = np.asarray(
+    runtime.initialize_history(
         [
-            [np.cos(yaw), 0.0, np.sin(yaw)],
-            [0.0, 1.0, 0.0],
-            [-np.sin(yaw), 0.0, np.cos(yaw)],
-        ]
+            WorldPoseState(
+                rotations[index],
+                float(source["root_yaw"][index]),
+                float(source["pelvis_height"][index, 0]),
+                source["root_pos_world"][index],
+            )
+            for index in range(1, 11)
+        ],
+        source["tracker_pos_world"][:11],
+        source["tracker_rot_world_6d"][:11],
+        source["root_pos_world"][:11, 1],
     )
-    target = rotation_6d_forward_up_np(rotations).reshape(-1).astype(np.float32)
-    tracker = np.zeros((6, TRACKER_FEATURE_DIM), dtype=np.float32)
-    tracker[0, 1] = 1.7
-
-    unwrapped = decode_and_resolve_pose(
-        target,
-        tracker,
-        current_head_yaw_world=0.0,
-        current_head_position_world=np.zeros(3, dtype=np.float32),
-        floor_y=0.0,
-        joint_offsets_parent=source["joint_offsets_parent"],
-        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
-        previous_root_yaw_world=np.radians(179.0),
-    )
-    assert np.degrees(unwrapped.root_yaw_world) == pytest.approx(181.0, abs=1e-4)
-
-    rotations[0] = np.diag([1.0, -1.0, -1.0])
-    singular_target = rotation_6d_forward_up_np(rotations).reshape(-1).astype(np.float32)
-    fallback = decode_and_resolve_pose(
-        singular_target,
-        tracker,
-        current_head_yaw_world=0.4,
-        current_head_position_world=np.zeros(3, dtype=np.float32),
-        floor_y=0.0,
-        joint_offsets_parent=source["joint_offsets_parent"],
-        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
-        previous_root_yaw_world=1.2,
-    )
-    first_frame = decode_and_resolve_pose(
-        singular_target,
-        tracker,
-        current_head_yaw_world=0.4,
-        current_head_position_world=np.zeros(3, dtype=np.float32),
-        floor_y=0.0,
-        joint_offsets_parent=source["joint_offsets_parent"],
-        joint_rest_local_rotations_6d=source["joint_rest_local_rotations_6d"],
-    )
-    assert fallback.root_yaw_world == pytest.approx(1.2)
-    assert first_frame.root_yaw_world == pytest.approx(0.4)
+    return runtime
 
 
-def test_runtime_dropout_and_reconnect_preserve_duration_semantics():
-    source = build_toy_realtime_source(frame_count=18)
-    runtime = _runtime(_RecordingModel(), _OneStepProjectedDiffusion(), source)
-    valid = np.ones(6, dtype=bool)
-    stable = [_step(runtime, source, frame, valid) for frame in range(16)]
-    assert not stable[0].hard_rotation_state[1:].any()
-    assert stable[14].hard_rotation_state.all()
-    dropout = valid.copy()
-    dropout[[1, 3]] = False
-    dropped = _step(runtime, source, 16, dropout)
-    assert not dropped.hard_rotation_state[[1, 3]].any()
-    assert runtime.previous_d_off[[1, 3]].tolist() == [1, 1]
-    reconnected = _step(runtime, source, 17, valid)
-    assert not reconnected.hard_rotation_state[[1, 3]].any()
-    assert runtime.previous_d_on[[1, 3]].tolist() == [1, 1]
-
-
-def test_runtime_rejects_future_rolling_prior_in_first_round():
-    source = build_toy_realtime_source(frame_count=1)
-    with pytest.raises(ValueError, match="显式禁用"):
-        _runtime(
-            _RecordingModel(),
-            _OneStepProjectedDiffusion(),
-            source,
-            use_future_rolling_prior=True,
+def test_runtime_requires_complete_history():
+    source = build_toy_realtime_source(24)
+    rotations = compute_source_joint_rotations_world(source)
+    runtime = _runtime(source, rotations, _models())
+    runtime.pose_history.pop()
+    with np.testing.assert_raises(RuntimeError):
+        runtime.step(
+            source["tracker_pos_world"][11],
+            source["tracker_rot_world_6d"][11],
+            STATIC_OPTIONAL_TRACKER_MASKS[0],
+            0.0,
         )
 
 
-def test_runtime_uses_linear_tracker_warmup_for_current_joint_confidence():
-    source = build_toy_realtime_source(frame_count=4)
-    runtime = _runtime(
-        _RecordingModel(),
-        _OneStepProjectedDiffusion(),
-        source,
-        tracker_confidence_warmup=2,
+def test_stationary_tracker_values_still_advance_runtime_history():
+    source = build_toy_realtime_source(24)
+    rotations = compute_source_joint_rotations_world(source)
+    runtime = _runtime(source, rotations, _models())
+    repeated_position = source["tracker_pos_world"][10].copy()
+    repeated_rotation = source["tracker_rot_world_6d"][10].copy()
+    runtime.step(
+        repeated_position,
+        repeated_rotation,
+        STATIC_OPTIONAL_TRACKER_MASKS[0],
+        0.0,
+        noise=torch.zeros(1, 144),
+        known_noise=torch.zeros(1, 144),
     )
-    valid = np.ones(6, dtype=bool)
-    results = [_step(runtime, source, frame, valid) for frame in range(4)]
-
-    np.testing.assert_array_equal(runtime.previous_d_on, np.full(6, 4))
-    assert results[0].inpaint_confidence[0].max() == pytest.approx(0.5)
-    assert results[1].inpaint_confidence[0].max() == pytest.approx(1.0)
+    assert len(runtime.tracker_history) == 12
+    assert runtime._preloaded_current_pending is False
 
 
-def test_batched_runtime_samples_one_window_per_sequence():
-    source = build_toy_realtime_source(frame_count=1)
-    model = _RecordingModel()
-    diffusion = _OneStepProjectedDiffusion()
-    runtimes = [
-        _runtime(model, diffusion, source)
-        for _ in range(2)
-    ]
+def test_single_and_batch_runtime_match_and_output_contract():
+    torch.manual_seed(4)
+    source = build_toy_realtime_source(24)
+    rotations = compute_source_joint_rotations_world(source)
+    models = _models()
+    single = _runtime(source, rotations, models)
+    batch_runtime = _runtime(source, rotations, models)
+    noise = torch.randn(1, 144)
+    known = torch.randn(1, 144)
+    single_result = single.step(
+        source["tracker_pos_world"][11],
+        source["tracker_rot_world_6d"][11],
+        STATIC_OPTIONAL_TRACKER_MASKS[-1],
+        0.0,
+        noise=noise,
+        known_noise=known,
+    )
+    batch_result = step_realtime_pose_batch(
+        [batch_runtime],
+        source["tracker_pos_world"][11:12],
+        source["tracker_rot_world_6d"][11:12],
+        np.asarray(STATIC_OPTIONAL_TRACKER_MASKS[-1])[None],
+        np.asarray([0.0]),
+        noise=noise,
+        known_noise=known,
+    )[0]
+    np.testing.assert_allclose(single_result.deployed_pred_pose, batch_result.deployed_pred_pose)
+    assert single_result.predictor_pose_horizon.shape == (11, 144)
+    assert single_result.raw_pred_pose.shape == (144,)
+    assert single_result.inpaint_confidence.shape == (24,)
+    assert single_result.contact_logits.shape == (2,)
+    assert np.isfinite(single_result.current_head_yaw_world)
+
+
+def test_all_eight_static_tracker_combinations_run():
+    source = build_toy_realtime_source(24)
+    rotations = compute_source_joint_rotations_world(source)
+    models = _models()
+    runtimes = [_runtime(source, rotations, models) for _ in STATIC_OPTIONAL_TRACKER_MASKS]
+    count = len(runtimes)
     results = step_realtime_pose_batch(
         runtimes,
-        np.repeat(source["tracker_pos_world"][:1], 2, axis=0),
-        np.repeat(source["tracker_rot_world_6d"][:1], 2, axis=0),
-        np.ones((2, 6), dtype=bool),
-        np.ones((2, 6), dtype=bool),
-        np.zeros(2, dtype=np.float32),
+        np.repeat(source["tracker_pos_world"][11:12], count, axis=0),
+        np.repeat(source["tracker_rot_world_6d"][11:12], count, axis=0),
+        np.asarray(STATIC_OPTIONAL_TRACKER_MASKS),
+        np.zeros(count, dtype=np.float32),
+        noise=torch.zeros(count, 144),
+        known_noise=torch.zeros(count, 144),
     )
-    assert len(results) == 2
-    assert model.batch_sizes == [2]
-    assert all(result.deployed_pred_pose_horizon.shape == (11, 144) for result in results)
-
-
-def test_batched_runtime_forwards_and_validates_known_noise():
-    class NoiseRecordingDiffusion(_OneStepProjectedDiffusion):
-        def __init__(self) -> None:
-            self.known_noise: torch.Tensor | None = None
-
-        def projected_ddim_sample_loop(self, *args, **kwargs):
-            self.known_noise = kwargs["known_noise"].detach().cpu().clone()
-            return super().projected_ddim_sample_loop(*args, **kwargs)
-
-    source = build_toy_realtime_source(frame_count=1)
-    model = _RecordingModel()
-    diffusion = NoiseRecordingDiffusion()
-    runtime = _runtime(model, diffusion, source)
-    known_noise = torch.randn(1, REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
-    runtime.step(
-        source["tracker_pos_world"][0],
-        source["tracker_rot_world_6d"][0],
-        np.ones(6, dtype=bool),
-        np.ones(6, dtype=bool),
-        float(source["root_pos_world"][0, 1]),
-        known_noise=known_noise,
-    )
-    torch.testing.assert_close(diffusion.known_noise, known_noise)
-
-    with pytest.raises(ValueError, match="known_noise"):
-        step_realtime_pose_batch(
-            [runtime],
-            source["tracker_pos_world"][:1],
-            source["tracker_rot_world_6d"][:1],
-            np.ones((1, 6), dtype=bool),
-            np.ones((1, 6), dtype=bool),
-            np.zeros(1, dtype=np.float32),
-            known_noise=torch.zeros(1, 144),
-        )
-
-
-def test_runtime_pushes_only_horizon_zero_into_pose_history():
-    class DistinctFutureDiffusion(_OneStepProjectedDiffusion):
-        def projected_ddim_sample_loop(self, *args, **kwargs):
-            result = super().projected_ddim_sample_loop(*args, **kwargs)
-            result["raw_pred_xstart"][:, 1:, :6] = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-            )
-            result["deployed_pred_xstart"] = kwargs["projection_fn"](
-                result["raw_pred_xstart"]
-            )
-            result["sample"] = result["deployed_pred_xstart"]
-            return result
-
-    source = build_toy_realtime_source(frame_count=1)
-    runtime = _runtime(_RecordingModel(), DistinctFutureDiffusion(), source)
-    result = _step(runtime, source, 0, np.ones(6, dtype=bool))
-    assert not np.allclose(
-        result.deployed_pred_pose_horizon[0], result.deployed_pred_pose_horizon[1]
-    )
-    np.testing.assert_allclose(
-        runtime.pose_history[-1].joint_rotations_world,
-        result.resolved_pose.joint_rotations_world,
-        atol=1e-6,
-    )
-
-
-def test_ema_checkpoint_returns_inner_model_and_runs_runtime(tmp_path):
-    model_path = tmp_path / "model000000001.pt"
-    ema_path = tmp_path / "ema000000001.pt"
-    online_model = _RecordingModel()
-    ema = EMA(online_model, include_online_model=False)
-    with torch.no_grad():
-        ema.ema_model.anchor.fill_(2.0)
-    torch.save(online_model.state_dict(), model_path)
-    torch.save(ema.state_dict(), ema_path)
-    loaded_model, weight_source = load_checkpoint_model(
-        _RecordingModel(), model_path, device=torch.device("cpu"), use_ema=True
-    )
-    assert weight_source == "ema"
-    assert not loaded_model.training
-    torch.testing.assert_close(loaded_model.anchor, torch.tensor(2.0))
-
-    source = build_toy_realtime_source(frame_count=1)
-    runtime = _runtime(loaded_model, _OneStepProjectedDiffusion(), source)
-    result = _step(runtime, source, 0, np.ones(6, dtype=bool))
-    assert result.deployed_pred_pose_horizon.shape == (11, 144)
-    assert loaded_model.history_valid_counts == [0]
-
-
-def test_legacy_single_frame_checkpoint_is_rejected_explicitly(tmp_path):
-    model = RealtimePoseSpatioTemporalDiT(
-        latent_dim=32,
-        num_layers=1,
-        num_heads=4,
-        max_seq_len=21,
-    )
-    state = model.state_dict()
-    state.pop("joint_diffusion_horizon_length")
-    state["future_leg_head.weight"] = torch.zeros(1)
-    path = tmp_path / "model000000001.pt"
-    torch.save(state, path)
-    with pytest.raises(RuntimeError, match="单帧 checkpoint 与联合 11 帧模型不兼容"):
-        load_checkpoint_model(model, path, device=torch.device("cpu"), use_ema=False)
-
-
-def test_checkpoint_requires_lightweight_current_tracker_encoder(tmp_path):
-    model = RealtimePoseSpatioTemporalDiT(
-        latent_dim=32,
-        num_layers=1,
-        num_heads=4,
-        max_seq_len=21,
-    )
-    complete_path = tmp_path / "model000000001.pt"
-    torch.save(model.state_dict(), complete_path)
-    loaded, source = load_checkpoint_model(
-        RealtimePoseSpatioTemporalDiT(
-            latent_dim=32,
-            num_layers=1,
-            num_heads=4,
-            max_seq_len=21,
-        ),
-        complete_path,
-        device=torch.device("cpu"),
-        use_ema=False,
-    )
-    assert source == "model"
-    assert isinstance(loaded.current_joint_condition_input, torch.nn.Linear)
-
-    legacy_state = model.state_dict()
-    legacy_state.pop("current_joint_condition_input.weight")
-    legacy_state.pop("current_joint_condition_input.bias")
-    legacy_path = tmp_path / "model000000002.pt"
-    torch.save(legacy_state, legacy_path)
-    with pytest.raises(RuntimeError, match="缺少轻量 Tracker 条件编码器"):
-        load_checkpoint_model(
-            model,
-            legacy_path,
-            device=torch.device("cpu"),
-            use_ema=False,
-        )
+    assert len(results) == 8
+    assert all(np.isfinite(result.deployed_pred_pose).all() for result in results)

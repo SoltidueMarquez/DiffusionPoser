@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
-
-import pytest
 
 from scripts import run_realtime_pose_pipeline as pipeline
 
@@ -11,85 +8,57 @@ from scripts import run_realtime_pose_pipeline as pipeline
 def _args(tmp_path: Path, *extra: str):
     return pipeline.build_arg_parser().parse_args(
         [
-            "--amass_dir", str(tmp_path / "AMASS"),
-            "--smpl_model_dir", str(tmp_path / "body_models"),
-            "--source_dir", str(tmp_path / "sources"),
+            "--source_dir", str(tmp_path / "source"),
             "--task_dir", str(tmp_path / "tasks"),
             "--normalizer_dir", str(tmp_path / "normalizer"),
             "--split_dir", str(tmp_path / "splits"),
-            "--save_dir", str(tmp_path / "runs"),
-            "--splits", "train",
+            "--predictor_save_dir", str(tmp_path / "predictor"),
+            "--save_dir", str(tmp_path / "dit"),
             *extra,
         ]
     )
 
 
-def test_pipeline_stops_at_first_failed_stage(monkeypatch, tmp_path):
-    calls: list[str] = []
-
-    def fail(module: str, args: list[str], dry_run: bool) -> None:
-        del args, dry_run
-        calls.append(module)
-        raise subprocess.CalledProcessError(7, module)
-
-    monkeypatch.setattr(pipeline, "run_python_module", fail)
-    with pytest.raises(subprocess.CalledProcessError):
-        pipeline.run_pipeline(_args(tmp_path, "--stop_after", "normalizer"))
-    assert calls == ["data_converter.amass_to_realtime_pose"]
+def test_pipeline_stage_order_contains_single_predictor_stage():
+    assert pipeline.selected_stages("tasks", "train") == (
+        "tasks",
+        "normalizer",
+        "predictor",
+        "calibrate",
+        "train",
+    )
 
 
 def test_pipeline_passes_parallel_converter_args(tmp_path):
+    rest_path = tmp_path / "body_fbx_rest.json"
     args = _args(
         tmp_path,
-        "--convert_num_workers", "3",
-        "--convert_worker_torch_threads", "2",
+        "--convert_num_workers",
+        "3",
+        "--convert_worker_torch_threads",
+        "2",
+        "--body_fbx_rest_json",
+        str(rest_path),
     )
     values = pipeline.build_convert_args(args)
+    assert "--target_fps" not in values
     assert values[values.index("--num_workers") + 1] == "3"
     assert values[values.index("--worker_torch_threads") + 1] == "2"
+    assert values[values.index("--body_fbx_rest_json") + 1] == str(rest_path)
 
 
-def test_pipeline_passes_joint_horizon_training_args(tmp_path):
-    args = _args(
-        tmp_path,
-        "--base_windows_per_source", "7",
-        "--shard_size", "128",
-        "--history_noise_prob", "0.7",
-        "--rotation_velocity_loss_weight", "1.5",
-        "--contact_slide_loss_weight", "0.2",
-        "--hip_height_loss_weight", "0.7",
-        "--scenario_weights", "5", "4", "3", "2", "1",
+def test_predictor_and_dit_use_single_predictor_checkpoint(tmp_path):
+    args = _args(tmp_path)
+    predictor = pipeline.build_predictor_args(args)
+    dit = pipeline.build_train_args(args)
+    assert dit[dit.index("--predictor_model_path") + 1].endswith(
+        "predictor/model_latest.pt"
     )
-    task_args = pipeline.build_task_args(args)
-    train_args = pipeline.build_train_args(args)
-    assert task_args[task_args.index("--base_windows_per_source") + 1] == "7"
-    assert task_args[task_args.index("--shard_size") + 1] == "128"
-    assert train_args[train_args.index("--history_noise_prob") + 1] == "0.7"
-    assert train_args[train_args.index("--rotation_velocity_loss_weight") + 1] == "1.5"
-    assert train_args[train_args.index("--contact_slide_loss_weight") + 1] == "0.2"
-    assert train_args[train_args.index("--hip_height_loss_weight") + 1] == "0.7"
-    assert train_args[train_args.index("--ik_calibration_path") + 1] == "output/ik_calibration.json"
-    assert "--future_leg_loss_weight" not in train_args
-    weights = train_args.index("--scenario_weights")
-    assert train_args[weights + 1 : weights + 6] == ["5.0", "4.0", "3.0", "2.0", "1.0"]
-
-
-def test_pipeline_inserts_ik_calibration_between_tasks_and_normalizer(tmp_path):
-    args = _args(
-        tmp_path,
-        "--ik_calibration_path", str(tmp_path / "ik_calibration.json"),
-        "--calibration_max_samples", "123",
-        "--calibration_batch_size", "16",
-    )
-    assert pipeline.selected_stages("tasks", "normalizer") == (
-        "tasks",
-        "calibrate",
-        "normalizer",
-    )
-    module, calibration_args = pipeline.build_stage_args("calibrate", args)
-    assert module == "eval.calibrate_realtime_pose_ik"
-    assert calibration_args[calibration_args.index("--output") + 1] == str(
-        tmp_path / "ik_calibration.json"
-    )
-    assert calibration_args[calibration_args.index("--max_samples") + 1] == "123"
-    assert calibration_args[calibration_args.index("--batch_size") + 1] == "16"
+    assert predictor[predictor.index("--checkpoint_max_keep") + 1] == "3"
+    assert predictor[predictor.index("--num_steps") + 1] == "100000"
+    assert dit[dit.index("--num_steps") + 1] == "1000000"
+    assert dit[dit.index("--log_interval") + 1] == "10"
+    assert "--stage" not in predictor
+    assert "--stage1_model_path" not in predictor
+    assert "--scenario_weights" not in dit
+    assert "--tracker_confidence_warmup" not in dit

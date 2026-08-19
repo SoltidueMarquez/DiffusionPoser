@@ -1,14 +1,22 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import torch
+
 from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
-from model.realtime_pose_spatiotemporal_dit import RealtimePoseSpatioTemporalDiT
+from model.realtime_pose_current_dit import RealtimePoseCurrentDiT
+from model.realtime_pose_predictor import RealtimePosePredictor
 
 
 def create_model_and_diffusion(args):
-    model_arch = getattr(args, "model_arch", "spatiotemporal_dit")
-    if model_arch != "spatiotemporal_dit":
-        raise ValueError("当前主链路只支持 spatiotemporal_dit；旧模型架构不兼容。")
-    model = RealtimePoseSpatioTemporalDiT(
-        input_feats=args.input_feats,
+    model_arch = getattr(args, "model_arch", "current_dit")
+    if model_arch != "current_dit":
+        raise ValueError("当前主链路只支持 current_dit。")
+    model = RealtimePoseCurrentDiT(
+        input_feats=getattr(args, "input_feats", 144),
         latent_dim=args.latent_dim,
         num_layers=args.layers,
         num_heads=args.heads,
@@ -20,7 +28,7 @@ def create_model_and_diffusion(args):
 
 
 def create_gaussian_diffusion(args):
-    """创建联合恢复当前帧和未来 10 帧、以 10 帧历史为条件的扩散过程。"""
+    """创建只恢复当前 144D Pose 的扩散过程。"""
 
     steps = int(args.diffusion_steps)
     timestep_respacing = args.ts_respace if getattr(args, "ts_respace", "") else [steps]
@@ -48,6 +56,30 @@ def create_gaussian_diffusion(args):
         rotation_velocity_loss_weight=getattr(
             args, "rotation_velocity_loss_weight", 1.0
         ),
-        contact_loss_weight=getattr(args, "contact_loss_weight", 0.1),
-        contact_slide_loss_weight=getattr(args, "contact_slide_loss_weight", 0.1),
+        contact_loss_weight=getattr(args, "contact_loss_weight", 0.0),
+        contact_slide_loss_weight=getattr(args, "contact_slide_loss_weight", 0.0),
     )
+
+
+def load_realtime_pose_predictor(
+    checkpoint_path: str | Path,
+    device: torch.device,
+) -> RealtimePosePredictor:
+    """从 checkpoint 邻接的训练参数恢复冻结 Predictor。"""
+
+    checkpoint = Path(checkpoint_path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Predictor checkpoint 不存在：{checkpoint}")
+    args_path = checkpoint.with_name("args.json")
+    values = json.loads(args_path.read_text(encoding="utf-8")) if args_path.is_file() else {}
+    model = RealtimePosePredictor(
+        latent_dim=int(values.get("latent_dim", 512)),
+        num_layers=int(values.get("layers", 4)),
+        num_heads=int(values.get("heads", 4)),
+        feedforward_dim=int(values.get("feedforward_dim", 1024)),
+        dropout=float(values.get("dropout", 0.1)),
+    ).to(device)
+    model.load_state_dict(
+        torch.load(checkpoint, map_location=device, weights_only=True)
+    )
+    return model.eval().requires_grad_(False)

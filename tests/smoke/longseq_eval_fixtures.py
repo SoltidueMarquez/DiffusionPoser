@@ -35,7 +35,7 @@ def write_toy_longseq_task_run(tmp_path: Path) -> tuple[Path, Path]:
                 "source_path": str(source_path),
                 "source_relative_path": relative_path,
                 "source_frames": frame_count,
-                "target_fps": 60.0,
+                "target_fps": 30.0,
                 "is_mirrored": is_mirrored,
             }
             file.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")

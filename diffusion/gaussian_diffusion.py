@@ -8,7 +8,6 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 
 import enum
 import math
-from pickle import TRUE
 
 import numpy as np
 import torch
@@ -16,7 +15,6 @@ import torch as th
 from copy import deepcopy
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_LENGTH,
 )
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood, compute_snr
@@ -146,8 +144,8 @@ class GaussianDiffusion:
         head_to_root_xz_loss_weight=1.0,
         hip_height_loss_weight=1.0,
         rotation_velocity_loss_weight=1.0,
-        contact_loss_weight=0.1,
-        contact_slide_loss_weight=0.1,
+        contact_loss_weight=0.0,
+        contact_slide_loss_weight=0.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -854,7 +852,6 @@ class GaussianDiffusion:
         model_kwargs=None,
         eta=0.0,
         inpaint_condition=None,
-        known_noise=None,
     ):
         """在模型前注入 IK 条件，并用最终 deployed x0 重算 epsilon。"""
 
@@ -862,13 +859,10 @@ class GaussianDiffusion:
             model_kwargs = {}
         x_model = x
         if inpaint_condition is not None:
-            if known_noise is None:
-                raise ValueError("启用 IK-Inpainting 时必须复用同一份 known_noise。")
             x_model, _ = apply_realtime_pose_inpainting(
                 x_t=x,
                 t=t,
                 condition=inpaint_condition,
-                known_noise=known_noise,
                 alphas_cumprod=self.alphas_cumprod,
             )
         step_model_kwargs = dict(model_kwargs)
@@ -929,18 +923,12 @@ class GaussianDiffusion:
         eta=0.0,
         progress=False,
         inpaint_condition=None,
-        known_noise=None,
     ):
         """执行完整 IK-Inpainting DDIM，并保留最终 raw/deployed x0。"""
 
         if device is None:
             device = next(model.parameters()).device
         image = noise if noise is not None else th.randn(*shape, device=device)
-        if inpaint_condition is not None and known_noise is None:
-            raise ValueError(
-                "启用 IK-Inpainting 时必须显式提供 known_noise，"
-                "避免采样器内部引入不可控随机性。"
-            )
         if inpaint_condition is not None:
             validate_realtime_pose_inpainting_condition(inpaint_condition)
         indices = list(range(self.num_timesteps))[::-1]
@@ -961,7 +949,6 @@ class GaussianDiffusion:
                     model_kwargs=model_kwargs,
                     eta=eta,
                     inpaint_condition=inpaint_condition,
-                    known_noise=known_noise,
                 )
             image = final["sample"]
         if final is None:
@@ -1453,7 +1440,6 @@ class GaussianDiffusion:
         model_kwargs=None,
         noise=None,
         inpaint_condition=None,
-        known_noise=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
@@ -1470,7 +1456,6 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             noise=noise,
             inpaint_condition=inpaint_condition,
-            known_noise=known_noise,
             feature_w=feature_w,
             snr_gamma=snr_gamma,
             use_l1=use_l1,
@@ -1485,38 +1470,26 @@ class GaussianDiffusion:
         model_kwargs,
         noise=None,
         inpaint_condition=None,
-        known_noise=None,
         feature_w=None,
         snr_gamma=0.0,
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """对当前到未来 10 帧联合加噪，并显式分离 raw/deployed x0 路径。"""
+        """只对当前 144D Pose 加噪，并显式分离 raw/deployed x0 路径。"""
 
-        if x_start.ndim != 3 or tuple(x_start.shape[1:]) != (
-            REALTIME_POSE_TARGET_LENGTH,
-            REALTIME_POSE_TARGET_DIM,
-        ):
-            raise ValueError(
-                "RealtimePose diffusion target 必须为当前帧和未来 10 帧 "
-                f"[B,{REALTIME_POSE_TARGET_LENGTH},{REALTIME_POSE_TARGET_DIM}]。"
-            )
+        if x_start.ndim != 2 or x_start.shape[1] != REALTIME_POSE_TARGET_DIM:
+            raise ValueError("RealtimePose diffusion target 必须为 [B,144]。")
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
         if inpaint_condition is None:
-            if known_noise is not None:
-                raise ValueError("没有 inpaint_condition 时不得单独提供 known_noise。")
             x_model = x_t
         else:
             validate_realtime_pose_inpainting_condition(inpaint_condition)
-            if known_noise is None:
-                raise ValueError("训练 IK Inpainting 必须显式提供独立 known_noise。")
             x_model, _ = apply_realtime_pose_inpainting(
                 x_t=x_t,
                 t=t,
                 condition=inpaint_condition,
-                known_noise=known_noise,
                 alphas_cumprod=self.alphas_cumprod,
             )
         batch = model_kwargs.get("y", model_kwargs)
@@ -1540,12 +1513,11 @@ class GaussianDiffusion:
         )
         deployed_pred_xstart = project_realtime_pose_xstart(
             pred_xstart=raw_pred_xstart,
-            current_tracker_raw=batch["tracker_window_raw"][:, -1],
-            hard_rotation_state=batch["hard_rotation_state_window"][:, -1],
+            current_tracker_raw=batch["current_tracker_raw"],
             pose_mean=batch.get("pose_mean"),
             pose_scale=batch.get("pose_scale"),
         )
-        # 新动态分支同样遵守公共训练 CLI：L1/MSE 只切换 diffusion
+        # 单帧分支遵守公共训练 CLI：L1/MSE 只切换 diffusion
         # reconstruction term，feature_w 按 [B,144] 对特征维加权。
         elementwise_loss = (
             (target - model_output).abs()
@@ -1558,9 +1530,7 @@ class GaussianDiffusion:
                 dtype=elementwise_loss.dtype,
             )
             if feature_weight.ndim == 1:
-                feature_weight = feature_weight[None, None]
-            elif feature_weight.ndim == 2:
-                feature_weight = feature_weight[:, None]
+                feature_weight = feature_weight[None]
             if (
                 feature_weight.shape[-1] != elementwise_loss.shape[-1]
                 or feature_weight.shape[0] not in (1, elementwise_loss.shape[0])

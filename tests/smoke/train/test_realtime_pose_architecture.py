@@ -1,541 +1,307 @@
 from __future__ import annotations
 
-import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from data_loaders.realtime_pose_config import TARGET_JOINT_REGIONS
-from data_loaders.realtime_pose_history_noise import (
-    HistoryPoseNoiseConfig,
-    corrupt_history_pose_observation,
+from data_loaders.realtime_pose_kinematics import (
+    make_yaw_rotation_torch,
+    rotation_6d_forward_up_torch,
+    rotation_6d_to_matrix_torch,
 )
-from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_torch
-from diffusion.realtime_pose_inpainting import RealtimePoseInpaintingCondition
-from model.realtime_pose_spatiotemporal_dit import (
-    HEAD_MOTION_FEATURE_DIM,
-    RealtimePoseSpatioTemporalDiT,
-    build_head_motion_summary,
+from data_loaders.realtime_pose_predictor_features import build_predictor_step_features_torch
+from model.realtime_pose_current_dit import RealtimePoseCurrentDiT
+from model.realtime_pose_predictor import RealtimePosePredictor
+from train.predictor_losses import compute_predictor_losses
+from train.predictor_training_loop import (
+    PredictorTrainLoop,
+    append_predictor_current_prediction,
+    resolve_predictor_resume_checkpoint,
 )
-from train.training_loop import (
-    TRAIN_DEVICE_FIELDS,
-    TrainLoop,
-    move_training_batch_to_device,
-)
+from utils.normalizer import RealtimePoseNormalizer
 
 
-FRAME_OFFSETS = torch.tensor(
-    [-60, -53, -47, -40, -34, -27, -21, -14, -8, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-)
-
-
-def _model() -> RealtimePoseSpatioTemporalDiT:
-    return RealtimePoseSpatioTemporalDiT(
-        latent_dim=64,
-        num_layers=1,
-        num_heads=8,
-        dropout=0.0,
-        max_seq_len=21,
-    ).eval()
-
-
-def _conditioning(batch_size: int = 2, cold_start: bool = False) -> dict[str, torch.Tensor]:
-    valid = torch.ones(batch_size, 11, dtype=torch.bool)
-    if cold_start:
-        valid[:, :-1] = False
-    history = torch.randn(batch_size, 10, 144)
-    history[~valid[:, :-1]] = 0.0
-    head_path = torch.randn(batch_size, 11, 5)
-    head_path[:, -1, :2] = 0.0
-    head_path[:, -1, 3:] = torch.tensor([0.0, 1.0])
-    head_path[~valid] = 0.0
-    confidence = torch.ones(batch_size, 10, 5)
-    confidence[~valid[:, :-1]] = 0.0
-    return {
-        "history_pose_observation": history,
-        "head_path_window": head_path,
-        "history_region_confidence": confidence,
-        "window_valid_mask": valid,
-        "frame_offsets": FRAME_OFFSETS,
-        "current_joint_condition": torch.zeros(batch_size, 24, 10),
-    }
-
-
-def _static_conditioning(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return dict(values)
-
-
-def test_target_regions_cover_each_joint_once():
-    assert TARGET_JOINT_REGIONS.shape == (24,)
-    assert set(TARGET_JOINT_REGIONS.tolist()) == {0, 1, 2, 3, 4}
-
-
-def test_spatiotemporal_model_shape_cached_condition_and_cold_start_are_finite():
-    model = _model()
-    values = _conditioning(cold_start=True)
-    hidden = torch.randn(2, 11, 144)
-    timestep = torch.tensor([1, 2])
-    prepared = model.prepare_conditioning(**_static_conditioning(values))
-    direct, direct_aux = model(hidden, timestep, **values, return_aux_outputs=True)
-    cached, cached_aux = model(
-        hidden,
-        timestep,
-        prepared_conditioning=prepared,
-        return_aux_outputs=True,
+def test_predictor_transformer_contract():
+    model = RealtimePosePredictor(
+        latent_dim=64, num_layers=1, num_heads=4, feedforward_dim=128
     )
-    torch.testing.assert_close(direct, cached)
-    torch.testing.assert_close(direct_aux["contact_logits"], cached_aux["contact_logits"])
-    assert direct.shape == (2, 11, 144)
-    assert set(direct_aux) == {"contact_logits"}
-    assert direct_aux["contact_logits"].shape == (2, 2)
-    assert torch.isfinite(direct).all()
+    output = model(torch.randn(2, 10, 144), torch.randn(2, 11, 54))
+    assert output.shape == (2, 11, 144)
+    assert torch.isfinite(output).all()
 
 
-def test_history_and_current_use_independent_input_projections_once():
-    model = _model()
-    values = _conditioning(batch_size=1)
-    inputs: dict[str, list[torch.Size]] = {"history": [], "current": []}
-    handles = [
-        model.history_pose_input.register_forward_pre_hook(
-            lambda _module, args: inputs["history"].append(args[0].shape)
-        ),
-        model.joint_input.register_forward_pre_hook(
-            lambda _module, args: inputs["current"].append(args[0].shape)
-        ),
-    ]
-    try:
-        model(torch.randn(1, 11, 144), torch.ones(1), **values)
-    finally:
-        for handle in handles:
-            handle.remove()
-    assert inputs == {
-        "history": [torch.Size([1, 10, 24, 6])],
-        "current": [torch.Size([1, 11, 24, 6])],
-    }
-
-
-def test_model_has_one_lightweight_current_condition_projection():
-    model = _model()
-    assert isinstance(model.current_joint_condition_input, torch.nn.Linear)
-    assert model.current_joint_condition_input.in_features == 10
-    assert model.current_joint_condition_input.out_features == model.latent_dim
-    assert not hasattr(model, "constraint_kind_embedding")
-    assert not hasattr(model, "confidence_projection")
-
-
-def test_head_motion_summary_uses_real_multiscale_time_and_validity():
-    offsets = FRAME_OFFSETS.unsqueeze(0)
-    valid = torch.ones(1, 11, dtype=torch.bool)
-    path = torch.zeros(1, 11, 5)
-    horizontal_velocity = torch.tensor([2.0, -1.0])
-    vertical_velocity = 0.3
-    yaw_rate = math.pi / 2.0
-    current_height = 1.7
-    path[:, -1, 2] = current_height
-    path[:, -1, 4] = 1.0
-    for anchor_index, frame_offset in ((9, -1), (8, -8), (0, -60)):
-        delta_seconds = -frame_offset / 60.0
-        path[:, anchor_index, :2] = -horizontal_velocity * delta_seconds
-        path[:, anchor_index, 2] = current_height - vertical_velocity * delta_seconds
-        old_yaw = -yaw_rate * delta_seconds
-        path[:, anchor_index, 3] = math.sin(old_yaw)
-        path[:, anchor_index, 4] = math.cos(old_yaw)
-
-    summary = build_head_motion_summary(path, valid, offsets)
-
-    assert summary.shape == (1, HEAD_MOTION_FEATURE_DIM)
-    torch.testing.assert_close(
-        summary[0],
-        torch.tensor(
-            [
-                2.0,
-                -1.0,
-                2.0,
-                -1.0,
-                2.0,
-                -1.0,
-                0.5,
-                0.5,
-                current_height,
-                vertical_velocity,
-                vertical_velocity,
-                1.0,
-                1.0,
-                1.0,
-            ]
-        ),
-        atol=1e-5,
-        rtol=1e-5,
+def test_predictor_rollout_only_uses_horizon_zero():
+    identity = torch.eye(3).reshape(1, 1, 1, 3, 3).repeat(1, 10, 24, 1, 1)
+    prediction_a = torch.zeros(1, 11, 144)
+    prediction_a[:, 0] = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0]).repeat(24)
+    prediction_b = prediction_a.clone()
+    prediction_b[:, 1:] = torch.randn_like(prediction_b[:, 1:]) * 100.0
+    kwargs = dict(
+        motion_world=identity,
+        head_yaw_world=torch.zeros(1),
+        pose_mean=torch.zeros(144),
+        pose_scale=torch.ones(144),
     )
-
-    invalid = valid.clone()
-    invalid[:, 0] = False
-    first = build_head_motion_summary(path, invalid, offsets)
-    changed = path.clone()
-    changed[:, 0] = 10_000.0
-    second = build_head_motion_summary(changed, invalid, offsets)
+    first = append_predictor_current_prediction(prediction_normalized=prediction_a, **kwargs)
+    second = append_predictor_current_prediction(prediction_normalized=prediction_b, **kwargs)
     torch.testing.assert_close(first, second)
-    torch.testing.assert_close(first[0, [4, 5, 7, 10, 13]], torch.zeros(5))
+    assert first.shape == (1, 10, 24, 3, 3)
 
 
-def test_head_motion_summary_wraps_yaw_across_pi():
-    path = torch.zeros(1, 11, 5)
-    valid = torch.ones(1, 11, dtype=torch.bool)
-    current_yaw = math.radians(-179.0)
-    old_yaw = math.radians(179.0)
-    path[..., 4] = 1.0
-    path[:, -1, 3:5] = torch.tensor(
-        [math.sin(current_yaw), math.cos(current_yaw)]
-    )
-    path[:, 8, 3:5] = torch.tensor([math.sin(old_yaw), math.cos(old_yaw)])
-
-    summary = build_head_motion_summary(path, valid, FRAME_OFFSETS)
-
-    expected = math.radians(2.0) / (8.0 / 60.0) / math.pi
-    assert summary[0, 6].item() == pytest.approx(expected, abs=1e-6)
-
-
-def test_head_motion_adapter_only_changes_current_pelvis_token():
-    model = _model()
-    values = _conditioning(batch_size=1)
+def test_current_dit_contract_and_predictor_future_changes_output():
+    torch.manual_seed(2)
+    model = RealtimePoseCurrentDiT(
+        latent_dim=64, num_layers=1, num_heads=4, dropout=0.0
+    ).eval()
+    # AdaLN gate 默认零初始化；打开 temporal gate 后验证 future 确实位于 forward 路径。
     with torch.no_grad():
-        for parameter in model.head_path_encoder.parameters():
-            parameter.zero_()
-        model.pelvis_head_motion_input.weight.fill_(1.0)
-        model.pelvis_head_motion_input.bias.zero_()
-    first_values = {name: value.clone() for name, value in values.items()}
-    second_values = {name: value.clone() for name, value in values.items()}
-    first_values["head_path_window"].zero_()
-    second_values["head_path_window"].zero_()
-    first_values["head_path_window"][:, -1, 4] = 1.0
-    second_values["head_path_window"][:, -1, 4] = 1.0
-    second_values["head_path_window"][:, 9, 0] = -1.0 / 60.0
-
-    first = model.prepare_conditioning(**first_values)
-    second = model.prepare_conditioning(**second_values)
-    difference = second.static_pose_condition - first.static_pose_condition
-
-    assert torch.linalg.norm(difference[:, 10, 0]) > 0.0
-    difference[:, 10, 0] = 0.0
-    torch.testing.assert_close(difference, torch.zeros_like(difference))
-    assert model.pelvis_head_motion_input.in_features == HEAD_MOTION_FEATURE_DIM
+        model.blocks[0].adaln_modulation[-1].bias[5 * 64 : 6 * 64] = 1.0
+    x = torch.randn(2, 144)
+    timestep = torch.tensor([1, 2])
+    motion = torch.randn(2, 10, 144)
+    predictor = torch.randn(2, 11, 144)
+    joint_condition = torch.randn(2, 24, 10)
+    first = model(x, timestep, motion, predictor, joint_condition)
+    changed = predictor.clone()
+    changed[:, 1:] += 2.0
+    second = model(x, timestep, motion, changed, joint_condition)
+    assert first.shape == (2, 144)
+    assert not torch.allclose(first, second)
 
 
-def test_tracker_cross_attention_and_constraint_tokens_are_removed():
-    model = _model()
-    assert not any("attention" in name and "tracker" in name for name, _ in model.named_modules())
-    assert not hasattr(model, "observation_encoder")
-    assert not hasattr(model, "constraint_tokens")
-
-
-def test_head_path_and_history_pose_are_independent_conditions():
-    model = _model()
-    values = _conditioning(batch_size=1)
-    first = model.prepare_conditioning(**_static_conditioning(values))
-    changed = {name: value.clone() for name, value in values.items()}
-    changed["head_path_window"][:, 4, 0] += 10.0
-    second = model.prepare_conditioning(**_static_conditioning(changed))
-    assert not torch.allclose(
-        first.static_pose_condition[:, 4], second.static_pose_condition[:, 4]
-    )
-    torch.testing.assert_close(
-        values["history_pose_observation"], changed["history_pose_observation"]
-    )
-
-
-def test_current_joint_condition_only_changes_current_static_slot():
-    model = _model()
-    values = _conditioning(batch_size=1)
-    first = model.prepare_conditioning(**_static_conditioning(values))
-    changed = {name: value.clone() for name, value in values.items()}
-    changed["current_joint_condition"][0, 10, 0] = 1.0
-    second = model.prepare_conditioning(**_static_conditioning(changed))
-
-    difference = second.static_pose_condition - first.static_pose_condition
-    assert torch.linalg.norm(difference[:, 10, 10]) > 0.0
-    torch.testing.assert_close(difference[:, :10], torch.zeros_like(difference[:, :10]))
-    torch.testing.assert_close(difference[:, 11:], torch.zeros_like(difference[:, 11:]))
-
-
-def test_future_outputs_receive_gradient_from_current_joint_condition():
-    model = _model().train()
-    values = _conditioning(batch_size=1)
-    condition = values["current_joint_condition"].clone().requires_grad_(True)
-    values["current_joint_condition"] = condition
+def test_dit_backward_does_not_create_predictor_gradients():
+    predictor = RealtimePosePredictor(
+        latent_dim=32, num_layers=1, num_heads=4, feedforward_dim=64
+    ).eval().requires_grad_(False)
+    dit = RealtimePoseCurrentDiT(latent_dim=32, num_layers=1, num_heads=4)
+    motion = torch.randn(1, 10, 144)
     with torch.no_grad():
-        latent_dim = model.latent_dim
-        model.blocks[0].adaln_modulation[-1].bias[
-            5 * latent_dim : 6 * latent_dim
-        ].fill_(1.0)
-    output = model(torch.randn(1, 11, 144), torch.ones(1), **values)
-    output[:, [1, 5, 10]].square().mean().backward()
-    assert condition.grad is not None and torch.isfinite(condition.grad).all()
-    assert torch.linalg.norm(condition.grad) > 0.0
-
-
-def test_temporal_mask_is_prefix_bidirectional_and_ignores_padding_keys():
-    model = _model()
-    valid = torch.tensor([[False, False] + [True] * 19])
-    mask = model._temporal_mask(valid, joint_count=24).reshape(1, 24, 8, 21, 21)
-    # 历史 query 不能读取目标；目标 query 可双向读取整个目标窗口。
-    assert mask[0, 0, 0, 5, 10:].all()
-    assert not mask[0, 0, 0, 10, 2:].any()
-    assert not mask[0, 0, 0, 20, 10:].any()
-    assert not mask[0, 0, 0, 5, 6]
-    assert not mask[0, 0, 0, 6, 5]
-    assert mask[0, 0, 0, 5, 10]
-    assert mask[0, 0, 0, 10, :2].all()
-    assert mask[0, 0, 0, 5, :2].all()
-
-
-def test_changing_current_token_does_not_change_history_block_rows():
-    model = _model()
-    values = _conditioning(batch_size=1)
-    with torch.no_grad():
-        block = model.blocks[0]
-        latent_dim = model.latent_dim
-        block.adaln_modulation[-1].bias[5 * latent_dim : 6 * latent_dim].fill_(1.0)
-    captured: list[torch.Tensor] = []
-    handle = model.blocks[0].register_forward_hook(
-        lambda _module, _args, output: captured.append(output.detach().clone())
+        horizon = predictor(motion, torch.randn(1, 11, 54))
+    output = dit(
+        torch.randn(1, 144),
+        torch.tensor([1]),
+        motion,
+        horizon,
+        torch.randn(1, 24, 10),
     )
-    try:
-        model(torch.zeros(1, 11, 144), torch.ones(1), **values)
-        changed = torch.zeros(1, 11, 144)
-        changed[:, 0] = 10.0
-        model(changed, torch.ones(1), **values)
-    finally:
-        handle.remove()
-    torch.testing.assert_close(captured[0][:, :10], captured[1][:, :10])
+    output.square().mean().backward()
+    assert all(parameter.grad is None for parameter in predictor.parameters())
+    assert any(parameter.grad is not None for parameter in dit.parameters())
 
 
-def test_current_loss_backpropagates_into_history_input_projection():
-    model = _model().train()
-    values = _conditioning(batch_size=1)
-    with torch.no_grad():
-        latent_dim = model.latent_dim
-        model.blocks[0].adaln_modulation[-1].bias[
-            5 * latent_dim : 6 * latent_dim
-        ].fill_(1.0)
-    output = model(torch.randn(1, 11, 144), torch.ones(1), **values)
-    output[:, 0].square().mean().backward()
-    gradient = model.history_pose_input.weight.grad
-    assert gradient is not None
-    assert torch.linalg.norm(gradient) > 0.0
+def test_predictor_rotation_output_projects_to_finite_so3():
+    rotations = rotation_6d_to_matrix_torch(torch.randn(2, 11, 24, 6))
+    assert torch.isfinite(rotations).all()
+    assert torch.all(torch.linalg.det(rotations) > 0.999)
 
 
-def test_token_valid_mask_has_history_and_target_semantics():
-    model = _model()
-    values = _conditioning(batch_size=1, cold_start=True)
-    prepared = model.prepare_conditioning(**_static_conditioning(values))
-    assert prepared.token_valid_mask.shape == (1, 21)
-    assert not prepared.token_valid_mask[:, :10].any()
-    assert prepared.token_valid_mask[:, 10:].all()
-    assert not hasattr(prepared, "tracker_condition_valid_mask")
-
-
-def test_future_tokens_and_temporal_attention_receive_finite_nonzero_gradients():
-    model = _model().train()
-    values = _conditioning(batch_size=1)
-    with torch.no_grad():
-        latent_dim = model.latent_dim
-        model.blocks[0].adaln_modulation[-1].bias[
-            5 * latent_dim : 6 * latent_dim
-        ].fill_(1.0)
-    hidden = torch.randn(1, 11, 144, requires_grad=True)
-    output = model(hidden, torch.ones(1), **values)
-    output[:, 1:].square().mean().backward()
-    assert torch.isfinite(hidden.grad).all()
-    assert torch.linalg.norm(hidden.grad[:, 1:]) > 0.0
-    gradient = model.blocks[0].temporal_attention.in_proj_weight.grad
-    assert gradient is not None and torch.isfinite(gradient).all()
-    assert torch.linalg.norm(gradient) > 0.0
-
-
-def test_history_noise_only_changes_valid_history_in_so3_space():
-    identity = torch.eye(3).expand(2, 10, 24, 3, 3)
-    clean = rotation_6d_forward_up_torch(identity).reshape(2, 10, 144)
-    valid = torch.tensor(
-        [[False, False, True, True, True, True, True, True, True, True], [True] * 10]
+def test_predictor_four_full_horizon_losses_are_finite_and_differentiable():
+    prediction = torch.randn(2, 11, 144, requires_grad=True)
+    losses = compute_predictor_losses(
+        prediction_normalized=prediction,
+        target_normalized=torch.randn(2, 11, 144),
+        motion_context_normalized=torch.randn(2, 10, 144),
+        joint_offsets_parent=torch.randn(2, 24, 3) * 0.05,
+        pose_mean=torch.zeros(144),
+        pose_scale=torch.ones(144),
     )
-    clean[~valid] = 0.0
-    torch.manual_seed(0)
-    noisy = corrupt_history_pose_observation(
-        clean,
-        history_region_confidence=torch.full((2, 10, 5), 0.5),
-        history_valid_mask=valid,
-        pose_mean=None,
-        pose_scale=None,
-        config=HistoryPoseNoiseConfig(probability=1.0),
-    )
-    assert torch.isfinite(noisy).all()
-    assert torch.count_nonzero(noisy[~valid]) == 0
-    assert not torch.allclose(noisy[valid], clean[valid])
-
-
-def test_clean_history_probability_zero_is_exact_identity():
-    clean = torch.randn(2, 10, 144)
-    valid = torch.ones(2, 10, dtype=torch.bool)
-    result = corrupt_history_pose_observation(
-        clean,
-        torch.ones(2, 10, 5),
-        valid,
-        None,
-        None,
-        HistoryPoseNoiseConfig(probability=0.0),
-    )
-    torch.testing.assert_close(result, clean)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        (field, value)
-        for field in (
-            "probability",
-            "min_degrees",
-            "max_degrees",
-            "temporal_rho",
-            "region_ratio",
-            "joint_ratio",
-        )
-        for value in (math.nan, math.inf, -math.inf)
-    ],
-)
-def test_history_noise_config_rejects_nonfinite_values(field: str, value: float):
-    with pytest.raises(ValueError, match=field):
-        HistoryPoseNoiseConfig(**{field: value}).validate()
-
-
-def test_model_rejects_unknown_constructor_and_forward_arguments():
-    with pytest.raises(TypeError):
-        RealtimePoseSpatioTemporalDiT(latent_dmi=64)
-
-    model = _model()
-    with pytest.raises(TypeError):
-        model(torch.randn(1, 11, 144), torch.ones(1), obsolete_argument=True)
-
-
-def test_training_device_transfer_moves_all_ik_and_projection_fields():
-    for name in (
-        "configured",
-        "measured_valid",
-        "d_on",
-        "joint_rest_local_rotations_6d",
-        "hard_rotation_state_window",
-    ):
-        assert name in TRAIN_DEVICE_FIELDS
-    batch = {
-        "x": torch.zeros(1),
-        "configured": torch.ones(1, dtype=torch.bool),
-        "joint_rest_local_rotations_6d": torch.zeros(24, 6),
-        "hard_rotation_state_window": torch.zeros(11, 6, dtype=torch.bool),
+    assert set(losses) == {
+        "loss",
+        "pose_mse",
+        "rotation_velocity_loss",
+        "fk_loss",
+        "fk_velocity_loss",
     }
-
-    moved = move_training_batch_to_device(batch, torch.device("meta"))
-
-    assert moved["x"].device.type == "meta"
-    assert moved["configured"].device.type == "meta"
-    assert moved["joint_rest_local_rotations_6d"].device.type == "meta"
-    assert moved["hard_rotation_state_window"].device.type == "meta"
+    assert all(value.shape == (2,) for value in losses.values())
+    assert all(torch.isfinite(value).all() for value in losses.values())
+    losses["loss"].mean().backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
 
 
-def test_training_model_kwargs_use_y_as_the_only_condition_source():
-    loop = object.__new__(TrainLoop)
-    loop.model = _model()
-    loop.pose_mean = None
-    loop.pose_scale = None
-    loop.device = torch.device("cpu")
-    loop.history_noise_config = HistoryPoseNoiseConfig(probability=0.0)
-    sample = torch.zeros(1, 11, 144)
+@pytest.mark.parametrize("rollout_steps", [0, 30])
+def test_predictor_training_loop_decodes_resident_rotation6d_batch(
+    tmp_path, rollout_steps
+):
+    normalizer_dir = tmp_path / "normalizer"
+    RealtimePoseNormalizer(normalizer_dir, disable=True).save(
+        pose_mean=torch.zeros(144),
+        pose_scale=torch.ones(144),
+        tracker_mean=torch.zeros(6, 9),
+        tracker_std=torch.ones(6, 9),
+        predictor_sparse_mean=torch.zeros(54),
+        predictor_sparse_std=torch.ones(54),
+    )
+    args = SimpleNamespace(
+        save_dir=str(tmp_path / "predictor"),
+        normalizer_dir=str(normalizer_dir),
+        lr=1e-4,
+        lr_drop_step=50_000,
+        lr_drop_factor=30.0,
+        weight_decay=0.0,
+        ema_decay=0.995,
+        resume_checkpoint="",
+    )
+    model = RealtimePosePredictor(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=64,
+        dropout=0.0,
+    )
+    loop = PredictorTrainLoop(args, model, [], torch.device("cpu"))
+    identity_6d = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
     batch = {
-        "history_pose_observation": torch.zeros(1, 10, 144),
-        "head_path_window": torch.zeros(1, 11, 5),
-        "history_region_confidence": torch.zeros(1, 10, 5),
-        "window_valid_mask": torch.ones(1, 11, dtype=torch.bool),
-        "frame_offsets": torch.zeros(1, 21, dtype=torch.long),
-        "tracker_window_raw": torch.zeros(1, 11, 6, 13),
-        "hard_rotation_state_window": torch.zeros(1, 11, 6, dtype=torch.bool),
-        "target_joints_head_ref": torch.zeros(1, 24, 3),
+        "joint_rotations_world_6d": identity_6d.repeat(1, 52, 24, 1),
+        "tracker_positions_world": torch.zeros(1, 52, 6, 3),
+        "tracker_rotations_world_6d": identity_6d.repeat(1, 52, 6, 1),
+        "floor_y": torch.zeros(1, 52),
         "joint_offsets_parent": torch.zeros(1, 24, 3),
-        "joint_rest_local_rotations_6d": torch.tensor(
-            [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
-        ).reshape(1, 1, 6).expand(1, 24, 6).clone(),
-        "target_root_position_head_ref": torch.zeros(1, 3),
-        "target_root_yaw_world": torch.zeros(1),
-        "target_hip_height": torch.zeros(1),
-        "current_head_yaw_world": torch.zeros(1),
-        "previous_contact_target": torch.zeros(1, 2),
-        "contact_target": torch.zeros(1, 2),
     }
+    losses = loop._forward_loss(batch, rollout_steps, gradient=True)
+    assert all(torch.isfinite(value).all() for value in losses.values())
+    losses["loss"].mean().backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
 
-    current_joint_condition = torch.zeros(1, 24, 10)
-    model_kwargs = loop.mask_manager(
-        batch,
-        sample,
-        current_joint_condition=current_joint_condition,
+
+def test_predictor_rolling_rebuilds_head_yaw_frame_for_30_steps():
+    torch.manual_seed(4)
+    model = RealtimePosePredictor(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=64,
+        dropout=0.0,
+    ).eval()
+    motion_world = torch.eye(3).reshape(1, 1, 1, 3, 3).repeat(1, 10, 24, 1, 1)
+    frame_count = 41
+    tracker_yaws = torch.linspace(0.0, 0.8, frame_count)
+    tracker_rotation = make_yaw_rotation_torch(tracker_yaws)
+    tracker_rotation = tracker_rotation[:, None].repeat(1, 6, 1, 1)
+    tracker_rotation_6d = rotation_6d_forward_up_torch(tracker_rotation)[None]
+    tracker_position = torch.zeros(1, frame_count, 6, 3)
+    tracker_position[0, :, :, 1] = torch.tensor(
+        [1.7, 1.3, 1.3, 1.0, 0.1, 0.1]
     )
+    tracker_position[0, :, :, 0] = torch.linspace(0.0, 0.2, frame_count)[:, None]
+    head_yaws = []
+    with torch.no_grad():
+        for step_index in range(30):
+            motion, sparse, _, head_yaw = build_predictor_step_features_torch(
+                motion_world,
+                tracker_position[:, step_index : step_index + 12],
+                tracker_rotation_6d[:, step_index : step_index + 12],
+                torch.zeros(1),
+            )
+            prediction = model(motion, sparse)
+            assert torch.isfinite(prediction).all()
+            motion_world = append_predictor_current_prediction(
+                motion_world=motion_world,
+                prediction_normalized=prediction,
+                head_yaw_world=head_yaw,
+                pose_mean=torch.zeros(144),
+                pose_scale=torch.ones(144),
+            )
+            assert torch.isfinite(motion_world).all()
+            head_yaws.append(float(head_yaw[0]))
+    assert head_yaws[-1] > head_yaws[0] + 0.4
 
-    assert set(model_kwargs) == {"y"}
-    assert "tracker_window" not in model_kwargs["y"]
-    assert "inpaint_pose" not in model_kwargs["y"]
-    assert "inpaint_confidence" not in model_kwargs["y"]
-    assert "inpaint_kind" not in model_kwargs["y"]
-    assert "inpaint_mask" not in model_kwargs["y"]
-    assert model_kwargs["y"]["hard_rotation_state_window"] is batch[
-        "hard_rotation_state_window"
-    ]
-    assert model_kwargs["y"]["window_valid_mask"] is batch["window_valid_mask"]
-    assert model_kwargs["y"]["current_joint_condition"] is current_joint_condition
 
-
-def test_training_boundary_passes_entire_joint_horizon_to_diffusion():
-    class CapturingDiffusion:
-        def __init__(self) -> None:
-            self.targets: list[torch.Tensor] = []
-            self.kwargs: list[dict] = []
-
-        def training_losses(self, _model, x_start, _timesteps, **kwargs):
-            self.targets.append(x_start.detach().clone())
-            self.kwargs.append(kwargs)
-            return {"loss": torch.zeros(x_start.shape[0])}
-
-    loop = object.__new__(TrainLoop)
-    loop.model = torch.nn.Identity()
-    loop.diffusion = CapturingDiffusion()
-    loop.feature_w = None
-    loop.snr_gamma = 0.0
-    loop.use_l1 = False
-    loop._prepare_history_observation = lambda batch: batch[
-        "history_pose_observation"
-    ]
-    loop.mask_manager = lambda batch, sample, current_joint_condition, history_observation=None: {
-        "y": {"history_pose_observation": batch["history_pose_observation"]}
-    }
-    sample_window = torch.randn(2, 11, 144)
-    condition = RealtimePoseInpaintingCondition(
-        pose=torch.zeros_like(sample_window),
-        valid=torch.zeros(2, 11, 24, dtype=torch.bool),
-        release_level=torch.ones(2, 11, 24),
+def test_predictor_checkpoint_save_and_strict_resume(tmp_path):
+    normalizer_dir = tmp_path / "normalizer"
+    RealtimePoseNormalizer(normalizer_dir, disable=True).save(
+        pose_mean=torch.zeros(144),
+        pose_scale=torch.ones(144),
+        tracker_mean=torch.zeros(6, 9),
+        tracker_std=torch.ones(6, 9),
+        predictor_sparse_mean=torch.zeros(54),
+        predictor_sparse_std=torch.ones(54),
     )
-    loop.build_training_current_conditions = (
-        lambda batch, history_observation, sample: (
-            condition,
-            torch.zeros(sample.shape[0], 24, 10),
-        )
+    args = SimpleNamespace(
+        save_dir=str(tmp_path / "predictor"),
+        normalizer_dir=str(normalizer_dir),
+        lr=1e-4,
+        lr_drop_step=50_000,
+        lr_drop_factor=30.0,
+        weight_decay=0.0,
+        ema_decay=0.995,
+        checkpoint_max_keep=2,
+        resume_checkpoint="",
     )
-    batch = {
-        "x": sample_window.clone(),
-        "history_pose_observation": torch.randn(2, 10, 144),
-    }
+    model = RealtimePosePredictor(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=64,
+        dropout=0.0,
+    )
+    loop = PredictorTrainLoop(args, model, [], torch.device("cpu"))
+    for step in (5, 6, 7):
+        loop.step = step
+        loop.save()
 
-    loop.compute_losses(batch, torch.ones(2, dtype=torch.long))
-    batch["history_pose_observation"].add_(100.0)
-    loop.compute_losses(batch, torch.ones(2, dtype=torch.long))
+    checkpoint = tmp_path / "predictor" / "model000000007.pt"
+    assert (tmp_path / "predictor" / "model_latest.pt").is_file()
+    for prefix in ("model", "ema", "opt"):
+        assert not (tmp_path / "predictor" / f"{prefix}000000005.pt").exists()
+        assert (tmp_path / "predictor" / f"{prefix}000000006.pt").is_file()
+        assert (tmp_path / "predictor" / f"{prefix}000000007.pt").is_file()
+    resumed_args = SimpleNamespace(**{**vars(args), "resume_checkpoint": "latest"})
+    resumed_model = RealtimePosePredictor(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=64,
+        dropout=0.0,
+    )
+    resumed = PredictorTrainLoop(resumed_args, resumed_model, [], torch.device("cpu"))
+    assert resumed.step == 7
+    for expected, actual in zip(model.parameters(), resumed_model.parameters()):
+        torch.testing.assert_close(actual, expected)
 
-    torch.testing.assert_close(loop.diffusion.targets[0], sample_window)
-    torch.testing.assert_close(loop.diffusion.targets[1], sample_window)
-    assert loop.diffusion.kwargs[0]["inpaint_condition"] is condition
-    assert loop.diffusion.kwargs[0]["known_noise"].data_ptr() != loop.diffusion.kwargs[0][
-        "noise"
-    ].data_ptr()
+
+def test_predictor_rollout_sampler_covers_single_stage_range(tmp_path):
+    torch.manual_seed(0)
+    normalizer_dir = tmp_path / "normalizer"
+    RealtimePoseNormalizer(normalizer_dir, disable=True).save(
+        pose_mean=torch.zeros(144),
+        pose_scale=torch.ones(144),
+        tracker_mean=torch.zeros(6, 9),
+        tracker_std=torch.ones(6, 9),
+        predictor_sparse_mean=torch.zeros(54),
+        predictor_sparse_std=torch.ones(54),
+    )
+    args = SimpleNamespace(
+        save_dir=str(tmp_path / "predictor"),
+        normalizer_dir=str(normalizer_dir),
+        lr=3e-4,
+        lr_drop_step=50_000,
+        lr_drop_factor=30.0,
+        weight_decay=1e-4,
+        ema_decay=0.995,
+        checkpoint_max_keep=3,
+        resume_checkpoint="",
+    )
+    model = RealtimePosePredictor(
+        latent_dim=32,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=64,
+        dropout=0.0,
+    )
+    loop = PredictorTrainLoop(args, model, [], torch.device("cpu"))
+    samples = [loop.sample_rollout_steps() for _ in range(512)]
+    assert min(samples) == 0
+    assert max(samples) == 30
+    assert all(0 <= value <= 30 for value in samples)
+    loop.step = 50_000
+    loop._update_learning_rate()
+    assert loop.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
+
+
+def test_predictor_resume_rejects_inference_alias(tmp_path):
+    latest = tmp_path / "model_latest.pt"
+    latest.touch()
+    with pytest.raises(ValueError, match="仅用于推理"):
+        resolve_predictor_resume_checkpoint(tmp_path, latest)

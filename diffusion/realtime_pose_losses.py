@@ -20,6 +20,7 @@ from data_loaders.sensor_masking import (
     HEAD_TRACKER_INDEX,
     NON_HEAD_TRACKER_INDICES,
     REALTIME_POSE_FPS,
+    TRACKER_AVAILABLE_OFFSET,
     TRACKER_TO_JOINT,
 )
 
@@ -42,42 +43,45 @@ def compute_raw_deployed_losses(
     raw_pred = _to_raw_pose(raw_pred_xstart, batch)
     deployed_pred = _to_raw_pose(deployed_pred_xstart, batch)
     target = _to_raw_pose(target_xstart, batch)
+    if raw_pred.ndim != 2:
+        raise ValueError("单帧 loss 的 Pose 必须为 [B,144]。")
     raw_global, _ = decode_target_head_rotations_torch(raw_pred)
     deployed_global, deployed_root_yaw = decode_target_head_rotations_torch(deployed_pred)
     target_global, _ = decode_target_head_rotations_torch(target)
 
     global_rotation_loss = _rotation_angle(raw_global, target_global).square().flatten(1).mean(dim=1)
     parents = torch.as_tensor(SMPL_PARENTS[1:], device=raw_pred.device, dtype=torch.long)
-    raw_local = raw_global.index_select(2, parents).transpose(-1, -2) @ raw_global[:, :, 1:]
-    target_local = target_global.index_select(2, parents).transpose(-1, -2) @ target_global[:, :, 1:]
+    raw_local = raw_global.index_select(1, parents).transpose(-1, -2) @ raw_global[:, 1:]
+    target_local = target_global.index_select(1, parents).transpose(-1, -2) @ target_global[:, 1:]
     local_rotation_loss = _rotation_angle(raw_local, target_local).square().flatten(1).mean(dim=1)
 
-    raw_velocity = raw_global[:, :-1].transpose(-1, -2) @ raw_global[:, 1:]
-    target_velocity = target_global[:, :-1].transpose(-1, -2) @ target_global[:, 1:]
+    previous_pose = _to_raw_pose(
+        batch["previous_pose_target"].to(device=raw_pred.device, dtype=raw_pred.dtype),
+        batch,
+    )
+    previous_global, previous_root_yaw = decode_target_head_rotations_torch(previous_pose)
+    raw_velocity = previous_global.transpose(-1, -2) @ raw_global
+    target_velocity = previous_global.transpose(-1, -2) @ target_global
     rotation_velocity_loss = (
         _rotation_angle(raw_velocity, target_velocity).square().flatten(1).mean(dim=1)
     )
 
-    raw_current_global = raw_global[:, 0]
-    deployed_current_global = deployed_global[:, 0]
-    deployed_current_root_yaw = deployed_root_yaw[:, 0]
-
-    current_tracker = batch["tracker_window_raw"][:, -1].to(
+    current_tracker = batch["current_tracker_raw"].to(
         device=raw_pred.device, dtype=raw_pred.dtype
     )
     tracker_rot = rotation_6d_to_matrix_torch(current_tracker[..., 3:9])
-    measured = current_tracker[..., 10] > 0.5
+    measured = current_tracker[..., TRACKER_AVAILABLE_OFFSET] > 0.5
     tracker_joints = torch.as_tensor(TRACKER_TO_JOINT, device=raw_pred.device, dtype=torch.long)
     tracker_rotation_error = _rotation_angle(
-        raw_current_global.index_select(1, tracker_joints), tracker_rot
+        raw_global.index_select(1, tracker_joints), tracker_rot
     )
     tracker_rotation_loss = _masked_mean(tracker_rotation_error.square(), measured)
 
     offsets = batch["joint_offsets_parent"].to(device=raw_pred.device, dtype=raw_pred.dtype)
     tracker_pos = current_tracker[..., :3]
     deployed_root_position, deployed_hip_height, deployed_joints = resolve_root_head_reference_torch(
-        deployed_current_global,
-        deployed_current_root_yaw,
+        deployed_global,
+        deployed_root_yaw,
         offsets,
         observed_head_height=tracker_pos[:, HEAD_TRACKER_INDEX, 1],
     )
@@ -106,7 +110,7 @@ def compute_raw_deployed_losses(
     # Actor Root 的 Y 固定在 floor；root_loss 只监督 yaw，避免与下面的
     # Head-to-Root 水平几何项重复惩罚同一个 XZ 偏移。
     root_loss = _root_yaw_circular_loss(
-        deployed_current_global[:, JOINT_INDEX["pelvis"]],
+        deployed_global[:, JOINT_INDEX["pelvis"]],
         target_root_yaw_head,
     )
     head_to_root_xz_loss = _scaled_huber_loss(
@@ -142,16 +146,7 @@ def compute_raw_deployed_losses(
         reduction="none",
     ).mean(dim=-1)
 
-    previous_pose = _to_raw_pose(
-        batch["previous_pose_target"].to(
-            device=raw_pred.device, dtype=raw_pred.dtype
-        ),
-        batch,
-    )
-    previous_global, previous_root_yaw = decode_target_head_rotations_torch(
-        previous_pose
-    )
-    previous_head_position = batch["tracker_window_raw"][:, -2, HEAD_TRACKER_INDEX, :3].to(
+    previous_head_position = batch["previous_head_position_current_ref"].to(
         device=raw_pred.device, dtype=raw_pred.dtype
     )
     _, _, previous_joints = resolve_root_head_reference_torch(
@@ -175,8 +170,8 @@ def compute_raw_deployed_losses(
         predicted_feet=deployed_joints.index_select(1, foot_indices),
         previous_target_feet=previous_joints.index_select(1, foot_indices),
         contact_weight=adjacent_contact_weight,
-        previous_frame_valid=batch["window_valid_mask"][:, -2].to(
-            device=raw_pred.device
+        previous_frame_valid=torch.ones(
+            raw_pred.shape[0], device=raw_pred.device, dtype=torch.bool
         ),
         fps=REALTIME_POSE_FPS,
         huber_beta_mps=CONTACT_SLIDE_HUBER_BETA_MPS,

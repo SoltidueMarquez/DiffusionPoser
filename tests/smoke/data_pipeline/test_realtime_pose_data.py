@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 import torch
 
-from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY
+from data_converter.amass_to_realtime_pose import parse_args
+from data_loaders.realtime_pose_kinematics import derive_stationary_prob_5
+from data_loaders.sensor_masking import (
+    BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
+    REALTIME_POSE_FPS,
+)
 from tests.smoke.realtime_pose_fixtures import build_toy_realtime_source
 from utils.normalizer import RealtimePoseNormalizer
 
@@ -17,11 +22,16 @@ def test_reusable_source_keeps_local_pose_fk_and_stationary_fields():
     np.testing.assert_allclose(source["root_pos_world"][:, 1], 0.0, atol=1e-7)
 
 
-def test_old_mean_std_normalizer_fails_fast(tmp_path):
-    torch.save(torch.zeros(214), tmp_path / "mean.pt")
-    torch.save(torch.ones(214), tmp_path / "std.pt")
-    with pytest.raises(FileNotFoundError):
-        RealtimePoseNormalizer(tmp_path)
+def test_realtime_pose_converter_and_stationary_speed_use_30hz():
+    args = parse_args([])
+    assert REALTIME_POSE_FPS == 30.0
+    assert args.target_fps == 30.0
+    assert str(args.output_dir).endswith("_30hz")
+
+    joints = np.zeros((3, 24, 3), dtype=np.float32)
+    joints[:, :, 0] = np.arange(3, dtype=np.float32)[:, None] * 0.005
+    probability = derive_stationary_prob_5(joints, median_window=1)
+    np.testing.assert_allclose(probability, 0.4, atol=1e-6)
 
 
 def test_pose_scale_is_the_single_pose_conversion_contract(tmp_path):
@@ -31,10 +41,8 @@ def test_pose_scale_is_the_single_pose_conversion_contract(tmp_path):
         pose_scale=torch.full((144,), 2.0),
         tracker_mean=torch.zeros(6, 9),
         tracker_std=torch.ones(6, 9),
-        head_path_xz_mean=torch.zeros(2),
-        head_path_xz_std=torch.ones(2),
-        head_height_mean=torch.tensor(0.0),
-        head_height_std=torch.tensor(1.0),
+        predictor_sparse_mean=torch.zeros(54),
+        predictor_sparse_std=torch.ones(54),
     )
 
     normalizer = RealtimePoseNormalizer(tmp_path, eps=1e-8)

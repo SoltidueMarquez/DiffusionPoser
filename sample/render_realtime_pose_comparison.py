@@ -26,13 +26,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def as_unbatched(array: np.ndarray, name: str) -> np.ndarray:
+def as_unbatched(
+    array: np.ndarray,
+    name: str,
+    expected_ndim: int,
+) -> np.ndarray:
+    """接受无 batch 或单 batch 数组，避免把单帧序列误当成 batch。"""
+
     value = np.asarray(array)
-    if value.ndim >= 1 and value.shape[0] == 1:
-        return value[0]
-    if value.ndim >= 2:
+    if value.ndim == int(expected_ndim):
         return value
-    raise ValueError(f"{name} 维度不合法：{value.shape}")
+    if value.ndim == int(expected_ndim) + 1 and value.shape[0] == 1:
+        return value[0]
+    raise ValueError(
+        f"{name} 应为 {expected_ndim} 维或带单 batch 的 {expected_ndim + 1} 维，"
+        f"实际为 {value.shape}"
+    )
 
 
 def fixed_axis_limits(*arrays: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
@@ -230,20 +239,52 @@ def render_realtime_pose_comparison(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    reference = as_unbatched(np.asarray(reference_joints, dtype=np.float32), "reference_joints")
-    predicted = as_unbatched(np.asarray(predicted_joints, dtype=np.float32), "predicted_joints")
+    reference = as_unbatched(
+        np.asarray(reference_joints, dtype=np.float32), "reference_joints", 3
+    )
+    predicted = as_unbatched(
+        np.asarray(predicted_joints, dtype=np.float32), "predicted_joints", 3
+    )
     if reference.shape != predicted.shape or reference.ndim != 3 or reference.shape[1:] != (24, 3):
         raise ValueError(f"joints 应为相同的 [T,24,3]，实际 reference={reference.shape}, predicted={predicted.shape}")
 
-    trackers = None if tracker_pos_world is None else as_unbatched(np.asarray(tracker_pos_world, dtype=np.float32), "tracker_pos_world")
-    valid = None if sensor_valid is None else as_unbatched(np.asarray(sensor_valid, dtype=bool), "sensor_valid")
+    trackers = (
+        None
+        if tracker_pos_world is None
+        else as_unbatched(
+            np.asarray(tracker_pos_world, dtype=np.float32), "tracker_pos_world", 3
+        )
+    )
+    valid = (
+        None
+        if sensor_valid is None
+        else as_unbatched(np.asarray(sensor_valid, dtype=bool), "sensor_valid", 2)
+    )
     eval_mask = (
         np.ones((reference.shape[0],), dtype=bool)
         if eval_frame_mask is None
-        else as_unbatched(np.asarray(eval_frame_mask, dtype=bool), "eval_frame_mask")
+        else as_unbatched(
+            np.asarray(eval_frame_mask, dtype=bool), "eval_frame_mask", 1
+        )
     )
-    yaw_ref = None if root_yaw_reference is None else as_unbatched(np.asarray(root_yaw_reference, dtype=np.float32), "root_yaw_reference")
-    yaw_pred = None if root_yaw_predicted is None else as_unbatched(np.asarray(root_yaw_predicted, dtype=np.float32), "root_yaw_predicted")
+    yaw_ref = (
+        None
+        if root_yaw_reference is None
+        else as_unbatched(
+            np.asarray(root_yaw_reference, dtype=np.float32),
+            "root_yaw_reference",
+            1,
+        )
+    )
+    yaw_pred = (
+        None
+        if root_yaw_predicted is None
+        else as_unbatched(
+            np.asarray(root_yaw_predicted, dtype=np.float32),
+            "root_yaw_predicted",
+            1,
+        )
+    )
     if camera_mode not in {"global", "follow"}:
         raise ValueError(f"camera_mode 必须是 global/follow，实际为 {camera_mode}")
     if layout not in {"split", "overlay"}:

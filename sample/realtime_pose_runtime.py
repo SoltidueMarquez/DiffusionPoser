@@ -5,53 +5,42 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from data_loaders.realtime_pose_config import (
-    FutureRollingPriorConfig,
-    IKInpaintingConfig,
-    TrackerReliabilityConfig,
-)
+from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_geometry import (
-    assemble_tracker_features_np,
-    build_head_path_window_np,
-    build_pose_target_np,
+    assemble_current_tracker_features_np,
     build_tracker_measurements_np,
     decode_target_head_rotations_np,
-    extract_forward_yaw_np,
     extract_rotation_heading_components_np,
     global_head_rotations_to_local_delta_6d_np,
     ROOT_HEADING_OBSERVABILITY_EPS,
     resolve_root_head_reference_np,
 )
-from data_loaders.realtime_pose_kinematics import make_yaw_rotation_np, rotation_6d_to_matrix_np
+from data_loaders.realtime_pose_kinematics import (
+    make_yaw_rotation_np,
+    rotation_6d_to_matrix_np,
+)
+from data_loaders.realtime_pose_predictor_features import build_predictor_step_features_np
 from data_loaders.sensor_masking import (
+    CORE_TRACKER_INDICES,
     HEAD_TRACKER_INDEX,
-    REALTIME_POSE_CONDITION_WINDOW_LENGTH,
-    REALTIME_POSE_FRAME_OFFSETS,
-    REALTIME_POSE_HISTORY_ANCHOR_COUNT,
-    REALTIME_POSE_HISTORY_ANCHOR_INDICES,
     REALTIME_POSE_HISTORY_LENGTH,
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_LENGTH,
+    PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH,
+    PREDICTOR_POSE_HORIZON_LENGTH,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
+    validate_tracker_available,
 )
-from data_loaders.tracker_reliability import (
-    compute_hard_rotation_state_np,
-    compute_region_coverage_np,
-    compute_tracker_reliability_np,
-)
+from diffusion.realtime_pose_inpainting import build_current_realtime_pose_conditions
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
-from diffusion.realtime_pose_inpainting import (
-    build_current_realtime_pose_conditions,
-)
 
 
 @dataclass(frozen=True)
 class WorldPoseState:
-    joint_rotations_world: np.ndarray
+    joint_rotations_world: np.ndarray  # [24,3,3]
     root_yaw_world: float
     hip_height: float
-    root_position_world: np.ndarray
+    root_position_world: np.ndarray  # [3]
 
 
 @dataclass(frozen=True)
@@ -75,101 +64,142 @@ class ResolvedPose:
 
 @dataclass(frozen=True)
 class RuntimeStepResult:
+    predictor_pose_horizon: np.ndarray  # [11,144]，原始物理值
+    raw_pred_pose: np.ndarray  # [144]
+    deployed_pred_pose: np.ndarray  # [144]
+    inpaint_confidence: np.ndarray  # [24]
+    contact_logits: np.ndarray  # [2]
     resolved_pose: ResolvedPose
-    raw_pred_pose_horizon: np.ndarray
-    deployed_pred_pose_horizon: np.ndarray
-    kappa_position: np.ndarray
-    kappa_rotation: np.ndarray
-    hard_rotation_state: np.ndarray
-    current_tracker_raw: np.ndarray
-    inpaint_confidence: np.ndarray
-    contact_logits: np.ndarray | None = None
+    current_tracker_raw: np.ndarray  # [6,10]
+    current_head_yaw_world: float
 
 
 @dataclass(frozen=True)
-class _TrackerFrameState:
-    tracker_pos_world: np.ndarray
-    tracker_rot_world_6d: np.ndarray
-    configured: np.ndarray
-    measured_valid: np.ndarray
-    d_off: np.ndarray
-    d_on: np.ndarray
+class _TrackerWorldState:
+    positions: np.ndarray
+    rotations_6d: np.ndarray
+    floor_y: float
+
+
+@dataclass(frozen=True)
+class _PreparedStep:
+    motion_context: np.ndarray
+    core_tracker_context: np.ndarray
+    current_tracker_raw: np.ndarray
+    tracker_positions: np.ndarray
+    tracker_rotations_6d: np.ndarray
     head_yaw_world: float
     floor_y: float
-
-
-@dataclass(frozen=True)
-class _PreparedRuntimeStep:
-    position: np.ndarray
-    rotation_6d: np.ndarray
-    configured: np.ndarray
-    measured: np.ndarray
-    d_off: np.ndarray
-    d_on: np.ndarray
-    kappa_position: np.ndarray
-    kappa_rotation: np.ndarray
-    head_yaw: float
-    floor_y: float
-    tracker_window_raw: np.ndarray
-    hard_rotation_state_window: np.ndarray
-    conditioning: dict[str, torch.Tensor]
+    consumes_preloaded_current: bool
 
 
 class RealtimePoseRuntime:
-    """维护 60 帧密集历史的状态化 Python runtime。"""
+    """30Hz Predictor + 单帧 DiT runtime；调用前必须显式提供完整历史。
+
+    `step()` 一次对应一个 30Hz 模型帧。更高刷新率的显示插值属于 Python
+    模型输出之后的客户端职责，不在此处降采样或补帧。
+    """
 
     def __init__(
         self,
-        model,
+        predictor_model,
+        dit_model,
         diffusion,
         device: torch.device,
         joint_offsets_parent: np.ndarray,
         joint_rest_local_rotations_6d: np.ndarray,
-        normalizer=None,
-        tracker_confidence_warmup: int = 15,
+        normalizer,
         fabrik_iterations: int = 2,
         ik_direction_only_quality: float | None = None,
         ik_residual_scale: float | None = None,
         ik_position_solved_quality: float | None = None,
-        use_future_rolling_prior: bool = False,
-        future_confidence_decay: float = 0.9,
     ):
-        self.model = model
+        self.predictor_model = predictor_model.eval().requires_grad_(False)
+        self.dit_model = dit_model.eval().requires_grad_(False)
         self.diffusion = diffusion
-        self.device = device
+        self.device = torch.device(device)
         self.normalizer = normalizer
-        self.reliability_config = TrackerReliabilityConfig().validate()
         self.ik_inpainting_config = IKInpaintingConfig(
-            tracker_confidence_warmup=int(tracker_confidence_warmup),
             fabrik_iterations=int(fabrik_iterations),
             direction_only_quality=ik_direction_only_quality,
             residual_scale=ik_residual_scale,
             position_solved_quality=ik_position_solved_quality,
         ).validate()
-        if bool(use_future_rolling_prior):
-            raise ValueError(
-                "第一轮显式禁用 future rolling prior；请勿传入 --use_future_rolling_prior。"
-            )
-        self.future_rolling_prior_config = FutureRollingPriorConfig(
-            enabled=False,
-            confidence_decay=float(future_confidence_decay),
-        ).validate()
-        self.joint_offsets_parent = np.asarray(joint_offsets_parent, dtype=np.float32).reshape(24, 3)
+        self.joint_offsets_parent = np.asarray(
+            joint_offsets_parent, dtype=np.float32
+        ).reshape(24, 3)
         self.joint_rest_local_rotations_6d = np.asarray(
             joint_rest_local_rotations_6d, dtype=np.float32
         ).reshape(24, 6)
         self.pose_history: list[WorldPoseState] = []
-        self.tracker_history: list[_TrackerFrameState] = []
-        self.previous_d_off = np.zeros(TRACKER_COUNT, dtype=np.int64)
-        self.previous_d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
-        self.previous_head_yaw: float | None = None
+        self.tracker_history: list[_TrackerWorldState] = []
+        self._preloaded_current_pending = False
+
+    def initialize_history(
+        self,
+        pose_history: list[WorldPoseState],
+        tracker_positions_world: np.ndarray,
+        tracker_rotations_world_6d: np.ndarray,
+        floor_y: np.ndarray | float,
+    ) -> None:
+        """设置历史。
+
+        Pose 必须恰好 10 帧。Tracker 可传 offset `-11..-1` 的 11 帧，随后由
+        `step()` 追加当前帧；也可传 `-11..0` 的 12 帧，此时第一次 step 的
+        当前测量必须与最后一帧一致。
+        """
+
+        if len(pose_history) != REALTIME_POSE_HISTORY_LENGTH:
+            raise ValueError("runtime 初始化必须提供恰好 10 帧 Pose history。")
+        positions = np.asarray(tracker_positions_world, dtype=np.float32)
+        rotations = np.asarray(tracker_rotations_world_6d, dtype=np.float32)
+        if positions.ndim != 3 or positions.shape[1:] != (TRACKER_COUNT, 3):
+            raise ValueError("tracker_positions_world 必须为 [11或12,6,3]。")
+        if rotations.shape != (positions.shape[0], TRACKER_COUNT, 6):
+            raise ValueError("tracker_rotations_world_6d 必须为 [11或12,6,6]。")
+        if positions.shape[0] not in (
+            PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH,
+            PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH + 1,
+        ):
+            raise ValueError("Tracker history 必须为 11 或 12 帧。")
+        floors = np.asarray(floor_y, dtype=np.float32)
+        if floors.ndim == 0:
+            floors = np.full(positions.shape[0], float(floors), dtype=np.float32)
+        if floors.shape != (positions.shape[0],):
+            raise ValueError("floor_y 必须为标量或与 Tracker history 等长。")
+        if not all(
+            np.asarray(state.joint_rotations_world).shape == (24, 3, 3)
+            for state in pose_history
+        ):
+            raise ValueError("每个 WorldPoseState 必须包含 [24,3,3] 旋转。")
+        core = list(CORE_TRACKER_INDICES)
+        if not (
+            np.isfinite(positions[:, core]).all()
+            and np.isfinite(rotations[:, core]).all()
+        ):
+            raise ValueError("核心三点 Tracker history 必须全部有效。")
+        self.pose_history = [
+            WorldPoseState(
+                np.asarray(state.joint_rotations_world, dtype=np.float32).copy(),
+                float(state.root_yaw_world),
+                float(state.hip_height),
+                np.asarray(state.root_position_world, dtype=np.float32).reshape(3).copy(),
+            )
+            for state in pose_history
+        ]
+        self.tracker_history = [
+            _TrackerWorldState(positions[index].copy(), rotations[index].copy(), float(floors[index]))
+            for index in range(positions.shape[0])
+        ]
+        self._preloaded_current_pending = positions.shape[0] == (
+            PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH + 1
+        )
 
     def step(
         self,
         tracker_pos_world: np.ndarray,
         tracker_rot_world_6d: np.ndarray,
-        configured: np.ndarray,
-        measured_valid: np.ndarray,
+        tracker_available: np.ndarray,
         floor_y: float,
         noise: torch.Tensor | None = None,
         known_noise: torch.Tensor | None = None,
@@ -178,585 +208,268 @@ class RealtimePoseRuntime:
             [self],
             np.asarray(tracker_pos_world, dtype=np.float32)[None],
             np.asarray(tracker_rot_world_6d, dtype=np.float32)[None],
-            np.asarray(configured, dtype=bool)[None],
-            np.asarray(measured_valid, dtype=bool)[None],
+            np.asarray(tracker_available, dtype=bool)[None],
             np.asarray([floor_y], dtype=np.float32),
             noise=noise,
             known_noise=known_noise,
         )[0]
 
-    def append_ground_truth_frame(
-        self,
-        pose_state: WorldPoseState,
-        tracker_pos_world: np.ndarray,
-        tracker_rot_world_6d: np.ndarray,
-        configured: np.ndarray,
-        measured_valid: np.ndarray,
-        floor_y: float,
-    ) -> None:
-        """不执行扩散采样，用一帧 GT Pose/Tracker 推进初始化历史。
-
-        长序列测评可先调用本方法填满 60 帧历史，再从下一帧开始闭环预测。
-        Tracker duration 与 Head yaw 仍按真实逐帧状态推进，避免 warmup 结束时
-        的可靠度状态和正常 runtime 路径发生分叉。
-        """
-
-        prepared = self._prepare_step(
-            tracker_pos_world,
-            tracker_rot_world_6d,
-            configured,
-            measured_valid,
-            floor_y,
-        )
-        self._append_history_state(prepared, pose_state)
-
-    def _build_conditioning(
-        self,
-        position: np.ndarray,
-        rotation_6d: np.ndarray,
-        configured: np.ndarray,
-        measured: np.ndarray,
-        d_off: np.ndarray,
-        d_on: np.ndarray,
-        head_yaw: float,
-        floor_y: float,
-    ) -> tuple[dict[str, torch.Tensor], np.ndarray, np.ndarray]:
-        history_count = min(len(self.pose_history), REALTIME_POSE_HISTORY_LENGTH)
-        if len(self.tracker_history) != len(self.pose_history):
-            raise RuntimeError("Pose 与 Tracker 密集历史长度不一致。")
-        session_start = REALTIME_POSE_HISTORY_LENGTH - history_count
-        anchor_indices = np.asarray(REALTIME_POSE_HISTORY_ANCHOR_INDICES, dtype=np.int64)
-        history_valid = anchor_indices >= session_start
-        window_valid = np.concatenate([history_valid, np.asarray([True])])
-
-        pose_raw = np.zeros(
-            (REALTIME_POSE_HISTORY_ANCHOR_COUNT, REALTIME_POSE_TARGET_DIM),
-            dtype=np.float32,
-        )
-        tracker_positions = np.zeros(
-            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT, 3), dtype=np.float32
-        )
-        tracker_rotations = np.zeros(
-            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT, 6), dtype=np.float32
-        )
-        configured_window = np.zeros(
-            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, TRACKER_COUNT), dtype=bool
-        )
-        measured_window = np.zeros_like(configured_window)
-        d_off_window = np.zeros_like(configured_window, dtype=np.int64)
-        d_on_window = np.zeros_like(configured_window, dtype=np.int64)
-        head_positions = np.zeros(
-            (REALTIME_POSE_CONDITION_WINDOW_LENGTH, 3), dtype=np.float32
-        )
-        head_yaws = np.zeros(REALTIME_POSE_CONDITION_WINDOW_LENGTH, dtype=np.float32)
-
-        selected_pose_rotations: list[np.ndarray] = []
-        selected_pose_slots: list[int] = []
-        for slot, dense_index in enumerate(anchor_indices.tolist()):
-            if dense_index < session_start:
-                continue
-            history_index = dense_index - session_start
-            pose_state = self.pose_history[history_index]
-            tracker_state = self.tracker_history[history_index]
-            selected_pose_slots.append(slot)
-            selected_pose_rotations.append(pose_state.joint_rotations_world)
-            tracker_positions[slot] = tracker_state.tracker_pos_world
-            tracker_rotations[slot] = tracker_state.tracker_rot_world_6d
-            configured_window[slot] = tracker_state.configured
-            measured_window[slot] = tracker_state.measured_valid
-            d_off_window[slot] = tracker_state.d_off
-            d_on_window[slot] = tracker_state.d_on
-            head_positions[slot] = tracker_state.tracker_pos_world[HEAD_TRACKER_INDEX]
-            head_yaws[slot] = tracker_state.head_yaw_world
-        if selected_pose_rotations:
-            pose_raw[np.asarray(selected_pose_slots, dtype=np.int64)] = build_pose_target_np(
-                np.stack(selected_pose_rotations, axis=0), head_yaw
-            )
-
-        tracker_positions[-1] = position
-        tracker_rotations[-1] = rotation_6d
-        configured_window[-1] = configured
-        measured_window[-1] = measured
-        d_off_window[-1] = d_off
-        d_on_window[-1] = d_on
-        head_positions[-1] = position[HEAD_TRACKER_INDEX]
-        head_yaws[-1] = head_yaw
-        tracker_measurements = build_tracker_measurements_np(
-            tracker_positions,
-            tracker_rotations,
-            position[HEAD_TRACKER_INDEX],
-            floor_y,
-            head_yaw,
-        )
-        tracker_raw = np.zeros(
-            (
-                REALTIME_POSE_CONDITION_WINDOW_LENGTH,
-                TRACKER_COUNT,
-                TRACKER_FEATURE_DIM,
-            ),
-            dtype=np.float32,
-        )
-        tracker_raw[window_valid] = assemble_tracker_features_np(
-            tracker_measurements[window_valid],
-            configured_window[window_valid],
-            measured_window[window_valid],
-            d_off_window[window_valid],
-            d_on_window[window_valid],
-            duration_cap=self.reliability_config.duration_cap,
-        )
-        hard_rotation_window = np.zeros_like(configured_window)
-        hard_rotation_window[window_valid] = compute_hard_rotation_state_np(
-            configured_window[window_valid],
-            measured_window[window_valid],
-            d_on_window[window_valid],
-            self.reliability_config,
-        )
-        head_path_raw = build_head_path_window_np(
-            head_positions,
-            head_yaws,
-            position[HEAD_TRACKER_INDEX],
-            floor_y,
-            head_yaw,
-        )
-        pose = self._normalize_pose_numpy(pose_raw)
-        head_path = (
-            head_path_raw
-            if self.normalizer is None
-            else np.asarray(
-                self.normalizer.normalize_head_path(head_path_raw), dtype=np.float32
-            )
-        )
-        pose[~history_valid] = 0.0
-        head_path[~window_valid] = 0.0
-        kappa_position, kappa_rotation = compute_tracker_reliability_np(
-            configured_window[:-1], measured_window[:-1], d_on_window[:-1],
-            config=self.reliability_config,
-        )
-        rho_position, rho_rotation = compute_region_coverage_np(
-            kappa_position, kappa_rotation
-        )
-        history_confidence = 0.5 * (rho_position + rho_rotation)
-        history_confidence *= history_valid[:, None]
-        conditioning = {
-            "history_pose_observation": torch.as_tensor(
-                pose, device=self.device, dtype=torch.float32
-            ).unsqueeze(0),
-            "head_path_window": torch.as_tensor(
-                head_path, device=self.device, dtype=torch.float32
-            ).unsqueeze(0),
-            "history_region_confidence": torch.as_tensor(
-                history_confidence, device=self.device, dtype=torch.float32
-            ).unsqueeze(0),
-            "window_valid_mask": torch.as_tensor(
-                window_valid, device=self.device, dtype=torch.bool
-            ).unsqueeze(0),
-            "frame_offsets": torch.tensor(
-                REALTIME_POSE_FRAME_OFFSETS, device=self.device, dtype=torch.long
-            ).unsqueeze(0),
-        }
-        return conditioning, tracker_raw, hard_rotation_window
-
-
-    def _normalizer_pose_stats(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self.normalizer is None:
-            return None, None
-        return (
-            self.normalizer.pose_mean.to(self.device),
-            self.normalizer.pose_scale.to(self.device),
-        )
-
-    def _normalizer_tracker_position_stats(
-        self,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """返回与离线训练一致的六 Tracker position mean/scale。"""
-
-        if self.normalizer is None:
-            return None, None
-        if self.normalizer.tracker_mean is None or self.normalizer.tracker_std is None:
-            self.normalizer.load()
-        return (
-            self.normalizer.tracker_mean[:, :3].to(self.device),
-            self.normalizer.tracker_std[:, :3].to(self.device)
-            + float(self.normalizer.eps),
-        )
-
-    def _normalize_pose_numpy(self, value: np.ndarray) -> np.ndarray:
-        return value if self.normalizer is None else np.asarray(self.normalizer.normalize_pose(value), dtype=np.float32)
-
-    def _inverse_pose(self, value: torch.Tensor) -> np.ndarray:
-        cpu = value.detach().cpu()
-        if self.normalizer is not None:
-            cpu = self.normalizer.inverse_pose(cpu)
-        return np.asarray(cpu, dtype=np.float32)
-
-    def _previous_pose_for_ik(self, current_head_yaw: float) -> tuple[np.ndarray, bool]:
-        """把唯一的上一已部署 Pose 转到当前 Head-yaw 参考系。"""
-
-        if self.pose_history:
-            previous_pose_raw = build_pose_target_np(
-                self.pose_history[-1].joint_rotations_world[None], current_head_yaw
-            )[0]
-            previous_pose_valid = True
-        else:
-            previous_pose_raw = np.zeros(REALTIME_POSE_TARGET_DIM, dtype=np.float32)
-            previous_pose_valid = False
-        return previous_pose_raw, previous_pose_valid
-
     def _prepare_step(
         self,
-        tracker_pos_world: np.ndarray,
-        tracker_rot_world_6d: np.ndarray,
-        configured: np.ndarray,
-        measured_valid: np.ndarray,
+        tracker_positions: np.ndarray,
+        tracker_rotations_6d: np.ndarray,
+        tracker_available: np.ndarray,
         floor_y: float,
-    ) -> _PreparedRuntimeStep:
-        """只构建当前帧条件，不采样也不推进该序列的历史。"""
-
-        position = np.asarray(tracker_pos_world, dtype=np.float32).reshape(TRACKER_COUNT, 3)
-        rotation_6d = np.asarray(tracker_rot_world_6d, dtype=np.float32).reshape(TRACKER_COUNT, 6)
-        configured = np.asarray(configured, dtype=bool).reshape(TRACKER_COUNT)
-        measured = np.asarray(measured_valid, dtype=bool).reshape(TRACKER_COUNT)
-        if np.any(measured & ~configured):
-            raise ValueError("measured_valid 必须是 configured 的子集。")
-        if not configured[HEAD_TRACKER_INDEX] or not measured[HEAD_TRACKER_INDEX]:
-            raise ValueError("Head 必须始终为 configured 且 measured_valid。")
-
-        head_rotation = rotation_6d_to_matrix_np(
-            rotation_6d[HEAD_TRACKER_INDEX : HEAD_TRACKER_INDEX + 1]
+    ) -> _PreparedStep:
+        if len(self.pose_history) != REALTIME_POSE_HISTORY_LENGTH:
+            raise RuntimeError("runtime 尚未初始化完整 10 帧 Pose history。")
+        if len(self.tracker_history) not in (11, 12):
+            raise RuntimeError("runtime 尚未初始化 11/12 帧 Tracker history。")
+        positions = np.asarray(tracker_positions, dtype=np.float32).reshape(TRACKER_COUNT, 3)
+        rotations = np.asarray(tracker_rotations_6d, dtype=np.float32).reshape(TRACKER_COUNT, 6)
+        available = validate_tracker_available(tracker_available).reshape(TRACKER_COUNT)
+        consumes_preloaded_current = bool(self._preloaded_current_pending)
+        if consumes_preloaded_current:
+            current_matches_last = np.allclose(
+                self.tracker_history[-1].positions[list(CORE_TRACKER_INDICES)],
+                positions[list(CORE_TRACKER_INDICES)],
+                atol=1e-6,
+            ) and np.allclose(
+                self.tracker_history[-1].rotations_6d[list(CORE_TRACKER_INDICES)],
+                rotations[list(CORE_TRACKER_INDICES)],
+                atol=1e-6,
+            )
+            if not current_matches_last:
+                raise ValueError(
+                    "初始化已包含 offset 0 时，第一次 step 的核心 Tracker 必须与该帧一致。"
+                )
+        current_state = _TrackerWorldState(
+            positions.copy(), rotations.copy(), float(floor_y)
         )
-        head_yaw = float(
-            extract_forward_yaw_np(
-                head_rotation,
-                initial_yaw=0.0 if self.previous_head_yaw is None else self.previous_head_yaw,
-            )[0]
+        tracker_window = (
+            self.tracker_history[-12:]
+            if consumes_preloaded_current
+            else [*self.tracker_history, current_state][-12:]
         )
-        d_off, d_on = _advance_durations(
-            self.previous_d_off,
-            self.previous_d_on,
-            configured,
-            measured,
-            self.reliability_config.duration_cap,
-        )
-        kappa_pos, kappa_rot = compute_tracker_reliability_np(
-            configured,
-            measured,
-            d_on,
-            config=self.reliability_config,
-        )
-        conditioning, tracker_window_raw, hard_rotation_state_window = self._build_conditioning(
-            position,
-            rotation_6d,
-            configured,
-            measured,
-            d_off,
-            d_on,
-            head_yaw,
-            float(floor_y),
-        )
-        return _PreparedRuntimeStep(
-            position=position,
-            rotation_6d=rotation_6d,
-            configured=configured,
-            measured=measured,
-            d_off=d_off,
-            d_on=d_on,
-            kappa_position=kappa_pos,
-            kappa_rotation=kappa_rot,
-            head_yaw=head_yaw,
+        if len(tracker_window) != 12:
+            raise RuntimeError("Predictor 当前 step 必须具有 offset -11..0 的 12 帧 Tracker。")
+        predictor_features = build_predictor_step_features_np(
+            motion_rotations_world=np.stack(
+                [state.joint_rotations_world for state in self.pose_history], axis=0
+            ),
+            tracker_positions_world_with_previous=np.stack(
+                [state.positions for state in tracker_window], axis=0
+            ),
+            tracker_rotations_world_6d_with_previous=np.stack(
+                [state.rotations_6d for state in tracker_window], axis=0
+            ),
             floor_y=float(floor_y),
-            tracker_window_raw=tracker_window_raw,
-            hard_rotation_state_window=hard_rotation_state_window,
-            conditioning=conditioning,
+        )
+        continuous = build_tracker_measurements_np(
+            positions[None],
+            rotations[None],
+            positions[HEAD_TRACKER_INDEX],
+            float(floor_y),
+            predictor_features.current_head_yaw_world,
+        )[0]
+        current_tracker_raw = assemble_current_tracker_features_np(
+            continuous, available
+        )
+        return _PreparedStep(
+            motion_context=predictor_features.motion_context,
+            core_tracker_context=predictor_features.core_tracker_context,
+            current_tracker_raw=current_tracker_raw,
+            tracker_positions=positions,
+            tracker_rotations_6d=rotations,
+            head_yaw_world=predictor_features.current_head_yaw_world,
+            floor_y=float(floor_y),
+            consumes_preloaded_current=consumes_preloaded_current,
         )
 
     def _finish_step(
         self,
-        prepared: _PreparedRuntimeStep,
-        raw_pose_horizon: np.ndarray,
-        deployed_pose_horizon: np.ndarray,
-        contact_logits: np.ndarray | None,
+        prepared: _PreparedStep,
+        predictor_pose_horizon: np.ndarray,
+        raw_pred_pose: np.ndarray,
+        deployed_pred_pose: np.ndarray,
         inpaint_confidence: np.ndarray,
+        contact_logits: np.ndarray | None,
     ) -> RuntimeStepResult:
-        """用采样结果推进一条序列，不影响批内其他序列。"""
-
-        raw_pose_horizon = np.asarray(raw_pose_horizon, dtype=np.float32).reshape(
-            REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM
-        )
-        deployed_pose_horizon = np.asarray(
-            deployed_pose_horizon, dtype=np.float32
-        ).reshape(REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM)
         resolved = decode_and_resolve_pose(
-            deployed_pose_horizon[0],
-            prepared.tracker_window_raw[-1],
-            prepared.head_yaw,
-            prepared.position[HEAD_TRACKER_INDEX],
+            deployed_pred_pose,
+            prepared.current_tracker_raw,
+            prepared.head_yaw_world,
+            prepared.tracker_positions[HEAD_TRACKER_INDEX],
             prepared.floor_y,
             self.joint_offsets_parent,
             self.joint_rest_local_rotations_6d,
-            previous_root_yaw_world=(
-                None
-                if not self.pose_history
-                else self.pose_history[-1].root_yaw_world
-            ),
+            previous_root_yaw_world=self.pose_history[-1].root_yaw_world,
         )
-        self._append_history_state(prepared, resolved.as_world_state())
-        return RuntimeStepResult(
-            resolved_pose=resolved,
-            raw_pred_pose_horizon=raw_pose_horizon,
-            deployed_pred_pose_horizon=deployed_pose_horizon,
-            kappa_position=prepared.kappa_position.copy(),
-            kappa_rotation=prepared.kappa_rotation.copy(),
-            hard_rotation_state=prepared.hard_rotation_state_window[-1].copy(),
-            current_tracker_raw=prepared.tracker_window_raw[-1].copy(),
-            inpaint_confidence=np.asarray(inpaint_confidence, dtype=np.float32),
-            contact_logits=(
-                None if contact_logits is None else np.asarray(contact_logits, dtype=np.float32)
-            ),
-        )
-
-    def _append_history_state(
-        self,
-        prepared: _PreparedRuntimeStep,
-        pose_state: WorldPoseState,
-    ) -> None:
-        """以统一路径提交 Pose 与 Tracker，保证预测帧和 GT warmup 状态一致。"""
-
-        committed_pose = WorldPoseState(
-            joint_rotations_world=np.asarray(
-                pose_state.joint_rotations_world, dtype=np.float32
-            ).reshape(24, 3, 3).copy(),
-            root_yaw_world=float(pose_state.root_yaw_world),
-            hip_height=float(pose_state.hip_height),
-            root_position_world=np.asarray(
-                pose_state.root_position_world, dtype=np.float32
-            ).reshape(3).copy(),
-        )
-        frame_state = _TrackerFrameState(
-            prepared.position.copy(),
-            prepared.rotation_6d.copy(),
-            prepared.configured.copy(),
-            prepared.measured.copy(),
-            prepared.d_off.copy(),
-            prepared.d_on.copy(),
-            prepared.head_yaw,
-            prepared.floor_y,
-        )
-        self.pose_history.append(committed_pose)
-        self.tracker_history.append(frame_state)
+        self.pose_history.append(resolved.as_world_state())
         self.pose_history = self.pose_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.tracker_history = self.tracker_history[-REALTIME_POSE_HISTORY_LENGTH:]
-        self.previous_d_off = prepared.d_off.copy()
-        self.previous_d_on = prepared.d_on.copy()
-        self.previous_head_yaw = prepared.head_yaw
+        if prepared.consumes_preloaded_current:
+            self._preloaded_current_pending = False
+        else:
+            self.tracker_history.append(
+                _TrackerWorldState(
+                    prepared.tracker_positions.copy(),
+                    prepared.tracker_rotations_6d.copy(),
+                    prepared.floor_y,
+                )
+            )
+        self.tracker_history = self.tracker_history[-12:]
+        logits = (
+            np.zeros(2, dtype=np.float32)
+            if contact_logits is None
+            else np.asarray(contact_logits, dtype=np.float32).reshape(2)
+        )
+        return RuntimeStepResult(
+            predictor_pose_horizon=np.asarray(predictor_pose_horizon, dtype=np.float32).reshape(11, 144),
+            raw_pred_pose=np.asarray(raw_pred_pose, dtype=np.float32).reshape(144),
+            deployed_pred_pose=np.asarray(deployed_pred_pose, dtype=np.float32).reshape(144),
+            inpaint_confidence=np.asarray(inpaint_confidence, dtype=np.float32).reshape(24),
+            contact_logits=logits,
+            resolved_pose=resolved,
+            current_tracker_raw=prepared.current_tracker_raw.copy(),
+            current_head_yaw_world=float(prepared.head_yaw_world),
+        )
 
 
 def step_realtime_pose_batch(
     runtimes: list[RealtimePoseRuntime],
     tracker_pos_world: np.ndarray,
     tracker_rot_world_6d: np.ndarray,
-    configured: np.ndarray,
-    measured_valid: np.ndarray,
+    tracker_available: np.ndarray,
     floor_y: np.ndarray,
     noise: torch.Tensor | None = None,
     known_noise: torch.Tensor | None = None,
 ) -> list[RuntimeStepResult]:
-    """将多条独立序列的当前帧合成一次模型采样。
-
-    批内条件张量为 ``[B, ...]``；每个 runtime 仍各自维护历史、
-    tracker 持续时间和头部轨迹，因此可以在序列结束后缩小活跃批。
-    """
-
     if not runtimes:
-        raise ValueError("跨序列批处理至少需要一个 runtime。")
+        raise ValueError("批处理至少需要一个 runtime。")
     batch_size = len(runtimes)
     first = runtimes[0]
     for runtime in runtimes[1:]:
-        if runtime.model is not first.model or runtime.diffusion is not first.diffusion:
-            raise ValueError("批内 runtime 必须共享同一个 model 和 diffusion。")
-        if runtime.device != first.device or runtime.normalizer is not first.normalizer:
-            raise ValueError("批内 runtime 必须共享 device 和 normalizer。")
-        if runtime.ik_inpainting_config != first.ik_inpainting_config:
-            raise ValueError("批内 runtime 必须使用相同的 IK/Inpainting 配置。")
-        if runtime.future_rolling_prior_config != first.future_rolling_prior_config:
-            raise ValueError("批内 runtime 必须使用相同的 future rolling prior 配置。")
-
-    positions = np.asarray(tracker_pos_world, dtype=np.float32).reshape(
-        batch_size, TRACKER_COUNT, 3
-    )
-    rotations = np.asarray(tracker_rot_world_6d, dtype=np.float32).reshape(
-        batch_size, TRACKER_COUNT, 6
-    )
-    configured_batch = np.asarray(configured, dtype=bool).reshape(batch_size, TRACKER_COUNT)
-    measured_batch = np.asarray(measured_valid, dtype=bool).reshape(batch_size, TRACKER_COUNT)
-    floor_batch = np.asarray(floor_y, dtype=np.float32).reshape(batch_size)
-    prepared_steps = [
-        runtime._prepare_step(
-            positions[index],
-            rotations[index],
-            configured_batch[index],
-            measured_batch[index],
-            float(floor_batch[index]),
-        )
+        if runtime.predictor_model is not first.predictor_model or runtime.dit_model is not first.dit_model:
+            raise ValueError("批内 runtime 必须共享 Predictor 与 DiT。")
+        if runtime.diffusion is not first.diffusion or runtime.device != first.device:
+            raise ValueError("批内 runtime 必须共享 diffusion 与 device。")
+    positions = np.asarray(tracker_pos_world, dtype=np.float32).reshape(batch_size, 6, 3)
+    rotations = np.asarray(tracker_rot_world_6d, dtype=np.float32).reshape(batch_size, 6, 6)
+    available = np.asarray(tracker_available, dtype=bool).reshape(batch_size, 6)
+    floors = np.asarray(floor_y, dtype=np.float32).reshape(batch_size)
+    prepared = [
+        runtime._prepare_step(positions[index], rotations[index], available[index], floors[index])
         for index, runtime in enumerate(runtimes)
     ]
-    conditioning = {
-        name: torch.cat([step.conditioning[name] for step in prepared_steps], dim=0)
-        for name in prepared_steps[0].conditioning
-    }
-    tracker_window_tensor = torch.as_tensor(
-        np.stack([step.tracker_window_raw for step in prepared_steps]),
+    motion_raw = np.stack([value.motion_context for value in prepared])
+    sparse_raw = np.stack([value.core_tracker_context for value in prepared])
+    motion = _normalize_pose_numpy(first.normalizer, motion_raw)
+    sparse = _normalize_sparse_numpy(first.normalizer, sparse_raw)
+    motion_tensor = torch.as_tensor(motion, device=first.device, dtype=torch.float32)
+    sparse_tensor = torch.as_tensor(sparse, device=first.device, dtype=torch.float32)
+    tracker_tensor = torch.as_tensor(
+        np.stack([value.current_tracker_raw for value in prepared]),
         device=first.device,
         dtype=torch.float32,
     )
-    previous_pose_inputs = [
-        runtime._previous_pose_for_ik(step.head_yaw)
-        for runtime, step in zip(runtimes, prepared_steps)
-    ]
-    previous_pose_raw = torch.as_tensor(
-        np.stack([value[0] for value in previous_pose_inputs]),
+    offsets_tensor = torch.as_tensor(
+        np.stack([runtime.joint_offsets_parent for runtime in runtimes]),
         device=first.device,
         dtype=torch.float32,
     )
-    previous_pose_valid = torch.as_tensor(
-        np.asarray([value[1] for value in previous_pose_inputs]),
-        device=first.device,
-        dtype=torch.bool,
-    )
+    mean, scale = _normalizer_pose_stats(first)
+    tracker_mean, tracker_scale = _normalizer_tracker_position_stats(first)
+    if known_noise is not None:
+        if tuple(known_noise.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
+            raise ValueError("known_noise 必须为 [B,144]。")
+        known_noise = known_noise.to(first.device, dtype=torch.float32)
     with torch.no_grad():
-        mean, scale = first._normalizer_pose_stats()
-        tracker_position_mean, tracker_position_scale = (
-            first._normalizer_tracker_position_stats()
-        )
-        (
-            ik_result,
-            inpainting,
-            current_joint_condition,
-        ) = build_current_realtime_pose_conditions(
-            previous_pose_raw=previous_pose_raw,
-            previous_pose_valid=previous_pose_valid,
-            current_tracker_raw=tracker_window_tensor[:, -1],
-            configured=torch.as_tensor(
-                np.stack([step.configured for step in prepared_steps]),
-                device=first.device,
-                dtype=torch.bool,
-            ),
-            measured_valid=torch.as_tensor(
-                np.stack([step.measured for step in prepared_steps]),
-                device=first.device,
-                dtype=torch.bool,
-            ),
-            d_on=torch.as_tensor(
-                np.stack([step.d_on for step in prepared_steps]),
-                device=first.device,
-                dtype=torch.float32,
-            ),
-            joint_offsets_parent=torch.as_tensor(
-                np.stack([runtime.joint_offsets_parent for runtime in runtimes]),
-                device=first.device,
-                dtype=torch.float32,
-            ),
-            joint_rest_local_rotations_6d=torch.as_tensor(
-                np.stack(
-                    [runtime.joint_rest_local_rotations_6d for runtime in runtimes]
-                ),
-                device=first.device,
-                dtype=torch.float32,
-            ),
+        predictor_normalized = first.predictor_model(motion_tensor, sparse_tensor)
+        predictor_current_raw = _inverse_pose_tensor(first.normalizer, predictor_normalized[:, 0])
+        ik_result, inpainting, joint_condition = build_current_realtime_pose_conditions(
+            initial_pose_raw=predictor_current_raw,
+            current_tracker_raw=tracker_tensor,
+            joint_offsets_parent=offsets_tensor,
             pose_mean=mean,
             pose_scale=scale,
-            tracker_position_mean=tracker_position_mean,
-            tracker_position_scale=tracker_position_scale,
+            tracker_position_mean=tracker_mean,
+            tracker_position_scale=tracker_scale,
             config=first.ik_inpainting_config,
+            known_noise=known_noise,
         )
-        model_impl = getattr(first.model, "module", first.model)
-        # 当前 Tracker 条件与历史条件一起只编码一次，并在完整 DDIM 轨迹复用。
-        prepared_conditioning = model_impl.prepare_conditioning(
-            conditioning["history_pose_observation"],
-            conditioning["head_path_window"],
-            conditioning["history_region_confidence"],
-            conditioning["window_valid_mask"],
-            conditioning["frame_offsets"],
-            current_joint_condition,
+        dit_impl = getattr(first.dit_model, "module", first.dit_model)
+        prepared_conditioning = dit_impl.prepare_conditioning(
+            motion_tensor, predictor_normalized, joint_condition
         )
-    sampling_shape = (
-        batch_size,
-        REALTIME_POSE_TARGET_LENGTH,
-        REALTIME_POSE_TARGET_DIM,
-    )
+    sampling_shape = (batch_size, REALTIME_POSE_TARGET_DIM)
     if noise is not None:
         if tuple(noise.shape) != sampling_shape:
-            raise ValueError(
-                f"noise 应为 [{batch_size},{REALTIME_POSE_TARGET_LENGTH},"
-                f"{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(noise.shape)}"
-            )
-        noise = noise.to(device=first.device, dtype=torch.float32)
-    if known_noise is None:
-        # 普通实时推理允许由 runtime 显式生成；受控评测则从调用方传入独立噪声流。
-        known_noise = torch.randn(sampling_shape, device=first.device)
-    else:
-        if tuple(known_noise.shape) != sampling_shape:
-            raise ValueError(
-                f"known_noise 应为 [{batch_size},{REALTIME_POSE_TARGET_LENGTH},"
-                f"{REALTIME_POSE_TARGET_DIM}]，实际为 {tuple(known_noise.shape)}"
-            )
-        known_noise = known_noise.to(device=first.device, dtype=torch.float32)
+            raise ValueError("noise 必须为 [B,144]。")
+        noise = noise.to(first.device, dtype=torch.float32)
     sample = first.diffusion.projected_ddim_sample_loop(
-        first.model,
+        first.dit_model,
         shape=sampling_shape,
         projection_fn=lambda value: project_realtime_pose_xstart(
-            pred_xstart=value,
-            current_tracker_raw=tracker_window_tensor[:, -1],
-            hard_rotation_state=torch.as_tensor(
-                np.stack(
-                    [step.hard_rotation_state_window[-1] for step in prepared_steps]
-                ),
-                device=first.device,
-                dtype=torch.bool,
-            ),
+            value,
+            tracker_tensor,
             pose_mean=mean,
             pose_scale=scale,
         ),
+        noise=noise,
         clip_denoised=False,
         model_kwargs={"prepared_conditioning": prepared_conditioning},
+        device=first.device,
         inpaint_condition=inpainting,
-        known_noise=known_noise,
-        device=first.device,
-        noise=noise,
     )
-    raw_targets = first._inverse_pose(sample["raw_pred_xstart"])
-    deployed_targets = first._inverse_pose(sample["deployed_pred_xstart"])
-    auxiliary = sample.get("auxiliary_outputs", {})
-    contact_logits = _batch_auxiliary_numpy(auxiliary.get("contact_logits"), batch_size)
-    inpaint_confidence = torch.zeros(
-        batch_size,
-        REALTIME_POSE_TARGET_LENGTH,
-        24,
-        device=first.device,
-        dtype=ik_result.confidence.dtype,
-    )
-    inpaint_confidence[:, 0] = ik_result.confidence
+    predictor_raw = _inverse_pose_tensor(first.normalizer, predictor_normalized).cpu().numpy()
+    raw = _inverse_pose_tensor(first.normalizer, sample["raw_pred_xstart"]).cpu().numpy()
+    deployed = _inverse_pose_tensor(
+        first.normalizer, sample["deployed_pred_xstart"]
+    ).cpu().numpy()
+    contact = sample.get("auxiliary_outputs", {}).get("contact_logits")
+    contact_np = None if contact is None else contact.detach().cpu().numpy()
+    confidence = ik_result.confidence.detach().cpu().numpy()
     return [
         runtime._finish_step(
-            prepared_steps[index],
-            raw_targets[index],
-            deployed_targets[index],
-            None if contact_logits is None else contact_logits[index],
-            inpaint_confidence[index].detach().cpu().numpy(),
+            prepared[index],
+            predictor_raw[index],
+            raw[index],
+            deployed[index],
+            confidence[index],
+            None if contact_np is None else contact_np[index],
         )
         for index, runtime in enumerate(runtimes)
     ]
 
 
-def _batch_auxiliary_numpy(value, batch_size: int) -> np.ndarray | None:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        result = value.detach().cpu().numpy()
-    else:
-        result = np.asarray(value)
-    if result.shape[0] != batch_size:
-        raise ValueError(f"辅助输出批维不匹配：{result.shape[0]} != {batch_size}")
-    return np.asarray(result, dtype=np.float32)
+def _normalizer_pose_stats(runtime: RealtimePoseRuntime):
+    if runtime.normalizer is None or runtime.normalizer.disable:
+        return None, None
+    return (
+        runtime.normalizer.pose_mean.to(runtime.device),
+        runtime.normalizer.pose_scale.to(runtime.device),
+    )
+
+
+def _normalizer_tracker_position_stats(runtime: RealtimePoseRuntime):
+    if runtime.normalizer is None or runtime.normalizer.disable:
+        return None, None
+    return (
+        runtime.normalizer.tracker_mean[:, :3].to(runtime.device),
+        (runtime.normalizer.tracker_std[:, :3] + runtime.normalizer.eps).to(runtime.device),
+    )
+
+
+def _normalize_pose_numpy(normalizer, value: np.ndarray) -> np.ndarray:
+    return value if normalizer is None else np.asarray(normalizer.normalize_pose(value), dtype=np.float32)
+
+
+def _normalize_sparse_numpy(normalizer, value: np.ndarray) -> np.ndarray:
+    return value if normalizer is None else np.asarray(normalizer.normalize_predictor_sparse(value), dtype=np.float32)
+
+
+def _inverse_pose_tensor(normalizer, value: torch.Tensor) -> torch.Tensor:
+    return value if normalizer is None else normalizer.inverse_pose(value)
 
 
 def decode_and_resolve_pose(
@@ -769,20 +482,18 @@ def decode_and_resolve_pose(
     joint_rest_local_rotations_6d: np.ndarray,
     previous_root_yaw_world: float | None = None,
 ) -> ResolvedPose:
-    """执行一次 Head-Anchored Resolver；Tracker 强度只由 inpainting 置信度控制。"""
+    """从当前 Cn 的 144D Pose 恢复 Head-anchored 世界状态。"""
 
     target = np.asarray(target_raw, dtype=np.float32).reshape(REALTIME_POSE_TARGET_DIM)
-    tracker = np.asarray(current_tracker_raw, dtype=np.float32).reshape(TRACKER_COUNT, TRACKER_FEATURE_DIM)
+    tracker = np.asarray(current_tracker_raw, dtype=np.float32).reshape(
+        TRACKER_COUNT, TRACKER_FEATURE_DIM
+    )
     rotations_head, measured_root_yaw_head = decode_target_head_rotations_np(target)
     _, _, root_heading_observability = extract_rotation_heading_components_np(
         rotations_head[0]
     )
-    candidate_root_yaw_world = float(
-        current_head_yaw_world + float(measured_root_yaw_head)
-    )
+    candidate_root_yaw_world = float(current_head_yaw_world + measured_root_yaw_head)
     if float(root_heading_observability) < ROOT_HEADING_OBSERVABILITY_EPS:
-        # 真正的 swing-twist 奇异点没有可观测 heading；在线时沿用历史，
-        # 首帧则令 pelvis 与当前 Head yaw 对齐。
         root_yaw_world = (
             float(current_head_yaw_world)
             if previous_root_yaw_world is None
@@ -791,11 +502,10 @@ def decode_and_resolve_pose(
     elif previous_root_yaw_world is None:
         root_yaw_world = candidate_root_yaw_world
     else:
-        previous_yaw = float(previous_root_yaw_world)
-        wrapped_delta = (
-            candidate_root_yaw_world - previous_yaw + np.pi
-        ) % (2.0 * np.pi) - np.pi
-        root_yaw_world = previous_yaw + float(wrapped_delta)
+        delta = (candidate_root_yaw_world - previous_root_yaw_world + np.pi) % (
+            2.0 * np.pi
+        ) - np.pi
+        root_yaw_world = float(previous_root_yaw_world + delta)
     root_yaw_head = root_yaw_world - float(current_head_yaw_world)
     root_head, hip_height, joints_head = resolve_root_head_reference_np(
         rotations_head,
@@ -803,7 +513,9 @@ def decode_and_resolve_pose(
         joint_offsets_parent,
         observed_head_height=float(tracker[HEAD_TRACKER_INDEX, 1]),
     )
-    yaw_rotation = make_yaw_rotation_np(np.asarray([current_head_yaw_world], dtype=np.float64))[0]
+    yaw_rotation = make_yaw_rotation_np(
+        np.asarray([current_head_yaw_world], dtype=np.float64)
+    )[0]
     rotations_world = np.einsum("ij,ajk->aik", yaw_rotation, rotations_head)
     origin = np.asarray(
         [current_head_position_world[0], float(floor_y), current_head_position_world[2]],
@@ -819,33 +531,11 @@ def decode_and_resolve_pose(
         rest_local_rotations=rest_rotation,
     )
     return ResolvedPose(
-        target_raw=target,
+        target_raw=target.copy(),
         joint_rotations_world=rotations_world.astype(np.float32),
         body_local_delta_6d=local_delta.astype(np.float32),
-        root_yaw_world=float(root_yaw_world),
+        root_yaw_world=root_yaw_world,
         hip_height=float(hip_height),
         root_position_world=root_world.astype(np.float32),
         joints_world=joints_world.astype(np.float32),
     )
-
-
-def _advance_durations(
-    previous_d_off: np.ndarray,
-    previous_d_on: np.ndarray,
-    configured: np.ndarray,
-    measured_valid: np.ndarray,
-    cap: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    valid = configured & measured_valid
-    missing = configured & ~measured_valid
-    d_off = np.zeros(TRACKER_COUNT, dtype=np.int64)
-    d_on = np.zeros(TRACKER_COUNT, dtype=np.int64)
-    d_off[missing] = np.minimum(previous_d_off[missing] + 1, int(cap))
-    d_on[valid] = np.minimum(previous_d_on[valid] + 1, int(cap))
-    return d_off, d_on
-
-def _left_pad(value: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
-    result = np.zeros(target_shape, dtype=np.float32)
-    if value.shape[0]:
-        result[-value.shape[0] :] = value
-    return result

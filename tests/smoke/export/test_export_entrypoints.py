@@ -32,8 +32,8 @@ def test_source_rest_offsets_keep_positive_grounded_pelvis():
     assert rest_offsets[0, 1] == 1.0
 
 
-def test_sentis_export_rejects_joint_eleven_frame_model(tmp_path):
-    with pytest.raises(NotImplementedError, match="联合 11 帧"):
+def test_sentis_export_is_explicitly_out_of_scope_for_two_models(tmp_path):
+    with pytest.raises(NotImplementedError, match="双模型"):
         export_sentis_denoiser.main(
             ["--model_path", str(tmp_path / "model000000001.pt")]
         )

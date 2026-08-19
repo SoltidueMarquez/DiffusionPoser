@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import time
-from argparse import BooleanOptionalAction
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 from data_loaders.build_realtime_longseq_eval_set import (
     DEFAULT_SOURCE_DIR,
     DEFAULT_SPLIT_DIR,
-    build_sequence_output_dir_name,
     read_longseq_source_entries,
     resolve_source_entry_path,
 )
@@ -23,42 +17,29 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
 )
-from data_loaders.realtime_pose_geometry import (
-    build_pose_target_np,
-    extract_continuous_rotation_heading_np,
-    extract_forward_yaw_np,
-)
-from data_loaders.realtime_pose_kinematics import (
-    derive_foot_contact_prob_2,
-    rotation_6d_to_matrix_np,
-)
 from data_loaders.sensor_masking import (
-    BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
-    REALTIME_POSE_HISTORY_LENGTH,
-    REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_LENGTH,
-    TRACKER_PATTERN_CATEGORIES,
+    REALTIME_POSE_EVAL_METRICS_START_FRAME,
+    REALTIME_POSE_FPS,
+    STATIC_OPTIONAL_TRACKER_MASKS,
 )
-from data_loaders.tracker_timeline import (
-    TrackerTimeline,
-    build_isolated_condition_timeline,
-    classify_tracker_frame,
-    isolated_condition_eval_mask,
-    stable_context_seed,
+from eval.evaluate_realtime_pose_predictor import (
+    PREDICTOR_EVAL_FIRST_GENERATED_FRAME,
+    evaluation_last_frame_exclusive,
+    evaluate_predictor_entries,
+    pose_rotation_error_deg,
 )
-from eval.evaluate_realtime_pose import public_result
-from eval.evaluate_realtime_pose_rollout import evaluate_rollout_file, summarize_rollouts
+from eval.realtime_pose_metrics import (
+    aggregate_rpm_p2_mc_metrics,
+    compute_rpm_p2_mc_metrics,
+)
 from sample.realtime_pose_runtime import (
     RealtimePoseRuntime,
-    RuntimeStepResult,
     WorldPoseState,
-    step_realtime_pose_batch,
+    decode_and_resolve_pose,
 )
-from sample.render_realtime_pose_comparison import render_realtime_pose_comparison
 from sample.utils import load_checkpoint_model
-from utils import dist_util
 from utils.fixseed import fixseed
-from utils.model_util import create_model_and_diffusion
+from utils.model_util import create_model_and_diffusion, load_realtime_pose_predictor
 from utils.normalizer import RealtimePoseNormalizer
 from utils.parser_util import (
     add_base_options,
@@ -70,1132 +51,257 @@ from utils.parser_util import (
 )
 
 
-CONDITION_OUTPUT_TAGS = {
-    "fixed_six": "f6",
-    "fixed_three": "f3",
-    "three_to_six": "36",
-    "six_to_three": "63",
-    "two_point_dropout_reconnect": "dr",
-}
+TRACKER_CONFIG_NAMES = (
+    "core_only",
+    "core_hip",
+    "core_left_foot",
+    "core_right_foot",
+    "core_both_feet",
+    "core_hip_left_foot",
+    "core_hip_right_foot",
+    "all_six",
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="在固定长序列集合上执行 144D 自回归评估。")
+    parser = argparse.ArgumentParser(
+        description="评估 Predictor + 单帧 DiT 的 8 种静态 Tracker 配置。"
+    )
     add_base_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
     add_sampling_options(parser)
-
-    longseq = parser.add_argument_group("longseq_eval")
-    longseq.add_argument("--source_dir", default=DEFAULT_SOURCE_DIR, type=str)
-    longseq.add_argument("--split_dir", default=DEFAULT_SPLIT_DIR, type=str)
-    longseq.add_argument("--split", default="test", type=str)
-    longseq.add_argument("--min_frames", default=0, type=int)
-    longseq.add_argument("--include_mirror", default=False, action=BooleanOptionalAction)
-    longseq.add_argument(
-        "--normalizer_dir",
-        default="dataset/meta_AMASS_realtime_pose_144d_pelvis_residual_root_y0_stationary5_60hz",
-        type=str,
-    )
-    longseq.add_argument("--normalize_input", default=True, type=str2bool)
-    longseq.add_argument("--input_feats", default=REALTIME_POSE_TARGET_DIM, type=int)
-    longseq.add_argument("--limit", default=0, type=int)
-    longseq.add_argument("--sequence_batch_size", default=4, type=int)
-    longseq.add_argument(
-        "--conditions",
+    group = parser.add_argument_group("long sequence")
+    group.add_argument("--source_dir", default=DEFAULT_SOURCE_DIR)
+    group.add_argument("--split_dir", default=DEFAULT_SPLIT_DIR)
+    group.add_argument("--split", default="test")
+    group.add_argument("--normalizer_dir", required=True)
+    group.add_argument("--normalize_input", default=True, type=str2bool)
+    group.add_argument("--limit", default=0, type=int)
+    group.add_argument(
+        "--tracker_configs",
         nargs="+",
-        choices=TRACKER_PATTERN_CATEGORIES,
-        default=list(TRACKER_PATTERN_CATEGORIES),
+        choices=TRACKER_CONFIG_NAMES,
+        default=list(TRACKER_CONFIG_NAMES),
+        help="选择要独立闭环评估的 Tracker 配置；默认运行全部 8 种。",
     )
-    longseq.add_argument("--timeline_seed", default=10, type=int)
-    longseq.add_argument(
-        "--diffusion_noise_mode",
-        default="per_frame",
-        choices=("per_frame", "fixed_sequence", "correlated"),
-    )
-    longseq.add_argument("--diffusion_noise_rho", default=0.95, type=float)
-    longseq.add_argument(
-        "--pose_history_mode",
-        default="predicted",
-        choices=("predicted", "ground_truth"),
-        help=(
-            "predicted 使用上一已部署 Pose；ground_truth 使用上一帧 GT Pose，"
-            "仅用于诊断历史误差反馈。"
-        ),
-    )
-    longseq.add_argument(
-        "--gt_history_warmup_frames",
+    group.add_argument(
+        "--max_frames",
         default=0,
         type=int,
-        help="先用指定数量的 GT Pose/Tracker 填充历史，再从下一帧开始闭环预测与评估。",
+        help="P2 预热完成后每条序列最多计分的帧数；0 表示直到序列结束。",
     )
-    longseq.add_argument("--inference_steps", default=5, type=int)
-    longseq.add_argument("--latency_warmup_frames", default=20, type=int)
-    longseq.add_argument("--require_cuda", default=True, action=BooleanOptionalAction)
-    longseq.add_argument("--show_progress", default=True, action=BooleanOptionalAction)
-
-    render = parser.add_argument_group("render")
-    render.add_argument("--render_mp4", default=False, action=BooleanOptionalAction)
-    render.add_argument("--render_fps", default=30, type=int)
-    render.add_argument("--render_stride", default=1, type=int)
-    render.add_argument("--render_camera_mode", default="follow", choices=["global", "follow"], type=str)
-    render.add_argument("--render_layout", default="overlay", choices=["split", "overlay"], type=str)
-    render.add_argument("--render_local_radius", default=1.25, type=float)
+    group.add_argument("--output_json", required=True)
     return parser
 
 
-def rollout_long_sequence_source(
-    model,
-    diffusion,
-    source: dict[str, np.ndarray],
-    timeline: TrackerTimeline,
-    device: torch.device,
-    normalizer: RealtimePoseNormalizer | None,
-    tracker_confidence_warmup: int = 15,
-    fabrik_iterations: int = 2,
-    ik_direction_only_quality: float | None = None,
-    ik_residual_scale: float | None = None,
-    ik_position_solved_quality: float | None = None,
-    use_future_rolling_prior: bool = False,
-    future_confidence_decay: float = 0.9,
-    measure_latency: bool = False,
-    show_progress: bool = False,
-    progress_desc: str = "",
-    gt_history_warmup_frames: int = 0,
-) -> dict[str, np.ndarray]:
-    """可选 GT history warmup，之后逐帧闭环采样。"""
-
-    frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
-    if frame_count <= 0:
-        raise ValueError("长序列 source 不能为空。")
-    joint_rotations_world = compute_source_joint_rotations_world(source)
-    root_yaws_world = _continuous_source_root_yaws(source, joint_rotations_world)
-    runtime = RealtimePoseRuntime(
-        model,
-        diffusion,
-        device,
-        source["joint_offsets_parent"],
-        source["joint_rest_local_rotations_6d"],
-        normalizer=normalizer,
-        tracker_confidence_warmup=tracker_confidence_warmup,
-        fabrik_iterations=fabrik_iterations,
-        ik_direction_only_quality=ik_direction_only_quality,
-        ik_residual_scale=ik_residual_scale,
-        ik_position_solved_quality=ik_position_solved_quality,
-        use_future_rolling_prior=use_future_rolling_prior,
-        future_confidence_decay=future_confidence_decay,
+def main(argv: list[str] | None = None) -> dict:
+    parser = build_arg_parser()
+    args = parse_and_load_from_model(parser, argv)
+    fixseed(args.seed)
+    device = torch.device(
+        f"cuda:{args.device}" if args.cuda and torch.cuda.is_available() else "cpu"
     )
-    warmup_frames = _validate_gt_history_warmup_frames(
-        gt_history_warmup_frames,
-        frame_count,
+    dit, diffusion = create_model_and_diffusion(args)
+    dit, dit_weight_source = load_checkpoint_model(
+        dit, args.dit_model_path, device, use_ema=args.use_ema
     )
-    for frame_index in range(warmup_frames):
-        runtime.append_ground_truth_frame(
-            _ground_truth_world_pose_state(
-                source,
-                joint_rotations_world,
-                root_yaws_world,
-                frame_index,
-            ),
-            source["tracker_pos_world"][frame_index],
-            source["tracker_rot_world_6d"][frame_index],
-            timeline.configured[frame_index],
-            timeline.measured_valid[frame_index],
-            float(source["root_pos_world"][frame_index, 1]),
-        )
-    values = _new_rollout_values()
-    frame_indices = range(warmup_frames, frame_count)
-    if show_progress:
-        frame_indices = tqdm(
-            frame_indices,
-            total=frame_count - warmup_frames,
-            desc=progress_desc or "longseq",
-            unit="frame",
-            dynamic_ncols=True,
-        )
-    for frame_index in frame_indices:
-        frame_started = time.perf_counter()
-        history_length = len(runtime.pose_history)
-        if measure_latency:
-            torch.cuda.synchronize(device)
-            sampling_started = time.perf_counter()
-        step = runtime.step(
-            source["tracker_pos_world"][frame_index],
-            source["tracker_rot_world_6d"][frame_index],
-            timeline.configured[frame_index],
-            timeline.measured_valid[frame_index],
-            float(source["root_pos_world"][frame_index, 1]),
-        )
-        if measure_latency:
-            torch.cuda.synchronize(device)
-            elapsed = (time.perf_counter() - sampling_started) * 1000.0
-            total_elapsed = (time.perf_counter() - frame_started) * 1000.0
-        else:
-            elapsed = total_elapsed = float("nan")
-        _append_rollout_frame(
-            values=values,
-            source=source,
-            timeline=timeline,
-            runtime=runtime,
-            joint_rotations_world=joint_rotations_world,
-            root_yaws_world=root_yaws_world,
-            frame_index=frame_index,
-            history_length=history_length,
-            step=step,
-            sampling_latency_ms=elapsed,
-            e2e_latency_ms=total_elapsed,
-        )
-
-    return _finalize_rollout_values(
-        values,
-        frame_count - warmup_frames,
-        absolute_start_frame=warmup_frames,
+    predictor = load_realtime_pose_predictor(args.predictor_model_path, device)
+    normalizer = RealtimePoseNormalizer(
+        args.normalizer_dir, disable=not bool(args.normalize_input)
     )
-
-
-def _next_sequence_noise(
-    generator: torch.Generator,
-    mode: str,
-    rho: float,
-    fixed_value: torch.Tensor | None,
-    previous_value: torch.Tensor | None,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """按单序列随机流生成 `[11,144]` 噪声，并返回更新后的时序状态。"""
-
-    if mode == "fixed_sequence":
-        if fixed_value is None:
-            fixed_value = torch.randn(
-                REALTIME_POSE_TARGET_LENGTH,
-                REALTIME_POSE_TARGET_DIM,
-                generator=generator,
-                device=device,
-            )
-        return fixed_value, fixed_value, previous_value
-
-    innovation = torch.randn(
-        REALTIME_POSE_TARGET_LENGTH,
-        REALTIME_POSE_TARGET_DIM,
-        generator=generator,
+    entries = read_longseq_source_entries(
+        args.source_dir,
+        args.split_dir,
+        split=args.split,
+        min_frames=REALTIME_POSE_EVAL_METRICS_START_FRAME + 1,
+        include_mirror=False,
+    )
+    if args.limit > 0:
+        entries = entries[: args.limit]
+    predictor_only = evaluate_predictor_entries(
+        entries=entries,
+        predictor=predictor,
         device=device,
+        normalizer=normalizer,
+        max_frames=args.max_frames,
     )
-    if mode == "correlated" and previous_value is not None:
-        value = rho * previous_value + np.sqrt(1.0 - rho**2) * innovation
-    else:
-        value = innovation
-    return value, fixed_value, value
+    tracker_masks = dict(zip(TRACKER_CONFIG_NAMES, STATIC_OPTIONAL_TRACKER_MASKS))
+    reports = []
+    for config_name in args.tracker_configs:
+        mask = tracker_masks[config_name]
+        reports.append(
+            evaluate_tracker_configuration(
+                config_name=config_name,
+                tracker_available=np.asarray(mask, dtype=bool),
+                entries=entries,
+                predictor=predictor,
+                dit=dit,
+                diffusion=diffusion,
+                device=device,
+                normalizer=normalizer,
+                args=args,
+            )
+        )
+    payload = {
+        "predictor_model_path": str(Path(args.predictor_model_path).resolve()),
+        "dit_model_path": str(Path(args.dit_model_path).resolve()),
+        "dit_weight_source": dit_weight_source,
+        "sampler": "projected_ddim",
+        "diffusion_training_steps": int(args.diffusion_steps),
+        "timestep_respacing": str(args.ts_respace),
+        "sampling_steps": int(diffusion.num_timesteps),
+        "source_fps": float(REALTIME_POSE_FPS),
+        "initial_context_frames": PREDICTOR_EVAL_FIRST_GENERATED_FRAME,
+        "metrics_start_frame": REALTIME_POSE_EVAL_METRICS_START_FRAME,
+        "history_policy": "closed-loop starts at frame 11; official metrics start at frame 30",
+        "tracker_policy": "current frame only; no future tracker",
+        "requested_tracker_configs": list(args.tracker_configs),
+        "predictor_only": predictor_only,
+        "configurations": reports,
+    }
+    output = Path(args.output_json).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"[longseq] wrote {output}")
+    return payload
 
 
-def rollout_long_sequence_sources(
-    model,
+def evaluate_tracker_configuration(
+    *,
+    config_name: str,
+    tracker_available: np.ndarray,
+    entries: list[dict],
+    predictor,
+    dit,
     diffusion,
-    sources: list[dict[str, np.ndarray]],
-    timelines: list[TrackerTimeline],
     device: torch.device,
-    normalizer: RealtimePoseNormalizer | None,
-    tracker_confidence_warmup: int = 15,
-    fabrik_iterations: int = 2,
-    ik_direction_only_quality: float | None = None,
-    ik_residual_scale: float | None = None,
-    ik_position_solved_quality: float | None = None,
-    use_future_rolling_prior: bool = False,
-    future_confidence_decay: float = 0.9,
-    measure_latency: bool = False,
-    show_progress: bool = False,
-    progress_desc: str = "",
-    diffusion_seeds: list[int] | None = None,
-    diffusion_noise_mode: str = "per_frame",
-    diffusion_noise_rho: float = 0.95,
-    pose_history_mode: str = "predicted",
-    gt_history_warmup_frames: int = 0,
-) -> list[dict[str, np.ndarray]]:
-    """跨序列逐帧批处理，序列结束后仅保留其余活跃 runtime。"""
-
-    if not sources or len(sources) != len(timelines):
-        raise ValueError("sources 与 timelines 必须非空且数量相同。")
-    if diffusion_seeds is not None and len(diffusion_seeds) != len(sources):
-        raise ValueError("diffusion_seeds 必须与 sources 数量相同。")
-    if diffusion_noise_mode not in {"per_frame", "fixed_sequence", "correlated"}:
-        raise ValueError("diffusion_noise_mode 必须为 per_frame/fixed_sequence/correlated。")
-    if not -1.0 <= float(diffusion_noise_rho) <= 1.0:
-        raise ValueError("diffusion_noise_rho 必须位于 [-1,1]。")
-    if pose_history_mode not in {"predicted", "ground_truth"}:
-        raise ValueError("pose_history_mode 必须为 predicted/ground_truth。")
-    frame_counts = [
-        int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]) for source in sources
-    ]
-    if any(frame_count <= 0 for frame_count in frame_counts):
-        raise ValueError("长序列 source 不能为空。")
-    if any(len(timeline.configured) != frame_count for timeline, frame_count in zip(timelines, frame_counts)):
-        raise ValueError("timeline 帧数必须与对应 source 一致。")
-
-    joint_rotations = [compute_source_joint_rotations_world(source) for source in sources]
-    root_yaws = [
-        _continuous_source_root_yaws(source, rotations)
-        for source, rotations in zip(sources, joint_rotations)
-    ]
-    warmup_counts = [
-        _validate_gt_history_warmup_frames(gt_history_warmup_frames, frame_count)
-        for frame_count in frame_counts
-    ]
-    runtimes = [
-        RealtimePoseRuntime(
-            model,
+    normalizer,
+    args,
+) -> dict:
+    generated_frame_count = 0
+    frame_count = 0
+    raw_sequence_metrics: list[dict[str, float | None]] = []
+    deployed_sequence_metrics: list[dict[str, float | None]] = []
+    for entry in entries:
+        source = load_realtime_source(resolve_source_entry_path(entry))
+        world_rotations = compute_source_joint_rotations_world(source)
+        last = evaluation_last_frame_exclusive(
+            len(world_rotations), int(args.max_frames)
+        )
+        if last <= REALTIME_POSE_EVAL_METRICS_START_FRAME:
+            continue
+        scored_raw_rotations: list[np.ndarray] = []
+        scored_deployed_rotations: list[np.ndarray] = []
+        scored_target_rotations: list[np.ndarray] = []
+        scored_raw_positions: list[np.ndarray] = []
+        scored_deployed_positions: list[np.ndarray] = []
+        scored_target_positions: list[np.ndarray] = []
+        pose_history = [
+            WorldPoseState(
+                joint_rotations_world=world_rotations[index],
+                root_yaw_world=float(source["root_yaw"][index]),
+                hip_height=float(source["pelvis_height"][index, 0]),
+                root_position_world=source["root_pos_world"][index],
+            )
+            for index in range(1, 11)
+        ]
+        runtime = RealtimePoseRuntime(
+            predictor,
+            dit,
             diffusion,
             device,
             source["joint_offsets_parent"],
             source["joint_rest_local_rotations_6d"],
-            normalizer=normalizer,
-            tracker_confidence_warmup=tracker_confidence_warmup,
-            fabrik_iterations=fabrik_iterations,
-            ik_direction_only_quality=ik_direction_only_quality,
-            ik_residual_scale=ik_residual_scale,
-            ik_position_solved_quality=ik_position_solved_quality,
-            use_future_rolling_prior=use_future_rolling_prior,
-            future_confidence_decay=future_confidence_decay,
+            normalizer,
+            fabrik_iterations=args.fabrik_iterations,
+            ik_direction_only_quality=args.ik_direction_only_quality,
+            ik_residual_scale=args.ik_residual_scale,
+            ik_position_solved_quality=args.ik_position_solved_quality,
         )
-        for source in sources
-    ]
-    for source, timeline, rotations, root_yaw, runtime, warmup_count in zip(
-        sources,
-        timelines,
-        joint_rotations,
-        root_yaws,
-        runtimes,
-        warmup_counts,
-    ):
-        for frame_index in range(warmup_count):
-            runtime.append_ground_truth_frame(
-                _ground_truth_world_pose_state(
-                    source,
-                    rotations,
-                    root_yaw,
-                    frame_index,
-                ),
-                source["tracker_pos_world"][frame_index],
-                source["tracker_rot_world_6d"][frame_index],
-                timeline.configured[frame_index],
-                timeline.measured_valid[frame_index],
-                float(source["root_pos_world"][frame_index, 1]),
+        runtime.initialize_history(
+            pose_history,
+            source["tracker_pos_world"][:11],
+            source["tracker_rot_world_6d"][:11],
+            source["root_pos_world"][:11, 1],
+        )
+        for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
+            previous_root_yaw = runtime.pose_history[-1].root_yaw_world
+            result = runtime.step(
+                source["tracker_pos_world"][current],
+                source["tracker_rot_world_6d"][current],
+                tracker_available,
+                float(source["root_pos_world"][current, 1]),
             )
-    values = [_new_rollout_values() for _ in sources]
-    noise_generators = None
-    known_noise_generators = None
-    if diffusion_seeds is not None:
-        noise_generators = []
-        known_noise_generators = []
-        for seed in diffusion_seeds:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(seed))
-            noise_generators.append(generator)
-            known_generator = torch.Generator(device=device)
-            known_generator.manual_seed(
-                int(stable_context_seed(seed, "longseq_inpaint_noise") % (2**63))
+            generated_frame_count += 1
+            if current < REALTIME_POSE_EVAL_METRICS_START_FRAME:
+                continue
+            raw_resolved = decode_and_resolve_pose(
+                result.raw_pred_pose,
+                result.current_tracker_raw,
+                result.current_head_yaw_world,
+                source["tracker_pos_world"][current, 0],
+                float(source["root_pos_world"][current, 1]),
+                source["joint_offsets_parent"],
+                source["joint_rest_local_rotations_6d"],
+                previous_root_yaw,
             )
-            known_noise_generators.append(known_generator)
-    fixed_noise: list[torch.Tensor | None] = [None] * len(sources)
-    previous_noise: list[torch.Tensor | None] = [None] * len(sources)
-    fixed_known_noise: list[torch.Tensor | None] = [None] * len(sources)
-    previous_known_noise: list[torch.Tensor | None] = [None] * len(sources)
-    progress = None
-    if show_progress:
-        progress = tqdm(
-            total=sum(
-                frame_count - warmup_count
-                for frame_count, warmup_count in zip(frame_counts, warmup_counts)
-            ),
-            desc=progress_desc or "longseq batch",
-            unit="frame",
-            dynamic_ncols=True,
-        )
-    for frame_index in range(max(frame_counts)):
-        active_indices = [
-            index
-            for index, frame_count in enumerate(frame_counts)
-            if warmup_counts[index] <= frame_index < frame_count
-        ]
-        if not active_indices:
-            continue
-        active_runtimes = [runtimes[index] for index in active_indices]
-        history_lengths = [len(runtime.pose_history) for runtime in active_runtimes]
-        frame_started = time.perf_counter()
-        if measure_latency:
-            torch.cuda.synchronize(device)
-            sampling_started = time.perf_counter()
-        frame_noise = None
-        frame_known_noise = None
-        if noise_generators is not None:
-            noise_values = []
-            known_noise_values = []
-            for index in active_indices:
-                value, fixed_noise[index], previous_noise[index] = _next_sequence_noise(
-                    noise_generators[index],
-                    diffusion_noise_mode,
-                    float(diffusion_noise_rho),
-                    fixed_noise[index],
-                    previous_noise[index],
-                    device,
-                )
-                known_value, fixed_known_noise[index], previous_known_noise[index] = (
-                    _next_sequence_noise(
-                        known_noise_generators[index],
-                        diffusion_noise_mode,
-                        float(diffusion_noise_rho),
-                        fixed_known_noise[index],
-                        previous_known_noise[index],
-                        device,
-                    )
-                )
-                noise_values.append(value)
-                known_noise_values.append(known_value)
-            frame_noise = torch.stack(noise_values)
-            frame_known_noise = torch.stack(known_noise_values)
-        steps = step_realtime_pose_batch(
-            active_runtimes,
-            np.stack([sources[index]["tracker_pos_world"][frame_index] for index in active_indices]),
-            np.stack(
-                [sources[index]["tracker_rot_world_6d"][frame_index] for index in active_indices]
-            ),
-            np.stack([timelines[index].configured[frame_index] for index in active_indices]),
-            np.stack([timelines[index].measured_valid[frame_index] for index in active_indices]),
-            np.asarray(
-                [sources[index]["root_pos_world"][frame_index, 1] for index in active_indices],
-                dtype=np.float32,
-            ),
-            noise=frame_noise,
-            known_noise=frame_known_noise,
-        )
-        if measure_latency:
-            torch.cuda.synchronize(device)
-            sampling_elapsed = (time.perf_counter() - sampling_started) * 1000.0
-            e2e_elapsed = (time.perf_counter() - frame_started) * 1000.0
-        else:
-            sampling_elapsed = e2e_elapsed = float("nan")
-        for active_offset, sequence_index in enumerate(active_indices):
-            _append_rollout_frame(
-                values=values[sequence_index],
-                source=sources[sequence_index],
-                timeline=timelines[sequence_index],
-                runtime=runtimes[sequence_index],
-                joint_rotations_world=joint_rotations[sequence_index],
-                root_yaws_world=root_yaws[sequence_index],
-                frame_index=frame_index,
-                history_length=history_lengths[active_offset],
-                step=steps[active_offset],
-                sampling_latency_ms=sampling_elapsed,
-                e2e_latency_ms=e2e_elapsed,
+            scored_raw_rotations.append(raw_resolved.joint_rotations_world)
+            scored_deployed_rotations.append(
+                result.resolved_pose.joint_rotations_world
             )
-            if pose_history_mode == "ground_truth":
-                # 当前输出仍按模型预测评估；下一帧只读取当前 GT 历史，
-                # 从而隔离自回归历史误差。
-                source = sources[sequence_index]
-                runtimes[sequence_index].pose_history[-1] = (
-                    _ground_truth_world_pose_state(
-                        source,
-                        joint_rotations[sequence_index],
-                        root_yaws[sequence_index],
-                        frame_index,
-                    )
-                )
-        if progress is not None:
-            progress.update(len(active_indices))
-    if progress is not None:
-        progress.close()
-    return [
-        _finalize_rollout_values(
-            sequence_values,
-            frame_count - warmup_count,
-            absolute_start_frame=warmup_count,
-        )
-        for sequence_values, frame_count, warmup_count in zip(
-            values,
-            frame_counts,
-            warmup_counts,
-        )
-    ]
-
-
-def _validate_gt_history_warmup_frames(value: int, frame_count: int) -> int:
-    """验证 GT warmup 后至少保留一帧用于模型预测与质量评估。"""
-
-    warmup_frames = int(value)
-    if warmup_frames < 0:
-        raise ValueError("gt_history_warmup_frames 不能为负数。")
-    if warmup_frames >= int(frame_count):
-        raise ValueError(
-            "gt_history_warmup_frames 必须小于序列帧数，"
-            f"实际为 warmup={warmup_frames}, frame_count={frame_count}。"
-        )
-    return warmup_frames
-
-
-def _ground_truth_world_pose_state(
-    source: dict[str, np.ndarray],
-    joint_rotations_world: np.ndarray,
-    root_yaws_world: np.ndarray,
-    frame_index: int,
-) -> WorldPoseState:
-    """构造 runtime history 使用的单帧 GT 世界状态。"""
-
-    rotations = np.asarray(joint_rotations_world[frame_index], dtype=np.float32)
-    return WorldPoseState(
-        joint_rotations_world=rotations.copy(),
-        root_yaw_world=float(root_yaws_world[frame_index]),
-        hip_height=float(source["pelvis_height"][frame_index, 0]),
-        root_position_world=np.asarray(
-            source["root_pos_world"][frame_index], dtype=np.float32
-        ).copy(),
-    )
-
-
-def _continuous_source_root_yaws(
-    source: dict[str, np.ndarray],
-    joint_rotations_world: np.ndarray,
-) -> np.ndarray:
-    """以首帧 Head yaw 为退化初值，统一构造完整 Source 的 pelvis heading。"""
-
-    tracker_rotations = rotation_6d_to_matrix_np(source["tracker_rot_world_6d"])
-    head_yaws = extract_forward_yaw_np(tracker_rotations[:, 0])
-    return extract_continuous_rotation_heading_np(
-        joint_rotations_world[:, 0],
-        initial_yaw=float(head_yaws[0]),
-    )
-
-
-def _new_rollout_values() -> dict[str, list]:
-    return {
-        name: []
-        for name in (
-            "reference_target_raw",
-            "raw_pred_target_raw",
-            "deployed_pred_target_raw",
-            "reference_pose_horizon_raw",
-            "raw_pred_pose_horizon_raw",
-            "deployed_pred_pose_horizon_raw",
-            "pose_horizon_valid_mask",
-            "reference_body_local_delta_6d",
-            "predicted_body_local_delta_6d",
-            "reference_joints_world",
-            "predicted_joints_world",
-            "reference_root_position_world",
-            "predicted_root_position_world",
-            "reference_root_yaw_world",
-            "predicted_root_yaw_world",
-            "reference_hip_height",
-            "predicted_hip_height",
-            "tracker_pos_world",
-            "tracker_rot_world_6d",
-            "current_tracker_raw",
-            "configured",
-            "measured_valid",
-            "d_off",
-            "d_on",
-            "hard_rotation_state",
-            "inpaint_confidence",
-            "history_length",
-            "contact_target",
-            "contact_logits",
-            "scenario",
-            "sampling_latency_ms",
-            "e2e_latency_ms",
-        )
-    }
-
-
-def _append_rollout_frame(
-    values: dict[str, list],
-    source: dict[str, np.ndarray],
-    timeline: TrackerTimeline,
-    runtime: RealtimePoseRuntime,
-    joint_rotations_world: np.ndarray,
-    root_yaws_world: np.ndarray,
-    frame_index: int,
-    history_length: int,
-    step: RuntimeStepResult,
-    sampling_latency_ms: float,
-    e2e_latency_ms: float,
-) -> None:
-    resolved = step.resolved_pose
-    reference_horizon, horizon_valid = _build_reference_pose_horizon(
-        joint_rotations_world,
-        frame_index,
-        runtime.previous_head_yaw,
-    )
-    reference_target = reference_horizon[0]
-    values["reference_target_raw"].append(reference_target)
-    values["raw_pred_target_raw"].append(step.raw_pred_pose_horizon[0])
-    values["deployed_pred_target_raw"].append(step.deployed_pred_pose_horizon[0])
-    values["reference_pose_horizon_raw"].append(reference_horizon)
-    values["raw_pred_pose_horizon_raw"].append(step.raw_pred_pose_horizon)
-    values["deployed_pred_pose_horizon_raw"].append(step.deployed_pred_pose_horizon)
-    values["pose_horizon_valid_mask"].append(horizon_valid)
-    values["reference_body_local_delta_6d"].append(
-        source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY][frame_index]
-    )
-    values["predicted_body_local_delta_6d"].append(resolved.body_local_delta_6d)
-    values["reference_joints_world"].append(source["joints_world"][frame_index])
-    values["predicted_joints_world"].append(resolved.joints_world)
-    values["reference_root_position_world"].append(source["root_pos_world"][frame_index])
-    values["predicted_root_position_world"].append(resolved.root_position_world)
-    values["reference_root_yaw_world"].append(float(root_yaws_world[frame_index]))
-    values["predicted_root_yaw_world"].append(resolved.root_yaw_world)
-    values["reference_hip_height"].append(float(source["pelvis_height"][frame_index, 0]))
-    values["predicted_hip_height"].append(resolved.hip_height)
-    for name in ("tracker_pos_world", "tracker_rot_world_6d"):
-        values[name].append(source[name][frame_index])
-    values["current_tracker_raw"].append(step.current_tracker_raw)
-    for name in ("configured", "measured_valid"):
-        values[name].append(getattr(timeline, name)[frame_index])
-    values["d_off"].append(runtime.previous_d_off.copy())
-    values["d_on"].append(runtime.previous_d_on.copy())
-    values["hard_rotation_state"].append(step.hard_rotation_state)
-    values["inpaint_confidence"].append(step.inpaint_confidence)
-    values["history_length"].append(history_length)
-    values["contact_target"].append(
-        derive_foot_contact_prob_2(
-            stationary_prob_5=source["stationary_prob_5"][frame_index],
-            joints_world=source["joints_world"][frame_index],
-            floor_y=source["root_pos_world"][frame_index, 1],
-        )
-    )
-    values["contact_logits"].append(
-        np.full(2, np.nan, dtype=np.float32)
-        if step.contact_logits is None
-        else step.contact_logits
-    )
-    values["scenario"].append(_classify_timeline_frame(timeline, frame_index))
-    values["sampling_latency_ms"].append(sampling_latency_ms)
-    values["e2e_latency_ms"].append(e2e_latency_ms)
-
-
-def _finalize_rollout_values(
-    values: dict[str, list],
-    frame_count: int,
-    absolute_start_frame: int = 0,
-) -> dict[str, np.ndarray]:
-    payload = {
-        name: np.asarray(
-            items,
-            dtype=(
-                np.float32
-                if name not in {
-                    "configured",
-                    "measured_valid",
-                    "hard_rotation_state",
-                    "pose_horizon_valid_mask",
-                    "scenario",
-                }
-                else None
-            ),
-        )[None]
-        for name, items in values.items()
-    }
-    for name in (
-        "configured",
-        "measured_valid",
-        "hard_rotation_state",
-        "pose_horizon_valid_mask",
-    ):
-        payload[name] = payload[name].astype(bool)
-    payload["d_off"] = payload["d_off"].astype(np.int64)
-    payload["d_on"] = payload["d_on"].astype(np.int64)
-    payload["history_length"] = payload["history_length"].astype(np.int64)
-    payload["scenario"] = np.asarray(values["scenario"])[None]
-    payload["fps"] = np.float32(60.0)
-    payload["absolute_frame_index"] = np.arange(
-        int(absolute_start_frame),
-        int(absolute_start_frame) + frame_count,
-        dtype=np.int64,
-    )
-    payload["eval_frame_mask"] = np.ones((1, frame_count), dtype=bool)
-    return payload
-
-
-def _build_reference_pose_horizon(
-    joint_rotations_world: np.ndarray,
-    frame_index: int,
-    current_head_yaw: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """将当前及未来目标统一表达在当前帧 Head-yaw 参考系中。"""
-
-    frame_count = int(joint_rotations_world.shape[0])
-    valid_count = min(REALTIME_POSE_TARGET_LENGTH, frame_count - frame_index)
-    horizon = np.full(
-        (REALTIME_POSE_TARGET_LENGTH, REALTIME_POSE_TARGET_DIM),
-        np.nan,
-        dtype=np.float32,
-    )
-    valid = np.zeros(REALTIME_POSE_TARGET_LENGTH, dtype=bool)
-    if valid_count > 0:
-        horizon[:valid_count] = build_pose_target_np(
-            joint_rotations_world[frame_index : frame_index + valid_count],
-            current_head_yaw,
-        )
-        valid[:valid_count] = True
-    return horizon, valid
-
-
-def _classify_timeline_frame(timeline: TrackerTimeline, frame_index: int) -> str:
-    """复用数据管线的事件语义，避免评估脚本维护另一套分类规则。"""
-
-    return classify_tracker_frame(timeline, frame_index)
-
-
-def summarize_latency(values_ms: np.ndarray, warmup_frames: int = 0) -> dict[str, float | int | None]:
-    """汇总逐帧延迟；预热帧仍参与质量评估，但不参与性能统计。"""
-
-    values = np.asarray(values_ms, dtype=np.float64).reshape(-1)
-    warmup = min(max(int(warmup_frames), 0), values.size)
-    measured = values[warmup:]
-    measured = measured[np.isfinite(measured)]
-    if measured.size == 0:
-        return {
-            "frames": 0,
-            "warmup_frames": warmup,
-            "mean_ms": None,
-            "p50_ms": None,
-            "p90_ms": None,
-            "p95_ms": None,
-            "p99_ms": None,
-            "max_ms": None,
-            "effective_fps": None,
-            "frames_under_16_67ms_ratio": None,
-        }
-    mean_ms = float(measured.mean())
-    return {
-        "frames": int(measured.size),
-        "warmup_frames": warmup,
-        "mean_ms": mean_ms,
-        "p50_ms": float(np.percentile(measured, 50)),
-        "p90_ms": float(np.percentile(measured, 90)),
-        "p95_ms": float(np.percentile(measured, 95)),
-        "p99_ms": float(np.percentile(measured, 99)),
-        "max_ms": float(measured.max()),
-        "effective_fps": 1000.0 / mean_ms if mean_ms > 0.0 else None,
-        "frames_under_16_67ms_ratio": float(np.mean(measured <= (1000.0 / 60.0))),
-    }
-
-
-def evaluate_longseq_entries(
-    entries: list[dict[str, Any]],
-    source_dir: Path,
-    output_dir: Path,
-    model,
-    diffusion,
-    device: torch.device,
-    normalizer: RealtimePoseNormalizer | None,
-    tracker_confidence_warmup: int = 15,
-    fabrik_iterations: int = 2,
-    ik_direction_only_quality: float | None = None,
-    ik_residual_scale: float | None = None,
-    ik_position_solved_quality: float | None = None,
-    use_future_rolling_prior: bool = False,
-    future_confidence_decay: float = 0.9,
-    model_path: str | Path = "",
-    weights: str = "",
-    limit: int = 0,
-    sequence_batch_size: int = 1,
-    conditions: list[str] | tuple[str, ...] = TRACKER_PATTERN_CATEGORIES,
-    timeline_seed: int = 10,
-    diffusion_noise_mode: str = "per_frame",
-    diffusion_noise_rho: float = 0.95,
-    pose_history_mode: str = "predicted",
-    gt_history_warmup_frames: int = 0,
-    render_mp4: bool = False,
-    render_fps: int = 30,
-    render_stride: int = 1,
-    render_camera_mode: str = "follow",
-    render_layout: str = "overlay",
-    render_local_radius: float = 1.25,
-    latency_warmup_frames: int = 20,
-    runtime_metadata: dict[str, Any] | None = None,
-    show_progress: bool = True,
-) -> dict[str, Any]:
-    source_dir = Path(source_dir).resolve()
-    output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    selected_entries = entries[: int(limit)] if int(limit) > 0 else entries
-    if not selected_entries:
-        raise RuntimeError("长序列评估集合为空。")
-    selected_conditions = tuple(dict.fromkeys(str(value) for value in conditions))
-    if not selected_conditions or any(
-        condition not in TRACKER_PATTERN_CATEGORIES for condition in selected_conditions
-    ):
-        raise ValueError(f"条件必须来自 {TRACKER_PATTERN_CATEGORIES}。")
-    # 按条件展开后再分批，批内条件一致，便于解读性能与显存数据。
-    jobs = [
-        (entry, condition)
-        for condition in selected_conditions
-        for entry in selected_entries
-    ]
-
-    results = []
-    sampling_latency_values: list[np.ndarray] = []
-    e2e_latency_values: list[np.ndarray] = []
-    batch_size = max(1, int(sequence_batch_size))
-    for batch_start in range(0, len(jobs), batch_size):
-        batch_jobs = jobs[batch_start : batch_start + batch_size]
-        batch_sources: list[dict[str, np.ndarray]] = []
-        batch_timelines: list[TrackerTimeline] = []
-        batch_eval_masks: list[np.ndarray] = []
-        batch_diffusion_seeds: list[int] = []
-        for entry, condition in batch_jobs:
-            sequence_id = str(entry["sequence_id"])
-            source_path = resolve_source_entry_path(entry)
-            source = load_realtime_source(source_path)
-            frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
-            timeline = build_isolated_condition_timeline(
-                source_id=sequence_id,
-                frame_count=frame_count,
-                condition=condition,
-                global_seed=int(timeline_seed),
-            )
-            batch_sources.append(source)
-            batch_timelines.append(timeline)
-            batch_eval_masks.append(isolated_condition_eval_mask(timeline, condition))
-            # 同一源序列在不同条件下使用相同的逐帧初始噪声，避免扩散随机性混入对照。
-            batch_diffusion_seeds.append(
-                int(stable_context_seed(timeline_seed, sequence_id, "longseq_diffusion") % (2**63))
-            )
-            print(f"[longseq] {condition}/{sequence_id}: {frame_count} frames")
-        payloads = rollout_long_sequence_sources(
-            model=model,
-            diffusion=diffusion,
-            sources=batch_sources,
-            timelines=batch_timelines,
-            device=device,
-            normalizer=normalizer,
-            tracker_confidence_warmup=tracker_confidence_warmup,
-            fabrik_iterations=fabrik_iterations,
-            ik_direction_only_quality=ik_direction_only_quality,
-            ik_residual_scale=ik_residual_scale,
-            ik_position_solved_quality=ik_position_solved_quality,
-            use_future_rolling_prior=use_future_rolling_prior,
-            future_confidence_decay=future_confidence_decay,
-            measure_latency=device.type == "cuda",
-            show_progress=bool(show_progress),
-            progress_desc=(
-                f"{batch_start + 1}-{batch_start + len(batch_jobs)}/"
-                f"{len(jobs)} batch"
-            ),
-            diffusion_seeds=batch_diffusion_seeds,
-            diffusion_noise_mode=diffusion_noise_mode,
-            diffusion_noise_rho=diffusion_noise_rho,
-            pose_history_mode=pose_history_mode,
-            gt_history_warmup_frames=gt_history_warmup_frames,
-        )
-
-        for (entry, condition), source, payload, eval_mask in zip(
-            batch_jobs,
-            batch_sources,
-            payloads,
-            batch_eval_masks,
-        ):
-            warmup_frames = _validate_gt_history_warmup_frames(
-                gt_history_warmup_frames,
-                int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0]),
-            )
-            eval_mask = eval_mask[warmup_frames:]
-            payload["eval_frame_mask"] = eval_mask[None]
-            sequence_id = str(entry["sequence_id"])
-            frame_count = int(source[BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY].shape[0])
-            condition_dir = CONDITION_OUTPUT_TAGS[condition]
-            sequence_dir = output_dir / condition_dir / build_sequence_output_dir_name(entry)
-            sequence_dir.mkdir(parents=True, exist_ok=True)
-            result_path = sequence_dir / "rollout_result.npz"
-            np.savez(result_path, **payload)
-            result = evaluate_rollout_file(result_path)
-            # 第一个批的每条流共享 GPU 预热阶段，应统一排除。
-            sequence_warmup = int(latency_warmup_frames) if batch_start == 0 else 0
-            result["latency"] = {
-                "sampling": summarize_latency(payload["sampling_latency_ms"], sequence_warmup),
-                "e2e": summarize_latency(payload["e2e_latency_ms"], sequence_warmup),
+            scored_target_rotations.append(world_rotations[current])
+            scored_raw_positions.append(raw_resolved.joints_world)
+            scored_deployed_positions.append(result.resolved_pose.joints_world)
+            scored_target_positions.append(source["joints_world"][current])
+            frame_count += 1
+        if scored_target_rotations:
+            target_rotations = np.stack(scored_target_rotations, axis=0)
+            target_positions = np.stack(scored_target_positions, axis=0)
+            common = {
+                "target_global_rotations": target_rotations,
+                "target_joint_positions": target_positions,
+                "fps": REALTIME_POSE_FPS,
             }
-            sampling_latency_values.append(
-                payload["sampling_latency_ms"].reshape(-1)[sequence_warmup:]
-            )
-            e2e_latency_values.append(payload["e2e_latency_ms"].reshape(-1)[sequence_warmup:])
-            result.update(
-                {
-                    "sequence_id": sequence_id,
-                    "condition": condition,
-                    "source_relative_path": str(entry.get("source_relative_path", "")),
-                    "num_frames": frame_count,
-                    "evaluated_frames": int(eval_mask.sum()),
-                    "result_path": str(result_path),
-                }
-            )
-
-            if render_mp4:
-                mp4_path = sequence_dir / "comparison.mp4"
-                render_realtime_pose_comparison(
-                    output_path=mp4_path,
-                    reference_joints=payload["reference_joints_world"],
-                    predicted_joints=payload["predicted_joints_world"],
-                    tracker_pos_world=payload["tracker_pos_world"],
-                    sensor_valid=payload["measured_valid"],
-                    eval_frame_mask=payload["eval_frame_mask"],
-                    root_yaw_reference=payload["reference_root_yaw_world"],
-                    root_yaw_predicted=payload["predicted_root_yaw_world"],
-                    fps=int(render_fps),
-                    stride=int(render_stride),
-                    camera_mode=str(render_camera_mode),
-                    layout=str(render_layout),
-                    local_radius=float(render_local_radius),
+            raw_sequence_metrics.append(
+                compute_rpm_p2_mc_metrics(
+                    predicted_global_rotations=np.stack(
+                        scored_raw_rotations, axis=0
+                    ),
+                    predicted_joint_positions=np.stack(
+                        scored_raw_positions, axis=0
+                    ),
+                    **common,
                 )
-                result["mp4_path"] = str(mp4_path)
-
-            summary_path = sequence_dir / "rollout_eval_summary.json"
-            with summary_path.open("w", encoding="utf-8") as file:
-                json.dump({"summary": public_result(result)}, file, ensure_ascii=False, indent=2)
-            result["summary_path"] = str(summary_path)
-            results.append(result)
-
-    aggregate = summarize_rollouts(results)
-    aggregate["by_condition"] = {
-        condition: summarize_rollouts(
-            [result for result in results if result["condition"] == condition]
-        )
-        for condition in selected_conditions
-    }
-    aggregate["latency"] = {
-        "sampling": summarize_latency(np.concatenate(sampling_latency_values)),
-        "e2e": summarize_latency(np.concatenate(e2e_latency_values)),
-    }
-    metadata = dict(runtime_metadata or {})
-    metadata["tracker_confidence_warmup"] = int(tracker_confidence_warmup)
-    metadata["fabrik_iterations"] = int(fabrik_iterations)
-    metadata["use_future_rolling_prior"] = bool(use_future_rolling_prior)
-    metadata["future_confidence_decay"] = float(future_confidence_decay)
-    metadata["sequence_batch_size"] = int(batch_size)
-    metadata["latency_scope"] = "active_batch_wall_time_per_stream"
-    metadata["evaluation_protocol"] = (
-        "isolated_condition_gt_history_warmup"
-        if int(gt_history_warmup_frames) > 0
-        else "isolated_condition_cold_start"
-    )
-    metadata["conditions"] = list(selected_conditions)
-    metadata["shared_diffusion_noise_across_conditions"] = True
-    metadata["diffusion_noise_mode"] = str(diffusion_noise_mode)
-    metadata["diffusion_noise_rho"] = float(diffusion_noise_rho)
-    metadata["pose_history_mode"] = str(pose_history_mode)
-    metadata["pose_history_protocol"] = (
-        "ground_truth_previous_pose"
-        if pose_history_mode == "ground_truth"
-        else "previous_deployed_pose"
-    )
-    metadata["gt_history_warmup_frames"] = int(gt_history_warmup_frames)
-    if device.type == "cuda":
-        metadata["peak_cuda_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024.0**2))
-    summary_payload = {
-        "summary": aggregate,
-        "files": [public_result(result) for result in results],
-        "metadata": {
-            "kind": "realtime_pose_144d_longseq_isolated_conditions",
-            "source_dir": str(source_dir),
-            "output_dir": str(output_dir),
-            "model_path": str(model_path),
-            "weights": str(weights),
-            "timeline_seed": int(timeline_seed),
-            "source_sequence_count": len(selected_entries),
-            "condition_count": len(selected_conditions),
-            "rollout_count": len(results),
-            **metadata,
-        },
-    }
-    aggregate_path = output_dir / "longseq_eval_summary.json"
-    with aggregate_path.open("w", encoding="utf-8") as file:
-        json.dump(summary_payload, file, ensure_ascii=False, indent=2)
-    summary_payload["summary_path"] = str(aggregate_path)
-    return summary_payload
-
-
-def build_default_output_dir(
-    source_dir: Path,
-    model_path: str | Path,
-    weights: str,
-    sequence_batch_size: int = 1,
-    conditions: list[str] | tuple[str, ...] = TRACKER_PATTERN_CATEGORIES,
-    use_future_rolling_prior: bool = False,
-    future_confidence_decay: float = 0.9,
-) -> Path:
-    """构造短路径，并用稳定摘要隔离不同评测集与训练 run。"""
-
-    model_path = Path(model_path)
-    model_stem = model_path.stem
-    step_text = model_stem.removeprefix("model")
-    step_tag = str(int(step_text)) if step_text.isdigit() else _short_digest(model_stem, 6)
-    weight_tag = {"ema": "e", "model": "m", "": "m"}.get(str(weights), "w")
-    # 摘要纳入评测集和 checkpoint 父目录，相同 step 的不同 run 不会覆盖。
-    identity = _short_digest(
-        f"{Path(source_dir).resolve()}\n{model_path.resolve().parent}",
-        10,
-    )
-    condition_values = tuple(dict.fromkeys(str(value) for value in conditions))
-    condition_tag = f"c{len(condition_values)}"
-    if condition_values != TRACKER_PATTERN_CATEGORIES:
-        condition_tag += _short_digest("\n".join(condition_values), 4)
-    prior_tag = build_future_rolling_prior_tag(
-        use_future_rolling_prior,
-        future_confidence_decay,
-    )
-    leaf = (
-        f"{step_tag}{weight_tag}-b{int(sequence_batch_size)}-"
-        f"{condition_tag}-{prior_tag}-{identity}"
-    )
-    return Path("output") / "l" / leaf
-
-
-def build_future_rolling_prior_tag(
-    enabled: bool,
-    confidence_decay: float,
-) -> str:
-    """生成短且可读的采样策略标签，防止 baseline 与 rolling 结果互相覆盖。"""
-
-    if not bool(enabled):
-        return "rp0"
-    decay_tag = f"{float(confidence_decay):.4g}".replace(".", "p")
-    return f"rp1g{decay_tag}"
-
-
-def _short_digest(value: str, length: int) -> str:
-    digest_size = max(1, (int(length) + 1) // 2)
-    return hashlib.blake2s(str(value).encode("utf-8"), digest_size=digest_size).hexdigest()[:length]
-
-
-def main(argv: list[str] | None = None) -> dict[str, Any]:
-    args = parse_and_load_from_model(
-        build_arg_parser(),
-        argv=argv,
-        ignore_keys={
-            "ts_respace",
-            "use_future_rolling_prior",
-            "future_confidence_decay",
-        },
-    )
-    if int(args.inference_steps) <= 0:
-        raise ValueError("inference_steps 必须大于 0。")
-    if int(args.sequence_batch_size) <= 0:
-        raise ValueError("sequence_batch_size 必须大于 0。")
-    if int(args.gt_history_warmup_frames) < 0:
-        raise ValueError("gt_history_warmup_frames 不能为负数。")
-    if not -1.0 <= float(args.diffusion_noise_rho) <= 1.0:
-        raise ValueError("diffusion_noise_rho 必须位于 [-1,1]。")
-    selected_conditions = list(dict.fromkeys(str(value) for value in args.conditions))
-    args.ts_respace = f"ddim{int(args.inference_steps)}"
-    fixseed(int(args.seed))
-    source_dir = Path(args.source_dir).resolve()
-    entries = read_longseq_source_entries(
-        source_dir=source_dir,
-        split_dir=args.split_dir,
-        split=args.split,
-        min_frames=int(args.min_frames),
-        include_mirror=bool(args.include_mirror),
-    )
-    normalizer = (
-        RealtimePoseNormalizer(args.normalizer_dir)
-        if bool(args.normalize_input)
-        else None
-    )
-
-    if bool(args.require_cuda) and (not bool(args.cuda) or not torch.cuda.is_available()):
-        raise RuntimeError("长序列实时评测要求使用可用的 CUDA GPU。")
-    dist_util.setup_dist(args.device if args.cuda else -1)
-    device = dist_util.dev()
-    if bool(args.require_cuda) and device.type != "cuda":
-        raise RuntimeError(f"长序列实时评测期望 CUDA，实际设备为 {device}。")
-    model, diffusion = create_model_and_diffusion(args)
-    if int(diffusion.num_timesteps) != int(args.inference_steps):
-        raise RuntimeError(
-            f"期望 {args.inference_steps} 个 DDIM 推理步，实际为 {diffusion.num_timesteps}。"
-        )
-    model, weights = load_checkpoint_model(model, args.model_path, device=device, use_ema=args.use_ema)
-    model.eval()
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    timestep_map = [int(value) for value in diffusion.timestep_map]
-    print(
-        f"[longseq] device={device}, train_steps={args.diffusion_steps}, "
-        f"inference_steps={diffusion.num_timesteps}, "
-        f"sequence_batch_size={args.sequence_batch_size}, conditions={selected_conditions}, "
-        f"gt_history_warmup_frames={args.gt_history_warmup_frames}, "
-        f"future_rolling_prior={args.use_future_rolling_prior}, "
-        f"timestep_map={timestep_map}"
-    )
-    if str(args.output_dir).strip():
-        output_dir = (
-            Path(args.output_dir).resolve()
-            / build_future_rolling_prior_tag(
-                bool(args.use_future_rolling_prior),
-                float(args.future_confidence_decay),
             )
-        )
-    else:
-        output_dir = build_default_output_dir(
-            source_dir,
-            args.model_path,
-            weights,
-            sequence_batch_size=args.sequence_batch_size,
-            conditions=selected_conditions,
-            use_future_rolling_prior=bool(args.use_future_rolling_prior),
-            future_confidence_decay=float(args.future_confidence_decay),
-        ).resolve()
-    summary = evaluate_longseq_entries(
-        entries=entries,
-        source_dir=source_dir,
-        output_dir=output_dir,
-        model=model,
-        diffusion=diffusion,
-        device=device,
-        normalizer=normalizer,
-        tracker_confidence_warmup=int(args.tracker_confidence_warmup),
-        fabrik_iterations=int(args.fabrik_iterations),
-        ik_direction_only_quality=args.ik_direction_only_quality,
-        ik_residual_scale=args.ik_residual_scale,
-        ik_position_solved_quality=args.ik_position_solved_quality,
-        use_future_rolling_prior=bool(args.use_future_rolling_prior),
-        future_confidence_decay=float(args.future_confidence_decay),
-        model_path=args.model_path,
-        weights=weights,
-        limit=int(args.limit),
-        sequence_batch_size=int(args.sequence_batch_size),
-        conditions=selected_conditions,
-        timeline_seed=int(args.timeline_seed),
-        diffusion_noise_mode=str(args.diffusion_noise_mode),
-        diffusion_noise_rho=float(args.diffusion_noise_rho),
-        pose_history_mode=str(args.pose_history_mode),
-        gt_history_warmup_frames=int(args.gt_history_warmup_frames),
-        render_mp4=bool(args.render_mp4),
-        render_fps=int(args.render_fps),
-        render_stride=int(args.render_stride),
-        render_camera_mode=str(args.render_camera_mode),
-        render_layout=str(args.render_layout),
-        render_local_radius=float(args.render_local_radius),
-        latency_warmup_frames=int(args.latency_warmup_frames),
-        runtime_metadata={
-            "device": str(device),
-            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "",
-            "batch_size": int(args.sequence_batch_size),
-            "sequence_batch_size": int(args.sequence_batch_size),
-            "training_diffusion_steps": int(args.diffusion_steps),
-            "inference_steps": int(diffusion.num_timesteps),
-            "timestep_map": timestep_map,
-            "use_ema": bool(args.use_ema),
-            "diffusion_seed": int(args.seed),
-            "diffusion_noise_mode": str(args.diffusion_noise_mode),
-            "diffusion_noise_rho": float(args.diffusion_noise_rho),
-            "pose_history_mode": str(args.pose_history_mode),
-            "latency_warmup_frames": int(args.latency_warmup_frames),
-            "history_initialization": (
-                f"ground_truth_first_{int(args.gt_history_warmup_frames)}_frames"
-                if int(args.gt_history_warmup_frames) > 0
-                else "cold_start_zero_padding"
-            ),
-        },
-        show_progress=bool(args.show_progress),
-    )
-    print(f"[evaluate_longseq_eval_set] wrote {summary['summary_path']}")
-    return summary
+            deployed_sequence_metrics.append(
+                compute_rpm_p2_mc_metrics(
+                    predicted_global_rotations=np.stack(
+                        scored_deployed_rotations, axis=0
+                    ),
+                    predicted_joint_positions=np.stack(
+                        scored_deployed_positions, axis=0
+                    ),
+                    **common,
+                )
+            )
+    if frame_count <= 0:
+        raise RuntimeError(f"Tracker 配置 {config_name} 没有可计分帧。")
+    report = {
+        "name": config_name,
+        "tracker_available": tracker_available.tolist(),
+        "seen_during_training": config_name in {"core_only", "all_six"},
+        "generated_frames": generated_frame_count,
+        "evaluated_frames": frame_count,
+        "dit_raw": aggregate_rpm_p2_mc_metrics(raw_sequence_metrics),
+        "dit_deployed": aggregate_rpm_p2_mc_metrics(
+            deployed_sequence_metrics
+        ),
+    }
+    print(f"[longseq] {config_name}: {report['dit_deployed']}", flush=True)
+    return report
 
 
 if __name__ == "__main__":

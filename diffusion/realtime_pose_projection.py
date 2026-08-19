@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
-    REALTIME_POSE_TARGET_LENGTH,
     SMPL_JOINT_COUNT,
+    TRACKER_AVAILABLE_OFFSET,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
     TRACKER_TO_JOINT,
@@ -59,38 +59,24 @@ def project_rotation_6d_to_so3(
 def project_realtime_pose_xstart(
     pred_xstart: torch.Tensor,
     current_tracker_raw: torch.Tensor,
-    hard_rotation_state: torch.Tensor,
     pose_mean: torch.Tensor | None = None,
     pose_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """合法化全部旋转，并只覆盖当前帧处于 hard 状态的 Tracker 旋转。"""
+    """合法化全部旋转，并硬覆盖当前所有 available Tracker 的直接旋转。"""
 
-    if pred_xstart.ndim != 3 or tuple(pred_xstart.shape[1:]) != (
-        REALTIME_POSE_TARGET_LENGTH,
-        REALTIME_POSE_TARGET_DIM,
-    ):
-        raise ValueError(
-            f"pred_xstart 必须为 [B,{REALTIME_POSE_TARGET_LENGTH},"
-            f"{REALTIME_POSE_TARGET_DIM}]。"
-        )
+    if pred_xstart.ndim != 2 or pred_xstart.shape[1] != REALTIME_POSE_TARGET_DIM:
+        raise ValueError("pred_xstart 必须为 [B,144]。")
     batch_size = pred_xstart.shape[0]
     if tuple(current_tracker_raw.shape) != (
         batch_size,
         TRACKER_COUNT,
         TRACKER_FEATURE_DIM,
     ):
-        raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
-    if tuple(hard_rotation_state.shape) != (batch_size, TRACKER_COUNT):
-        raise ValueError("hard_rotation_state 必须为 [B,6]。")
+        raise ValueError("current_tracker_raw 必须为 [B,6,10]。")
 
     raw = _inverse_pose(pred_xstart, pose_mean, pose_scale)
     rotations = project_rotation_6d_to_so3(
-        raw.reshape(
-            batch_size,
-            REALTIME_POSE_TARGET_LENGTH,
-            SMPL_JOINT_COUNT,
-            6,
-        )
+        raw.reshape(batch_size, SMPL_JOINT_COUNT, 6)
     )
     tracker_rotations = project_rotation_6d_to_so3(
         current_tracker_raw[..., 3:9].to(
@@ -104,21 +90,17 @@ def project_realtime_pose_xstart(
         dtype=torch.long,
     )
     deployed = rotations.clone()
-    deployed_current = deployed[:, 0]
-    current_rotations = deployed_current.index_select(1, joint_indices)
+    current_rotations = deployed.index_select(1, joint_indices)
     replacement = torch.where(
-        hard_rotation_state.to(device=pred_xstart.device, dtype=torch.bool)[..., None],
+        (current_tracker_raw[..., TRACKER_AVAILABLE_OFFSET] > 0.5).to(
+            device=pred_xstart.device
+        )[..., None],
         tracker_rotations,
         current_rotations,
     )
-    deployed_current.index_copy_(1, joint_indices, replacement)
-    deployed[:, 0] = deployed_current
+    deployed.index_copy_(1, joint_indices, replacement)
     return _normalize_pose(
-        deployed.reshape(
-            batch_size,
-            REALTIME_POSE_TARGET_LENGTH,
-            REALTIME_POSE_TARGET_DIM,
-        ),
+        deployed.reshape(batch_size, REALTIME_POSE_TARGET_DIM),
         pose_mean,
         pose_scale,
     )

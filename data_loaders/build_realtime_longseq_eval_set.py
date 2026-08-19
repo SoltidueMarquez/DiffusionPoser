@@ -18,7 +18,7 @@ from data_loaders.sensor_masking import BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY, REAL
 
 
 DEFAULT_SOURCE_DIR = (
-    "dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz"
+    "dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_30hz"
 )
 DEFAULT_SPLIT_DIR = "data_loaders/splits/RPM-P2"
 MAX_LONGSEQ_FILE_STEM_CHARS = 32

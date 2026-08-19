@@ -37,7 +37,7 @@ def test_longseq_listing_selects_split_non_mirror_long_sources(tmp_path):
         source_dir,
         split_dir,
         split="test",
-        min_frames=60,
+        min_frames=30,
         include_mirror=False,
     )
     assert [entry["source_relative_path"] for entry in entries] == [

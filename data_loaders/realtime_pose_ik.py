@@ -9,7 +9,6 @@ from data_loaders.realtime_pose_config import IKInpaintingConfig
 from data_loaders.realtime_pose_geometry import pelvis_relative_joint_positions_torch
 from data_loaders.realtime_pose_kinematics import (
     JOINT_INDEX,
-    SMPL_PARENTS,
     rotation_6d_forward_up_torch,
     rotation_6d_to_matrix_torch,
 )
@@ -21,13 +20,11 @@ from data_loaders.sensor_masking import (
     RIGHT_FOOT_TRACKER_INDEX,
     RIGHT_HAND_TRACKER_INDEX,
     SMPL_JOINT_COUNT,
-    TRACKER_CONFIGURED_OFFSET,
+    TRACKER_AVAILABLE_OFFSET,
     TRACKER_COUNT,
     TRACKER_FEATURE_DIM,
-    TRACKER_MEASURED_VALID_OFFSET,
     TRACKER_TO_JOINT,
 )
-from data_loaders.tracker_reliability import compute_ik_joint_confidence_torch
 
 
 DIRECT_ROTATION = 0
@@ -79,12 +76,9 @@ _RIGHT_LEG_CHAIN = (
 
 
 def build_current_ik(
-    previous_pose_raw: torch.Tensor,
-    previous_pose_valid: torch.Tensor,
+    initial_pose_raw: torch.Tensor,
     current_tracker_raw: torch.Tensor,
-    tracker_source_reliability: torch.Tensor,
     joint_offsets_parent: torch.Tensor,
-    joint_rest_local_rotations_6d: torch.Tensor,
     config: IKInpaintingConfig,
 ) -> RealtimePoseIKResult:
     """用初始化 Pose 和当前 Tracker 构造 `[B,24,6]` 部分 IK 结果。
@@ -96,33 +90,19 @@ def build_current_ik(
     """
 
     cfg = config.validate()
-    batch_size = previous_pose_raw.shape[0]
-    if tuple(previous_pose_raw.shape) != (batch_size, SMPL_JOINT_COUNT * 6):
-        raise ValueError("previous_pose_raw 必须为 [B,144]。")
-    if tuple(previous_pose_valid.shape) != (batch_size,):
-        raise ValueError("previous_pose_valid 必须为 [B]。")
+    batch_size = initial_pose_raw.shape[0]
+    if tuple(initial_pose_raw.shape) != (batch_size, SMPL_JOINT_COUNT * 6):
+        raise ValueError("initial_pose_raw 必须为 Predictor current `[B,144]`。")
     if tuple(current_tracker_raw.shape) != (
         batch_size,
         TRACKER_COUNT,
         TRACKER_FEATURE_DIM,
     ):
-        raise ValueError("current_tracker_raw 必须为 [B,6,13]。")
-    if tuple(tracker_source_reliability.shape) != (batch_size, TRACKER_COUNT):
-        raise ValueError("tracker_source_reliability 必须为 [B,6]。")
+        raise ValueError("current_tracker_raw 必须为 [B,6,10]。")
     if tuple(joint_offsets_parent.shape) != (batch_size, SMPL_JOINT_COUNT, 3):
         raise ValueError("joint_offsets_parent 必须为 [B,24,3]。")
-    if tuple(joint_rest_local_rotations_6d.shape) != (
-        batch_size,
-        SMPL_JOINT_COUNT,
-        6,
-    ):
-        raise ValueError("joint_rest_local_rotations_6d 必须为 [B,24,6]。")
-    previous_global = rotation_6d_to_matrix_torch(
-        previous_pose_raw.reshape(batch_size, SMPL_JOINT_COUNT, 6)
-    )
-    rest_global = _rest_local_to_global_rotations(joint_rest_local_rotations_6d)
-    global_rotations = torch.where(
-        previous_pose_valid[:, None, None, None], previous_global, rest_global
+    global_rotations = rotation_6d_to_matrix_torch(
+        initial_pose_raw.reshape(batch_size, SMPL_JOINT_COUNT, 6)
     )
     updated_mask = torch.zeros(
         batch_size, SMPL_JOINT_COUNT, device=global_rotations.device, dtype=torch.bool
@@ -142,9 +122,7 @@ def build_current_ik(
     )
     chain_length = build_ik_joint_chain_length(joint_offsets_parent)
 
-    configured = current_tracker_raw[..., TRACKER_CONFIGURED_OFFSET] > 0.5
-    measured = current_tracker_raw[..., TRACKER_MEASURED_VALID_OFFSET] > 0.5
-    tracker_valid = configured & measured
+    tracker_valid = current_tracker_raw[..., TRACKER_AVAILABLE_OFFSET] > 0.5
     tracker_rotations = rotation_6d_to_matrix_torch(current_tracker_raw[..., 3:9])
     tracker_positions = current_tracker_raw[..., :3]
 
@@ -277,7 +255,7 @@ def build_current_ik(
             )
 
     joint_source_reliability = build_ik_joint_source_reliability(
-        tracker_source_reliability=tracker_source_reliability,
+        tracker_source_reliability=tracker_valid.to(global_rotations.dtype),
         constraint_type=constraint_type,
     )
     confidence = compute_ik_joint_confidence_torch(
@@ -382,6 +360,63 @@ def build_ik_joint_source_reliability(
     return result
 
 
+def compute_ik_joint_confidence_torch(
+    joint_source_reliability: torch.Tensor,
+    constraint_type: torch.Tensor,
+    updated_mask: torch.Tensor,
+    position_residual: torch.Tensor,
+    chain_length: torch.Tensor,
+    direction_only_quality: float,
+    residual_scale: float,
+    position_solved_quality: float | None = None,
+) -> torch.Tensor:
+    """按约束类型、FABRIK 端点残差和固定 source reliability 计算 confidence。"""
+
+    source = joint_source_reliability.float()
+    expected = source.shape
+    if source.ndim != 2 or source.shape[1] != SMPL_JOINT_COUNT:
+        raise ValueError("joint_source_reliability 必须为 [B,24]。")
+    if any(
+        value.shape != expected
+        for value in (constraint_type, updated_mask, position_residual, chain_length)
+    ):
+        raise ValueError("IK confidence 的逐关节输入必须同为 [B,24]。")
+    if not 0.0 < float(direction_only_quality) < 1.0:
+        raise ValueError("direction_only_quality 必须位于 (0,1)。")
+    if float(residual_scale) <= 0.0:
+        raise ValueError("residual_scale 必须大于 0。")
+    constraint = constraint_type.long()
+    position_solved = constraint == POSITION_SOLVED
+    if bool(position_solved.any()) and position_solved_quality is None:
+        raise ValueError("POSITION_SOLVED 必须提供 position_solved_quality。")
+    quality = torch.zeros_like(source)
+    quality = torch.where(constraint == DIRECT_ROTATION, torch.ones_like(quality), quality)
+    if position_solved_quality is not None:
+        quality = torch.where(
+            position_solved,
+            torch.full_like(quality, float(position_solved_quality)),
+            quality,
+        )
+    quality = torch.where(
+        constraint == DIRECTION_ONLY,
+        torch.full_like(quality, float(direction_only_quality)),
+        quality,
+    )
+    residual_constrained = updated_mask.bool() & (
+        position_solved | (constraint == DIRECTION_ONLY)
+    )
+    if bool((residual_constrained & (chain_length <= 0.0)).any()):
+        raise ValueError("位置/方向约束必须有正的 chain_length。")
+    residual_quality = torch.exp(
+        -(position_residual / chain_length.clamp_min(1e-8)) / float(residual_scale)
+    )
+    residual_quality = torch.where(
+        constraint == DIRECT_ROTATION, torch.ones_like(source), residual_quality
+    )
+    confidence = (source * quality * residual_quality).clamp(0.0, 1.0)
+    return torch.where(updated_mask.bool(), confidence, torch.zeros_like(confidence))
+
+
 def _mark_direction_only_chain(
     updated_mask: torch.Tensor,
     constraint_type: torch.Tensor,
@@ -397,18 +432,6 @@ def _mark_direction_only_chain(
             torch.full_like(constraint_type[:, joint_index], DIRECTION_ONLY),
             constraint_type[:, joint_index],
         )
-
-
-def _rest_local_to_global_rotations(rest_local_6d: torch.Tensor) -> torch.Tensor:
-    local = rotation_6d_to_matrix_torch(rest_local_6d)
-    global_values: list[torch.Tensor] = []
-    for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
-        if parent_index < 0:
-            value = local[:, joint_index]
-        else:
-            value = global_values[parent_index] @ local[:, joint_index]
-        global_values.append(value)
-    return torch.stack(global_values, dim=1)
 
 
 def _aligned_joint_positions(

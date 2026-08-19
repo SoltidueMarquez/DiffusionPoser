@@ -1,11 +1,13 @@
-"""当前 realtime pose 主模型。"""
+"""Predictor 与单帧 DiT 模型。"""
 
-from .realtime_pose_spatiotemporal_dit import (
-    PreparedSpatioTemporalConditioning,
-    RealtimePoseSpatioTemporalDiT,
+from .realtime_pose_current_dit import (
+    PreparedCurrentConditioning,
+    RealtimePoseCurrentDiT,
 )
+from .realtime_pose_predictor import RealtimePosePredictor
 
 __all__ = [
-    "PreparedSpatioTemporalConditioning",
-    "RealtimePoseSpatioTemporalDiT",
+    "PreparedCurrentConditioning",
+    "RealtimePoseCurrentDiT",
+    "RealtimePosePredictor",
 ]

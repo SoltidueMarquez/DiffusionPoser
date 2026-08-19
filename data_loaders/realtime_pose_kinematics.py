@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from data_loaders.sensor_masking import (
+    REALTIME_POSE_FPS,
     STATIONARY_JOINT_INDICES,
     STATIONARY_PROB_DIM,
 )
@@ -139,7 +140,7 @@ def integrate_root_delta_xz_ref(
 
 def derive_stationary_prob_5(
     joints_world: np.ndarray,
-    fps: float = 60.0,
+    fps: float = REALTIME_POSE_FPS,
     speed_full_motion: float = 0.25,
     median_window: int = 5,
 ) -> np.ndarray:

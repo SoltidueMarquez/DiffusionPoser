@@ -19,11 +19,12 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_TARGET_DIM,
     ROTATION_6D_DIM,
     SMPL_JOINT_COUNT,
+    TRACKER_AVAILABLE_OFFSET,
+    TRACKER_CONTINUOUS_DIM,
     TRACKER_COUNT,
-    TRACKER_D_OFF_OFFSET,
-    TRACKER_D_ON_OFFSET,
     TRACKER_FEATURE_DIM,
     TRACKER_TO_JOINT,
+    validate_tracker_available,
 )
 
 
@@ -118,77 +119,21 @@ def build_tracker_measurements_np(
     return result
 
 
-def build_head_path_window_np(
-    head_pos_world: np.ndarray,
-    head_yaw_world: np.ndarray,
-    reference_head_pos_world: np.ndarray,
-    floor_y: float,
-    reference_head_yaw: float,
-) -> np.ndarray:
-    """把同步锚点构造成当前参考系下的绝对 Head 路径 `[T,5]`。
-
-    与旧的逐帧增量 trajectory 不同，这里保存每个锚点相对当前 Head 原点的
-    绝对 XZ 位置和相对当前 yaw。这样下采样后仍能直接表达整条历史路径。
-    """
-
-    positions = np.asarray(head_pos_world, dtype=np.float64)
-    yaws = np.asarray(head_yaw_world, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3 or yaws.shape != (positions.shape[0],):
-        raise ValueError("Head 路径输入必须为 [T,3] 和 [T]。")
-    origin = np.asarray(
-        [reference_head_pos_world[0], float(floor_y), reference_head_pos_world[2]],
-        dtype=np.float64,
-    )
-    yaw_inverse = make_yaw_rotation_np(
-        np.asarray([reference_head_yaw], dtype=np.float64)
-    )[0].T
-    positions_reference = np.einsum(
-        "ij,tj->ti", yaw_inverse, positions - origin[None]
-    )
-    relative_yaw = (yaws - float(reference_head_yaw) + math.pi) % (2.0 * math.pi) - math.pi
-    return np.stack(
-        [
-            positions_reference[:, 0],
-            positions_reference[:, 2],
-            positions_reference[:, 1],
-            np.sin(relative_yaw),
-            np.cos(relative_yaw),
-        ],
-        axis=-1,
-    ).astype(np.float32)
-
-
-def assemble_tracker_features_np(
+def assemble_current_tracker_features_np(
     measurements: np.ndarray,
-    configured: np.ndarray,
-    measured_valid: np.ndarray,
-    d_off: np.ndarray,
-    d_on: np.ndarray,
-    duration_cap: int = 60,
+    available: np.ndarray,
 ) -> np.ndarray:
-    """组合 `[T,6,13]`，且只归一化 duration 两个状态通道。"""
+    """组合当前 `[6,10]` Tracker，并把不可用测量严格清零。"""
 
     continuous = np.asarray(measurements, dtype=np.float32)
-    if continuous.ndim != 3 or continuous.shape[1:] != (TRACKER_COUNT, 9):
-        raise ValueError("measurements 必须为 [T,6,9]。")
-    state_shape = continuous.shape[:2]
-    configured = np.asarray(configured, dtype=bool)
-    measured = np.asarray(measured_valid, dtype=bool)
-    d_off = np.asarray(d_off, dtype=np.float32)
-    d_on = np.asarray(d_on, dtype=np.float32)
-    if any(value.shape != state_shape for value in (configured, measured, d_off, d_on)):
-        raise ValueError("Tracker 状态必须与 measurements 的 [T,6] 轴一致。")
-    if np.any(measured & ~configured):
-        raise ValueError("measured_valid 必须是 configured 子集。")
-    if not configured[:, HEAD_TRACKER_INDEX].all() or not measured[:, HEAD_TRACKER_INDEX].all():
-        raise ValueError("Head 必须始终 configured 且 measured_valid。")
-    result = np.zeros((*state_shape, TRACKER_FEATURE_DIM), dtype=np.float32)
-    result[..., :9] = continuous
-    result[..., 9] = configured
-    result[..., 10] = measured
-    result[..., TRACKER_D_OFF_OFFSET] = np.clip(d_off, 0, duration_cap) / float(duration_cap)
-    result[..., TRACKER_D_ON_OFFSET] = np.clip(d_on, 0, duration_cap) / float(duration_cap)
-    result[..., :9] *= measured[..., None]
+    if continuous.shape != (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM):
+        raise ValueError("measurements 必须为 [6,9]。")
+    active = validate_tracker_available(available)
+    result = np.zeros((TRACKER_COUNT, TRACKER_FEATURE_DIM), dtype=np.float32)
+    result[:, :TRACKER_CONTINUOUS_DIM] = np.where(
+        active[:, None], continuous, 0.0
+    )
+    result[:, TRACKER_AVAILABLE_OFFSET] = active
     validate_tracker_features_np(result)
     return result
 
@@ -459,18 +404,11 @@ def global_head_rotations_to_local_delta_6d_np(
 def validate_tracker_features_np(tracker_window: np.ndarray) -> None:
     tracker = np.asarray(tracker_window)
     if tracker.shape[-2:] != (TRACKER_COUNT, TRACKER_FEATURE_DIM):
-        raise ValueError(f"Tracker 特征尾部形状必须为 [6,13]，实际为 {tracker.shape}")
-    d_off = tracker[..., TRACKER_D_OFF_OFFSET]
-    d_on = tracker[..., TRACKER_D_ON_OFFSET]
-    if np.any((d_off < 0.0) | (d_off > 1.0)) or np.any((d_on < 0.0) | (d_on > 1.0)):
-        raise ValueError("d_off/d_on norm 必须在 [0,1]。")
-    configured = tracker[..., 9] > 0.5
-    measured = tracker[..., 10] > 0.5
-    if np.any(measured & ~configured):
-        raise ValueError("measured_valid 必须是 configured 子集。")
-    if np.any((~configured | measured) & (np.abs(d_off) > 1e-7)):
-        raise ValueError("未配置或有效 Tracker 的 d_off 必须为 0。")
-    if np.any((~configured | ~measured) & (np.abs(d_on) > 1e-7)):
-        raise ValueError("未配置或掉线 Tracker 的 d_on 必须为 0。")
-    if np.any(np.abs(tracker[..., :9][~measured]) > 1e-7):
-        raise ValueError("无效测量的前 9 维必须严格清零。")
+        raise ValueError(f"Tracker 特征尾部形状必须为 [6,10]，实际为 {tracker.shape}")
+    available = validate_tracker_available(
+        tracker[..., TRACKER_AVAILABLE_OFFSET] > 0.5
+    )
+    if np.any(
+        np.abs(tracker[..., :TRACKER_CONTINUOUS_DIM][~available]) > 1e-7
+    ):
+        raise ValueError("不可用 Tracker 的连续量必须严格清零。")

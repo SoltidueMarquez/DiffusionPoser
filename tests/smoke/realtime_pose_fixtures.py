@@ -29,7 +29,7 @@ def build_toy_source_metadata(frame_count: int = 70) -> dict:
         "stablemotion_split_key": "ACCAD/toy_realtime",
         "output_path": "ACCAD/toy_realtime.npz",
         "frames": int(frame_count),
-        "target_fps": 60.0,
+        "target_fps": 30.0,
         "is_mirrored": False,
     }
     metadata["stationary_joint_indices"] = [int(index) for index in STATIONARY_JOINT_INDICES]

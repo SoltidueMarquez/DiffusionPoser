@@ -65,10 +65,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smpl_model_dir", default="dataset/body_models", type=Path)
     parser.add_argument(
         "--output_dir",
-        default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_60hz",
+        default="dataset/AMASS_realtime_pose_body_fbx_local_pelvis_residual_root_y0_stationary5_30hz",
         type=Path,
     )
-    parser.add_argument("--target_fps", default=60.0, type=float)
     parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=1, type=int)
     parser.add_argument("--worker_torch_threads", default=1, type=int)
@@ -78,6 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--allow_partial", action="store_true")
     parser.add_argument("--body_fbx_rest_json", default="", type=Path)
+    parser.set_defaults(target_fps=REALTIME_POSE_FPS)
     return parser.parse_args(argv)
 
 
@@ -87,8 +87,6 @@ _WORKER_MODEL_CACHE: SmplModelCache | None = None
 
 def validate_converter_args(args: argparse.Namespace) -> None:
     validate_shared_args(args)
-    if not np.isclose(float(args.target_fps), float(REALTIME_POSE_FPS), rtol=0.0, atol=1e-6):
-        raise ValueError(f"当前 realtime pose source 固定为 {REALTIME_POSE_FPS:g} Hz。")
     if int(args.num_workers) <= 0:
         raise ValueError("--num_workers 必须为正整数")
     if int(args.worker_torch_threads) < 0:
@@ -147,7 +145,6 @@ def output_path_for(source: MotionSource, output_dir: Path) -> Path:
 
 def build_realtime_pose_features(
     smpl_motion: SmplMotion,
-    target_fps: float = 60.0,
     body_fbx_rest: BodyFbxRest | None = None,
 ) -> dict[str, np.ndarray]:
     """构建当前 realtime_pose source 字段。"""
@@ -203,7 +200,7 @@ def build_realtime_pose_features(
     features["pelvis_height"] = pelvis_world[:, 1:2].astype(np.float32)
     features["stationary_prob_5"] = derive_stationary_prob_5(
         joints_world=joints_world,
-        fps=float(target_fps),
+        fps=REALTIME_POSE_FPS,
     )
     return features
 
@@ -293,14 +290,17 @@ def convert_one_motion(
     elif output_path.exists() and not args.overwrite:
         raise FileExistsError(f"输出文件已存在: {output_path}，请使用 --overwrite 或 --skip_existing。")
 
-    source = load_motion_source(path=path, amass_dir=args.amass_dir, target_fps=args.target_fps)
+    source = load_motion_source(
+        path=path,
+        amass_dir=args.amass_dir,
+        target_fps=REALTIME_POSE_FPS,
+    )
     if mirror_variant:
         source = mirror_motion_source(source)
     smpl_motion = run_smpl_forward(source=source, model_cache=model_cache, batch_size=args.batch_size)
     body_fbx_rest = resolve_body_fbx_rest(args)
     features = build_realtime_pose_features(
         smpl_motion,
-        target_fps=float(args.target_fps),
         body_fbx_rest=body_fbx_rest,
     )
     save_realtime_pose_motion(

@@ -210,7 +210,7 @@ def build_rpm_protocol_split(
 
     metadata = {
         "protocol": f"rpm_{protocol}",
-        "split_origin": "RPM_Table2_Research_Kit_P1_P2_20260811",
+        "split_origin": "PREDICTOR_Table2_Research_Kit_P1_P2_20260811",
         "mapping_policy": "casefold_remove_punctuation_stageii_to_poses",
         "mirror_policy": "disabled",
         "counts": {

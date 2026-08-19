@@ -24,6 +24,7 @@ TRAIN_PLATFORMS = {
 
 def main():
     args = train_args()
+    args.predictor_model_path = str(Path(args.predictor_model_path).resolve())
     fixseed(args.seed)
     resolve_save_dir(args)
     prepare_save_dir(args)
@@ -46,8 +47,6 @@ def main():
             normalize_input=args.normalize_input,
             num_workers=args.num_workers,
             pin_memory=args.cuda,
-            cold_start_prob=args.cold_start_prob,
-            scenario_weights=args.scenario_weights,
             seed=args.seed,
         )
         eval_data = None
@@ -63,8 +62,6 @@ def main():
                 normalize_input=args.normalize_input,
                 num_workers=args.num_workers,
                 pin_memory=args.cuda,
-                cold_start_prob=0.0,
-                scenario_weights=args.scenario_weights,
                 seed=args.seed,
             )
 
@@ -73,7 +70,10 @@ def main():
         model.to(dist_util.dev())
         print(f"Total params: {model.num_parameters() / 1_000_000.0:.2f}M")
 
-        print(f"training DiffusionPoser model, task_mode={args.task_mode}...")
+        print(
+            f"training DiffusionPoser model, task_mode={args.task_mode}, "
+            f"precision={args.precision}..."
+        )
         TrainLoop(args, train_platform, model, diffusion, data, eval_data=eval_data).run_loop()
     finally:
         train_platform.close()
