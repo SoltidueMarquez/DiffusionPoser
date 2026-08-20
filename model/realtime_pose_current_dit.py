@@ -134,7 +134,7 @@ class CurrentDiTBlock(nn.Module):
 
 
 class RealtimePoseCurrentDiT(nn.Module):
-    """以 Predictor 为 prior，去噪当前 144D 完整 residual。"""
+    """以 Predictor 为 prior，去噪当前 144D 条件加权 residual。"""
 
     def __init__(
         self,

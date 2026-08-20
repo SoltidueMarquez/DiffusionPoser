@@ -264,7 +264,13 @@ class TrainLoop:
             "y": loss_batch,
         }
         predictor_current = predictor_pose_horizon[:, 0]
-        diffusion_target = batch["x"] - predictor_current.detach()
+        residual = batch["x"] - predictor_current.detach()
+        # m 只定义 DiT 应学习的修正幅度；模型输出不再重复乘 m，避免旧方案的
+        # 双重门控把弱约束关节的梯度进一步缩小。
+        diffusion_target = (
+            residual.reshape_as(ik_condition.ik_residual)
+            * ik_condition.denoise_strength[..., None]
+        ).reshape_as(residual)
         model = self.model if model_override is None else model_override
         # diffusion 只看到 FP32 输出，BF16 的数值边界严格限制在 DiT forward。
         def model_forward(*model_args, **model_kwargs):

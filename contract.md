@@ -122,7 +122,7 @@ latest` 从最近的带步号 `model*.pt` 恢复模型、optimizer、EMA 与 ste
 模型输出和 sample 均为 `[B,144]` residual：
 
 ```text
-x_start = r
+x_start = broadcast6(m) * r
 raw_pred_pose = p + predicted_residual
 ```
 
@@ -156,8 +156,8 @@ attention logits 中排除，因此逻辑 K/V 长度是 3～6；只把缺失 tok
 这个 mask。随后进入 4 个 block，每层依次执行 24 关节 spatial self-attention、
 同关节 20 帧 temporal cross-attention 和 timestep AdaLN MLP。固定模型配置为
 `D=192, layers=4, heads=6, mlp_ratio=4, dropout=0, max_seq_len=21`，参数量小于
-5M。`LayerNorm → Linear(D,6)` 输出头零初始化，直接输出完整 residual；`m`
-只作为条件提示，不限制输出幅度。
+5M。`LayerNorm → Linear(D,6)` 输出头零初始化，直接输出 residual；`m` 已经作用于
+训练 target，不在模型输出上再次相乘。
 
 第二阶段冻结训练中的 Predictor 始终 `eval()`、`requires_grad=False` 且在 `torch.no_grad()`
 中执行。DiT optimizer、EMA 和 checkpoint 不含 Predictor 权重；`args.json` 记录
@@ -169,7 +169,7 @@ attention logits 中排除，因此逻辑 K/V 长度是 3～6；只把缺失 tok
 
 冻结 DiT 阶段收敛后，使用 `python -m train.train_realtime_pose_joint` 加载同一套
 Predictor 与 DiT checkpoint 做短程联合微调。联合阶段继续使用相同 Task Store、
-8 种 Tracker 配置和完整 residual，不改变训练与部署张量契约。
+8 种 Tracker 配置和条件加权 residual，不改变训练与部署张量契约。
 
 令可训练 Predictor 输出为 `p`。IK、DiT condition 和 diffusion target 使用
 `stopgrad(p)`，避免 Predictor 通过移动 residual target 或 IK 条件降低 diffusion
@@ -177,13 +177,13 @@ loss；最终姿态仍使用未 detach 的 `p`：
 
 ```text
 p_condition = stopgrad(p)
-x_start = GT - p_condition
+x_start = broadcast6(m) * (GT - p_condition)
 raw_pred_pose = p + predicted_residual
 loss = dit_loss + predictor_loss_weight * mse(p, GT)
 ```
 
-因此 Predictor 从最终姿态辅助损失和当前帧 pose MSE 获得梯度，DiT 继续学习完整
-residual。optimizer 使用两个参数组，默认 DiT `lr=1e-5`、Predictor
+因此 Predictor 从最终姿态辅助损失和当前帧 pose MSE 获得梯度，DiT 继续学习条件
+加权 residual。optimizer 使用两个参数组，默认 DiT `lr=1e-5`、Predictor
 `lr=1e-6`，默认联合训练 20,000 step。
 
 联合 checkpoint 必须成对使用。`modelXXXXXXXXX.pt` / `emaXXXXXXXXX.pt` 保存 DiT，
@@ -208,8 +208,9 @@ m_j = 0.05 + 0.95 * support_j * ik_confidence_j * demand_j
 ```
 
 `support` 固定为直接旋转 `1.0`、方向/位置骨链约束 `0.35`、继承未约束 `0.0`。
-`m` 作为条件显式告诉 DiT 当前关节的建议修正需求，不再乘到训练 target 或模型
-输出上。校准在全部 8 种 Tracker 配置的 `updated_mask=True` 关节上统计
+`m` 既作为条件显式告诉 DiT 当前关节的建议修正需求，也只在训练 target 中作用
+一次；模型输出不再重复乘 `m`。校准在全部 8 种 Tracker 配置的
+`updated_mask=True` 关节上统计
 Predictor/IK gap，全局 P25/P90 分别写入 `ik_gap_low/high`；两者相差小于
 `1e-4` 弧度时校准失败。校准 JSON 同时保留 `ik_direction_only_quality` 与
 `ik_residual_scale`。训练和采样缺少 gap 校准值时 fail fast。

@@ -859,7 +859,8 @@ class GaussianDiffusion:
         )
         raw_pred_residual = out["pred_xstart"]
         raw_pred_pose = predictor_current + raw_pred_residual
-        # 门控已经包含在模型输出中；最终步只负责 SO(3) 与直接 Tracker 投影。
+        # 模型学习的 pred_xstart 已对应条件加权 target；采样时不再额外乘 m。
+        # 最终步只负责 SO(3) 与直接 Tracker 投影。
         if is_final_step:
             deployed_pred_pose = projection_fn(raw_pred_pose)
         else:
@@ -1456,7 +1457,7 @@ class GaussianDiffusion:
         use_l1=False,
         return_pred_xstart=False,
     ):
-        """只对门控 Predictor residual 加噪，并恢复绝对姿态计算辅助损失。"""
+        """对条件加权的 Predictor residual 加噪，并恢复绝对姿态计算辅助损失。"""
 
         if x_start.ndim != 2 or x_start.shape[1] != REALTIME_POSE_TARGET_DIM:
             raise ValueError("RealtimePose residual diffusion target 必须为 [B,144]。")
