@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import re
+from itertools import chain
 from pathlib import Path
 
 import torch
@@ -9,17 +10,14 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 
 from data_loaders.realtime_pose_config import IKInpaintingConfig
-from diffusion.realtime_pose_inpainting import (
-    build_current_realtime_pose_conditions,
-    gate_realtime_pose_residual,
-)
+from diffusion.realtime_pose_inpainting import build_current_realtime_pose_conditions
 from utils.model_util import load_realtime_pose_predictor
 from utils.normalizer import RealtimePoseNormalizer
 from utils.training_precision import TrainingPrecision
 
 
 class TrainLoop:
-    """冻结 Predictor、只优化单帧 DiT 的训练循环。"""
+    """训练单帧 DiT；联合阶段额外以小学习率更新 Predictor。"""
 
     def __init__(self, args, train_platform, model, diffusion, data, eval_data=None):
         self.args = args
@@ -34,6 +32,7 @@ class TrainLoop:
         )
         self.save_dir = Path(args.save_dir)
         self.step = 0
+        self.joint_finetune = bool(getattr(args, "joint_finetune", False))
         self.normalizer = RealtimePoseNormalizer(
             args.normalizer_dir, disable=not bool(args.normalize_input)
         )
@@ -66,12 +65,31 @@ class TrainLoop:
         self.predictor = load_realtime_pose_predictor(
             args.predictor_model_path, self.device
         )
+        if self.joint_finetune:
+            self.predictor.train().requires_grad_(True)
+        parameter_groups = [
+            {
+                "params": self.model.parameters(),
+                "lr": float(args.lr),
+            }
+        ]
+        if self.joint_finetune:
+            parameter_groups.append(
+                {
+                    "params": self.predictor.parameters(),
+                    "lr": float(args.predictor_lr),
+                }
+            )
         self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=float(args.lr),
+            parameter_groups,
             weight_decay=float(args.weight_decay),
         )
         self.ema_model = copy.deepcopy(self.model).eval().requires_grad_(False)
+        self.ema_predictor = (
+            copy.deepcopy(self.predictor).eval().requires_grad_(False)
+            if self.joint_finetune
+            else None
+        )
         self.ema_decay = float(args.model_ema_decay)
         self.feature_w = self._load_feature_weights()
         self._load_resume()
@@ -109,6 +127,26 @@ class TrainLoop:
             )
         else:
             self.ema_model.load_state_dict(self.model.state_dict())
+        if self.joint_finetune:
+            predictor_path = checkpoint.with_name(f"predictor{self.step:09d}.pt")
+            predictor_ema_path = checkpoint.with_name(
+                f"predictor_ema{self.step:09d}.pt"
+            )
+            if not predictor_path.is_file():
+                raise FileNotFoundError(f"联合 checkpoint 缺少 Predictor：{predictor_path}")
+            self.predictor.load_state_dict(
+                torch.load(predictor_path, map_location=self.device, weights_only=True)
+            )
+            if predictor_ema_path.is_file():
+                self.ema_predictor.load_state_dict(
+                    torch.load(
+                        predictor_ema_path,
+                        map_location=self.device,
+                        weights_only=True,
+                    )
+                )
+            else:
+                self.ema_predictor.load_state_dict(self.predictor.state_dict())
 
     def run_loop(self) -> None:
         iterator = iter(self.data)
@@ -138,14 +176,23 @@ class TrainLoop:
 
     def run_step(self, batch: dict) -> dict[str, torch.Tensor]:
         self.model.train()
+        if self.joint_finetune:
+            self.predictor.train()
         self.optimizer.zero_grad(set_to_none=True)
         losses = self._forward_losses(batch)
         losses["loss"].mean().backward()
         if bool(self.args.gradient_clip):
-            clip_grad_norm_(self.model.parameters(), 1.0)
+            parameters = (
+                chain(self.model.parameters(), self.predictor.parameters())
+                if self.joint_finetune
+                else self.model.parameters()
+            )
+            clip_grad_norm_(parameters, 1.0)
         self.optimizer.step()
         self._update_ema()
-        if any(parameter.grad is not None for parameter in self.predictor.parameters()):
+        if not self.joint_finetune and any(
+            parameter.grad is not None for parameter in self.predictor.parameters()
+        ):
             raise RuntimeError("冻结 Predictor 不应产生梯度。")
         return losses
 
@@ -154,16 +201,34 @@ class TrainLoop:
         batch: dict,
         *,
         model_override: torch.nn.Module | None = None,
+        predictor_override: torch.nn.Module | None = None,
     ) -> dict[str, torch.Tensor]:
         motion_context = batch["motion_context"]
         # Predictor 与 DiT 共享 Task Store 中的干净完整历史；Predictor 训练时
         # 已用 0～30 步闭环回填覆盖部署历史分布，不再额外构造人工历史噪声。
-        with torch.no_grad():
+        predictor_model = (
+            self.predictor if predictor_override is None else predictor_override
+        )
+        if self.joint_finetune and predictor_override is None:
             predictor_pose_horizon = self.precision.forward(
-                self.predictor,
+                predictor_model,
                 motion_context, batch["core_tracker_context"]
             )
-        initial_pose_raw = self._inverse_pose(predictor_pose_horizon[:, 0])
+        else:
+            with torch.no_grad():
+                predictor_pose_horizon = self.precision.forward(
+                    predictor_model,
+                    motion_context,
+                    batch["core_tracker_context"],
+                )
+        # IK 与扩散监督描述的是当前 Predictor 给出的固定基线。联合阶段不让
+        # Predictor 通过移动 target 或 IK 条件来降低 diffusion loss。
+        conditioning_horizon = (
+            predictor_pose_horizon.detach()
+            if self.joint_finetune
+            else predictor_pose_horizon
+        )
+        initial_pose_raw = self._inverse_pose(conditioning_horizon[:, 0])
         _, ik_condition, tracker_geometry = (
             build_current_realtime_pose_conditions(
                 initial_pose_raw=initial_pose_raw,
@@ -188,7 +253,7 @@ class TrainLoop:
         )
         model_kwargs = {
             "motion_context": motion_context,
-            "predictor_pose_horizon": predictor_pose_horizon,
+            "predictor_pose_horizon": conditioning_horizon,
             "tracker_geometry": tracker_geometry,
             "tracker_available": batch["tracker_available"].bool(),
             "ik_residual": ik_condition.ik_residual,
@@ -199,10 +264,7 @@ class TrainLoop:
             "y": loss_batch,
         }
         predictor_current = predictor_pose_horizon[:, 0]
-        diffusion_target = gate_realtime_pose_residual(
-            batch["x"] - predictor_current,
-            ik_condition.denoise_strength,
-        )
+        diffusion_target = batch["x"] - predictor_current.detach()
         model = self.model if model_override is None else model_override
         # diffusion 只看到 FP32 输出，BF16 的数值边界严格限制在 DiT forward。
         def model_forward(*model_args, **model_kwargs):
@@ -210,7 +272,7 @@ class TrainLoop:
                 model, *model_args, **model_kwargs
             )
 
-        return self.diffusion.training_losses(
+        terms = self.diffusion.training_losses(
             model_forward,
             diffusion_target,
             timestep,
@@ -220,6 +282,15 @@ class TrainLoop:
             snr_gamma=float(self.args.snr_gamma),
             use_l1=bool(self.args.l1_loss),
         )
+        if self.joint_finetune:
+            predictor_pose_loss = (
+                predictor_current - batch["x"]
+            ).square().mean(dim=1)
+            terms["predictor_pose_loss"] = predictor_pose_loss
+            terms["loss"] = terms["loss"] + float(
+                self.args.predictor_loss_weight
+            ) * predictor_pose_loss
+        return terms
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
@@ -228,10 +299,14 @@ class TrainLoop:
         totals: dict[str, float] = {}
         count = 0
         self.ema_model.eval()
+        if self.ema_predictor is not None:
+            self.ema_predictor.eval()
         for batch in self.eval_data:
             batch = move_batch_to_device(batch, self.device)
             losses = self._forward_losses(
-                batch, model_override=self.ema_model
+                batch,
+                model_override=self.ema_model,
+                predictor_override=self.ema_predictor,
             )
             for name, value in losses.items():
                 if torch.is_tensor(value) and value.ndim <= 1:
@@ -250,13 +325,13 @@ class TrainLoop:
 
     @torch.no_grad()
     def _update_ema(self) -> None:
-        online = self.model.state_dict()
-        for name, value in self.ema_model.state_dict().items():
-            source = online[name].detach()
-            if value.is_floating_point():
-                value.lerp_(source, 1.0 - self.ema_decay)
-            else:
-                value.copy_(source)
+        _update_model_ema(self.ema_model, self.model, self.ema_decay)
+        if self.ema_predictor is not None:
+            _update_model_ema(
+                self.ema_predictor,
+                self.predictor,
+                self.ema_decay,
+            )
 
     def _report(self, losses: dict, group: str) -> None:
         values = {}
@@ -269,13 +344,44 @@ class TrainLoop:
                 scalar = float(value)
             values[name] = scalar
             self.train_platform.report_scalar(name, scalar, self.step, group)
-        print(f"dit {group} step[{self.step}]: {values}", flush=True)
+        stage = "joint" if self.joint_finetune else "dit"
+        print(f"{stage} {group} step[{self.step}]: {values}", flush=True)
 
     def save(self) -> None:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.model.state_dict(), self.save_dir / f"model{self.step:09d}.pt")
         torch.save(self.ema_model.state_dict(), self.save_dir / f"ema{self.step:09d}.pt")
         torch.save(self.optimizer.state_dict(), self.save_dir / f"opt{self.step:09d}.pt")
+        if self.joint_finetune:
+            torch.save(
+                self.predictor.state_dict(),
+                self.save_dir / f"predictor{self.step:09d}.pt",
+            )
+            torch.save(
+                self.ema_predictor.state_dict(),
+                self.save_dir / f"predictor_ema{self.step:09d}.pt",
+            )
+            # latest 始终保存同一步的两份 EMA，运行时必须成对使用。
+            torch.save(self.ema_model.state_dict(), self.save_dir / "model_latest.pt")
+            torch.save(
+                self.ema_predictor.state_dict(),
+                self.save_dir / "predictor_latest.pt",
+            )
+
+
+@torch.no_grad()
+def _update_model_ema(
+    target: torch.nn.Module,
+    online: torch.nn.Module,
+    decay: float,
+) -> None:
+    online_state = online.state_dict()
+    for name, value in target.state_dict().items():
+        source = online_state[name].detach()
+        if value.is_floating_point():
+            value.lerp_(source, 1.0 - decay)
+        else:
+            value.copy_(source)
 
 
 def move_batch_to_device(batch, device):

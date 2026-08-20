@@ -151,6 +151,9 @@ def test_masked_tracker_tokens_do_not_change_output_and_model_is_under_5m():
     torch.testing.assert_close(first, second)
     blocked = dict(conditions)
     blocked["denoise_strength"] = torch.zeros(1, 24)
+    with torch.no_grad():
+        model.joint_output.weight.zero_()
+        model.joint_output.bias.fill_(1.0)
     blocked_output = model(
         x,
         torch.tensor([1]),
@@ -158,7 +161,7 @@ def test_masked_tracker_tokens_do_not_change_output_and_model_is_under_5m():
         predictor_pose_horizon=predictor,
         **blocked,
     )
-    torch.testing.assert_close(blocked_output, torch.zeros_like(blocked_output))
+    torch.testing.assert_close(blocked_output, torch.ones_like(blocked_output))
     assert RealtimePoseCurrentDiT().num_parameters() < 5_000_000
 
 

@@ -10,7 +10,11 @@ from train.train_realtime_pose_predictor import (
     build_parser as build_predictor_parser,
 )
 from utils.model_util import create_model_and_diffusion
-from utils.parser_util import build_train_arg_parser, train_args
+from utils.parser_util import (
+    build_train_arg_parser,
+    joint_finetune_args,
+    train_args,
+)
 from utils.training_precision import TrainingPrecision
 
 
@@ -58,6 +62,19 @@ def test_training_parsers_accept_bf16(tmp_path):
         ]
     )
     assert dit_args.precision == predictor_args.precision == "bf16"
+
+
+def test_joint_finetune_parser_uses_small_two_model_learning_rates(tmp_path):
+    args = joint_finetune_args(
+        _required(tmp_path)
+        + ["--dit_model_path", str(tmp_path / "dit.pt")]
+    )
+    assert args.joint_finetune
+    assert args.dit_model_path.endswith("dit.pt")
+    assert args.lr == 1e-5
+    assert args.predictor_lr == 1e-6
+    assert args.predictor_loss_weight == 1.0
+    assert args.num_steps == 20_000
 
 
 def test_predictor_parser_uses_single_official_style_schedule(tmp_path):

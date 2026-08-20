@@ -10,10 +10,7 @@ from data_loaders.realtime_pose_ik import (
     INHERITED,
     RealtimePoseIKResult,
 )
-from diffusion.realtime_pose_inpainting import (
-    build_realtime_pose_inpainting_condition,
-    gate_realtime_pose_residual,
-)
+from diffusion.realtime_pose_inpainting import build_realtime_pose_inpainting_condition
 
 
 IDENTITY_6D = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
@@ -69,7 +66,7 @@ def test_ik_gap_controls_direct_direction_and_untracked_strength():
     assert condition.denoise_strength[0, 3] == 0.05
 
 
-def test_strength_is_monotonic_in_gap_and_gates_each_joint_six_channels():
+def test_strength_is_monotonic_in_gap():
     predictor = IDENTITY_6D.repeat(24)[None].repeat(3, 1)
     base = _ik_result()
     result = RealtimePoseIKResult(
@@ -89,13 +86,6 @@ def test_strength_is_monotonic_in_gap_and_gates_each_joint_six_channels():
         condition.denoise_strength[1:, 1]
         >= condition.denoise_strength[:-1, 1]
     )
-    gated = gate_realtime_pose_residual(
-        torch.ones(3, 144), condition.denoise_strength
-    ).reshape(3, 24, 6)
-    torch.testing.assert_close(
-        gated[..., 0], condition.denoise_strength, atol=0.0, rtol=0.0
-    )
-    torch.testing.assert_close(gated[..., 0], gated[..., 5])
 
 
 def test_gap_calibration_is_required_and_must_have_nonzero_range():

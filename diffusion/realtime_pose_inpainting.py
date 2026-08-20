@@ -26,7 +26,7 @@ from data_loaders.sensor_masking import (
 
 @dataclass(frozen=True)
 class RealtimePoseInpaintingCondition:
-    """由 IK 生成的 Predictor residual 方向与逐关节去噪门控。"""
+    """由 IK 生成的 Predictor residual 方向与逐关节修正条件。"""
 
     ik_residual: torch.Tensor  # [B,24,6]，normalized IK - Predictor
     ik_gap: torch.Tensor  # [B,24]，SO(3) geodesic angle，单位为弧度
@@ -42,7 +42,7 @@ def build_realtime_pose_inpainting_condition(
     pose_scale: torch.Tensor | None,
     config: IKInpaintingConfig,
 ) -> RealtimePoseInpaintingCondition:
-    """比较 Predictor prior 与 IK，生成可解释的逐关节 residual 门控。"""
+    """比较 Predictor prior 与 IK，生成可解释的逐关节修正条件。"""
 
     cfg = config
     batch_size = initial_pose_raw.shape[0]
@@ -123,7 +123,7 @@ def build_current_realtime_pose_conditions(
     tracker_scale: torch.Tensor | None,
     config: IKInpaintingConfig,
 ) -> tuple[RealtimePoseIKResult, RealtimePoseInpaintingCondition, torch.Tensor]:
-    """由 Predictor current 与当前 Tracker 构造 IK、门控和 Tracker K/V 几何。"""
+    """由 Predictor current 与当前 Tracker 构造 IK、修正条件和 Tracker K/V 几何。"""
 
     ik_result = build_current_ik(
         initial_pose_raw=initial_pose_raw,
@@ -174,23 +174,6 @@ def build_tracker_geometry_condition(
     available = current_tracker_raw[..., TRACKER_AVAILABLE_OFFSET] > 0.5
     geometry = torch.where(available[..., None], geometry, torch.zeros_like(geometry))
     return geometry
-
-
-def gate_realtime_pose_residual(
-    residual: torch.Tensor,
-    denoise_strength: torch.Tensor,
-) -> torch.Tensor:
-    """把 `[B,24]` 门控广播到 normalized rotation6D residual。"""
-
-    batch_size = residual.shape[0]
-    if tuple(residual.shape) != (batch_size, REALTIME_POSE_TARGET_DIM):
-        raise ValueError("residual 必须为 [B,144]。")
-    if tuple(denoise_strength.shape) != (batch_size, SMPL_JOINT_COUNT):
-        raise ValueError("denoise_strength 必须为 [B,24]。")
-    return (
-        residual.reshape(batch_size, SMPL_JOINT_COUNT, ROTATION_6D_DIM)
-        * denoise_strength.to(residual)[..., None]
-    ).reshape_as(residual)
 
 
 def _normalize_pose(

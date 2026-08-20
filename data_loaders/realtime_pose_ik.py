@@ -198,7 +198,9 @@ def build_current_ik(
         (_LEFT_LEG_CHAIN, LEFT_FOOT_TRACKER_INDEX),
         (_RIGHT_LEG_CHAIN, RIGHT_FOOT_TRACKER_INDEX),
     ):
-        active = tracker_valid[:, HIP_TRACKER_INDEX] & tracker_valid[:, tracker_index]
+        # 缺少 Hip 时，骨架已经由 Head 对齐到 Predictor 的骨盆位置；Foot 本身即可
+        # 提供腿链末端目标，不必丢弃这条新增 Tracker 约束。
+        active = tracker_valid[:, tracker_index]
         solved = solve_fabrik_chain(
             joints[:, chain],
             tracker_positions[:, tracker_index],
@@ -237,12 +239,12 @@ def build_current_ik(
         (
             _LEFT_LEG_CHAIN,
             LEFT_FOOT_TRACKER_INDEX,
-            tracker_valid[:, HIP_TRACKER_INDEX] & tracker_valid[:, LEFT_FOOT_TRACKER_INDEX],
+            tracker_valid[:, LEFT_FOOT_TRACKER_INDEX],
         ),
         (
             _RIGHT_LEG_CHAIN,
             RIGHT_FOOT_TRACKER_INDEX,
-            tracker_valid[:, HIP_TRACKER_INDEX] & tracker_valid[:, RIGHT_FOOT_TRACKER_INDEX],
+            tracker_valid[:, RIGHT_FOOT_TRACKER_INDEX],
         ),
     ):
         chain_points = final_joints[:, chain]
@@ -333,14 +335,8 @@ def build_ik_joint_source_reliability(
         (_TORSO_CHAIN, torch.minimum(source[:, HEAD_TRACKER_INDEX], source[:, HIP_TRACKER_INDEX])),
         (_LEFT_ARM_CHAIN, source[:, LEFT_HAND_TRACKER_INDEX]),
         (_RIGHT_ARM_CHAIN, source[:, RIGHT_HAND_TRACKER_INDEX]),
-        (
-            _LEFT_LEG_CHAIN,
-            torch.minimum(source[:, HIP_TRACKER_INDEX], source[:, LEFT_FOOT_TRACKER_INDEX]),
-        ),
-        (
-            _RIGHT_LEG_CHAIN,
-            torch.minimum(source[:, HIP_TRACKER_INDEX], source[:, RIGHT_FOOT_TRACKER_INDEX]),
-        ),
+        (_LEFT_LEG_CHAIN, source[:, LEFT_FOOT_TRACKER_INDEX]),
+        (_RIGHT_LEG_CHAIN, source[:, RIGHT_FOOT_TRACKER_INDEX]),
     )
     for chain, chain_source in chain_sources:
         for joint_index in chain[:-1]:

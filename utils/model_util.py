@@ -69,8 +69,7 @@ def load_realtime_pose_predictor(
     checkpoint = Path(checkpoint_path).resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Predictor checkpoint 不存在：{checkpoint}")
-    args_path = checkpoint.with_name("args.json")
-    values = json.loads(args_path.read_text(encoding="utf-8")) if args_path.is_file() else {}
+    values = load_realtime_pose_predictor_architecture(checkpoint)
     model = RealtimePosePredictor(
         latent_dim=int(values.get("latent_dim", 512)),
         num_layers=int(values.get("layers", 4)),
@@ -82,3 +81,21 @@ def load_realtime_pose_predictor(
         torch.load(checkpoint, map_location=device, weights_only=True)
     )
     return model.eval().requires_grad_(False)
+
+
+def load_realtime_pose_predictor_architecture(
+    checkpoint_path: str | Path,
+) -> dict[str, int | float]:
+    """读取 Predictor 结构；联合 checkpoint 在同一 args.json 中使用独立命名空间。"""
+
+    checkpoint = Path(checkpoint_path).resolve()
+    args_path = checkpoint.with_name("args.json")
+    values = json.loads(args_path.read_text(encoding="utf-8")) if args_path.is_file() else {}
+    architecture = values.get("predictor_architecture", values)
+    return {
+        "latent_dim": int(architecture.get("latent_dim", 512)),
+        "layers": int(architecture.get("layers", 4)),
+        "heads": int(architecture.get("heads", 4)),
+        "feedforward_dim": int(architecture.get("feedforward_dim", 1024)),
+        "dropout": float(architecture.get("dropout", 0.1)),
+    }

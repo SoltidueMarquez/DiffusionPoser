@@ -44,6 +44,67 @@ def train_args(argv: list[str] | None = None):
     return apply_ik_calibration(build_train_arg_parser().parse_args(argv))
 
 
+def build_joint_finetune_arg_parser() -> ArgumentParser:
+    parser = ArgumentParser(description="联合微调 realtime pose Predictor 与 DiT。")
+    add_base_options(parser)
+    add_data_options(parser)
+    add_model_options(parser)
+    add_diffusion_options(parser)
+    add_ik_inpainting_options(parser)
+    add_training_options(parser)
+    group = parser.add_argument_group("joint finetuning")
+    group.add_argument("--dit_model_path", required=True)
+    group.add_argument("--predictor_lr", default=1e-6, type=float)
+    group.add_argument("--predictor_loss_weight", default=1.0, type=float)
+    parser.set_defaults(
+        lr=1e-5,
+        num_steps=20_000,
+        save_interval=1_000,
+        run_name="joint_finetune",
+    )
+    return parser
+
+
+def joint_finetune_args(argv: list[str] | None = None):
+    parser = build_joint_finetune_arg_parser()
+    # 只继承 DiT 的结构、扩散和 loss 契约；联合阶段自己的数据路径、学习率和
+    # 运行长度必须由本次命令决定，不能被上一阶段的 args.json 覆盖。
+    args = parse_and_load_from_model(
+        parser,
+        argv,
+        ignore_keys={
+            "cuda",
+            "device",
+            "seed",
+            "batch_size",
+            "precision",
+            "data_dir",
+            "data_split",
+            "normalizer_dir",
+            "normalize_input",
+            "num_workers",
+            "save_dir",
+            "run_name",
+            "overwrite",
+            "train_platform_type",
+            "lr",
+            "weight_decay",
+            "log_interval",
+            "save_interval",
+            "num_steps",
+            "resume_checkpoint",
+            "gradient_clip",
+            "eval_during_training",
+            "eval_split",
+            "eval_num_batches",
+            "predictor_lr",
+            "predictor_loss_weight",
+        },
+    )
+    args.joint_finetune = True
+    return args
+
+
 def apply_ik_calibration(args):
     calibration = str(getattr(args, "ik_calibration_path", "") or "").strip()
     if not calibration:

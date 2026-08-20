@@ -55,12 +55,12 @@ def test_ik_initializes_from_predictor_current_and_core_trackers_solve_arms():
     )
 
 
-def test_foot_without_hip_is_direct_condition_but_does_not_run_leg_fabrik():
+def test_foot_without_hip_runs_leg_fabrik_from_predictor_root():
     initial, tracker, offsets = _inputs((False, True, False))
     result = build_current_ik(initial, tracker, offsets, _config())
     assert result.direct_rotation_mask[0, JOINT_INDEX["left_foot"]]
-    assert not result.updated_mask[0, JOINT_INDEX["left_knee"]]
-    assert tracker[0, 4, 9] == 1
+    assert result.updated_mask[0, JOINT_INDEX["left_knee"]]
+    assert result.confidence[0, JOINT_INDEX["left_knee"]] > 0
 
 
 def test_projection_overwrites_available_and_preserves_absent_tracker_joint():

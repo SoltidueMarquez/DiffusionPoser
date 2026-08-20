@@ -134,7 +134,7 @@ class CurrentDiTBlock(nn.Module):
 
 
 class RealtimePoseCurrentDiT(nn.Module):
-    """以 Predictor 为 prior，去噪当前 144D 门控 residual。"""
+    """以 Predictor 为 prior，去噪当前 144D 完整 residual。"""
 
     def __init__(
         self,
@@ -197,7 +197,7 @@ class RealtimePoseCurrentDiT(nn.Module):
             torch.tensor(CURRENT_DIT_CONTEXT_OFFSETS, dtype=torch.float32),
             persistent=False,
         )
-        # 门控 residual 的零输出严格等于 Predictor prior，因此输出头始终零初始化。
+        # 零初始化保证训练开始时 residual 为零，即最终姿态等于 Predictor prior。
         nn.init.zeros_(self.joint_output.weight)
         nn.init.zeros_(self.joint_output.bias)
 
@@ -379,7 +379,6 @@ class RealtimePoseCurrentDiT(nn.Module):
                 diffusion_time,
             )
         current = self.output_norm(current)
-        raw_output = self.joint_output(current)
-        return (
-            raw_output * prepared_conditioning.denoise_strength.to(raw_output)[..., None]
-        ).reshape(batch_size, REALTIME_POSE_TARGET_DIM)
+        return self.joint_output(current).reshape(
+            batch_size, REALTIME_POSE_TARGET_DIM
+        )

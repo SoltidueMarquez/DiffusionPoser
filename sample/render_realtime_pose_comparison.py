@@ -101,6 +101,31 @@ def follow_axis_limits(
     )
 
 
+def follow_multi_axis_limits(
+    joint_frames: list[np.ndarray],
+    tracker_frame: np.ndarray | None,
+    local_radius: float,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """让多路骨架共用同一个局部相机，避免不同面板的缩放造成错觉。"""
+
+    points = [
+        np.asarray(frame, dtype=np.float32).reshape(-1, 3)
+        for frame in joint_frames
+    ]
+    if tracker_frame is not None:
+        points.append(np.asarray(tracker_frame, dtype=np.float32).reshape(-1, 3))
+    stacked = np.concatenate(points, axis=0)
+    mins = np.nanmin(stacked, axis=0)
+    maxs = np.nanmax(stacked, axis=0)
+    center = (mins + maxs) * 0.5
+    radius = max(float(local_radius), float(np.max(maxs - mins) * 0.75))
+    return (
+        (float(center[0] - radius), float(center[0] + radius)),
+        (float(max(0.0, center[1] - radius)), float(center[1] + radius)),
+        (float(center[2] - radius), float(center[2] + radius)),
+    )
+
+
 def draw_skeleton(ax, joints: np.ndarray, color: str, label: str) -> None:
     joints = np.asarray(joints, dtype=np.float32)
     for joint_index, parent_index in enumerate(SMPL_PARENTS.tolist()):
@@ -122,6 +147,18 @@ def draw_trackers(ax, tracker_pos: np.ndarray, sensor_valid: np.ndarray) -> None
     if visible.size == 0:
         return
     ax.scatter(visible[:, 0], visible[:, 2], visible[:, 1], color="#f59e0b", marker="o", s=24, depthshade=False)
+
+
+def mean_joint_speed(joints: np.ndarray, fps: float) -> np.ndarray:
+    """计算每帧 24 个关节的平均世界速度，供视频中观察速度峰值是否被抹平。"""
+
+    value = np.asarray(joints, dtype=np.float32)
+    if value.ndim != 3 or value.shape[1:] != (24, 3):
+        raise ValueError(f"joints 应为 [T,24,3]，实际为 {value.shape}")
+    speed = np.zeros((value.shape[0],), dtype=np.float32)
+    if value.shape[0] > 1:
+        speed[1:] = np.linalg.norm(np.diff(value, axis=0), axis=-1).mean(axis=-1) * float(fps)
+    return speed
 
 
 def figure_to_rgb(fig) -> np.ndarray:
@@ -346,6 +383,155 @@ def render_realtime_pose_comparison(
             frame_rgb = figure_to_rgb(fig)
             if writer is None:
                 writer = Mp4FrameWriter(output_path=output_path, frame_rgb=frame_rgb, fps=int(fps))
+            writer.append(frame_rgb)
+            plt.close(fig)
+    finally:
+        if writer is not None:
+            writer.close()
+    return output_path
+
+
+def render_realtime_pose_four_way_comparison(
+    output_path: Path,
+    reference_joints: np.ndarray,
+    predictor_joints: np.ndarray,
+    core_only_joints: np.ndarray,
+    all_six_joints: np.ndarray,
+    tracker_pos_world: np.ndarray,
+    fps: int = 30,
+    stride: int = 1,
+    camera_mode: str = "follow",
+    local_radius: float = 1.25,
+    frame_offset: int = 0,
+) -> Path:
+    """渲染 GT、Predictor、core-only DiT 与 all-six DiT 的同步四路视频。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    methods = {
+        "GT": as_unbatched(np.asarray(reference_joints), "reference_joints", 3),
+        "Predictor-only": as_unbatched(
+            np.asarray(predictor_joints), "predictor_joints", 3
+        ),
+        "DiT core-only": as_unbatched(
+            np.asarray(core_only_joints), "core_only_joints", 3
+        ),
+        "DiT all-six": as_unbatched(
+            np.asarray(all_six_joints), "all_six_joints", 3
+        ),
+    }
+    reference = methods["GT"]
+    for name, joints in methods.items():
+        if joints.shape != reference.shape or joints.shape[1:] != (24, 3):
+            raise ValueError(
+                f"四路 joints 必须同为 [T,24,3]，{name}={joints.shape}，"
+                f"GT={reference.shape}"
+            )
+    trackers = as_unbatched(
+        np.asarray(tracker_pos_world), "tracker_pos_world", 3
+    )
+    if trackers.shape != (reference.shape[0], TRACKER_COUNT, 3):
+        raise ValueError(
+            f"tracker_pos_world 应为 [T,{TRACKER_COUNT},3]，实际为 {trackers.shape}"
+        )
+    if camera_mode not in {"global", "follow"}:
+        raise ValueError(f"camera_mode 必须是 global/follow，实际为 {camera_mode}")
+
+    colors = {
+        "GT": "#2563eb",
+        "Predictor-only": "#6b7280",
+        "DiT core-only": "#dc2626",
+        "DiT all-six": "#16a34a",
+    }
+    tracker_masks = {
+        "GT": np.zeros((TRACKER_COUNT,), dtype=bool),
+        "Predictor-only": np.asarray([True, True, True, False, False, False]),
+        "DiT core-only": np.asarray([True, True, True, False, False, False]),
+        "DiT all-six": np.ones((TRACKER_COUNT,), dtype=bool),
+    }
+    speeds = {
+        name: mean_joint_speed(joints, fps=float(fps))
+        for name, joints in methods.items()
+    }
+    seconds = np.arange(reference.shape[0], dtype=np.float32) / float(fps)
+    max_speed = max(float(np.max(speed)) for speed in speeds.values())
+    global_axis_limits = fixed_axis_limits(*methods.values(), trackers)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer: Mp4FrameWriter | None = None
+    try:
+        for frame_index in range(0, reference.shape[0], max(1, int(stride))):
+            joint_frames = [joints[frame_index] for joints in methods.values()]
+            axis_limits = (
+                global_axis_limits
+                if camera_mode == "global"
+                else follow_multi_axis_limits(
+                    joint_frames=joint_frames,
+                    tracker_frame=trackers[frame_index],
+                    local_radius=float(local_radius),
+                )
+            )
+            fig = plt.figure(figsize=(14.4, 7.2), dpi=100)
+            grid = fig.add_gridspec(2, 4, height_ratios=(4.0, 1.25))
+            for column, (name, joints) in enumerate(methods.items()):
+                ax = fig.add_subplot(grid[0, column], projection="3d")
+                draw_skeleton(
+                    ax,
+                    joints[frame_index],
+                    color=colors[name],
+                    label=name,
+                )
+                draw_trackers(
+                    ax,
+                    trackers[frame_index],
+                    tracker_masks[name],
+                )
+                set_axes_equal(ax, axis_limits)
+                if name == "GT":
+                    ax.set_title(name)
+                else:
+                    mpjpe_cm = float(
+                        np.linalg.norm(
+                            joints[frame_index] - reference[frame_index], axis=-1
+                        ).mean()
+                        * 100.0
+                    )
+                    ax.set_title(f"{name}\nMPJPE={mpjpe_cm:.2f} cm")
+
+            speed_ax = fig.add_subplot(grid[1, :])
+            for name, speed in speeds.items():
+                speed_ax.plot(
+                    seconds,
+                    speed,
+                    color=colors[name],
+                    linewidth=1.3,
+                    label=name,
+                )
+            speed_ax.axvline(
+                seconds[frame_index], color="#111827", linewidth=1.0, alpha=0.75
+            )
+            speed_ax.set_xlim(0.0, max(float(seconds[-1]), 1.0 / float(fps)))
+            speed_ax.set_ylim(0.0, max(max_speed * 1.05, 0.1))
+            speed_ax.set_xlabel("Time (s)")
+            speed_ax.set_ylabel("Mean joint speed (m/s)")
+            speed_ax.grid(alpha=0.2)
+            speed_ax.legend(loc="upper right", ncol=4, fontsize=8)
+            fig.suptitle(
+                f"source_frame={int(frame_offset) + frame_index}  "
+                f"time={seconds[frame_index]:.2f}s",
+                fontsize=11,
+            )
+            fig.tight_layout()
+            frame_rgb = figure_to_rgb(fig)
+            if writer is None:
+                writer = Mp4FrameWriter(
+                    output_path=output_path,
+                    frame_rgb=frame_rgb,
+                    fps=int(fps),
+                )
             writer.append(frame_rgb)
             plt.close(fig)
     finally:
