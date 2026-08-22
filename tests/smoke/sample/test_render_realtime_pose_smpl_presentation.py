@@ -1,6 +1,6 @@
 import numpy as np
 
-from sample.render_realtime_pose_smpl_comparison import METHOD_ORDER, SmplMeshSequence
+from sample.realtime_pose_smpl_rendering import METHOD_ORDER, SmplMeshSequence
 from sample.render_realtime_pose_smpl_presentation import (
     INTRO_FRAME_COUNT,
     METHOD_GAP_METERS,

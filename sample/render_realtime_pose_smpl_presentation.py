@@ -12,8 +12,7 @@ from PIL import Image, ImageDraw
 
 from data_loaders.realtime_pose_kinematics import JOINT_INDEX
 from eval.realtime_pose_metrics import compute_rpm_p2_mc_metrics
-from sample.render_realtime_pose_comparison import Mp4FrameWriter
-from sample.render_realtime_pose_smpl_comparison import (
+from sample.realtime_pose_smpl_rendering import (
     CameraSpec,
     METHOD_ORDER,
     SmplMeshSequence,
@@ -29,6 +28,7 @@ from sample.render_realtime_pose_smpl_comparison import (
     load_font,
     normalize_vector,
 )
+from utils.video_io import Mp4FrameWriter
 
 
 OUTPUT_WIDTH = 1920
