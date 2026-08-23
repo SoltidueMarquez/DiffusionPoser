@@ -4,9 +4,10 @@ from sample.realtime_pose_smpl_rendering import METHOD_ORDER, SmplMeshSequence
 from sample.render_realtime_pose_smpl_presentation import (
     INTRO_FRAME_COUNT,
     METHOD_GAP_METERS,
-    build_intro_tracker_points,
+    build_method_tracker_points,
     build_presentation_frame_schedule,
     build_presentation_layout,
+    build_visible_tracker_glyph_points,
 )
 
 
@@ -109,16 +110,33 @@ def test_shared_stage_offsets_camera_follow_and_frustum():
     assert projected_intervals[1][0] - projected_intervals[0][1] >= METHOD_GAP_METERS - 1e-6
     assert projected_intervals[2][0] - projected_intervals[1][1] >= METHOD_GAP_METERS - 1e-6
 
-    # 开场的两份 tracker 去除各自展示偏移后必须逐点完全相同。
-    intro_trackers = build_intro_tracker_points(
+    # 两路全程使用同一组 tracker，去除展示偏移后必须逐点完全相同。
+    method_trackers = build_method_tracker_points(
         trackers[0, :3],
         layout.method_offsets,
     )
     np.testing.assert_allclose(
-        intro_trackers[0] - layout.method_offsets[1],
-        intro_trackers[1] - layout.method_offsets[2],
+        method_trackers[0] - layout.method_offsets[1],
+        method_trackers[1] - layout.method_offsets[2],
         atol=1e-7,
     )
+
+    # 图标只沿观察射线前移，保证被网格遮挡时仍保持原投影位置。
+    visible_trackers = build_visible_tracker_glyph_points(
+        method_trackers,
+        layout.camera_poses[0, :3, 3],
+    )
+    original_ndc, _ = project_to_ndc(
+        method_trackers.reshape(-1, 3),
+        layout.camera_poses[0],
+        layout.base_camera.yfov,
+    )
+    visible_ndc, _ = project_to_ndc(
+        visible_trackers.reshape(-1, 3),
+        layout.camera_poses[0],
+        layout.base_camera.yfov,
+    )
+    np.testing.assert_allclose(visible_ndc, original_ndc, atol=1e-6)
 
     # 展示偏移不能污染调用方持有的原始模型结果。
     for method_name in METHOD_ORDER:
@@ -180,7 +198,7 @@ def test_presentation_schedule_has_exact_intro_normal_and_replay_mapping():
     )
     normal = schedule[INTRO_FRAME_COUNT : INTRO_FRAME_COUNT + 60]
     assert [frame.source_frame_index for frame in normal] == list(range(60))
-    assert all(not frame.show_trackers and frame.playback_label == "1.0×" for frame in normal)
+    assert all(frame.show_trackers and frame.playback_label == "1.0×" for frame in normal)
     replay = schedule[INTRO_FRAME_COUNT + 60 :]
     assert [frame.source_frame_index for frame in replay] == [
         frame_index
@@ -188,6 +206,6 @@ def test_presentation_schedule_has_exact_intro_normal_and_replay_mapping():
         for _ in range(2)
     ]
     assert all(
-        not frame.show_trackers and frame.playback_label == "0.5× replay"
+        frame.show_trackers and frame.playback_label == "0.5× replay"
         for frame in replay
     )

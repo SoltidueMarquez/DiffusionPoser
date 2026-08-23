@@ -52,6 +52,7 @@ METHOD_LABELS = {
     "+ Diffusion": "+ Diffusion (same 3 trackers)",
 }
 TRACKER_COLOR = (1.0, 0.55, 0.05, 1.0)
+TRACKER_CAMERA_OFFSET = 0.12
 CHEST_MARKER_COLOR = (1.0, 0.88, 0.18, 1.0)
 LEFT_FOOT_COLOR = (0.05, 0.82, 0.92, 1.0)
 RIGHT_FOOT_COLOR = (0.86, 0.24, 0.78, 1.0)
@@ -61,7 +62,7 @@ RIGHT_FOOT_COLOR = (0.86, 0.24, 0.78, 1.0)
 class PresentationLayout:
     """共享舞台的固定几何关系；所有数组均使用项目 Unity/y-up 坐标。"""
 
-    method_offsets: np.ndarray  # [3,3]，仅用于展示，不参与指标
+    method_offsets: np.ndarray  # [M,3]，仅用于展示，不参与指标
     follow_offsets: np.ndarray  # [T,3]，只包含 GT pelvis 的 XZ 平移
     base_camera: CameraSpec
     camera_poses: np.ndarray  # [T,4,4]，旋转、距离与高度恒定
@@ -135,23 +136,34 @@ def presentation_view_direction_unity() -> np.ndarray:
 
 def validate_mesh_sequences(
     sequences: dict[str, SmplMeshSequence],
+    method_order: tuple[str, ...] = METHOD_ORDER,
 ) -> tuple[int, int]:
-    """校验三路网格契约，并返回 ``(frame_count, vertex_count)``。"""
+    """校验共享舞台网格契约，并返回 ``(frame_count, vertex_count)``。"""
 
-    if tuple(sequences.keys()) != METHOD_ORDER:
+    methods = tuple(method_order)
+    if not methods:
+        raise ValueError("method_order 不能为空。")
+    if tuple(sequences.keys()) != methods:
         raise ValueError(
-            f"sequences 必须按 {METHOD_ORDER} 排列，实际为 {tuple(sequences.keys())}"
+            f"sequences 必须按 {methods} 排列，实际为 {tuple(sequences.keys())}"
         )
-    reference = sequences["GT"]
+    reference_name = methods[0]
+    reference = sequences[reference_name]
     vertices = np.asarray(reference.vertices_world)
     joints = np.asarray(reference.joints_world)
     if vertices.ndim != 3 or vertices.shape[-1] != 3:
-        raise ValueError(f"GT vertices_world 应为 [T,V,3]，实际为 {vertices.shape}")
+        raise ValueError(
+            f"{reference_name} vertices_world 应为 [T,V,3]，"
+            f"实际为 {vertices.shape}"
+        )
     if joints.ndim != 3 or joints.shape[0] != vertices.shape[0] or joints.shape[-1] != 3:
-        raise ValueError(f"GT joints_world 应为 [T,J,3]，实际为 {joints.shape}")
+        raise ValueError(
+            f"{reference_name} joints_world 应为 [T,J,3]，"
+            f"实际为 {joints.shape}"
+        )
     expected_vertices = vertices.shape
     expected_joints = joints.shape
-    for method_name in METHOD_ORDER:
+    for method_name in methods:
         sequence = sequences[method_name]
         method_vertices = np.asarray(sequence.vertices_world)
         method_joints = np.asarray(sequence.joints_world)
@@ -187,20 +199,20 @@ def build_presentation_frame_schedule(
         PresentationFrame(0, "Input setup", True) for _ in range(intro_count)
     )
     frames.extend(
-        PresentationFrame(frame_index, "1.0×", False)
+        PresentationFrame(frame_index, "1.0×", True)
         for frame_index in range(count)
     )
     for frame_index in range(count):
         frames.extend(
             (
-                PresentationFrame(frame_index, "0.5× replay", False),
-                PresentationFrame(frame_index, "0.5× replay", False),
+                PresentationFrame(frame_index, "0.5× replay", True),
+                PresentationFrame(frame_index, "0.5× replay", True),
             )
         )
     return tuple(frames)
 
 
-def build_intro_tracker_points(
+def build_method_tracker_points(
     core_tracker_frame: np.ndarray,
     method_offsets: np.ndarray,
 ) -> np.ndarray:
@@ -224,16 +236,47 @@ def build_intro_tracker_points(
     ).astype(np.float32)
 
 
+def build_visible_tracker_glyph_points(
+    tracker_points: np.ndarray,
+    camera_position: np.ndarray,
+    *,
+    camera_offset: float = TRACKER_CAMERA_OFFSET,
+) -> np.ndarray:
+    """沿观察射线把 tracker 图标前移，避免 Head 点被头部网格完全遮挡。
+
+    前移不改变透视投影位置，也不回写 tracker 数据或指标输入。
+    """
+
+    points = np.asarray(tracker_points, dtype=np.float64)
+    camera = np.asarray(camera_position, dtype=np.float64)
+    if points.ndim < 2 or points.shape[-1] != 3:
+        raise ValueError(f"tracker_points 末维应为 3，实际为 {points.shape}")
+    if camera.shape != (3,):
+        raise ValueError(f"camera_position 应为 [3]，实际为 {camera.shape}")
+    if not (np.isfinite(points).all() and np.isfinite(camera).all()):
+        raise ValueError("tracker_points/camera_position 含 NaN/Inf。")
+    offset = float(camera_offset)
+    if offset < 0.0:
+        raise ValueError("camera_offset 不能为负数。")
+    camera_rays = camera - points
+    ray_lengths = np.linalg.norm(camera_rays, axis=-1, keepdims=True)
+    if np.any(ray_lengths <= 1e-8):
+        raise ValueError("tracker 不能与相机位置重合。")
+    return (points + camera_rays / ray_lengths * offset).astype(np.float32)
+
+
 def build_stage_method_offsets(
     *,
     sequences: dict[str, SmplMeshSequence],
     follow_offsets: np.ndarray,
     camera_right: np.ndarray,
     method_gap: float = METHOD_GAP_METERS,
+    method_order: tuple[str, ...] = METHOD_ORDER,
 ) -> tuple[np.ndarray, float]:
-    """沿相机右轴横向排列三路，并保证整段投影包围盒至少留出固定间隔。"""
+    """沿相机右轴横向排列各路，并保证整段投影包围盒留出间隔。"""
 
-    frame_count, _ = validate_mesh_sequences(sequences)
+    methods = tuple(method_order)
+    frame_count, _ = validate_mesh_sequences(sequences, methods)
     follow = np.asarray(follow_offsets, dtype=np.float64)
     if follow.shape != (frame_count, 3):
         raise ValueError(
@@ -246,7 +289,7 @@ def build_stage_method_offsets(
 
     scalar_min = math.inf
     scalar_max = -math.inf
-    for method_name in METHOD_ORDER:
+    for method_name in methods:
         # [T,V,3] 减去只含 XZ 的 pelvis 跟随量；因此起跳高度和方法间差异都保留。
         centered = (
             np.asarray(sequences[method_name].vertices_world, dtype=np.float64)
@@ -256,8 +299,11 @@ def build_stage_method_offsets(
         scalar_min = min(scalar_min, float(np.min(scalar)))
         scalar_max = max(scalar_max, float(np.max(scalar)))
     stage_spacing = max(float(scalar_max - scalar_min) + gap, gap + 0.25)
+    centered_indices = np.arange(len(methods), dtype=np.float64) - (
+        len(methods) - 1
+    ) * 0.5
     method_offsets = (
-        np.asarray([-1.0, 0.0, 1.0], dtype=np.float64)[:, None]
+        centered_indices[:, None]
         * right[None, :]
         * stage_spacing
     )
@@ -273,38 +319,57 @@ def fit_fixed_presentation_camera(
     viewport_width: int = OUTPUT_WIDTH,
     viewport_height: int = OUTPUT_HEIGHT,
     padding: float = CAMERA_FIT_PADDING,
+    method_order: tuple[str, ...] = METHOD_ORDER,
+    tracker_available_by_method: np.ndarray | None = None,
 ) -> CameraSpec:
     """在 pelvis 局部移动坐标中一次性拟合相机，后续禁止逐帧缩放。"""
 
-    frame_count, _ = validate_mesh_sequences(sequences)
+    methods = tuple(method_order)
+    frame_count, _ = validate_mesh_sequences(sequences, methods)
     follow = np.asarray(follow_offsets, dtype=np.float64)
     offsets = np.asarray(method_offsets, dtype=np.float64)
     trackers = np.asarray(tracker_pos_world, dtype=np.float64)
     if follow.shape != (frame_count, 3):
         raise ValueError(f"follow_offsets 应为 {(frame_count, 3)}，实际为 {follow.shape}")
-    if offsets.shape != (len(METHOD_ORDER), 3):
-        raise ValueError(f"method_offsets 应为 [3,3]，实际为 {offsets.shape}")
+    if offsets.shape != (len(methods), 3):
+        raise ValueError(
+            f"method_offsets 应为 {(len(methods), 3)}，实际为 {offsets.shape}"
+        )
     if trackers.shape != (frame_count, 6, 3):
         raise ValueError(f"tracker_pos_world 应为 {(frame_count, 6, 3)}，实际为 {trackers.shape}")
     if int(viewport_width) <= 0 or int(viewport_height) <= 0:
         raise ValueError("viewport_width/viewport_height 必须为正数。")
 
+    if tracker_available_by_method is None:
+        tracker_masks = np.zeros((len(methods), 6), dtype=bool)
+        # 旧三路 Demo 中 GT 不显示 tracker，其他两路显示三点。
+        if methods == METHOD_ORDER:
+            tracker_masks[1:, :CORE_TRACKER_COUNT] = True
+    else:
+        tracker_masks = np.asarray(tracker_available_by_method, dtype=bool)
+        if tracker_masks.shape != (len(methods), 6):
+            raise ValueError(
+                "tracker_available_by_method 应为 "
+                f"{(len(methods), 6)}，实际为 {tracker_masks.shape}"
+            )
+
     stage_parts = []
-    for method_index, method_name in enumerate(METHOD_ORDER):
+    for method_index, method_name in enumerate(methods):
         centered_vertices = (
             np.asarray(sequences[method_name].vertices_world, dtype=np.float64)
             - follow[:, None, :]
             + offsets[method_index]
         )
         stage_parts.append(centered_vertices.reshape(-1, 3))
-    # 开场会在 Predictor 和 Diffusion 两侧各显示同一份三点，因此也必须纳入视锥。
-    centered_core_trackers = trackers[:, :CORE_TRACKER_COUNT] - follow[:, None, :]
-    stage_parts.extend(
-        [
-            (centered_core_trackers + offsets[1]).reshape(-1, 3),
-            (centered_core_trackers + offsets[2]).reshape(-1, 3),
-        ]
-    )
+    # 每路只把实际启用的 tracker 纳入视锥，避免增加无效留白。
+    centered_trackers = trackers - follow[:, None, :]
+    for method_index, tracker_mask in enumerate(tracker_masks):
+        if np.any(tracker_mask):
+            stage_parts.append(
+                (centered_trackers[:, tracker_mask] + offsets[method_index]).reshape(
+                    -1, 3
+                )
+            )
     points = np.concatenate(stage_parts, axis=0)
     if not np.isfinite(points).all():
         raise ValueError("共享舞台点集含 NaN/Inf。")
@@ -379,18 +444,29 @@ def build_presentation_layout(
     *,
     sequences: dict[str, SmplMeshSequence],
     tracker_pos_world: np.ndarray,
+    method_order: tuple[str, ...] = METHOD_ORDER,
+    tracker_available_by_method: np.ndarray | None = None,
+    follow_method_name: str | None = None,
 ) -> PresentationLayout:
-    """构造三路共享舞台、固定尺度透视相机以及整段地面范围。"""
+    """构造共享舞台、固定尺度透视相机以及整段地面范围。"""
 
-    frame_count, _ = validate_mesh_sequences(sequences)
+    methods = tuple(method_order)
+    frame_count, _ = validate_mesh_sequences(sequences, methods)
     trackers = np.asarray(tracker_pos_world, dtype=np.float64)
     if trackers.shape != (frame_count, 6, 3):
         raise ValueError(f"tracker_pos_world 应为 {(frame_count, 6, 3)}，实际为 {trackers.shape}")
     if not np.isfinite(trackers).all():
         raise ValueError("tracker_pos_world 含 NaN/Inf。")
 
+    follow_name = (
+        ("GT" if "GT" in methods else methods[0])
+        if follow_method_name is None
+        else str(follow_method_name)
+    )
+    if follow_name not in methods:
+        raise ValueError(f"follow_method_name={follow_name!r} 不在 {methods} 中。")
     follow_offsets = build_horizontal_pelvis_follow_offsets(
-        sequences["GT"].joints_world
+        sequences[follow_name].joints_world
     ).astype(np.float64)
     provisional_pose = camera_pose_look_at(
         presentation_view_direction_unity(),
@@ -400,18 +476,21 @@ def build_presentation_layout(
         sequences=sequences,
         follow_offsets=follow_offsets,
         camera_right=provisional_pose[:3, 0],
+        method_order=methods,
     )
     base_camera = fit_fixed_presentation_camera(
         sequences=sequences,
         tracker_pos_world=trackers,
         follow_offsets=follow_offsets,
         method_offsets=method_offsets,
+        method_order=methods,
+        tracker_available_by_method=tracker_available_by_method,
     )
     camera_poses = build_follow_camera_poses(base_camera.pose, follow_offsets)
 
     horizontal_mins = np.full((2,), np.inf, dtype=np.float64)
     horizontal_maxs = np.full((2,), -np.inf, dtype=np.float64)
-    for method_index, method_name in enumerate(METHOD_ORDER):
+    for method_index, method_name in enumerate(methods):
         vertices = (
             np.asarray(sequences[method_name].vertices_world, dtype=np.float64)
             + method_offsets[method_index]
@@ -420,7 +499,10 @@ def build_presentation_layout(
         horizontal_mins = np.minimum(horizontal_mins, np.min(horizontal, axis=0))
         horizontal_maxs = np.maximum(horizontal_maxs, np.max(horizontal, axis=0))
     horizontal_center = (horizontal_mins + horizontal_maxs) * 0.5
-    floor_y = float(np.min(sequences["GT"].vertices_world[..., 1]))
+    floor_y = min(
+        float(np.min(sequences[method_name].vertices_world[..., 1]))
+        for method_name in methods
+    )
     grid_center = np.asarray(
         [horizontal_center[0], floor_y, horizontal_center[1]],
         dtype=np.float64,
@@ -648,6 +730,7 @@ def render_presentation_view(
     sequences: dict[str, SmplMeshSequence],
     faces: np.ndarray,
     method_offsets: np.ndarray,
+    camera_pose: np.ndarray,
     show_trackers: bool,
 ) -> np.ndarray:
     """在同一 scene 一次渲染三个人体；展示偏移不回写任何模型结果。"""
@@ -731,9 +814,13 @@ def render_presentation_view(
                 clip.tracker_pos_world[frame_index, :CORE_TRACKER_COUNT],
                 dtype=np.float64,
             )
-            tracker_points = build_intro_tracker_points(
+            tracker_points = build_method_tracker_points(
                 core_trackers,
                 method_offsets,
+            )
+            tracker_points = build_visible_tracker_glyph_points(
+                tracker_points,
+                np.asarray(camera_pose, dtype=np.float64)[:3, 3],
             )
             tracker_cloud = create_sphere_cloud(
                 tracker_points.reshape(-1, 3),
@@ -801,6 +888,7 @@ def render_presentation_video(
             sequences=sequences,
             faces=faces,
             method_offsets=layout.method_offsets,
+            camera_pose=layout.camera_poses[0],
             show_trackers=True,
         )
         intro_frame = compose_presentation_frame(
@@ -829,7 +917,8 @@ def render_presentation_video(
                 sequences=sequences,
                 faces=faces,
                 method_offsets=layout.method_offsets,
-                show_trackers=False,
+                camera_pose=layout.camera_poses[frame_index],
+                show_trackers=True,
             )
             normal_frame = compose_presentation_frame(
                 viewport_rgb=viewport,
