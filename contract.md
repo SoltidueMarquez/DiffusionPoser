@@ -253,6 +253,21 @@ DiT raw 与 DiT deployed 的同组 RPM-P2/MC 指标；全局 Predictor-only 基�
 全部 8 种配置都属于训练分布。`--tracker_configs` 可选择评估子集；正式报告运行
 全部 8 种，并同时报告 Tracker error 与端到端延迟。
 
+动态 Tracker 退化实验由 `sample.evaluate_progressive_tracker_dropout` 独立运行。
+帧 11～29 使用完整六点预热，正式计分区间等分四段，并按指定排列依次移除
+Hip、Left Foot、Right Foot，使当前帧 availability 按 `6→5→4→3` 变化。
+正式实验覆盖三个 optional Tracker 的全部 6 种移除顺序；每种顺序分别对整条拼接
+序列计算 MPJRE、MPJPE、MPJVE 与预测 Jitter，再报告跨顺序均值和总体标准差。
+分阶段指标仅作退化诊断，整条指标保留 Tracker 切换边界的速度与 Jitter。动态报告
+不重复计算静态 6/3 Tracker 或 Predictor-only baseline。
+
+动态 Tracker 添加实验由 `sample.evaluate_progressive_tracker_addition` 独立运行。
+帧 11～29 使用 Head、Left Hand、Right Hand 三点预热，正式计分区间同样等分
+四段，并按指定排列依次添加 Hip、Left Foot、Right Foot，使当前帧 availability
+按 `3→4→5→6` 变化。正式实验覆盖全部 6 种添加顺序；每个 `add_order` 记录
+逆序的 `paired_drop_order`，两条路径经过相同 Tracker mask 集合。整条指标保留
+Tracker 添加边界的速度与 Jitter，报告不读取退化 JSON，也不重复生成静态 baseline。
+
 `predictor_sparse_*` 统计键、`predictor_sparse_mean.pt/std.pt`、模型参数名与
 `predictor_pose_horizon` 都是当前唯一契约。已有 Predictor checkpoint、当前 Task Store
 及 Pose/Tracker normalizer 可直接复用；绝对 Pose diffusion/旧 IK trajectory 条件的

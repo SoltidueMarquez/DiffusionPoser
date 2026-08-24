@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from pathlib import Path
 
 import numpy as np
@@ -12,33 +11,21 @@ from data_loaders.build_realtime_longseq_eval_set import (
     DEFAULT_SOURCE_DIR,
     DEFAULT_SPLIT_DIR,
     read_longseq_source_entries,
-    resolve_source_entry_path,
-)
-from data_loaders.generate_realtime_pose_tasks import (
-    compute_source_joint_rotations_world,
-    load_realtime_source,
 )
 from data_loaders.sensor_masking import (
     REALTIME_POSE_EVAL_METRICS_START_FRAME,
     REALTIME_POSE_FPS,
-    REALTIME_POSE_TARGET_DIM,
     STATIC_OPTIONAL_TRACKER_MASKS,
-    TRACKER_TO_JOINT,
 )
-from data_loaders.realtime_pose_kinematics import rotation_6d_to_matrix_np
 from eval.evaluate_realtime_pose_predictor import (
     PREDICTOR_EVAL_FIRST_GENERATED_FRAME,
-    evaluation_last_frame_exclusive,
     evaluate_predictor_entries,
 )
-from eval.realtime_pose_metrics import (
-    aggregate_rpm_p2_mc_metrics,
-    compute_rpm_p2_mc_metrics,
-)
-from sample.realtime_pose_runtime import (
-    RealtimePoseRuntime,
-    WorldPoseState,
-    decode_and_resolve_pose,
+from sample.realtime_pose_longseq_evaluator import (
+    build_static_tracker_protocol,
+    create_eval_noise_generator,
+    evaluate_longseq_protocol,
+    evaluate_longseq_protocols,
 )
 from sample.utils import load_checkpoint_model
 from utils.fixseed import fixseed
@@ -64,13 +51,6 @@ TRACKER_CONFIG_NAMES = (
     "core_hip_right_foot",
     "all_six",
 )
-
-
-def create_eval_noise_generator(seed: int, device: torch.device) -> torch.Generator:
-    """每个 Tracker 配置从同一 seed 开始，保证逐帧扩散噪声可直接比较。"""
-
-    return torch.Generator(device=device).manual_seed(int(seed))
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -136,22 +116,22 @@ def main(argv: list[str] | None = None) -> dict:
         max_frames=args.max_frames,
     )
     tracker_masks = dict(zip(TRACKER_CONFIG_NAMES, STATIC_OPTIONAL_TRACKER_MASKS))
-    reports = []
-    for config_name in args.tracker_configs:
-        mask = tracker_masks[config_name]
-        reports.append(
-            evaluate_tracker_configuration(
-                config_name=config_name,
-                tracker_available=np.asarray(mask, dtype=bool),
-                entries=entries,
-                predictor=predictor,
-                dit=dit,
-                diffusion=diffusion,
-                device=device,
-                normalizer=normalizer,
-                args=args,
-            )
+    protocols = [
+        build_static_tracker_protocol(
+            config_name, np.asarray(tracker_masks[config_name], dtype=bool)
         )
+        for config_name in args.tracker_configs
+    ]
+    reports = evaluate_longseq_protocols(
+        protocols=protocols,
+        entries=entries,
+        predictor=predictor,
+        dit=dit,
+        diffusion=diffusion,
+        device=device,
+        normalizer=normalizer,
+        args=args,
+    )
     payload = {
         "predictor_model_path": str(Path(args.predictor_model_path).resolve()),
         "dit_model_path": str(Path(args.dit_model_path).resolve()),
@@ -192,184 +172,17 @@ def evaluate_tracker_configuration(
     normalizer,
     args,
 ) -> dict:
-    generated_frame_count = 0
-    frame_count = 0
-    raw_sequence_metrics: list[dict[str, float | None]] = []
-    deployed_sequence_metrics: list[dict[str, float | None]] = []
-    tracker_position_errors: list[float] = []
-    tracker_rotation_errors: list[float] = []
-    runtime_latencies_ms: list[float] = []
-    noise_generator = create_eval_noise_generator(args.seed, device)
-    for entry in entries:
-        source = load_realtime_source(resolve_source_entry_path(entry))
-        world_rotations = compute_source_joint_rotations_world(source)
-        last = evaluation_last_frame_exclusive(
-            len(world_rotations), int(args.max_frames)
-        )
-        if last <= REALTIME_POSE_EVAL_METRICS_START_FRAME:
-            continue
-        scored_raw_rotations: list[np.ndarray] = []
-        scored_deployed_rotations: list[np.ndarray] = []
-        scored_target_rotations: list[np.ndarray] = []
-        scored_raw_positions: list[np.ndarray] = []
-        scored_deployed_positions: list[np.ndarray] = []
-        scored_target_positions: list[np.ndarray] = []
-        pose_history = [
-            WorldPoseState(
-                joint_rotations_world=world_rotations[index],
-                root_yaw_world=float(source["root_yaw"][index]),
-                hip_height=float(source["pelvis_height"][index, 0]),
-                root_position_world=source["root_pos_world"][index],
-            )
-            for index in range(1, 11)
-        ]
-        runtime = RealtimePoseRuntime(
-            predictor,
-            dit,
-            diffusion,
-            device,
-            source["joint_offsets_parent"],
-            source["joint_rest_local_rotations_6d"],
-            normalizer,
-            fabrik_iterations=args.fabrik_iterations,
-            ik_direction_only_quality=args.ik_direction_only_quality,
-            ik_residual_scale=args.ik_residual_scale,
-            ik_position_solved_quality=args.ik_position_solved_quality,
-            ik_gap_low=args.ik_gap_low,
-            ik_gap_high=args.ik_gap_high,
-            ik_direction_support=args.ik_direction_support,
-            ik_untracked_strength=args.ik_untracked_strength,
-        )
-        runtime.initialize_history(
-            pose_history,
-            source["tracker_pos_world"][:11],
-            source["tracker_rot_world_6d"][:11],
-            source["root_pos_world"][:11, 1],
-        )
-        for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
-            previous_root_yaw = runtime.pose_history[-1].root_yaw_world
-            noise = torch.randn(
-                (1, REALTIME_POSE_TARGET_DIM),
-                generator=noise_generator,
-                device=device,
-            )
-            scored = current >= REALTIME_POSE_EVAL_METRICS_START_FRAME
-            if scored and device.type == "cuda":
-                torch.cuda.synchronize(device)
-            started_at = time.perf_counter() if scored else 0.0
-            result = runtime.step(
-                source["tracker_pos_world"][current],
-                source["tracker_rot_world_6d"][current],
-                tracker_available,
-                float(source["root_pos_world"][current, 1]),
-                noise=noise,
-            )
-            generated_frame_count += 1
-            if not scored:
-                continue
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            runtime_latencies_ms.append((time.perf_counter() - started_at) * 1000.0)
-            raw_resolved = decode_and_resolve_pose(
-                result.raw_pred_pose,
-                result.current_tracker_raw,
-                result.current_head_yaw_world,
-                source["tracker_pos_world"][current, 0],
-                float(source["root_pos_world"][current, 1]),
-                source["joint_offsets_parent"],
-                source["joint_rest_local_rotations_6d"],
-                previous_root_yaw,
-            )
-            scored_raw_rotations.append(raw_resolved.joint_rotations_world)
-            scored_deployed_rotations.append(
-                result.resolved_pose.joint_rotations_world
-            )
-            scored_target_rotations.append(world_rotations[current])
-            scored_raw_positions.append(raw_resolved.joints_world)
-            scored_deployed_positions.append(result.resolved_pose.joints_world)
-            scored_target_positions.append(source["joints_world"][current])
-            tracker_indices = np.flatnonzero(tracker_available)
-            joint_indices = np.asarray(TRACKER_TO_JOINT, dtype=np.int64)[
-                tracker_indices
-            ]
-            tracker_position_errors.extend(
-                np.linalg.norm(
-                    result.resolved_pose.joints_world[joint_indices]
-                    - source["tracker_pos_world"][current, tracker_indices],
-                    axis=-1,
-                ).tolist()
-            )
-            predicted_tracker_rotations = result.resolved_pose.joint_rotations_world[
-                joint_indices
-            ]
-            measured_tracker_rotations = rotation_6d_to_matrix_np(
-                source["tracker_rot_world_6d"][current, tracker_indices]
-            )
-            relative = (
-                predicted_tracker_rotations.transpose(0, 2, 1)
-                @ measured_tracker_rotations
-            )
-            cosine = np.clip(
-                (np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5,
-                -1.0,
-                1.0,
-            )
-            tracker_rotation_errors.extend(np.arccos(cosine).tolist())
-            frame_count += 1
-        if scored_target_rotations:
-            target_rotations = np.stack(scored_target_rotations, axis=0)
-            target_positions = np.stack(scored_target_positions, axis=0)
-            common = {
-                "target_global_rotations": target_rotations,
-                "target_joint_positions": target_positions,
-                "fps": REALTIME_POSE_FPS,
-            }
-            raw_sequence_metrics.append(
-                compute_rpm_p2_mc_metrics(
-                    predicted_global_rotations=np.stack(
-                        scored_raw_rotations, axis=0
-                    ),
-                    predicted_joint_positions=np.stack(
-                        scored_raw_positions, axis=0
-                    ),
-                    **common,
-                )
-            )
-            deployed_sequence_metrics.append(
-                compute_rpm_p2_mc_metrics(
-                    predicted_global_rotations=np.stack(
-                        scored_deployed_rotations, axis=0
-                    ),
-                    predicted_joint_positions=np.stack(
-                        scored_deployed_positions, axis=0
-                    ),
-                    **common,
-                )
-            )
-    if frame_count <= 0:
-        raise RuntimeError(f"Tracker 配置 {config_name} 没有可计分帧。")
-    report = {
-        "name": config_name,
-        "tracker_available": tracker_available.tolist(),
-        "seen_during_training": True,
-        "generated_frames": generated_frame_count,
-        "evaluated_frames": frame_count,
-        "dit_raw": aggregate_rpm_p2_mc_metrics(raw_sequence_metrics),
-        "dit_deployed": aggregate_rpm_p2_mc_metrics(
-            deployed_sequence_metrics
-        ),
-        "tracker_error": {
-            "position_cm": float(np.mean(tracker_position_errors) * 100.0),
-            "rotation_deg": float(np.degrees(np.mean(tracker_rotation_errors))),
-        },
-        "runtime_latency_ms": {
-            "mean": float(np.mean(runtime_latencies_ms)),
-            "p50": float(np.percentile(runtime_latencies_ms, 50.0)),
-            "p90": float(np.percentile(runtime_latencies_ms, 90.0)),
-        },
-    }
-    print(f"[longseq] {config_name}: {report['dit_deployed']}", flush=True)
-    return report
+    protocol = build_static_tracker_protocol(config_name, tracker_available)
+    return evaluate_longseq_protocol(
+        protocol=protocol,
+        entries=entries,
+        predictor=predictor,
+        dit=dit,
+        diffusion=diffusion,
+        device=device,
+        normalizer=normalizer,
+        args=args,
+    )
 
 
 if __name__ == "__main__":

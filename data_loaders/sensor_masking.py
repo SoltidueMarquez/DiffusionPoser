@@ -165,7 +165,7 @@ def validate_realtime_target(target_start: int, target_length: int) -> None:
 
 
 def validate_tracker_available(available: np.ndarray) -> np.ndarray:
-    """校验静态 Tracker 可用性；核心三点在所有样本中必须存在。"""
+    """校验逐帧或静态 Tracker 可用性；核心三点必须始终存在。"""
 
     values = np.asarray(available, dtype=bool)
     if values.shape[-1] != TRACKER_COUNT:
