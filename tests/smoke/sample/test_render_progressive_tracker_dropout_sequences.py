@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
+from data_loaders.realtime_pose_kinematics import (
+    rotation_6d_forward_up_np,
+    rotation_6d_to_matrix_np,
+)
 from sample.evaluate_progressive_tracker_dropout import (
     OPTIONAL_TRACKER_NAME_TO_INDEX,
     build_equal_quarter_tracker_schedule,
@@ -14,6 +21,9 @@ from sample.render_progressive_tracker_dropout_sequences import (
     ProgressiveSequenceResult,
     build_transition_schedule,
     compute_continuity_diagnostics,
+    interpolate_tracker_measurement,
+    progressive_output_filename,
+    smoothstep_activation_alpha,
     validate_add_order,
     validate_drop_order,
     warmup_tracker_available,
@@ -152,3 +162,40 @@ def test_addition_continuity_diagnostics_reports_added_trackers() -> None:
         "right_foot",
     ]
     assert all(report["transition"] == "addition" for report in reports)
+
+
+def test_tracker_activation_blends_position_and_rotation() -> None:
+    anchor_rotation = np.eye(3, dtype=np.float32)
+    measured_rotation = Rotation.from_euler("y", 90.0, degrees=True).as_matrix()
+
+    position, rotation_6d = interpolate_tracker_measurement(
+        anchor_position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        anchor_rotation=anchor_rotation,
+        measured_position=np.array([2.0, 4.0, 6.0], dtype=np.float32),
+        measured_rotation_6d=rotation_6d_forward_up_np(measured_rotation),
+        alpha=0.5,
+    )
+
+    np.testing.assert_allclose(position, [1.0, 2.0, 3.0], atol=1e-6)
+    expected_rotation = Rotation.from_euler("y", 45.0, degrees=True).as_matrix()
+    np.testing.assert_allclose(
+        rotation_6d_to_matrix_np(rotation_6d), expected_rotation, atol=1e-6
+    )
+
+
+def test_ten_frame_soft_start_uses_smoothstep_and_keeps_separate_filename() -> None:
+    alphas = [smoothstep_activation_alpha(index, 10) for index in range(10)]
+
+    assert alphas[0] == pytest.approx(0.028)
+    assert alphas[-1] == pytest.approx(1.0)
+    assert np.all(np.diff(alphas) > 0.0)
+    assert progressive_output_filename(
+        Path("Transitions/mocap/mazen/c3d/airkick_turntwist180_poses.npz"),
+        direction="addition",
+        activation_blend_frames=10,
+    ).endswith("_progressive_3to6_soft10f.mp4")
+    assert progressive_output_filename(
+        Path("Transitions/mocap/mazen/c3d/airkick_turntwist180_poses.npz"),
+        direction="addition",
+        activation_blend_frames=0,
+    ).endswith("_progressive_3to6.mp4")

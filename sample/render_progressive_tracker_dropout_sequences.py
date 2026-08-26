@@ -10,6 +10,7 @@ import re
 
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy.spatial.transform import Rotation, Slerp
 import torch
 
 from data_converter.amass_smpl_utils import (
@@ -22,6 +23,10 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
 )
+from data_loaders.realtime_pose_kinematics import (
+    rotation_6d_forward_up_np,
+    rotation_6d_to_matrix_np,
+)
 from data_loaders.sensor_masking import (
     ALL_SIX_AVAILABLE,
     CORE_THREE_AVAILABLE,
@@ -29,6 +34,7 @@ from data_loaders.sensor_masking import (
     REALTIME_POSE_FPS,
     REALTIME_POSE_TARGET_DIM,
     TRACKER_NAMES,
+    TRACKER_TO_JOINT,
 )
 from eval.evaluate_realtime_pose_predictor import (
     PREDICTOR_EVAL_FIRST_GENERATED_FRAME,
@@ -105,6 +111,10 @@ class ProgressiveSequenceResult:
     deployed_positions: np.ndarray
     deployed_root_yaw: np.ndarray
     tracker_positions: np.ndarray
+    runtime_tracker_positions: np.ndarray | None = None
+    runtime_tracker_rotations_6d: np.ndarray | None = None
+    tracker_blend_alpha: np.ndarray | None = None
+    activation_blend_frames: int = 0
 
     @property
     def frame_count(self) -> int:
@@ -166,6 +176,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         help="正式计分区间最多渲染多少帧；0 表示整条序列。",
     )
+    protocol.add_argument(
+        "--activation_blend_frames",
+        default=0,
+        type=int,
+        help=(
+            "3→6 中新 Tracker 测量的渐入帧数；位置使用 LERP、旋转使用 SLERP，"
+            "0 保持原来的硬切换。"
+        ),
+    )
     protocol.add_argument("--stride", default=1, type=int)
     protocol.add_argument("--skip_render", default=False, type=str2bool)
     return parser
@@ -216,6 +235,70 @@ def warmup_tracker_available(direction: str) -> np.ndarray:
     raise ValueError(f"direction 必须为 dropout/addition，实际为 {direction}")
 
 
+def smoothstep_activation_alpha(frame_offset: int, frame_count: int) -> float:
+    """返回新 Tracker 第 `frame_offset` 帧的 smoothstep 渐入权重。"""
+
+    if int(frame_count) <= 0:
+        raise ValueError("frame_count 必须为正整数。")
+    if int(frame_offset) < 0:
+        raise ValueError("frame_offset 不能为负数。")
+    unit = float(np.clip((int(frame_offset) + 1) / int(frame_count), 0.0, 1.0))
+    return unit * unit * (3.0 - 2.0 * unit)
+
+
+def interpolate_tracker_measurement(
+    *,
+    anchor_position: np.ndarray,
+    anchor_rotation: np.ndarray,
+    measured_position: np.ndarray,
+    measured_rotation_6d: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """从切换前部署姿态平滑过渡到当前真实 Tracker 测量。"""
+
+    weight = float(alpha)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(f"alpha 必须位于 [0,1]，实际为 {weight}")
+    anchor_position = np.asarray(anchor_position, dtype=np.float64)
+    measured_position = np.asarray(measured_position, dtype=np.float64)
+    anchor_rotation = np.asarray(anchor_rotation, dtype=np.float64)
+    measured_rotation = rotation_6d_to_matrix_np(measured_rotation_6d)
+    if anchor_position.shape != (3,) or measured_position.shape != (3,):
+        raise ValueError(
+            f"Tracker 位置应为 [3]，实际为 {anchor_position.shape}/{measured_position.shape}"
+        )
+    if anchor_rotation.shape != (3, 3) or measured_rotation.shape != (3, 3):
+        raise ValueError(
+            f"Tracker 旋转应为 [3,3]，实际为 {anchor_rotation.shape}/{measured_rotation.shape}"
+        )
+    position = (1.0 - weight) * anchor_position + weight * measured_position
+    key_rotations = Rotation.from_matrix(
+        np.stack([anchor_rotation, measured_rotation], axis=0)
+    )
+    rotation = Slerp([0.0, 1.0], key_rotations)([weight]).as_matrix()[0]
+    return (
+        position.astype(np.float32),
+        rotation_6d_forward_up_np(rotation).astype(np.float32),
+    )
+
+
+def progressive_output_filename(
+    relative_path: Path,
+    *,
+    direction: str,
+    activation_blend_frames: int,
+) -> str:
+    """soft-start 使用独立文件名，避免覆盖原来的硬切换展示。"""
+
+    direction_token = "6to3" if direction == "dropout" else "3to6"
+    blend_frames = int(activation_blend_frames)
+    blend_token = f"_soft{blend_frames}f" if blend_frames > 0 else ""
+    return (
+        f"{sequence_stem(relative_path)}_progressive_"
+        f"{direction_token}{blend_token}.mp4"
+    )
+
+
 def read_scalar_string(payload, key: str) -> str:
     if key not in payload.files:
         raise KeyError(f"source npz 缺少 {key}。")
@@ -259,6 +342,7 @@ def run_progressive_sequence(
 ) -> ProgressiveSequenceResult:
     """严格复用正式评估的预热、等分 schedule、闭环 runtime 和噪声规则。"""
 
+    blend_frames = int(getattr(args, "activation_blend_frames", 0))
     world_rotations = compute_source_joint_rotations_world(source)
     last = evaluation_last_frame_exclusive(len(world_rotations), int(args.max_frames))
     scored_frame_count = last - REALTIME_POSE_EVAL_METRICS_START_FRAME
@@ -299,21 +383,80 @@ def run_progressive_sequence(
     rotations: list[np.ndarray] = []
     positions: list[np.ndarray] = []
     root_yaw: list[float] = []
+    runtime_tracker_positions: list[np.ndarray] = []
+    runtime_tracker_rotations_6d: list[np.ndarray] = []
+    tracker_blend_alpha: list[np.ndarray] = []
     noise_generator = create_eval_noise_generator(args.seed, device)
+    previous_available = np.asarray(warmup_available, dtype=bool).copy()
+    previous_result = None
+    # tracker_index -> (起始帧、切换前部署位置、切换前部署旋转)
+    activation_ramps: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
     for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
         if current < REALTIME_POSE_EVAL_METRICS_START_FRAME:
             frame_tracker_available = warmup_available
         else:
             scored_offset = current - REALTIME_POSE_EVAL_METRICS_START_FRAME
             frame_tracker_available = schedule.tracker_available[scored_offset]
+        frame_tracker_available = np.asarray(frame_tracker_available, dtype=bool)
+        frame_tracker_positions = np.asarray(
+            source["tracker_pos_world"][current], dtype=np.float32
+        ).copy()
+        frame_tracker_rotations_6d = np.asarray(
+            source["tracker_rot_world_6d"][current], dtype=np.float32
+        ).copy()
+        frame_blend_alpha = frame_tracker_available.astype(np.float32)
+
+        newly_added = ~previous_available & frame_tracker_available
+        if blend_frames > 0 and np.any(newly_added):
+            if previous_result is None:
+                raise RuntimeError("Tracker 渐入缺少切换前一帧的部署姿态。")
+            for tracker_index in np.flatnonzero(newly_added).tolist():
+                joint_index = int(TRACKER_TO_JOINT[tracker_index])
+                activation_ramps[tracker_index] = (
+                    current,
+                    np.asarray(
+                        previous_result.resolved_pose.joints_world[joint_index],
+                        dtype=np.float32,
+                    ).copy(),
+                    np.asarray(
+                        previous_result.resolved_pose.joint_rotations_world[joint_index],
+                        dtype=np.float32,
+                    ).copy(),
+                )
+
+        finished_ramps: list[int] = []
+        for tracker_index, (start_frame, anchor_position, anchor_rotation) in (
+            activation_ramps.items()
+        ):
+            if not frame_tracker_available[tracker_index]:
+                finished_ramps.append(tracker_index)
+                continue
+            frame_offset = current - start_frame
+            if frame_offset >= blend_frames:
+                finished_ramps.append(tracker_index)
+                continue
+            alpha = smoothstep_activation_alpha(frame_offset, blend_frames)
+            blended_position, blended_rotation_6d = interpolate_tracker_measurement(
+                anchor_position=anchor_position,
+                anchor_rotation=anchor_rotation,
+                measured_position=frame_tracker_positions[tracker_index],
+                measured_rotation_6d=frame_tracker_rotations_6d[tracker_index],
+                alpha=alpha,
+            )
+            frame_tracker_positions[tracker_index] = blended_position
+            frame_tracker_rotations_6d[tracker_index] = blended_rotation_6d
+            frame_blend_alpha[tracker_index] = alpha
+        for tracker_index in finished_ramps:
+            del activation_ramps[tracker_index]
+
         noise = torch.randn(
             (1, REALTIME_POSE_TARGET_DIM),
             generator=noise_generator,
             device=device,
         )
         result = runtime.step(
-            source["tracker_pos_world"][current],
-            source["tracker_rot_world_6d"][current],
+            frame_tracker_positions,
+            frame_tracker_rotations_6d,
             frame_tracker_available,
             float(source["root_pos_world"][current, 1]),
             noise=noise,
@@ -322,6 +465,11 @@ def run_progressive_sequence(
             rotations.append(result.resolved_pose.joint_rotations_world)
             positions.append(result.resolved_pose.joints_world)
             root_yaw.append(result.resolved_pose.root_yaw_world)
+            runtime_tracker_positions.append(frame_tracker_positions)
+            runtime_tracker_rotations_6d.append(frame_tracker_rotations_6d)
+            tracker_blend_alpha.append(frame_blend_alpha)
+        previous_available = frame_tracker_available.copy()
+        previous_result = result
 
     selected = slice(REALTIME_POSE_EVAL_METRICS_START_FRAME, last)
     return ProgressiveSequenceResult(
@@ -335,6 +483,12 @@ def run_progressive_sequence(
         deployed_positions=np.stack(positions).astype(np.float32),
         deployed_root_yaw=np.asarray(root_yaw, dtype=np.float32),
         tracker_positions=np.asarray(source["tracker_pos_world"][selected], dtype=np.float32),
+        runtime_tracker_positions=np.stack(runtime_tracker_positions).astype(np.float32),
+        runtime_tracker_rotations_6d=np.stack(runtime_tracker_rotations_6d).astype(
+            np.float32
+        ),
+        tracker_blend_alpha=np.stack(tracker_blend_alpha).astype(np.float32),
+        activation_blend_frames=blend_frames,
     )
 
 
@@ -530,6 +684,17 @@ def write_sidecars(
     boundaries = compute_continuity_diagnostics(result, direction=direction)
     npz_path = output_mp4.with_suffix(".npz")
     json_path = output_mp4.with_suffix(".json")
+    runtime_positions = (
+        result.tracker_positions
+        if result.runtime_tracker_positions is None
+        else result.runtime_tracker_positions
+    )
+    runtime_rotations_6d = result.runtime_tracker_rotations_6d
+    blend_alpha = (
+        result.tracker_available.astype(np.float32)
+        if result.tracker_blend_alpha is None
+        else result.tracker_blend_alpha
+    )
     np.savez_compressed(
         npz_path,
         target_rotations_world=result.target_rotations,
@@ -538,6 +703,13 @@ def write_sidecars(
         deployed_joints_world=result.deployed_positions,
         deployed_root_yaw=result.deployed_root_yaw,
         tracker_pos_world=result.tracker_positions,
+        runtime_tracker_pos_world=runtime_positions,
+        runtime_tracker_rot_world_6d=(
+            np.empty((0, 6, 6), dtype=np.float32)
+            if runtime_rotations_6d is None
+            else runtime_rotations_6d
+        ),
+        tracker_blend_alpha=blend_alpha,
         tracker_available=result.tracker_available,
         stage_indices=result.stage_indices,
     )
@@ -559,6 +731,16 @@ def write_sidecars(
         "tracker_counts": [6, 5, 4, 3] if is_dropout else [3, 4, 5, 6],
         "warmup_tracker_count": 6 if is_dropout else 3,
         "stage_policy": "equal_scored_quarters",
+        "activation_blend": {
+            "frames": int(result.activation_blend_frames),
+            "curve": (
+                "smoothstep" if int(result.activation_blend_frames) > 0 else "none"
+            ),
+            "position": "lerp",
+            "rotation": "slerp",
+            "anchor": "previous_deployed_tracker_joint",
+            "tracker_available_remains_binary": True,
+        },
         "predictor_model_path": str(Path(args.predictor_model_path).resolve()),
         "dit_model_path": str(Path(args.dit_model_path).resolve()),
         "dit_weight_source": str(dit_weight_source),
@@ -605,6 +787,8 @@ def compose_frame(
     changed = "none" if stage == 0 else ", ".join(transition_order[:stage])
     is_dropout = direction == "dropout"
     direction_label = "Dynamic 6→3" if is_dropout else "Dynamic 3→6"
+    if int(result.activation_blend_frames) > 0:
+        direction_label += f" Soft-start {int(result.activation_blend_frames)}f"
     change_label = "Dropped" if is_dropout else "Added"
 
     draw.rounded_rectangle(
@@ -749,9 +933,14 @@ def render_video(
         raise ImportError("缺少 pyrender，无法执行 SMPL-H 离屏渲染。") from exc
 
     # 相机拟合纳入动态路可能出现的全部六点，后续 mask 切换不会改变视野尺度。
+    displayed_tracker_positions = (
+        result.tracker_positions
+        if result.runtime_tracker_positions is None
+        else result.runtime_tracker_positions
+    )
     layout = build_presentation_layout(
         sequences=sequences,
-        tracker_pos_world=result.tracker_positions,
+        tracker_pos_world=displayed_tracker_positions,
         method_order=METHOD_ORDER,
         tracker_available_by_method=np.asarray(
             [[False] * 6, [True] * 6], dtype=bool
@@ -780,7 +969,7 @@ def render_video(
                 sequences=sequences,
                 faces=faces,
                 method_offsets=layout.method_offsets,
-                tracker_positions=result.tracker_positions,
+                tracker_positions=displayed_tracker_positions,
                 tracker_available=result.tracker_available,
                 camera_pose=layout.camera_poses[frame_index],
             )
@@ -847,10 +1036,10 @@ def render_source(
     )
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    direction_token = "6to3" if direction == "dropout" else "3to6"
-    output_mp4 = (
-        output_dir
-        / f"{sequence_stem(relative_path)}_progressive_{direction_token}.mp4"
+    output_mp4 = output_dir / progressive_output_filename(
+        relative_path,
+        direction=direction,
+        activation_blend_frames=int(args.activation_blend_frames),
     )
     npz_path, json_path, report = write_sidecars(
         output_mp4=output_mp4,
@@ -898,7 +1087,11 @@ def main(argv: list[str] | None = None) -> list[dict[str, Path]]:
         raise ValueError(
             f"--max_frames 必须为 0 或至少 {MIN_PROGRESSIVE_SCORED_FRAMES}。"
         )
+    if int(args.activation_blend_frames) < 0:
+        raise ValueError("--activation_blend_frames 不能为负数。")
     direction = str(args.direction)
+    if direction != "addition" and int(args.activation_blend_frames) > 0:
+        raise ValueError("--activation_blend_frames 目前只用于 3→6 addition 展示。")
     if direction == "dropout":
         transition_order = tuple(str(name) for name in args.drop_order)
         transition_indices = validate_drop_order(transition_order)
