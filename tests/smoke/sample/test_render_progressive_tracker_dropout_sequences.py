@@ -21,11 +21,14 @@ from sample.render_progressive_tracker_dropout_sequences import (
     ProgressiveSequenceResult,
     build_transition_schedule,
     compute_continuity_diagnostics,
+    compute_metrics,
+    compute_reconnection_diagnostics,
     interpolate_tracker_measurement,
     progressive_output_filename,
     smoothstep_activation_alpha,
     validate_add_order,
     validate_drop_order,
+    validate_reconnect_tracker,
     warmup_tracker_available,
 )
 
@@ -199,3 +202,103 @@ def test_ten_frame_soft_start_uses_smoothstep_and_keeps_separate_filename() -> N
         direction="addition",
         activation_blend_frames=0,
     ).endswith("_progressive_3to6.mp4")
+
+
+def test_reconnection_render_schedule_stays_at_four_trackers() -> None:
+    tracker_index = validate_reconnect_tracker("hip")
+    schedule = build_transition_schedule(
+        scored_frame_count=300,
+        direction="reconnection",
+        transition_indices=(tracker_index,),
+    )
+
+    assert schedule.stage_indices.tolist() == [0] * 150 + [1] * 150
+    assert schedule.tracker_available.sum(axis=1).tolist() == [3] * 150 + [4] * 150
+    assert warmup_tracker_available("reconnection").tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert progressive_output_filename(
+        Path("HumanEva/S2/Box_1_poses.npz"),
+        direction="reconnection",
+        activation_blend_frames=0,
+        transition_order=("hip",),
+        stage_frames=150,
+    ).endswith("_reconnect_hip_after150f.mp4")
+
+
+def test_reconnection_render_schedule_supports_late_showcase_boundary() -> None:
+    tracker_index = validate_reconnect_tracker("right_foot")
+    schedule = build_transition_schedule(
+        scored_frame_count=300,
+        direction="reconnection",
+        transition_indices=(tracker_index,),
+        reconnect_after_frames=189,
+    )
+
+    assert schedule.stage_indices.tolist() == [0] * 189 + [1] * 111
+    assert schedule.tracker_available.sum(axis=1).tolist() == [3] * 189 + [4] * 111
+    changed = np.flatnonzero(
+        ~schedule.tracker_available[188] & schedule.tracker_available[189]
+    )
+    assert changed.tolist() == [tracker_index]
+
+
+def test_reconnection_diagnostics_reports_recovery_thresholds() -> None:
+    frame_count = 60
+    tracker_index = validate_reconnect_tracker("hip")
+    schedule = build_transition_schedule(
+        scored_frame_count=frame_count,
+        direction="reconnection",
+        transition_indices=(tracker_index,),
+    )
+    rotations = np.broadcast_to(
+        np.eye(3, dtype=np.float32), (frame_count, 24, 3, 3)
+    ).copy()
+    target_positions = np.zeros((frame_count, 24, 3), dtype=np.float32)
+    deployed_positions = np.zeros_like(target_positions)
+    deployed_positions[:30, 0, 0] = 0.10
+    post_error_cm = np.full((30,), 6.0, dtype=np.float32)
+    post_error_cm[1:] = 4.0
+    post_error_cm[3:] = 1.5
+    post_error_cm[5:] = 0.5
+    deployed_positions[30:, 0, 0] = post_error_cm / 100.0
+    result = ProgressiveSequenceResult(
+        frame_start=30,
+        frame_end_exclusive=90,
+        tracker_available=schedule.tracker_available,
+        stage_indices=schedule.stage_indices,
+        target_rotations=rotations,
+        target_positions=target_positions,
+        deployed_rotations=rotations,
+        deployed_positions=deployed_positions,
+        deployed_root_yaw=np.zeros((frame_count,), dtype=np.float32),
+        tracker_positions=np.zeros((frame_count, 6, 3), dtype=np.float32),
+    )
+
+    diagnostics = compute_reconnection_diagnostics(result)
+    overall, stages = compute_metrics(result)
+    boundary = compute_continuity_diagnostics(result, direction="reconnection")
+
+    assert diagnostics["reconnect_tracker"] == "hip"
+    assert diagnostics["reconnect_source_frame"] == 60
+    assert diagnostics["pre_reconnect_position_error_cm"] == pytest.approx(10.0)
+    assert diagnostics["post_reconnect_position_error_cm_by_frame_offset"] == {
+        "0": pytest.approx(6.0),
+        "4": pytest.approx(1.5),
+        "9": pytest.approx(0.5),
+        "19": pytest.approx(0.5),
+        "29": pytest.approx(0.5),
+    }
+    assert diagnostics["frames_to_position_error_threshold_cm"] == {
+        "5": 2,
+        "2": 4,
+        "1": 6,
+    }
+    assert overall["mpjpe_cm"] > 0.0
+    assert len(stages) == 2
+    assert boundary[0]["reconnected_tracker"] == "hip"

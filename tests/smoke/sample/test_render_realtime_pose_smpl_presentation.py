@@ -185,6 +185,41 @@ def test_shared_stage_offsets_camera_follow_and_frustum():
         assert np.all(np.abs(ndc) <= 1.0 + 1e-6)
 
 
+def test_larger_camera_fit_padding_pulls_camera_back():
+    """展示入口可增加留白，但不能改变相机朝向或舞台布局。"""
+
+    sequences, trackers = build_synthetic_sequences()
+    default_layout = build_presentation_layout(
+        sequences=sequences,
+        tracker_pos_world=trackers,
+    )
+    wide_layout = build_presentation_layout(
+        sequences=sequences,
+        tracker_pos_world=trackers,
+        camera_fit_padding=1.35,
+    )
+
+    default_distance = np.linalg.norm(
+        default_layout.base_camera.pose[:3, 3]
+        - default_layout.base_camera.target
+    )
+    wide_distance = np.linalg.norm(
+        wide_layout.base_camera.pose[:3, 3]
+        - wide_layout.base_camera.target
+    )
+    assert wide_distance > default_distance
+    np.testing.assert_allclose(
+        wide_layout.base_camera.pose[:3, :3],
+        default_layout.base_camera.pose[:3, :3],
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        wide_layout.method_offsets,
+        default_layout.method_offsets,
+        atol=1e-8,
+    )
+
+
 def test_presentation_schedule_has_exact_intro_normal_and_replay_mapping():
     """60 帧动作必须得到 21 帧开场、60 帧原速和 120 帧重复慢放。"""
 

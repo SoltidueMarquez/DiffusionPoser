@@ -447,6 +447,7 @@ def build_presentation_layout(
     method_order: tuple[str, ...] = METHOD_ORDER,
     tracker_available_by_method: np.ndarray | None = None,
     follow_method_name: str | None = None,
+    camera_fit_padding: float = CAMERA_FIT_PADDING,
 ) -> PresentationLayout:
     """构造共享舞台、固定尺度透视相机以及整段地面范围。"""
 
@@ -485,6 +486,7 @@ def build_presentation_layout(
         method_offsets=method_offsets,
         method_order=methods,
         tracker_available_by_method=tracker_available_by_method,
+        padding=float(camera_fit_padding),
     )
     camera_poses = build_follow_camera_poses(base_camera.pose, follow_offsets)
 

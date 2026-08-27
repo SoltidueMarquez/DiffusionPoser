@@ -48,7 +48,13 @@ from sample.evaluate_progressive_tracker_dropout import (
     OPTIONAL_TRACKER_NAME_TO_INDEX,
     build_equal_quarter_tracker_schedule as build_dropout_tracker_schedule,
 )
+from sample.evaluate_tracker_reconnection import (
+    MIN_STAGE_FRAMES as MIN_RECONNECTION_STAGE_FRAMES,
+    RECONNECT_TRACKER_NAME_TO_INDEX,
+    build_tracker_reconnection_schedule,
+)
 from sample.realtime_pose_longseq_evaluator import (
+    TrackerSequenceSchedule,
     compute_sequence_metrics_by_stage,
     create_eval_noise_generator,
     create_longseq_runtime,
@@ -95,6 +101,11 @@ INACTIVE_TRACKER_COLOR = (0.48, 0.51, 0.56, 1.0)
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
 INTRO_FRAME_COUNT = 15
+# 两路人物在 720p 画面中需要比通用三路展示留出更多边缘，避免脚部动作和
+# Tracker 图标贴近画面边界；只改变可视化相机，不参与推理或指标计算。
+PROGRESSIVE_CAMERA_FIT_PADDING = 1.35
+RECONNECT_ERROR_FRAME_OFFSETS = (0, 4, 9, 19, 29)
+RECONNECT_ERROR_THRESHOLDS_CM = (5.0, 2.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -134,8 +145,8 @@ class ProgressiveMeshInputs:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "重跑指定长序列的动态 Tracker 6→3/3→6 协议，并输出 SMPL-H 视频、"
-            "逐帧 NPZ 和连续性诊断 JSON。"
+            "重跑指定长序列的动态 Tracker 6→3/3→6、固定三点或 3→4 重连协议，"
+            "并输出 SMPL-H 视频、逐帧 NPZ 和连续性诊断 JSON。"
         )
     )
     add_base_options(parser)
@@ -153,8 +164,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     protocol.add_argument(
         "--direction",
         default="dropout",
-        choices=("dropout", "addition"),
-        help="dropout 运行 6→3；addition 运行 3→6。",
+        choices=("dropout", "addition", "core_only", "reconnection"),
+        help=(
+            "dropout 运行 6→3；addition 运行 3→6；"
+            "core_only 全程保持核心三点；reconnection 只运行一次 3→4 重连。"
+        ),
     )
     protocol.add_argument(
         "--drop_order",
@@ -171,6 +185,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="三个 optional Tracker 的添加顺序。",
     )
     protocol.add_argument(
+        "--reconnect_tracker",
+        default="hip",
+        choices=tuple(RECONNECT_TRACKER_NAME_TO_INDEX),
+        help="3→4 重连展示中作为第四点恢复的 Tracker。",
+    )
+    protocol.add_argument(
+        "--reconnect_after_frames",
+        default=0,
+        type=int,
+        help=(
+            "3→4 展示在多少个计分帧后恢复第四点；0 表示保持默认等分边界。"
+            "该参数只改变单序列展示，不改变正式 150/150 评估协议。"
+        ),
+    )
+    protocol.add_argument(
         "--max_frames",
         default=0,
         type=int,
@@ -181,8 +210,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         type=int,
         help=(
-            "3→6 中新 Tracker 测量的渐入帧数；位置使用 LERP、旋转使用 SLERP，"
-            "0 保持原来的硬切换。"
+            "3→6 添加或 3→4 重连中新 Tracker 测量的渐入帧数；"
+            "位置使用 LERP、旋转使用 SLERP，0 保持硬切换。"
         ),
     )
     protocol.add_argument("--stride", default=1, type=int)
@@ -204,13 +233,21 @@ def validate_add_order(add_order: tuple[str, ...]) -> tuple[int, ...]:
     return tuple(OPTIONAL_TRACKER_NAME_TO_INDEX[name] for name in names)
 
 
+def validate_reconnect_tracker(reconnect_tracker: str) -> int:
+    name = str(reconnect_tracker)
+    if name not in RECONNECT_TRACKER_NAME_TO_INDEX:
+        raise ValueError(f"未知重连 Tracker：{name}")
+    return int(RECONNECT_TRACKER_NAME_TO_INDEX[name])
+
+
 def build_transition_schedule(
     *,
     scored_frame_count: int,
     direction: str,
     transition_indices: tuple[int, ...],
+    reconnect_after_frames: int = 0,
 ):
-    """按展示方向选择正式评估使用的同一套等分 schedule 构造器。"""
+    """默认复用正式评估 schedule；仅重连展示可显式推迟单次边界。"""
 
     if direction == "dropout":
         return build_dropout_tracker_schedule(
@@ -222,7 +259,56 @@ def build_transition_schedule(
             scored_frame_count=scored_frame_count,
             add_order=transition_indices,
         )
-    raise ValueError(f"direction 必须为 dropout/addition，实际为 {direction}")
+    if direction == "reconnection":
+        if len(transition_indices) != 1:
+            raise ValueError("reconnection 必须恰好指定一个重连 Tracker。")
+        frame_count = int(scored_frame_count)
+        reconnect_boundary = int(reconnect_after_frames)
+        if reconnect_boundary < 0:
+            raise ValueError("reconnect_after_frames 不能为负数。")
+        if reconnect_boundary == 0:
+            if frame_count % 2 != 0:
+                raise ValueError("默认 3→4 重连展示的计分帧数必须为偶数。")
+            return build_tracker_reconnection_schedule(
+                scored_frame_count=frame_count,
+                reconnect_tracker_index=int(transition_indices[0]),
+                stage_frames=frame_count // 2,
+            )
+        remaining_frames = frame_count - reconnect_boundary
+        if min(reconnect_boundary, remaining_frames) < MIN_RECONNECTION_STAGE_FRAMES:
+            raise ValueError(
+                "自定义重连边界要求前后阶段均至少包含 "
+                f"{MIN_RECONNECTION_STAGE_FRAMES} 帧，实际为 "
+                f"{reconnect_boundary}/{remaining_frames}。"
+            )
+        # 自定义边界只服务于定性展示，因此在这里直接构造非等长的 3→4 mask，
+        # 不放宽 evaluate_tracker_reconnection 中正式 150/150 协议的约束。
+        tracker_available = np.broadcast_to(
+            np.asarray(CORE_THREE_AVAILABLE, dtype=bool)[None],
+            (frame_count, len(CORE_THREE_AVAILABLE)),
+        ).copy()
+        tracker_available[reconnect_boundary:, int(transition_indices[0])] = True
+        stage_indices = np.zeros((frame_count,), dtype=np.int64)
+        stage_indices[reconnect_boundary:] = 1
+        return TrackerSequenceSchedule(
+            tracker_available=tracker_available,
+            stage_indices=stage_indices,
+        )
+    if direction == "core_only":
+        if transition_indices:
+            raise ValueError("core_only 不接受 Tracker 切换顺序。")
+        frame_count = int(scored_frame_count)
+        return TrackerSequenceSchedule(
+            tracker_available=np.broadcast_to(
+                np.asarray(CORE_THREE_AVAILABLE, dtype=bool)[None],
+                (frame_count, len(CORE_THREE_AVAILABLE)),
+            ).copy(),
+            stage_indices=np.zeros((frame_count,), dtype=np.int64),
+        )
+    raise ValueError(
+        "direction 必须为 dropout/addition/core_only/reconnection，"
+        f"实际为 {direction}"
+    )
 
 
 def warmup_tracker_available(direction: str) -> np.ndarray:
@@ -230,9 +316,12 @@ def warmup_tracker_available(direction: str) -> np.ndarray:
 
     if direction == "dropout":
         return np.asarray(ALL_SIX_AVAILABLE, dtype=bool)
-    if direction == "addition":
+    if direction in ("addition", "core_only", "reconnection"):
         return np.asarray(CORE_THREE_AVAILABLE, dtype=bool)
-    raise ValueError(f"direction 必须为 dropout/addition，实际为 {direction}")
+    raise ValueError(
+        "direction 必须为 dropout/addition/core_only/reconnection，"
+        f"实际为 {direction}"
+    )
 
 
 def smoothstep_activation_alpha(frame_offset: int, frame_count: int) -> float:
@@ -287,12 +376,31 @@ def progressive_output_filename(
     *,
     direction: str,
     activation_blend_frames: int,
+    transition_order: tuple[str, ...] | None = None,
+    stage_frames: int | None = None,
 ) -> str:
     """soft-start 使用独立文件名，避免覆盖原来的硬切换展示。"""
 
-    direction_token = "6to3" if direction == "dropout" else "3to6"
     blend_frames = int(activation_blend_frames)
     blend_token = f"_soft{blend_frames}f" if blend_frames > 0 else ""
+    if direction == "core_only":
+        frame_count = int(stage_frames or 0)
+        if frame_count <= 0:
+            raise ValueError("core_only 输出文件名需要正数计分帧数。")
+        return f"{sequence_stem(relative_path)}_core3_{frame_count}f.mp4"
+    if direction == "reconnection":
+        order = tuple(transition_order or ())
+        if len(order) != 1:
+            raise ValueError("reconnection 输出文件名需要一个重连 Tracker。")
+        hold_frames = int(stage_frames or 0)
+        if hold_frames <= 0:
+            raise ValueError("reconnection 输出文件名需要正数 stage_frames。")
+        return (
+            f"{sequence_stem(relative_path)}_reconnect_{order[0]}_"
+            f"after{hold_frames}f{blend_token}.mp4"
+        )
+
+    direction_token = "6to3" if direction == "dropout" else "3to6"
     return (
         f"{sequence_stem(relative_path)}_progressive_"
         f"{direction_token}{blend_token}.mp4"
@@ -346,15 +454,21 @@ def run_progressive_sequence(
     world_rotations = compute_source_joint_rotations_world(source)
     last = evaluation_last_frame_exclusive(len(world_rotations), int(args.max_frames))
     scored_frame_count = last - REALTIME_POSE_EVAL_METRICS_START_FRAME
-    if scored_frame_count < MIN_PROGRESSIVE_SCORED_FRAMES:
+    minimum_scored_frames = (
+        2 * MIN_RECONNECTION_STAGE_FRAMES
+        if direction == "reconnection"
+        else MIN_PROGRESSIVE_SCORED_FRAMES
+    )
+    if scored_frame_count < minimum_scored_frames:
         raise ValueError(
-            f"动态展示至少需要 {MIN_PROGRESSIVE_SCORED_FRAMES} 个计分帧，"
+            f"动态展示至少需要 {minimum_scored_frames} 个计分帧，"
             f"实际为 {scored_frame_count}。"
         )
     schedule = build_transition_schedule(
         scored_frame_count=scored_frame_count,
         direction=direction,
         transition_indices=transition_indices,
+        reconnect_after_frames=int(getattr(args, "reconnect_after_frames", 0)),
     )
     warmup_available = warmup_tracker_available(direction)
     runtime = create_longseq_runtime(
@@ -576,7 +690,7 @@ def compute_continuity_diagnostics(
     direction: str = "dropout",
     local_radius: int = 5,
 ) -> list[dict[str, float | int | str]]:
-    """量化三次 mask 切换对应的单帧关节步长，并与局部正常运动比较。"""
+    """量化各 mask 切换的单帧关节步长，并与局部正常运动比较。"""
 
     predicted_steps = np.linalg.norm(
         np.diff(result.deployed_positions, axis=0), axis=-1
@@ -604,12 +718,17 @@ def compute_continuity_diagnostics(
         if direction == "dropout":
             changed = previous_available & ~current_available
             tracker_key = "dropped_tracker"
-        elif direction == "addition":
+        elif direction in ("addition", "reconnection"):
             changed = ~previous_available & current_available
-            tracker_key = "added_tracker"
+            tracker_key = (
+                "reconnected_tracker"
+                if direction == "reconnection"
+                else "added_tracker"
+            )
         else:
             raise ValueError(
-                f"direction 必须为 dropout/addition，实际为 {direction}"
+                "direction 必须为 dropout/addition/reconnection，"
+                f"实际为 {direction}"
             )
         changed_indices = np.flatnonzero(changed)
         if changed_indices.shape != (1,):
@@ -638,14 +757,71 @@ def compute_continuity_diagnostics(
     return reports
 
 
+def compute_reconnection_diagnostics(
+    result: ProgressiveSequenceResult,
+) -> dict[str, object]:
+    """量化第四点从不可用到恢复后的逐帧位置收敛速度。"""
+
+    boundaries = np.flatnonzero(np.diff(result.stage_indices) > 0) + 1
+    if boundaries.shape != (1,):
+        raise ValueError(
+            f"3→4 重连应恰好包含一个阶段边界，实际为 {boundaries.tolist()}。"
+        )
+    boundary = int(boundaries[0])
+    previous_available = np.asarray(result.tracker_available[boundary - 1], dtype=bool)
+    current_available = np.asarray(result.tracker_available[boundary], dtype=bool)
+    changed_indices = np.flatnonzero(~previous_available & current_available)
+    if changed_indices.shape != (1,):
+        raise ValueError(
+            "3→4 重连边界应恰好恢复一个 Tracker，"
+            f"实际为 {changed_indices.tolist()}。"
+        )
+    tracker_index = int(changed_indices[0])
+    joint_index = int(TRACKER_TO_JOINT[tracker_index])
+    # 与真实 Tracker 测量比较，而不是与可选 soft-start 的运行时插值目标比较，
+    # 这样硬重连和渐入展示的恢复速度保持同一物理参照。
+    position_error_cm = (
+        np.linalg.norm(
+            result.deployed_positions[:, joint_index]
+            - result.tracker_positions[:, tracker_index],
+            axis=-1,
+        )
+        * 100.0
+    )
+    post_error_cm = position_error_cm[boundary:]
+    sampled_errors: dict[str, float | None] = {}
+    for frame_offset in RECONNECT_ERROR_FRAME_OFFSETS:
+        sampled_errors[str(frame_offset)] = (
+            float(post_error_cm[frame_offset])
+            if frame_offset < post_error_cm.shape[0]
+            else None
+        )
+
+    frames_to_threshold: dict[str, int | None] = {}
+    for threshold_cm in RECONNECT_ERROR_THRESHOLDS_CM:
+        reached = np.flatnonzero(post_error_cm <= float(threshold_cm))
+        # 使用 1-based 帧数：1 表示第一个重连帧已经进入阈值。
+        frames_to_threshold[f"{threshold_cm:g}"] = (
+            int(reached[0]) + 1 if reached.size else None
+        )
+    return {
+        "reconnect_tracker": str(TRACKER_NAMES[tracker_index]),
+        "reconnect_source_frame": int(result.frame_start + boundary),
+        "pre_reconnect_position_error_cm": float(position_error_cm[boundary - 1]),
+        "post_reconnect_position_error_cm_by_frame_offset": sampled_errors,
+        "frames_to_position_error_threshold_cm": frames_to_threshold,
+    }
+
+
 def compute_metrics(result: ProgressiveSequenceResult) -> tuple[dict, list[dict]]:
+    stage_count = int(np.max(result.stage_indices)) + 1
     overall, stages = compute_sequence_metrics_by_stage(
         predicted_global_rotations=result.deployed_rotations,
         target_global_rotations=result.target_rotations,
         predicted_joint_positions=result.deployed_positions,
         target_joint_positions=result.target_positions,
         stage_indices=result.stage_indices,
-        stage_count=4,
+        stage_count=stage_count,
         fps=float(REALTIME_POSE_FPS),
     )
     stage_reports = []
@@ -713,13 +889,40 @@ def write_sidecars(
         tracker_available=result.tracker_available,
         stage_indices=result.stage_indices,
     )
+    stage_count = int(np.max(result.stage_indices)) + 1
+    tracker_counts = [
+        int(result.tracker_available[result.stage_indices == stage_index][0].sum())
+        for stage_index in range(stage_count)
+    ]
     is_dropout = direction == "dropout"
+    is_reconnection = direction == "reconnection"
+    is_core_only = direction == "core_only"
+    if is_dropout:
+        experiment = "progressive_tracker_dropout_6_to_3_showcase"
+        transition_metadata = {"drop_order": list(transition_order)}
+        stage_policy = "equal_scored_quarters"
+    elif is_reconnection:
+        experiment = "tracker_reconnection_3_to_4_showcase"
+        reconnect_after_frames = int(np.count_nonzero(result.stage_indices == 0))
+        transition_metadata = {
+            "reconnect_tracker": str(transition_order[0]),
+            "reconnect_after_frames": reconnect_after_frames,
+        }
+        stage_policy = (
+            "custom_reconnect_boundary"
+            if int(getattr(args, "reconnect_after_frames", 0)) > 0
+            else "equal_scored_halves"
+        )
+    elif is_core_only:
+        experiment = "tracker_core_only_showcase"
+        transition_metadata = {}
+        stage_policy = "constant_core_three"
+    else:
+        experiment = "progressive_tracker_addition_3_to_6_showcase"
+        transition_metadata = {"add_order": list(transition_order)}
+        stage_policy = "equal_scored_quarters"
     report = {
-        "experiment": (
-            "progressive_tracker_dropout_6_to_3_showcase"
-            if is_dropout
-            else "progressive_tracker_addition_3_to_6_showcase"
-        ),
+        "experiment": experiment,
         "source_path": str(source_path),
         "source_relative_path": str(relative_path),
         "amass_path": str(amass_path),
@@ -727,10 +930,10 @@ def write_sidecars(
         "frame_end_exclusive": result.frame_end_exclusive,
         "frames": result.frame_count,
         "fps": float(REALTIME_POSE_FPS),
-        ("drop_order" if is_dropout else "add_order"): list(transition_order),
-        "tracker_counts": [6, 5, 4, 3] if is_dropout else [3, 4, 5, 6],
+        **transition_metadata,
+        "tracker_counts": tracker_counts,
         "warmup_tracker_count": 6 if is_dropout else 3,
-        "stage_policy": "equal_scored_quarters",
+        "stage_policy": stage_policy,
         "activation_blend": {
             "frames": int(result.activation_blend_frames),
             "curve": (
@@ -754,10 +957,13 @@ def write_sidecars(
         "stage_metrics": stages,
         "switch_boundary_diagnostics": boundaries,
         "visualization_root_translation": "shared_ground_truth",
+        "visualization_camera_fit_padding": PROGRESSIVE_CAMERA_FIT_PADDING,
         "npz_path": str(npz_path),
         "video_path": str(output_mp4),
     }
-    if not is_dropout:
+    if is_reconnection:
+        report["reconnection_diagnostics"] = compute_reconnection_diagnostics(result)
+    elif direction == "addition":
         report["paired_drop_order"] = list(reversed(transition_order))
     json_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -782,14 +988,28 @@ def compose_frame(
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     stage = int(result.stage_indices[frame_index])
+    stage_count = int(np.max(result.stage_indices)) + 1
     tracker_count = int(result.tracker_available[frame_index].sum())
     stage_start = int(np.flatnonzero(result.stage_indices == stage)[0])
     changed = "none" if stage == 0 else ", ".join(transition_order[:stage])
     is_dropout = direction == "dropout"
-    direction_label = "Dynamic 6→3" if is_dropout else "Dynamic 3→6"
+    is_reconnection = direction == "reconnection"
+    is_core_only = direction == "core_only"
+    if is_dropout:
+        direction_label = "Dynamic 6→3"
+        change_label = "Dropped"
+    elif is_reconnection:
+        direction_label = "Reconnect 3→4"
+        change_label = "Reconnected"
+    elif is_core_only:
+        direction_label = "Always 3 trackers"
+        change_label = "Active"
+        changed = "head + wrists"
+    else:
+        direction_label = "Dynamic 3→6"
+        change_label = "Added"
     if int(result.activation_blend_frames) > 0:
         direction_label += f" Soft-start {int(result.activation_blend_frames)}f"
-    change_label = "Dropped" if is_dropout else "Added"
 
     draw.rounded_rectangle(
         (18, 16, OUTPUT_WIDTH - 18, 92),
@@ -801,7 +1021,10 @@ def compose_frame(
     draw.text((42, 29), "GT", font=load_font(24), fill=_rgba(METHOD_COLORS["GT"]))
     draw.text(
         (OUTPUT_WIDTH // 2 + 30, 25),
-        f"{direction_label}  |  Stage {stage + 1}/4  |  {tracker_count} trackers",
+        (
+            f"{direction_label}  |  Stage {stage + 1}/{stage_count}  |  "
+            f"{tracker_count} trackers"
+        ),
         font=load_font(23),
         fill=_rgba(METHOD_COLORS["Dynamic"]),
     )
@@ -819,7 +1042,11 @@ def compose_frame(
             outline=(245, 158, 11, 240),
             width=2,
         )
-        action = "removed" if is_dropout else "added"
+        action = (
+            "removed"
+            if is_dropout
+            else "reconnected" if is_reconnection else "added"
+        )
         message = f"Tracker {action}: {transition_order[stage - 1]}"
         box = draw.textbbox((0, 0), message, font=load_font(19))
         draw.text(
@@ -842,7 +1069,7 @@ def compose_frame(
         (250, 204, 21, 255),
         (251, 146, 60, 255),
     )
-    for stage_index in range(4):
+    for stage_index in range(stage_count):
         selected = np.flatnonzero(result.stage_indices == stage_index)
         left = timeline_left + int(
             round(selected[0] / result.frame_count * (timeline_right - timeline_left))
@@ -933,11 +1160,9 @@ def render_video(
         raise ImportError("缺少 pyrender，无法执行 SMPL-H 离屏渲染。") from exc
 
     # 相机拟合纳入动态路可能出现的全部六点，后续 mask 切换不会改变视野尺度。
-    displayed_tracker_positions = (
-        result.tracker_positions
-        if result.runtime_tracker_positions is None
-        else result.runtime_tracker_positions
-    )
+    # 可视化始终显示物理 Tracker 的原始测量；runtime 插值仍用于 Soft 推理，
+    # 但不再用橙色球展示，以免混淆测量位置与模型的有效输入。
+    displayed_tracker_positions = result.tracker_positions
     layout = build_presentation_layout(
         sequences=sequences,
         tracker_pos_world=displayed_tracker_positions,
@@ -946,6 +1171,7 @@ def render_video(
             [[False] * 6, [True] * 6], dtype=bool
         ),
         follow_method_name="GT",
+        camera_fit_padding=PROGRESSIVE_CAMERA_FIT_PADDING,
     )
     floor_y = min(float(np.min(value.vertices_world[..., 1])) for value in sequences.values())
     scene, camera_node = create_static_scene(
@@ -1036,10 +1262,13 @@ def render_source(
     )
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    stage_frames = int(np.count_nonzero(result.stage_indices == 0))
     output_mp4 = output_dir / progressive_output_filename(
         relative_path,
         direction=direction,
         activation_blend_frames=int(args.activation_blend_frames),
+        transition_order=transition_order,
+        stage_frames=stage_frames,
     )
     npz_path, json_path, report = write_sidecars(
         output_mp4=output_mp4,
@@ -1083,21 +1312,54 @@ def main(argv: list[str] | None = None) -> list[dict[str, Path]]:
     args = parse_and_load_from_model(build_arg_parser(), argv)
     if int(args.stride) <= 0:
         raise ValueError("--stride 必须为正整数。")
-    if 0 < int(args.max_frames) < MIN_PROGRESSIVE_SCORED_FRAMES:
+    if int(args.activation_blend_frames) < 0:
+        raise ValueError("--activation_blend_frames 不能为负数。")
+    reconnect_after_frames = int(args.reconnect_after_frames)
+    if reconnect_after_frames < 0:
+        raise ValueError("--reconnect_after_frames 不能为负数。")
+    direction = str(args.direction)
+    max_frames = int(args.max_frames)
+    if direction == "reconnection":
+        minimum_frames = 2 * MIN_RECONNECTION_STAGE_FRAMES
+        if max_frames < minimum_frames:
+            raise ValueError(
+                "3→4 重连展示要求 --max_frames 为不小于 "
+                f"{minimum_frames} 的正数。"
+            )
+        if reconnect_after_frames == 0 and max_frames % 2 != 0:
+            raise ValueError("默认 3→4 重连展示要求 --max_frames 为偶数。")
+        if reconnect_after_frames > 0 and min(
+            reconnect_after_frames, max_frames - reconnect_after_frames
+        ) < MIN_RECONNECTION_STAGE_FRAMES:
+            raise ValueError(
+                "--reconnect_after_frames 要求重连前后均至少保留 "
+                f"{MIN_RECONNECTION_STAGE_FRAMES} 帧。"
+            )
+    elif 0 < max_frames < MIN_PROGRESSIVE_SCORED_FRAMES:
         raise ValueError(
             f"--max_frames 必须为 0 或至少 {MIN_PROGRESSIVE_SCORED_FRAMES}。"
         )
-    if int(args.activation_blend_frames) < 0:
-        raise ValueError("--activation_blend_frames 不能为负数。")
-    direction = str(args.direction)
-    if direction != "addition" and int(args.activation_blend_frames) > 0:
-        raise ValueError("--activation_blend_frames 目前只用于 3→6 addition 展示。")
+    if direction != "reconnection" and reconnect_after_frames > 0:
+        raise ValueError("--reconnect_after_frames 只用于 direction=reconnection。")
+    if direction not in ("addition", "reconnection") and int(
+        args.activation_blend_frames
+    ) > 0:
+        raise ValueError(
+            "--activation_blend_frames 目前只用于 addition/reconnection 展示。"
+        )
     if direction == "dropout":
         transition_order = tuple(str(name) for name in args.drop_order)
         transition_indices = validate_drop_order(transition_order)
-    else:
+    elif direction == "addition":
         transition_order = tuple(str(name) for name in args.add_order)
         transition_indices = validate_add_order(transition_order)
+    elif direction == "reconnection":
+        reconnect_tracker = str(args.reconnect_tracker)
+        transition_order = (reconnect_tracker,)
+        transition_indices = (validate_reconnect_tracker(reconnect_tracker),)
+    else:
+        transition_order = ()
+        transition_indices = ()
     fixseed(args.seed)
     device = torch.device(
         f"cuda:{args.device}" if args.cuda and torch.cuda.is_available() else "cpu"
