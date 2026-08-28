@@ -89,12 +89,16 @@ def is_mirror_relative_path(relative_path: Path) -> bool:
 
 def load_motion_source(path: Path, amass_dir: Path, target_fps: float) -> MotionSource:
     with np.load(path, allow_pickle=True) as data:
-        missing_keys = [key for key in ("poses", "trans", "mocap_framerate") if key not in data.files]
+        missing_keys = [key for key in ("poses", "trans") if key not in data.files]
+        fps_key = "mocap_framerate" if "mocap_framerate" in data.files else "mocap_frame_rate"
+        if fps_key not in data.files:
+            missing_keys.append("mocap_framerate/mocap_frame_rate")
         if missing_keys:
             raise ValueError(f"缺少必要字段：{missing_keys}")
         poses = np.asarray(data["poses"], dtype=np.float64)
         trans = np.asarray(data["trans"], dtype=np.float64)
-        source_fps = float(np.asarray(data["mocap_framerate"]).item())
+        # SOMA 的 Stage-II 文件使用带下划线的 frame_rate，语义与 AMASS 标准字段一致。
+        source_fps = float(np.asarray(data[fps_key]).item())
         if poses.ndim != 2 or poses.shape[1] < SOURCE_BODY_JOINT_COUNT * 3:
             raise ValueError(f"poses 至少应为 [T,66]，实际为 {poses.shape}")
         if trans.shape != (poses.shape[0], 3):

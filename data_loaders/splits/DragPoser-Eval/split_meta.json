@@ -1,0 +1,16 @@
+{
+  "protocol": "dragposer_eval",
+  "source_fps": 30,
+  "mirror_policy": "disabled",
+  "minimum_frames": 31,
+  "counts": {
+    "HUMAN4D": 148,
+    "SOMA": 69,
+    "test": 217
+  },
+  "frames": {
+    "HUMAN4D": 130739,
+    "SOMA": 32919,
+    "test": 163658
+  }
+}
