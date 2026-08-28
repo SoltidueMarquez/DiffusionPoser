@@ -38,7 +38,6 @@ from data_loaders.sensor_masking import (
 )
 from eval.evaluate_realtime_pose_predictor import (
     PREDICTOR_EVAL_FIRST_GENERATED_FRAME,
-    evaluation_last_frame_exclusive,
 )
 from sample.evaluate_progressive_tracker_addition import (
     build_equal_quarter_tracker_schedule as build_addition_tracker_schedule,
@@ -110,7 +109,7 @@ RECONNECT_ERROR_THRESHOLDS_CM = (5.0, 2.0, 1.0)
 
 @dataclass(frozen=True)
 class ProgressiveSequenceResult:
-    """动态 schedule 的逐帧闭环输出，时间轴从正式计分帧 30 开始。"""
+    """动态 schedule 的逐帧闭环输出，时间轴从指定 source frame 开始。"""
 
     frame_start: int
     frame_end_exclusive: int
@@ -200,10 +199,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     protocol.add_argument(
+        "--source_frame_start",
+        default=REALTIME_POSE_EVAL_METRICS_START_FRAME,
+        type=int,
+        help=(
+            "动态 schedule 在哪个 30 Hz source frame 开始；此前帧继续使用预热 "
+            "Tracker 配置并参与闭环历史。"
+        ),
+    )
+    protocol.add_argument(
         "--max_frames",
         default=0,
         type=int,
-        help="正式计分区间最多渲染多少帧；0 表示整条序列。",
+        help="从 source_frame_start 起最多渲染多少帧；0 表示直到序列结束。",
     )
     protocol.add_argument(
         "--activation_blend_frames",
@@ -448,12 +456,20 @@ def run_progressive_sequence(
     direction: str,
     transition_indices: tuple[int, ...],
 ) -> ProgressiveSequenceResult:
-    """严格复用正式评估的预热、等分 schedule、闭环 runtime 和噪声规则。"""
+    """复用正式评估的预热、等分 schedule、闭环 runtime 和噪声规则。"""
 
     blend_frames = int(getattr(args, "activation_blend_frames", 0))
     world_rotations = compute_source_joint_rotations_world(source)
-    last = evaluation_last_frame_exclusive(len(world_rotations), int(args.max_frames))
-    scored_frame_count = last - REALTIME_POSE_EVAL_METRICS_START_FRAME
+    source_frame_start = int(
+        getattr(args, "source_frame_start", REALTIME_POSE_EVAL_METRICS_START_FRAME)
+    )
+    max_frames = int(args.max_frames)
+    last = (
+        len(world_rotations)
+        if max_frames <= 0
+        else min(len(world_rotations), source_frame_start + max_frames)
+    )
+    scored_frame_count = last - source_frame_start
     minimum_scored_frames = (
         2 * MIN_RECONNECTION_STAGE_FRAMES
         if direction == "reconnection"
@@ -506,10 +522,10 @@ def run_progressive_sequence(
     # tracker_index -> (起始帧、切换前部署位置、切换前部署旋转)
     activation_ramps: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
     for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
-        if current < REALTIME_POSE_EVAL_METRICS_START_FRAME:
+        if current < source_frame_start:
             frame_tracker_available = warmup_available
         else:
-            scored_offset = current - REALTIME_POSE_EVAL_METRICS_START_FRAME
+            scored_offset = current - source_frame_start
             frame_tracker_available = schedule.tracker_available[scored_offset]
         frame_tracker_available = np.asarray(frame_tracker_available, dtype=bool)
         frame_tracker_positions = np.asarray(
@@ -575,7 +591,7 @@ def run_progressive_sequence(
             float(source["root_pos_world"][current, 1]),
             noise=noise,
         )
-        if current >= REALTIME_POSE_EVAL_METRICS_START_FRAME:
+        if current >= source_frame_start:
             rotations.append(result.resolved_pose.joint_rotations_world)
             positions.append(result.resolved_pose.joints_world)
             root_yaw.append(result.resolved_pose.root_yaw_world)
@@ -585,9 +601,9 @@ def run_progressive_sequence(
         previous_available = frame_tracker_available.copy()
         previous_result = result
 
-    selected = slice(REALTIME_POSE_EVAL_METRICS_START_FRAME, last)
+    selected = slice(source_frame_start, last)
     return ProgressiveSequenceResult(
-        frame_start=REALTIME_POSE_EVAL_METRICS_START_FRAME,
+        frame_start=source_frame_start,
         frame_end_exclusive=last,
         tracker_available=np.asarray(schedule.tracker_available, dtype=bool),
         stage_indices=np.asarray(schedule.stage_indices, dtype=np.int64),
@@ -1318,6 +1334,12 @@ def main(argv: list[str] | None = None) -> list[dict[str, Path]]:
     if reconnect_after_frames < 0:
         raise ValueError("--reconnect_after_frames 不能为负数。")
     direction = str(args.direction)
+    source_frame_start = int(args.source_frame_start)
+    if source_frame_start < REALTIME_POSE_EVAL_METRICS_START_FRAME:
+        raise ValueError(
+            "--source_frame_start 不能早于正式可重建帧 "
+            f"{REALTIME_POSE_EVAL_METRICS_START_FRAME}。"
+        )
     max_frames = int(args.max_frames)
     if direction == "reconnection":
         minimum_frames = 2 * MIN_RECONNECTION_STAGE_FRAMES

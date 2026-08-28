@@ -321,6 +321,7 @@ def fit_fixed_presentation_camera(
     padding: float = CAMERA_FIT_PADDING,
     method_order: tuple[str, ...] = METHOD_ORDER,
     tracker_available_by_method: np.ndarray | None = None,
+    camera_view_direction: np.ndarray | None = None,
 ) -> CameraSpec:
     """在 pelvis 局部移动坐标中一次性拟合相机，后续禁止逐帧缩放。"""
 
@@ -374,7 +375,13 @@ def fit_fixed_presentation_camera(
     if not np.isfinite(points).all():
         raise ValueError("共享舞台点集含 NaN/Inf。")
 
-    view_direction = presentation_view_direction_unity()
+    view_direction = (
+        presentation_view_direction_unity()
+        if camera_view_direction is None
+        else normalize_vector(
+            np.asarray(camera_view_direction, dtype=np.float64).reshape(3)
+        )
+    )
     mins = np.min(points, axis=0)
     maxs = np.max(points, axis=0)
     target = (mins + maxs) * 0.5
@@ -448,6 +455,7 @@ def build_presentation_layout(
     tracker_available_by_method: np.ndarray | None = None,
     follow_method_name: str | None = None,
     camera_fit_padding: float = CAMERA_FIT_PADDING,
+    camera_view_direction: np.ndarray | None = None,
 ) -> PresentationLayout:
     """构造共享舞台、固定尺度透视相机以及整段地面范围。"""
 
@@ -469,8 +477,15 @@ def build_presentation_layout(
     follow_offsets = build_horizontal_pelvis_follow_offsets(
         sequences[follow_name].joints_world
     ).astype(np.float64)
+    view_direction = (
+        presentation_view_direction_unity()
+        if camera_view_direction is None
+        else normalize_vector(
+            np.asarray(camera_view_direction, dtype=np.float64).reshape(3)
+        )
+    )
     provisional_pose = camera_pose_look_at(
-        presentation_view_direction_unity(),
+        view_direction,
         np.zeros((3,), dtype=np.float64),
     )
     method_offsets, stage_spacing = build_stage_method_offsets(
@@ -487,6 +502,7 @@ def build_presentation_layout(
         method_order=methods,
         tracker_available_by_method=tracker_available_by_method,
         padding=float(camera_fit_padding),
+        camera_view_direction=view_direction,
     )
     camera_poses = build_follow_camera_poses(base_camera.pose, follow_offsets)
 

@@ -213,6 +213,7 @@ def run_dit_sequence(
     predicted_rotations: list[np.ndarray] = []
     predicted_positions: list[np.ndarray] = []
     predicted_root_yaw: list[float] = []
+    predicted_ik_confidence: list[np.ndarray] = []
     noise_generator = create_eval_noise_generator(args.seed, device)
     for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
         noise = torch.randn(
@@ -233,10 +234,14 @@ def run_dit_sequence(
             )
             predicted_positions.append(result.resolved_pose.joints_world)
             predicted_root_yaw.append(result.resolved_pose.root_yaw_world)
+            # 保留 Runtime 实际用于当前 Tracker 配置的逐关节观测置信度，
+            # 让静态论文图能够直接展示模型条件，而不是另外构造启发式热力图。
+            predicted_ik_confidence.append(result.ik_confidence)
     return {
         "rotations": np.stack(predicted_rotations).astype(np.float32),
         "positions": np.stack(predicted_positions).astype(np.float32),
         "root_yaw": np.asarray(predicted_root_yaw, dtype=np.float32),
+        "ik_confidence": np.stack(predicted_ik_confidence).astype(np.float32),
     }
 
 

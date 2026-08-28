@@ -220,6 +220,26 @@ def test_larger_camera_fit_padding_pulls_camera_back():
     )
 
 
+def test_custom_camera_view_direction_is_preserved():
+    """自定义观察方向只改变视角，固定相机仍应沿该方向看向舞台。"""
+
+    sequences, trackers = build_synthetic_sequences()
+    requested_direction = np.asarray([1.0, 0.5, -1.0], dtype=np.float64)
+    requested_direction /= np.linalg.norm(requested_direction)
+
+    layout = build_presentation_layout(
+        sequences=sequences,
+        tracker_pos_world=trackers,
+        camera_view_direction=requested_direction,
+    )
+
+    actual_direction = (
+        layout.base_camera.pose[:3, 3] - layout.base_camera.target
+    )
+    actual_direction /= np.linalg.norm(actual_direction)
+    np.testing.assert_allclose(actual_direction, requested_direction, atol=1e-8)
+
+
 def test_presentation_schedule_has_exact_intro_normal_and_replay_mapping():
     """60 帧动作必须得到 21 帧开场、60 帧原速和 120 帧重复慢放。"""
 
