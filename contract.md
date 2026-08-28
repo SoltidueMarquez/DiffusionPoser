@@ -272,3 +272,17 @@ Tracker 添加边界的速度与 Jitter，报告不读取退化 JSON，也不重
 `predictor_pose_horizon` 都是当前唯一契约。已有 Predictor checkpoint、当前 Task Store
 及 Pose/Tracker normalizer 可直接复用；绝对 Pose diffusion/旧 IK trajectory 条件的
 DiT checkpoint 与本 residual 架构不兼容，不提供兼容加载路径，必须重新训练 DiT。
+
+## FLUIDUnity 离线 Demo
+
+Unity 只录制六点 Tracker，固定顺序为 Head、LeftWrist、RightWrist、Hip、
+LeftFoot、RightFoot。录制 JSON 顶层保存 `floorY` 和 `frames`；每帧保存
+`time`、`positions [6,3]`、`rotations [6,4]`（quaternion xyzw）与
+`available [6]`。位置和旋转均为校准后的 Unity TrackingOrigin 局部坐标。
+
+`python -m sample.infer_unity_recording` 将录制重采样为 30Hz，运行当前
+Predictor + 单帧 DiT runtime，并输出 Unity 可直接回放的 JSON。每帧只保存
+`time`、Actor `rootPosition/rootRotation`、`pelvisLocalPosition` 和 SMPL24
+固定顺序的 `localRotations [24,4]`。该 Demo 文件不包含 schema 或版本字段。
+录制中的 Hip 异常时可传入 `--ignore_hip`，它只在本次推理中把 Hip availability
+全程设为 false，不修改原始 JSON；Head、双手和双脚仍按五点配置进入 runtime。
