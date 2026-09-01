@@ -247,10 +247,14 @@ def test_predictor_training_loop_decodes_resident_rotation6d_batch(
     )
     loop = PredictorTrainLoop(args, model, [], torch.device("cpu"))
     identity_6d = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+    tracker_available = torch.ones(1, 52, 6, dtype=torch.bool)
+    tracker_available[:, 5:20, 1] = False
+    tracker_available[:, 25:40, 2] = False
     batch = {
         "joint_rotations_world_6d": identity_6d.repeat(1, 52, 24, 1),
         "tracker_positions_world": torch.zeros(1, 52, 6, 3),
         "tracker_rotations_world_6d": identity_6d.repeat(1, 52, 6, 1),
+        "tracker_available": tracker_available,
         "floor_y": torch.zeros(1, 52),
         "joint_offsets_parent": torch.zeros(1, 24, 3),
     }

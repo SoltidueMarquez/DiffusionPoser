@@ -5,6 +5,7 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
 
 from data_loaders.realtime_pose_config import RealtimePoseLossWeights
+from data_loaders.rpm_hand_dropout import RPM_HAND_DROPOUT_TRAIN_SEED
 from data_loaders.sensor_masking import (
     REALTIME_POSE_MODEL_TOKEN_LENGTH,
     REALTIME_POSE_SEQ_LEN,
@@ -97,6 +98,8 @@ def joint_finetune_args(argv: list[str] | None = None):
             "eval_during_training",
             "eval_split",
             "eval_num_batches",
+            "rpm_hand_dropout",
+            "rpm_hand_dropout_seed",
             "predictor_lr",
             "predictor_loss_weight",
         },
@@ -263,6 +266,18 @@ def add_training_options(parser: ArgumentParser) -> None:
     group.add_argument("--eval_during_training", action="store_true")
     group.add_argument("--eval_split", default="test")
     group.add_argument("--eval_num_batches", default=4, type=int)
+    group.add_argument(
+        "--rpm_hand_dropout",
+        action=BooleanOptionalAction,
+        default=False,
+        help="训练数据启用 RPM 官方 10% 独立手部 segment masker。",
+    )
+    group.add_argument(
+        "--rpm_hand_dropout_seed",
+        default=RPM_HAND_DROPOUT_TRAIN_SEED,
+        type=int,
+        help="训练手部 mask 的固定 base seed；官方测试 seed=6 保持隔离。",
+    )
 
 
 def load_args_json(model_path: Path) -> dict:

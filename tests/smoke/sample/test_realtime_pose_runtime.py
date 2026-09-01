@@ -141,3 +141,33 @@ def test_all_eight_static_tracker_combinations_run():
     )
     assert len(results) == 8
     assert all(np.isfinite(result.deployed_pred_pose).all() for result in results)
+
+
+def test_hand_dropout_is_isolated_behind_explicit_runtime_flag():
+    source = build_toy_realtime_source(24)
+    rotations = compute_source_joint_rotations_world(source)
+    runtime = _runtime(source, rotations, _models())
+    hand_missing = np.asarray(STATIC_OPTIONAL_TRACKER_MASKS[0], dtype=bool).copy()
+    hand_missing[1] = False
+
+    with np.testing.assert_raises(ValueError):
+        runtime.step(
+            source["tracker_pos_world"][11],
+            source["tracker_rot_world_6d"][11],
+            hand_missing,
+            0.0,
+            noise=torch.zeros(1, 144),
+        )
+
+    diagnostic = _runtime(source, rotations, _models())
+    diagnostic.allow_missing_core_trackers = True
+    result = diagnostic.step(
+        source["tracker_pos_world"][11],
+        source["tracker_rot_world_6d"][11],
+        hand_missing,
+        0.0,
+        noise=torch.zeros(1, 144),
+    )
+    assert result.current_tracker_raw[1, 9] == 0.0
+    np.testing.assert_array_equal(result.current_tracker_raw[1, :9], 0.0)
+    assert not diagnostic.tracker_history[-1].available[1]

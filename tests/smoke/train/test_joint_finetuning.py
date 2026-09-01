@@ -48,11 +48,17 @@ def _save_predictor(tmp_path) -> str:
     return str(checkpoint)
 
 
-def _batch(batch_size: int = 2) -> dict[str, torch.Tensor]:
+def _batch(
+    batch_size: int = 2,
+    *,
+    hand_dropout: bool = False,
+) -> dict[str, torch.Tensor]:
     tracker = torch.zeros(batch_size, 6, 10)
     tracker[..., 3:9] = IDENTITY_6D
     tracker[:, :3, 9] = 1.0
     tracker[:, 0, 1] = 1.6
+    if hand_dropout:
+        tracker[:, 1] = 0.0
     offsets = torch.zeros(batch_size, 24, 3)
     offsets[:, 1:, 1] = 0.1
     return {
@@ -127,7 +133,7 @@ def test_joint_step_updates_dit_and_predictor_and_saves_paired_checkpoint(tmp_pa
 
     dit_before = dit.joint_output.weight.detach().clone()
     predictor_before = loop.predictor.output.weight.detach().clone()
-    losses = loop.run_step(_batch())
+    losses = loop.run_step(_batch(hand_dropout=True))
 
     assert "predictor_pose_loss" in losses
     assert any(parameter.grad is not None for parameter in dit.parameters())

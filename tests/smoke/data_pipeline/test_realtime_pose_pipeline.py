@@ -62,3 +62,19 @@ def test_predictor_and_dit_use_single_predictor_checkpoint(tmp_path):
     assert "--stage1_model_path" not in predictor
     assert "--scenario_weights" not in dit
     assert "--tracker_confidence_warmup" not in dit
+
+
+def test_pipeline_forwards_rpm_hand_dropout_to_both_training_stages(tmp_path):
+    args = _args(
+        tmp_path,
+        "--rpm_hand_dropout",
+        "--rpm_hand_dropout_seed",
+        "17",
+    )
+    predictor = pipeline.build_predictor_args(args)
+    dit = pipeline.build_train_args(args)
+
+    assert "--rpm_hand_dropout" in predictor
+    assert "--rpm_hand_dropout" in dit
+    assert predictor[predictor.index("--rpm_hand_dropout_seed") + 1] == "17"
+    assert dit[dit.index("--rpm_hand_dropout_seed") + 1] == "17"

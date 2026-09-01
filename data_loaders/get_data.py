@@ -4,6 +4,7 @@ from data_loaders.realtime_pose_dataset import (
     RealtimePoseBatchSampler,
     RealtimePoseTaskDataset,
 )
+from data_loaders.rpm_hand_dropout import RPM_HAND_DROPOUT_TRAIN_SEED
 
 
 def get_dataset_loader(
@@ -17,6 +18,8 @@ def get_dataset_loader(
     num_workers: int = 0,
     pin_memory: bool = False,
     seed: int = 10,
+    rpm_hand_dropout: bool = False,
+    rpm_hand_dropout_seed: int = RPM_HAND_DROPOUT_TRAIN_SEED,
 ):
     """返回单帧 DiT mmap Task Store 的 DataLoader。"""
 
@@ -29,6 +32,8 @@ def get_dataset_loader(
         seq_len=seq_len,
         normalizer_dir=normalizer_dir,
         normalize_input=normalize_input,
+        rpm_hand_dropout=rpm_hand_dropout,
+        rpm_hand_dropout_seed=rpm_hand_dropout_seed,
     )
     worker_kwargs = {
         "num_workers": int(num_workers),

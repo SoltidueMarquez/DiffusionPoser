@@ -15,6 +15,7 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_torch,
 )
 from data_loaders.sensor_masking import (
+    CORE_TRACKER_INDICES,
     HEAD_TRACKER_INDEX,
     REALTIME_POSE_TARGET_DIM,
     ROTATION_6D_DIM,
@@ -122,19 +123,27 @@ def build_tracker_measurements_np(
 def assemble_current_tracker_features_np(
     measurements: np.ndarray,
     available: np.ndarray,
+    *,
+    required_tracker_indices: tuple[int, ...] = CORE_TRACKER_INDICES,
 ) -> np.ndarray:
     """组合当前 `[6,10]` Tracker，并把不可用测量严格清零。"""
 
     continuous = np.asarray(measurements, dtype=np.float32)
     if continuous.shape != (TRACKER_COUNT, TRACKER_CONTINUOUS_DIM):
         raise ValueError("measurements 必须为 [6,9]。")
-    active = validate_tracker_available(available)
+    active = validate_tracker_available(
+        available,
+        required_tracker_indices=required_tracker_indices,
+    )
     result = np.zeros((TRACKER_COUNT, TRACKER_FEATURE_DIM), dtype=np.float32)
     result[:, :TRACKER_CONTINUOUS_DIM] = np.where(
         active[:, None], continuous, 0.0
     )
     result[:, TRACKER_AVAILABLE_OFFSET] = active
-    validate_tracker_features_np(result)
+    validate_tracker_features_np(
+        result,
+        required_tracker_indices=required_tracker_indices,
+    )
     return result
 
 
@@ -401,12 +410,17 @@ def global_head_rotations_to_local_delta_6d_np(
     return rotation_6d_forward_up_np(delta).reshape(*rotations.shape[:-3], 144).astype(np.float32)
 
 
-def validate_tracker_features_np(tracker_window: np.ndarray) -> None:
+def validate_tracker_features_np(
+    tracker_window: np.ndarray,
+    *,
+    required_tracker_indices: tuple[int, ...] = CORE_TRACKER_INDICES,
+) -> None:
     tracker = np.asarray(tracker_window)
     if tracker.shape[-2:] != (TRACKER_COUNT, TRACKER_FEATURE_DIM):
         raise ValueError(f"Tracker 特征尾部形状必须为 [6,10]，实际为 {tracker.shape}")
     available = validate_tracker_available(
-        tracker[..., TRACKER_AVAILABLE_OFFSET] > 0.5
+        tracker[..., TRACKER_AVAILABLE_OFFSET] > 0.5,
+        required_tracker_indices=required_tracker_indices,
     )
     if np.any(
         np.abs(tracker[..., :TRACKER_CONTINUOUS_DIM][~available]) > 1e-7

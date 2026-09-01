@@ -22,7 +22,13 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_to_matrix_np,
 )
 from data_loaders.realtime_pose_predictor_dataset import RealtimePosePredictorSequenceDataset
-from data_loaders.realtime_pose_predictor_features import build_predictor_sparse_features_np
+from data_loaders.realtime_pose_predictor_features import (
+    build_predictor_sparse_availability_mask_np,
+    build_predictor_sparse_features_np,
+)
+from data_loaders.rpm_hand_dropout import (
+    build_rpm_dit_training_availability,
+)
 from data_loaders.sensor_masking import (
     STATIC_OPTIONAL_TRACKER_MASKS,
     TRAIN_TRACKER_ENDPOINTS,
@@ -168,3 +174,65 @@ def test_materialized_task_normalizer_and_predictor_sequence_contract(
     predictor_sample = predictor_dataset[0]
     assert predictor_sample["joint_rotations_world_6d"].shape == (52, 24, 6)
     assert predictor_sample["tracker_positions_world"].shape == (52, 6, 3)
+    assert predictor_sample["tracker_available"].shape == (52, 6)
+
+
+def test_task_and_predictor_datasets_apply_same_deterministic_hand_dropout(
+    tmp_path, monkeypatch
+):
+    source_dir = tmp_path / "source"
+    write_toy_source_dataset(source_dir, frame_count=70)
+    split_dir = tmp_path / "splits"
+    split_dir.mkdir()
+    (split_dir / "train.txt").write_text(
+        "ACCAD/toy_realtime\n", encoding="utf-8"
+    )
+    task_dir = tmp_path / "tasks"
+    generate_realtime_pose_tasks(
+        SimpleNamespace(
+            source_dir=str(source_dir),
+            output_dir=str(task_dir),
+            split_dir=str(split_dir),
+            splits=["train"],
+            seq_len=11,
+            base_windows_per_source=1,
+            shard_size=1,
+            short_source_policy="error",
+            limit=0,
+            seed=10,
+            overwrite=False,
+        )
+    )
+    monkeypatch.setattr(
+        "data_loaders.realtime_pose_dataset.stable_rpm_hand_dropout_seed",
+        lambda *args: 127,
+    )
+    task_dataset = RealtimePoseTaskDataset(
+        task_dir,
+        split="train",
+        normalize_input=False,
+        rpm_hand_dropout=True,
+    )
+    task_sample = task_dataset[0]
+    expected_sparse_mask = build_predictor_sparse_availability_mask_np(
+        build_rpm_dit_training_availability(seed=127)
+    )
+    assert not task_sample["tracker_available"][1:3].any()
+    assert not task_sample["current_tracker_raw"][1:3].any()
+    assert not task_sample["core_tracker_context"].numpy()[~expected_sparse_mask].any()
+
+    monkeypatch.setattr(
+        "data_loaders.realtime_pose_predictor_dataset.stable_rpm_hand_dropout_seed",
+        lambda *args: 127,
+    )
+    predictor_dataset = RealtimePosePredictorSequenceDataset(
+        source_dir=source_dir,
+        split_dir=split_dir,
+        split="train",
+        windows_per_source=1,
+        seed=10,
+        rpm_hand_dropout=True,
+    )
+    predictor_sample = predictor_dataset[0]
+    assert not predictor_sample["tracker_available"][1:41, 1].any()
+    assert not predictor_sample["tracker_available"][7:25, 2].any()

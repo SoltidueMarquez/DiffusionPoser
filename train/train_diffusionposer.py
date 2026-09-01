@@ -48,6 +48,8 @@ def main():
             num_workers=args.num_workers,
             pin_memory=args.cuda,
             seed=args.seed,
+            rpm_hand_dropout=args.rpm_hand_dropout,
+            rpm_hand_dropout_seed=args.rpm_hand_dropout_seed,
         )
         eval_data = None
         if args.eval_during_training:
@@ -63,6 +65,8 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=args.cuda,
                 seed=args.seed,
+                rpm_hand_dropout=args.rpm_hand_dropout,
+                rpm_hand_dropout_seed=args.rpm_hand_dropout_seed + 1,
             )
 
         print("creating model and diffusion...")

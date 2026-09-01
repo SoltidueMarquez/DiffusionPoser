@@ -57,6 +57,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--checkpoint_max_keep", default=3, type=int)
     train.add_argument("--log_interval", default=10, type=int)
     train.add_argument("--run_name", default="auto")
+    train.add_argument(
+        "--rpm_hand_dropout",
+        action=BooleanOptionalAction,
+        default=False,
+    )
+    train.add_argument("--rpm_hand_dropout_seed", default=7, type=int)
     train.add_argument("--predictor_resume_checkpoint", default="")
     train.add_argument("--dit_resume_checkpoint", default="")
     train.add_argument("--ik_direction_only_quality", default=None, type=float)
@@ -148,7 +154,10 @@ def build_predictor_args(args) -> list[str]:
         "--checkpoint_max_keep", str(args.checkpoint_max_keep),
         "--log_interval", str(args.log_interval),
         "--device", str(args.device),
+        "--rpm_hand_dropout_seed", str(args.rpm_hand_dropout_seed),
     ]
+    if args.rpm_hand_dropout:
+        result.append("--rpm_hand_dropout")
     if str(args.predictor_resume_checkpoint).strip():
         result.extend(["--resume_checkpoint", str(args.predictor_resume_checkpoint)])
     return result
@@ -179,7 +188,10 @@ def build_train_args(args) -> list[str]:
         "--save_interval", str(args.save_interval),
         "--log_interval", str(args.log_interval),
         "--device", str(args.device),
+        "--rpm_hand_dropout_seed", str(args.rpm_hand_dropout_seed),
     ]
+    if args.rpm_hand_dropout:
+        result.append("--rpm_hand_dropout")
     if args.ik_direction_only_quality is not None:
         result.extend(["--ik_direction_only_quality", str(args.ik_direction_only_quality)])
     if args.ik_residual_scale is not None:

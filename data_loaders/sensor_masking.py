@@ -164,14 +164,24 @@ def validate_realtime_target(target_start: int, target_length: int) -> None:
         raise ValueError("单帧 DiT 固定使用 10 帧历史并只恢复当前帧。")
 
 
-def validate_tracker_available(available: np.ndarray) -> np.ndarray:
-    """校验逐帧或静态 Tracker 可用性；核心三点必须始终存在。"""
+def validate_tracker_available(
+    available: np.ndarray,
+    *,
+    required_tracker_indices: tuple[int, ...] = CORE_TRACKER_INDICES,
+) -> np.ndarray:
+    """校验逐帧或静态 Tracker 可用性，并检查调用方声明的必需 Tracker。"""
 
     values = np.asarray(available, dtype=bool)
     if values.shape[-1] != TRACKER_COUNT:
         raise ValueError(
             f"tracker_available 尾维必须为 {TRACKER_COUNT}，实际为 {values.shape}"
         )
-    if not values[..., list(CORE_TRACKER_INDICES)].all():
-        raise ValueError("Head、左手和右手 Tracker 必须始终 available。")
+    required = tuple(int(index) for index in required_tracker_indices)
+    if len(set(required)) != len(required) or any(
+        index < 0 or index >= TRACKER_COUNT for index in required
+    ):
+        raise ValueError(f"required_tracker_indices 非法：{required}")
+    if required and not values[..., list(required)].all():
+        names = "、".join(TRACKER_NAMES[index] for index in required)
+        raise ValueError(f"{names} Tracker 必须始终 available。")
     return values

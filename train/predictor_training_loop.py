@@ -9,6 +9,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 
 from data_loaders.realtime_pose_predictor_features import (
+    build_predictor_sparse_availability_mask_torch,
     build_predictor_step_features_torch,
     pose_head_to_world_rotations_torch,
 )
@@ -26,6 +27,7 @@ PREDICTOR_DEVICE_FIELDS = frozenset(
         "tracker_rotations_world_6d",
         "floor_y",
         "joint_offsets_parent",
+        "tracker_available",
         "current_frame",
     }
 )
@@ -160,6 +162,7 @@ class PredictorTrainLoop:
         )
         tracker_positions = batch["tracker_positions_world"]
         tracker_rotations = batch["tracker_rotations_world_6d"]
+        tracker_available = batch["tracker_available"]
         floor_y = batch["floor_y"]
         motion_world = rotations[:, 1:11].clone()
 
@@ -176,7 +179,12 @@ class PredictorTrainLoop:
                     prediction = self.precision.forward(
                         model,
                         self._normalize_pose(motion),
-                        self._normalize_sparse(sparse),
+                        self._normalize_sparse(
+                            sparse,
+                            tracker_available[
+                                :, step_index : step_index + 12
+                            ],
+                        ),
                     )
                     motion_world = append_predictor_current_prediction(
                         motion_world=motion_world,
@@ -203,7 +211,10 @@ class PredictorTrainLoop:
             prediction = self.precision.forward(
                 model,
                 motion_normalized,
-                self._normalize_sparse(sparse),
+                self._normalize_sparse(
+                    sparse,
+                    tracker_available[:, step_index : step_index + 12],
+                ),
             )
             return compute_predictor_losses(
                 prediction_normalized=prediction,
@@ -220,8 +231,20 @@ class PredictorTrainLoop:
     def _inverse_pose(self, value: torch.Tensor) -> torch.Tensor:
         return value * self.pose_scale + self.pose_mean
 
-    def _normalize_sparse(self, value: torch.Tensor) -> torch.Tensor:
-        return (value - self.sparse_mean) / (self.sparse_std + self.normalizer.eps)
+    def _normalize_sparse(
+        self,
+        value: torch.Tensor,
+        tracker_available_with_previous: torch.Tensor,
+    ) -> torch.Tensor:
+        normalized = (value - self.sparse_mean) / (
+            self.sparse_std + self.normalizer.eps
+        )
+        available = build_predictor_sparse_availability_mask_torch(
+            tracker_available_with_previous
+        )
+        # 与 runtime 一致，缺失观测使用归一化域零向量；速度通道在掉线和
+        # 重连首帧都关闭，避免模型把跨 gap 差分误认为真实高速运动。
+        return torch.where(available, normalized, torch.zeros_like(normalized))
 
     @torch.no_grad()
     def _update_ema(self) -> None:

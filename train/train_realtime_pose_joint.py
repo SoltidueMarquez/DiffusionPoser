@@ -87,6 +87,12 @@ def _create_data_loader(args, split: str):
         num_workers=args.num_workers,
         pin_memory=args.cuda,
         seed=args.seed,
+        rpm_hand_dropout=args.rpm_hand_dropout,
+        rpm_hand_dropout_seed=(
+            args.rpm_hand_dropout_seed
+            if str(split) == str(args.data_split)
+            else args.rpm_hand_dropout_seed + 1
+        ),
     )
 
 

@@ -55,6 +55,11 @@ FK，内存中仅常驻 `joint_rotations_world_6d [T,24,6]`、
 预载后释放。每个样本从内存切出 offset `-11..+40` 的 52 帧，3x3 旋转矩阵在
 batch 进入设备后重建。
 
+启用 `--rpm_hand_dropout` 时，Predictor Dataset 额外构造
+`tracker_available [52,6]`。左右手按 RPM 官方训练 masker 独立以 10% 概率
+丢弃一个连续 segment，长度 `L ~ U(1,41)`；随机数使用 Python `random` 的官方
+调用顺序，并由 train-only base seed 与 task id 派生，因此不受 worker 数量影响。
+
 ## 单帧 Task Store
 
 Task Store 保存原始物理值，不保存归一化结果。设 shard 样本数为 `M`：
@@ -86,6 +91,10 @@ tracker_available       [B,6]
 `current_tracker_raw` 通道为 position `0:3`、rotation6D `3:9`、available `9`。
 不可用 Tracker 的前 9 维为零。训练 sampler 对 Hip、LeftFoot、RightFoot 的所有
 开关组合做确定性轮换，长期等概率覆盖全部 8 种配置；模型不接收 scenario id。
+`--rpm_hand_dropout` 只在 Dataset 读取时叠加确定性左右手 gap，不改变 Task Store
+字段或 normalizer。缺失 sparse 通道在归一化域置零；当前手 Tracker 同步更新
+`tracker_available` 并清零连续量。训练默认 seed 为 7，训练期评估使用 seed+1；
+RPM-P2 官方测试 gap seed=6 只由正式评估入口读取，不进入训练。
 
 ## Normalizer
 
@@ -161,9 +170,10 @@ attention logits 中排除，因此逻辑 K/V 长度是 3～6；只把缺失 tok
 
 第二阶段冻结训练中的 Predictor 始终 `eval()`、`requires_grad=False` 且在 `torch.no_grad()`
 中执行。DiT optimizer、EMA 和 checkpoint 不含 Predictor 权重；`args.json` 记录
-`predictor_model_path`。冻结 Predictor 与 DiT 始终共享 Task Store 中同一份干净、
-完整的 10 帧历史，不添加人工历史扰动。部署历史的时间累积误差由 Predictor
-单阶段训练中的 0～30 步闭环回填建模。
+`predictor_model_path`。冻结 Predictor 与 DiT 始终共享 Task Store 中同一份干净
+Pose 历史；启用 RPM hand dropout 时，只对 Predictor sparse context 与当前手部
+Tracker availability 施加同一确定性 mask。部署 Pose 历史的时间累积误差仍由
+Predictor 单阶段训练中的 0～30 步闭环回填建模。
 
 ## Predictor 与 DiT 联合微调
 

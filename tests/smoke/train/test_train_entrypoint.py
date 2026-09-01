@@ -49,6 +49,8 @@ def test_training_parser_exposes_two_model_boundary_without_cold_start(tmp_path)
     assert not hasattr(args, "contact_slide_loss_weight")
     assert args.log_interval == 10
     assert args.precision == "fp32"
+    assert not args.rpm_hand_dropout
+    assert args.rpm_hand_dropout_seed == 7
 
 
 def test_training_parsers_accept_bf16(tmp_path):
@@ -90,6 +92,8 @@ def test_predictor_parser_uses_single_official_style_schedule(tmp_path):
     assert args.weight_decay == 1e-4
     assert args.lr_drop_step == 50_000
     assert args.lr_drop_factor == 30.0
+    assert not args.rpm_hand_dropout
+    assert args.rpm_hand_dropout_seed == 7
     assert not hasattr(args, "stage")
     assert not hasattr(args, "stage1_model_path")
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from data_loaders.realtime_pose_predictor_dataset import get_predictor_dataset_loader
+from data_loaders.rpm_hand_dropout import RPM_HAND_DROPOUT_TRAIN_SEED
 from model.realtime_pose_predictor import RealtimePosePredictor
 from train.predictor_training_loop import PredictorTrainLoop
 from utils.fixseed import fixseed
@@ -23,6 +24,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_split", default="train")
     parser.add_argument("--windows_per_source", default=128, type=int)
     parser.add_argument("--source_limit", default=0, type=int)
+    parser.add_argument(
+        "--rpm_hand_dropout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="训练数据启用 RPM 官方 10% 独立手部 segment masker。",
+    )
+    parser.add_argument(
+        "--rpm_hand_dropout_seed",
+        default=RPM_HAND_DROPOUT_TRAIN_SEED,
+        type=int,
+        help="训练手部 mask 的固定 base seed；官方测试 seed=6 不在这里使用。",
+    )
     parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--num_workers", default=0, type=int)
     parser.add_argument(
@@ -86,6 +99,8 @@ def main(argv: list[str] | None = None) -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         limit=args.source_limit,
+        rpm_hand_dropout=args.rpm_hand_dropout,
+        rpm_hand_dropout_seed=args.rpm_hand_dropout_seed,
     )
     train_data = get_predictor_dataset_loader(
         split=args.data_split,

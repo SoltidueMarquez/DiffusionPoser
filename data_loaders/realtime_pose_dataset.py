@@ -10,7 +10,19 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from data_loaders.realtime_pose_task_store import ShardReader, discover_shards
+from data_loaders.realtime_pose_predictor_features import (
+    build_predictor_sparse_availability_mask_np,
+)
+from data_loaders.rpm_hand_dropout import (
+    RPM_HAND_DROPOUT_TRAIN_SEED,
+    build_rpm_dit_training_availability,
+    rpm_hand_dropout_sample_key,
+    stable_rpm_hand_dropout_seed,
+)
 from data_loaders.sensor_masking import (
+    CORE_TRACKER_INDICES,
+    HAND_TRACKER_INDICES,
+    HEAD_TRACKER_INDEX,
     REALTIME_POSE_SEQ_LEN,
     TRACKER_AVAILABLE_OFFSET,
     TRACKER_CONTINUOUS_DIM,
@@ -59,6 +71,8 @@ class RealtimePoseTaskDataset(Dataset):
         seq_len: int = REALTIME_POSE_SEQ_LEN,
         normalizer_dir: str | Path | None = None,
         normalize_input: bool = True,
+        rpm_hand_dropout: bool = False,
+        rpm_hand_dropout_seed: int = RPM_HAND_DROPOUT_TRAIN_SEED,
     ):
         validate_realtime_seq_len(seq_len)
         self.data_dir = Path(data_dir).resolve()
@@ -66,6 +80,8 @@ class RealtimePoseTaskDataset(Dataset):
         self.split_dir = self.data_dir / self.split
         self.shards = discover_shards(self.split_dir, TASK_SHARD_FIELDS)
         self.normalizer = create_normalizer(normalizer_dir, bool(normalize_input))
+        self.rpm_hand_dropout = bool(rpm_hand_dropout)
+        self.rpm_hand_dropout_seed = int(rpm_hand_dropout_seed)
         self.locations: list[tuple[int, int]] = []
         self.indices_by_shard: list[list[int]] = [[] for _ in self.shards]
         for shard_index, shard in enumerate(self.shards):
@@ -124,6 +140,22 @@ class RealtimePoseTaskDataset(Dataset):
         previous_raw = np.asarray(
             shard["previous_pose_target_clean"][row_index], dtype=np.float32
         ).copy()
+        task_seed = int(shard["task_seed"][row_index])
+        hand_available_with_previous = np.ones(
+            (12, TRACKER_COUNT), dtype=bool
+        )
+        if self.rpm_hand_dropout:
+            dropout_seed = stable_rpm_hand_dropout_seed(
+                self.rpm_hand_dropout_seed,
+                self.split,
+                rpm_hand_dropout_sample_key(task_seed),
+            )
+            hand_available_with_previous = build_rpm_dit_training_availability(
+                seed=dropout_seed
+            )
+        sparse_available = build_predictor_sparse_availability_mask_np(
+            hand_available_with_previous
+        )
         if self.normalizer is None:
             motion = motion_raw
             sparse = sparse_raw
@@ -134,11 +166,26 @@ class RealtimePoseTaskDataset(Dataset):
             sparse = self.normalizer.normalize_predictor_sparse(sparse_raw)
             target = self.normalizer.normalize_pose(target_raw)
             previous = self.normalizer.normalize_pose(previous_raw)
+        if self.rpm_hand_dropout:
+            # Null token 与 runtime 保持一致，定义在归一化域零点，而不是把
+            # 原始零值送入旧 normalizer 后产生异常大的伪观测。
+            sparse = np.where(sparse_available, sparse, 0.0).astype(np.float32)
 
         tracker_available = np.asarray(
             TRAIN_TRACKER_ENDPOINTS[config_index], dtype=bool
+        ).copy()
+        if self.rpm_hand_dropout:
+            tracker_available[list(HAND_TRACKER_INDICES)] = (
+                hand_available_with_previous[-1, list(HAND_TRACKER_INDICES)]
+            )
+        validate_tracker_available(
+            tracker_available,
+            required_tracker_indices=(
+                (HEAD_TRACKER_INDEX,)
+                if self.rpm_hand_dropout
+                else tuple(CORE_TRACKER_INDICES)
+            ),
         )
-        validate_tracker_available(tracker_available)
         tracker_continuous = np.asarray(
             shard["current_tracker_continuous"][row_index], dtype=np.float32
         ).copy()
@@ -150,7 +197,6 @@ class RealtimePoseTaskDataset(Dataset):
         )
         tracker_raw[:, TRACKER_AVAILABLE_OFFSET] = tracker_available
 
-        task_seed = int(shard["task_seed"][row_index])
         result: dict[str, Any] = {
             "x": torch.from_numpy(np.asarray(target, dtype=np.float32)).float(),
             "motion_context": torch.from_numpy(
@@ -208,7 +254,7 @@ class RealtimePoseTaskDataset(Dataset):
 
     @staticmethod
     def task_id_from_seed(task_seed: int) -> str:
-        return f"task_{int(task_seed):016x}"
+        return rpm_hand_dropout_sample_key(task_seed)
 
 
 class RealtimePoseBatchSampler(Sampler[list[TaskRequest]]):

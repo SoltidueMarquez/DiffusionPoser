@@ -14,11 +14,18 @@ from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     filter_entries_by_split,
     make_task_id,
+    make_task_seed,
     read_source_entries,
     read_split_keys,
     select_window_starts,
 )
 from data_loaders.realtime_pose_kinematics import rotation_6d_forward_up_np
+from data_loaders.rpm_hand_dropout import (
+    RPM_HAND_DROPOUT_TRAIN_SEED,
+    build_rpm_predictor_training_availability,
+    rpm_hand_dropout_sample_key,
+    stable_rpm_hand_dropout_seed,
+)
 from data_loaders.sensor_masking import (
     BODY_POSE_BODY_FBX_LOCAL_DELTA_KEY,
     PREDICTOR_TRAINING_FIRST_OFFSET,
@@ -65,10 +72,14 @@ class RealtimePosePredictorSequenceDataset(Dataset):
         windows_per_source: int,
         seed: int,
         limit: int = 0,
+        rpm_hand_dropout: bool = False,
+        rpm_hand_dropout_seed: int = RPM_HAND_DROPOUT_TRAIN_SEED,
     ):
         self.source_dir = Path(source_dir).resolve()
         self.split = str(split)
         self.seed = int(seed)
+        self.rpm_hand_dropout = bool(rpm_hand_dropout)
+        self.rpm_hand_dropout_seed = int(rpm_hand_dropout_seed)
         entries = read_source_entries(self.source_dir)
         split_keys = (
             read_split_keys(Path(split_dir).resolve(), self.split)
@@ -133,6 +144,31 @@ class RealtimePosePredictorSequenceDataset(Dataset):
         if last - first != PREDICTOR_TRAINING_SEQUENCE_LENGTH:
             raise RuntimeError("Predictor raw sequence 长度计算错误。")
         entry = self.entries[entry_index]
+        task_id = make_task_id(
+            self.split,
+            str(entry["stablemotion_split_key"]),
+            current_frame,
+        )
+        tracker_available = np.ones(
+            (PREDICTOR_TRAINING_SEQUENCE_LENGTH, 6), dtype=bool
+        )
+        if self.rpm_hand_dropout:
+            # Task Store 只持久化 make_task_seed；这里复用同一个稳定身份，
+            # 保证 Predictor 与 DiT 对同一 source/current frame 派生相同 mask。
+            task_seed = make_task_seed(
+                self.split,
+                str(entry["stablemotion_split_key"]),
+                current_frame,
+            )
+            dropout_seed = stable_rpm_hand_dropout_seed(
+                self.rpm_hand_dropout_seed,
+                self.split,
+                rpm_hand_dropout_sample_key(task_seed),
+            )
+            tracker_available = build_rpm_predictor_training_availability(
+                output_frame_count=PREDICTOR_TRAINING_SEQUENCE_LENGTH,
+                seed=dropout_seed,
+            )
         return {
             "joint_rotations_world_6d": torch.from_numpy(
                 sequence.joint_rotations_world_6d[first:last].copy()
@@ -149,12 +185,9 @@ class RealtimePosePredictorSequenceDataset(Dataset):
             "joint_offsets_parent": torch.from_numpy(
                 sequence.joint_offsets_parent.copy()
             ),
+            "tracker_available": torch.from_numpy(tracker_available).bool(),
             "current_frame": torch.tensor(current_frame, dtype=torch.long),
-            "task_id": make_task_id(
-                self.split,
-                str(entry["stablemotion_split_key"]),
-                current_frame,
-            ),
+            "task_id": task_id,
         }
 
 
@@ -240,6 +273,8 @@ def get_predictor_dataset_loader(
     pin_memory: bool,
     shuffle: bool,
     limit: int = 0,
+    rpm_hand_dropout: bool = False,
+    rpm_hand_dropout_seed: int = RPM_HAND_DROPOUT_TRAIN_SEED,
 ) -> DataLoader:
     dataset = RealtimePosePredictorSequenceDataset(
         source_dir=source_dir,
@@ -248,6 +283,8 @@ def get_predictor_dataset_loader(
         windows_per_source=windows_per_source,
         seed=seed,
         limit=limit,
+        rpm_hand_dropout=rpm_hand_dropout,
+        rpm_hand_dropout_seed=rpm_hand_dropout_seed,
     )
     worker_kwargs: dict[str, Any] = {
         "num_workers": int(num_workers),

@@ -19,7 +19,10 @@ from data_loaders.realtime_pose_kinematics import (
     make_yaw_rotation_np,
     rotation_6d_to_matrix_np,
 )
-from data_loaders.realtime_pose_predictor_features import build_predictor_step_features_np
+from data_loaders.realtime_pose_predictor_features import (
+    build_predictor_sparse_availability_mask_np,
+    build_predictor_step_features_np,
+)
 from data_loaders.sensor_masking import (
     CORE_TRACKER_INDICES,
     HEAD_TRACKER_INDEX,
@@ -78,6 +81,7 @@ class RuntimeStepResult:
 class _TrackerWorldState:
     positions: np.ndarray
     rotations_6d: np.ndarray
+    available: np.ndarray
     floor_y: float
 
 
@@ -85,6 +89,7 @@ class _TrackerWorldState:
 class _PreparedStep:
     motion_context: np.ndarray
     core_tracker_context: np.ndarray
+    core_tracker_context_available: np.ndarray
     current_tracker_raw: np.ndarray
     tracker_positions: np.ndarray
     tracker_rotations_6d: np.ndarray
@@ -117,12 +122,16 @@ class RealtimePoseRuntime:
         ik_gap_high: float | None = None,
         ik_direction_support: float = 0.35,
         ik_untracked_strength: float = 0.05,
+        allow_missing_core_trackers: bool = False,
     ):
         self.predictor_model = predictor_model.eval().requires_grad_(False)
         self.dit_model = dit_model.eval().requires_grad_(False)
         self.diffusion = diffusion
         self.device = torch.device(device)
         self.normalizer = normalizer
+        # 正式训练/部署仍要求 Head+双手始终在线。只有手部断线诊断显式打开
+        # 此开关；此时 Head 仍是构造当前参考系不可缺少的锚点。
+        self.allow_missing_core_trackers = bool(allow_missing_core_trackers)
         self.ik_inpainting_config = IKInpaintingConfig(
             fabrik_iterations=int(fabrik_iterations),
             direction_only_quality=ik_direction_only_quality,
@@ -149,12 +158,14 @@ class RealtimePoseRuntime:
         tracker_positions_world: np.ndarray,
         tracker_rotations_world_6d: np.ndarray,
         floor_y: np.ndarray | float,
+        tracker_available_history: np.ndarray | None = None,
     ) -> None:
         """设置历史。
 
         Pose 必须恰好 10 帧。Tracker 可传 offset `-11..-1` 的 11 帧，随后由
         `step()` 追加当前帧；也可传 `-11..0` 的 12 帧，此时第一次 step 的
-        当前测量必须与最后一帧一致。
+        当前测量必须与最后一帧一致。手部断线诊断还应显式传入同长度的
+        `tracker_available_history [11或12,6]`，避免预热期 gap 泄露观测。
         """
 
         if len(pose_history) != REALTIME_POSE_HISTORY_LENGTH:
@@ -175,6 +186,28 @@ class RealtimePoseRuntime:
             floors = np.full(positions.shape[0], float(floors), dtype=np.float32)
         if floors.shape != (positions.shape[0],):
             raise ValueError("floor_y 必须为标量或与 Tracker history 等长。")
+        if tracker_available_history is None:
+            history_available = np.ones(
+                (positions.shape[0], TRACKER_COUNT), dtype=bool
+            )
+        else:
+            history_available = np.asarray(
+                tracker_available_history, dtype=bool
+            )
+            if history_available.shape != (positions.shape[0], TRACKER_COUNT):
+                raise ValueError(
+                    "tracker_available_history 必须为 [11或12,6]，并与 "
+                    "Tracker history 等长。"
+                )
+        required_tracker_indices = (
+            (HEAD_TRACKER_INDEX,)
+            if self.allow_missing_core_trackers
+            else tuple(CORE_TRACKER_INDICES)
+        )
+        history_available = validate_tracker_available(
+            history_available,
+            required_tracker_indices=required_tracker_indices,
+        )
         if not all(
             np.asarray(state.joint_rotations_world).shape == (24, 3, 3)
             for state in pose_history
@@ -196,7 +229,12 @@ class RealtimePoseRuntime:
             for state in pose_history
         ]
         self.tracker_history = [
-            _TrackerWorldState(positions[index].copy(), rotations[index].copy(), float(floors[index]))
+            _TrackerWorldState(
+                positions[index].copy(),
+                rotations[index].copy(),
+                history_available[index].copy(),
+                float(floors[index]),
+            )
             for index in range(positions.shape[0])
         ]
         self._preloaded_current_pending = positions.shape[0] == (
@@ -233,7 +271,15 @@ class RealtimePoseRuntime:
             raise RuntimeError("runtime 尚未初始化 11/12 帧 Tracker history。")
         positions = np.asarray(tracker_positions, dtype=np.float32).reshape(TRACKER_COUNT, 3)
         rotations = np.asarray(tracker_rotations_6d, dtype=np.float32).reshape(TRACKER_COUNT, 6)
-        available = validate_tracker_available(tracker_available).reshape(TRACKER_COUNT)
+        required_tracker_indices = (
+            (HEAD_TRACKER_INDEX,)
+            if self.allow_missing_core_trackers
+            else tuple(CORE_TRACKER_INDICES)
+        )
+        available = validate_tracker_available(
+            tracker_available,
+            required_tracker_indices=required_tracker_indices,
+        ).reshape(TRACKER_COUNT)
         consumes_preloaded_current = bool(self._preloaded_current_pending)
         if consumes_preloaded_current:
             current_matches_last = np.allclose(
@@ -250,7 +296,7 @@ class RealtimePoseRuntime:
                     "初始化已包含 offset 0 时，第一次 step 的核心 Tracker 必须与该帧一致。"
                 )
         current_state = _TrackerWorldState(
-            positions.copy(), rotations.copy(), float(floor_y)
+            positions.copy(), rotations.copy(), available.copy(), float(floor_y)
         )
         tracker_window = (
             self.tracker_history[-12:]
@@ -271,6 +317,9 @@ class RealtimePoseRuntime:
             ),
             floor_y=float(floor_y),
         )
+        predictor_sparse_available = build_predictor_sparse_availability_mask_np(
+            np.stack([state.available for state in tracker_window], axis=0)
+        )
         continuous = build_tracker_measurements_np(
             positions[None],
             rotations[None],
@@ -279,11 +328,14 @@ class RealtimePoseRuntime:
             predictor_features.current_head_yaw_world,
         )[0]
         current_tracker_raw = assemble_current_tracker_features_np(
-            continuous, available
+            continuous,
+            available,
+            required_tracker_indices=required_tracker_indices,
         )
         return _PreparedStep(
             motion_context=predictor_features.motion_context,
             core_tracker_context=predictor_features.core_tracker_context,
+            core_tracker_context_available=predictor_sparse_available,
             current_tracker_raw=current_tracker_raw,
             tracker_positions=positions,
             tracker_rotations_6d=rotations,
@@ -321,6 +373,7 @@ class RealtimePoseRuntime:
                 _TrackerWorldState(
                     prepared.tracker_positions.copy(),
                     prepared.tracker_rotations_6d.copy(),
+                    prepared.current_tracker_raw[:, 9] > 0.5,
                     prepared.floor_y,
                 )
             )
@@ -367,6 +420,12 @@ def step_realtime_pose_batch(
     sparse_raw = np.stack([value.core_tracker_context for value in prepared])
     motion = _normalize_pose_numpy(first.normalizer, motion_raw)
     sparse = _normalize_sparse_numpy(first.normalizer, sparse_raw)
+    sparse_available = np.stack(
+        [value.core_tracker_context_available for value in prepared]
+    )
+    # Null token 定义在归一化域的零点，避免原始零值经 z-score 后泄露为一个
+    # 巨大的伪测量；绝对量和速度量的 mask 已分别按因果依赖构造。
+    sparse = np.where(sparse_available, sparse, 0.0).astype(np.float32)
     motion_tensor = torch.as_tensor(motion, device=first.device, dtype=torch.float32)
     sparse_tensor = torch.as_tensor(sparse, device=first.device, dtype=torch.float32)
     tracker_tensor = torch.as_tensor(

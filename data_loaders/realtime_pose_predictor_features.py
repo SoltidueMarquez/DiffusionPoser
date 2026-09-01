@@ -79,6 +79,79 @@ def build_predictor_sparse_features_np(
     return result.astype(np.float32)
 
 
+def build_predictor_sparse_availability_mask_np(
+    tracker_available_with_previous: np.ndarray,
+) -> np.ndarray:
+    """把 `[-11,...,0]` 的逐点可用性转换为 Predictor `[11,54]` 通道 mask。
+
+    绝对旋转和位置只依赖当前帧；相对旋转和位置增量同时依赖相邻两帧。
+    因此掉线首帧与重连首帧都必须关闭速度类通道，防止用不存在的跨边界
+    测量构造虚假速度。
+    """
+
+    available = np.asarray(tracker_available_with_previous, dtype=bool)
+    expected = (
+        PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH + 1,
+        TRACKER_COUNT,
+    )
+    if available.shape != expected:
+        raise ValueError(f"tracker_available_with_previous 必须为 {expected}。")
+    core = available[:, list(CORE_TRACKER_INDICES)]
+    current = core[1:]
+    adjacent = core[:-1] & core[1:]
+    result = np.concatenate(
+        [
+            np.repeat(current, 6, axis=-1),
+            np.repeat(adjacent, 6, axis=-1),
+            np.repeat(current, 3, axis=-1),
+            np.repeat(adjacent, 3, axis=-1),
+        ],
+        axis=-1,
+    )
+    expected_result = (
+        PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH,
+        PREDICTOR_SPARSE_DIM,
+    )
+    if result.shape != expected_result:
+        raise RuntimeError("Predictor sparse availability mask 内部布局错误。")
+    return result
+
+
+def build_predictor_sparse_availability_mask_torch(
+    tracker_available_with_previous: torch.Tensor,
+) -> torch.Tensor:
+    """Torch 版 availability 映射，支持前导 batch 维并返回 ``[...,11,54]``。"""
+
+    available = tracker_available_with_previous.bool()
+    expected_tail = (
+        PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH + 1,
+        TRACKER_COUNT,
+    )
+    if tuple(available.shape[-2:]) != expected_tail:
+        raise ValueError(
+            f"tracker_available_with_previous 尾维必须为 {expected_tail}。"
+        )
+    core = available[..., list(CORE_TRACKER_INDICES)]
+    current = core[..., 1:, :]
+    adjacent = core[..., :-1, :] & core[..., 1:, :]
+    result = torch.cat(
+        [
+            torch.repeat_interleave(current, 6, dim=-1),
+            torch.repeat_interleave(adjacent, 6, dim=-1),
+            torch.repeat_interleave(current, 3, dim=-1),
+            torch.repeat_interleave(adjacent, 3, dim=-1),
+        ],
+        dim=-1,
+    )
+    expected_result_tail = (
+        PREDICTOR_CORE_TRACKER_CONTEXT_LENGTH,
+        PREDICTOR_SPARSE_DIM,
+    )
+    if tuple(result.shape[-2:]) != expected_result_tail:
+        raise RuntimeError("Predictor sparse availability mask Torch 布局错误。")
+    return result
+
+
 def build_predictor_sparse_features_torch(
     tracker_continuous_with_previous: torch.Tensor,
 ) -> torch.Tensor:
