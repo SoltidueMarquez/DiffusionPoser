@@ -617,6 +617,109 @@ def create_sphere_cloud(points: np.ndarray, radius: float):
     return trimesh.util.concatenate(parts)
 
 
+def build_surface_aligned_glyph_points(
+    anchor_points: np.ndarray,
+    camera_position: np.ndarray,
+    body_vertices: np.ndarray,
+    body_faces: np.ndarray,
+    *,
+    glyph_radius: float,
+    outward_offset_ratio: float = 0.18,
+) -> np.ndarray:
+    """把关节图标沿观察射线贴到人体可见表面，返回 ``[K,3]``。
+
+    ``anchor_points`` 表示图标应对应的渲染关节，而不是新的 tracker 数据。
+    每条射线从相机穿过关节投影位置，并取首次命中的人体三角面，因此图标
+    的屏幕中心不变，但不会再依赖固定的 12 cm 深度前移。图标中心只向相机
+    外移少量半径，使球体与皮肤相交，看起来是贴附而不是悬浮。
+    """
+
+    anchors = np.asarray(anchor_points, dtype=np.float64)
+    camera = np.asarray(camera_position, dtype=np.float64)
+    vertices = np.asarray(body_vertices, dtype=np.float64)
+    faces = np.asarray(body_faces, dtype=np.int64)
+    radius = float(glyph_radius)
+    offset_ratio = float(outward_offset_ratio)
+    if anchors.ndim != 2 or anchors.shape[1] != 3:
+        raise ValueError(f"anchor_points 应为 [K,3]，实际为 {anchors.shape}")
+    if camera.shape != (3,):
+        raise ValueError(f"camera_position 应为 [3]，实际为 {camera.shape}")
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"body_vertices 应为 [V,3]，实际为 {vertices.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"body_faces 应为 [F,3]，实际为 {faces.shape}")
+    if faces.size and (int(np.min(faces)) < 0 or int(np.max(faces)) >= vertices.shape[0]):
+        raise ValueError("body_faces 含越界顶点索引。")
+    if not (
+        np.isfinite(anchors).all()
+        and np.isfinite(camera).all()
+        and np.isfinite(vertices).all()
+    ):
+        raise ValueError("anchor/camera/body mesh 含 NaN/Inf。")
+    if radius <= 0.0:
+        raise ValueError("glyph_radius 必须为正数。")
+    if not 0.0 <= offset_ratio <= 1.0:
+        raise ValueError("outward_offset_ratio 必须位于 [0,1]。")
+    if anchors.shape[0] == 0:
+        return anchors.astype(np.float32)
+
+    triangles = vertices[faces]
+    edge_1 = triangles[:, 1] - triangles[:, 0]
+    edge_2 = triangles[:, 2] - triangles[:, 0]
+    ray_directions = anchors - camera[None]
+    ray_lengths = np.linalg.norm(ray_directions, axis=1, keepdims=True)
+    if np.any(ray_lengths <= 1e-8):
+        raise ValueError("anchor point 不能与相机位置重合。")
+    ray_directions /= ray_lengths
+
+    result = anchors.copy()
+    epsilon = 1e-9
+    for point_index, direction in enumerate(ray_directions):
+        # Moller-Trumbore 求交只在当前 tracker 的一条射线上展开；每帧最多
+        # 六条射线，避免引入 rtree 等额外运行时依赖。
+        cross_direction_edge_2 = np.cross(
+            np.broadcast_to(direction, edge_2.shape),
+            edge_2,
+        )
+        determinant = np.einsum("ij,ij->i", edge_1, cross_direction_edge_2)
+        valid = np.abs(determinant) > epsilon
+        inverse_determinant = np.zeros_like(determinant)
+        inverse_determinant[valid] = 1.0 / determinant[valid]
+        camera_from_triangle = camera[None] - triangles[:, 0]
+        barycentric_u = (
+            np.einsum("ij,ij->i", camera_from_triangle, cross_direction_edge_2)
+            * inverse_determinant
+        )
+        valid &= (barycentric_u >= -epsilon) & (barycentric_u <= 1.0 + epsilon)
+        cross_origin_edge_1 = np.cross(camera_from_triangle, edge_1)
+        barycentric_v = (
+            np.einsum(
+                "ij,ij->i",
+                np.broadcast_to(direction, cross_origin_edge_1.shape),
+                cross_origin_edge_1,
+            )
+            * inverse_determinant
+        )
+        valid &= (barycentric_v >= -epsilon) & (
+            barycentric_u + barycentric_v <= 1.0 + epsilon
+        )
+        distances = (
+            np.einsum("ij,ij->i", edge_2, cross_origin_edge_1)
+            * inverse_determinant
+        )
+        valid &= distances > epsilon
+        if not np.any(valid):
+            # 极端姿态下关节投影可能落在人体轮廓外；保留关节锚点比随意
+            # 吸附到另一块肢体更安全，也便于调用方发现真实的轮廓偏差。
+            continue
+        surface_distance = float(np.min(distances[valid]))
+        surface_point = camera + direction * surface_distance
+        result[point_index] = (
+            surface_point - direction * radius * offset_ratio
+        )
+    return result.astype(np.float32)
+
+
 def create_front_marker_mesh(center: np.ndarray, outward_normal: np.ndarray):
     """创建贴近胸口的小圆形徽标；它只标明身体正面，不编码额外姿态。"""
 

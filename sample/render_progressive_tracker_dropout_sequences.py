@@ -10,7 +10,6 @@ import re
 
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy.spatial.transform import Rotation, Slerp
 import torch
 
 from data_converter.amass_smpl_utils import (
@@ -22,10 +21,6 @@ from data_loaders.body_fbx_kinematics import load_body_fbx_rest
 from data_loaders.generate_realtime_pose_tasks import (
     compute_source_joint_rotations_world,
     load_realtime_source,
-)
-from data_loaders.realtime_pose_kinematics import (
-    rotation_6d_forward_up_np,
-    rotation_6d_to_matrix_np,
 )
 from data_loaders.sensor_masking import (
     ALL_SIX_AVAILABLE,
@@ -59,8 +54,15 @@ from sample.realtime_pose_longseq_evaluator import (
     create_longseq_runtime,
 )
 from sample.realtime_pose_runtime import WorldPoseState
+from sample.tracker_activation_blending import (
+    TrackerActivationRamps,
+    apply_tracker_activation_blend,
+    interpolate_tracker_measurement,
+    smoothstep_activation_alpha,
+)
 from sample.realtime_pose_smpl_rendering import (
     SmplMeshSequence,
+    build_surface_aligned_glyph_points,
     body_fbx_world_to_smpl_local_rotations,
     create_smplh_model,
     create_sphere_cloud,
@@ -72,7 +74,6 @@ from sample.realtime_pose_smpl_rendering import (
 )
 from sample.render_realtime_pose_smpl_presentation import (
     build_presentation_layout,
-    build_visible_tracker_glyph_points,
     create_material,
 )
 from sample.utils import load_checkpoint_model
@@ -100,6 +101,18 @@ INACTIVE_TRACKER_COLOR = (0.48, 0.51, 0.56, 1.0)
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
 INTRO_FRAME_COUNT = 15
+# 3→6 Demo 的标题使用独立安全区，避免标题直接压住人物头部。视口略微缩小后
+# 下移，底部被裁掉的只是不承载语义的地面区域，人体与 Tracker 都保持完整。
+ADDITION_HEADER_HEIGHT = 78
+ADDITION_VIEWPORT_SCALE = 0.87
+# 新 Tracker 接入后让提示保持 1.5 秒；原实现只显示一个 30 Hz 帧，正常播放时
+# 几乎不可见，无法承担“什么时候增加 Tracker”的叙事作用。
+ADDITION_EVENT_HOLD_FRAMES = 45
+TRACKER_DISPLAY_NAMES = {
+    "hip": "Hip",
+    "left_foot": "Left foot",
+    "right_foot": "Right foot",
+}
 # 两路人物在 720p 画面中需要比通用三路展示留出更多边缘，避免脚部动作和
 # Tracker 图标贴近画面边界；只改变可视化相机，不参与推理或指标计算。
 PROGRESSIVE_CAMERA_FIT_PADDING = 1.35
@@ -332,53 +345,6 @@ def warmup_tracker_available(direction: str) -> np.ndarray:
     )
 
 
-def smoothstep_activation_alpha(frame_offset: int, frame_count: int) -> float:
-    """返回新 Tracker 第 `frame_offset` 帧的 smoothstep 渐入权重。"""
-
-    if int(frame_count) <= 0:
-        raise ValueError("frame_count 必须为正整数。")
-    if int(frame_offset) < 0:
-        raise ValueError("frame_offset 不能为负数。")
-    unit = float(np.clip((int(frame_offset) + 1) / int(frame_count), 0.0, 1.0))
-    return unit * unit * (3.0 - 2.0 * unit)
-
-
-def interpolate_tracker_measurement(
-    *,
-    anchor_position: np.ndarray,
-    anchor_rotation: np.ndarray,
-    measured_position: np.ndarray,
-    measured_rotation_6d: np.ndarray,
-    alpha: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """从切换前部署姿态平滑过渡到当前真实 Tracker 测量。"""
-
-    weight = float(alpha)
-    if not 0.0 <= weight <= 1.0:
-        raise ValueError(f"alpha 必须位于 [0,1]，实际为 {weight}")
-    anchor_position = np.asarray(anchor_position, dtype=np.float64)
-    measured_position = np.asarray(measured_position, dtype=np.float64)
-    anchor_rotation = np.asarray(anchor_rotation, dtype=np.float64)
-    measured_rotation = rotation_6d_to_matrix_np(measured_rotation_6d)
-    if anchor_position.shape != (3,) or measured_position.shape != (3,):
-        raise ValueError(
-            f"Tracker 位置应为 [3]，实际为 {anchor_position.shape}/{measured_position.shape}"
-        )
-    if anchor_rotation.shape != (3, 3) or measured_rotation.shape != (3, 3):
-        raise ValueError(
-            f"Tracker 旋转应为 [3,3]，实际为 {anchor_rotation.shape}/{measured_rotation.shape}"
-        )
-    position = (1.0 - weight) * anchor_position + weight * measured_position
-    key_rotations = Rotation.from_matrix(
-        np.stack([anchor_rotation, measured_rotation], axis=0)
-    )
-    rotation = Slerp([0.0, 1.0], key_rotations)([weight]).as_matrix()[0]
-    return (
-        position.astype(np.float32),
-        rotation_6d_forward_up_np(rotation).astype(np.float32),
-    )
-
-
 def progressive_output_filename(
     relative_path: Path,
     *,
@@ -519,8 +485,7 @@ def run_progressive_sequence(
     noise_generator = create_eval_noise_generator(args.seed, device)
     previous_available = np.asarray(warmup_available, dtype=bool).copy()
     previous_result = None
-    # tracker_index -> (起始帧、切换前部署位置、切换前部署旋转)
-    activation_ramps: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
+    activation_ramps: TrackerActivationRamps = {}
     for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
         if current < source_frame_start:
             frame_tracker_available = warmup_available
@@ -528,56 +493,27 @@ def run_progressive_sequence(
             scored_offset = current - source_frame_start
             frame_tracker_available = schedule.tracker_available[scored_offset]
         frame_tracker_available = np.asarray(frame_tracker_available, dtype=bool)
-        frame_tracker_positions = np.asarray(
-            source["tracker_pos_world"][current], dtype=np.float32
-        ).copy()
-        frame_tracker_rotations_6d = np.asarray(
-            source["tracker_rot_world_6d"][current], dtype=np.float32
-        ).copy()
-        frame_blend_alpha = frame_tracker_available.astype(np.float32)
-
-        newly_added = ~previous_available & frame_tracker_available
-        if blend_frames > 0 and np.any(newly_added):
-            if previous_result is None:
-                raise RuntimeError("Tracker 渐入缺少切换前一帧的部署姿态。")
-            for tracker_index in np.flatnonzero(newly_added).tolist():
-                joint_index = int(TRACKER_TO_JOINT[tracker_index])
-                activation_ramps[tracker_index] = (
-                    current,
-                    np.asarray(
-                        previous_result.resolved_pose.joints_world[joint_index],
-                        dtype=np.float32,
-                    ).copy(),
-                    np.asarray(
-                        previous_result.resolved_pose.joint_rotations_world[joint_index],
-                        dtype=np.float32,
-                    ).copy(),
-                )
-
-        finished_ramps: list[int] = []
-        for tracker_index, (start_frame, anchor_position, anchor_rotation) in (
-            activation_ramps.items()
-        ):
-            if not frame_tracker_available[tracker_index]:
-                finished_ramps.append(tracker_index)
-                continue
-            frame_offset = current - start_frame
-            if frame_offset >= blend_frames:
-                finished_ramps.append(tracker_index)
-                continue
-            alpha = smoothstep_activation_alpha(frame_offset, blend_frames)
-            blended_position, blended_rotation_6d = interpolate_tracker_measurement(
-                anchor_position=anchor_position,
-                anchor_rotation=anchor_rotation,
-                measured_position=frame_tracker_positions[tracker_index],
-                measured_rotation_6d=frame_tracker_rotations_6d[tracker_index],
-                alpha=alpha,
+        frame_tracker_positions, frame_tracker_rotations_6d, frame_blend_alpha, _ = (
+            apply_tracker_activation_blend(
+                current_frame=current,
+                blend_frames=blend_frames,
+                previous_available=previous_available,
+                current_available=frame_tracker_available,
+                measured_positions=source["tracker_pos_world"][current],
+                measured_rotations_6d=source["tracker_rot_world_6d"][current],
+                previous_joint_positions=(
+                    None
+                    if previous_result is None
+                    else previous_result.resolved_pose.joints_world
+                ),
+                previous_joint_rotations=(
+                    None
+                    if previous_result is None
+                    else previous_result.resolved_pose.joint_rotations_world
+                ),
+                activation_ramps=activation_ramps,
             )
-            frame_tracker_positions[tracker_index] = blended_position
-            frame_tracker_rotations_6d[tracker_index] = blended_rotation_6d
-            frame_blend_alpha[tracker_index] = alpha
-        for tracker_index in finished_ramps:
-            del activation_ramps[tracker_index]
+        )
 
         noise = torch.randn(
             (1, REALTIME_POSE_TARGET_DIM),
@@ -991,6 +927,69 @@ def _rgba(color: tuple[float, float, float, float]) -> tuple[int, int, int, int]
     return tuple(int(round(float(value) * 255.0)) for value in color)
 
 
+def build_addition_safe_area_viewport(viewport_rgb: np.ndarray) -> Image.Image:
+    """把 `[H,W,3]` 场景缩进标题安全区，保证顶部文案不覆盖人体。"""
+
+    viewport = np.asarray(viewport_rgb, dtype=np.uint8)
+    if viewport.shape != (OUTPUT_HEIGHT, OUTPUT_WIDTH, 3):
+        raise ValueError(
+            "viewport_rgb 应为 "
+            f"{(OUTPUT_HEIGHT, OUTPUT_WIDTH, 3)}，实际为 {viewport.shape}"
+        )
+    source = Image.fromarray(viewport).convert("RGBA")
+    target_width = int(round(OUTPUT_WIDTH * ADDITION_VIEWPORT_SCALE))
+    target_height = int(round(OUTPUT_HEIGHT * ADDITION_VIEWPORT_SCALE))
+    resized = source.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (OUTPUT_WIDTH, OUTPUT_HEIGHT), (246, 248, 251, 255))
+    left = (OUTPUT_WIDTH - target_width) // 2
+    canvas.alpha_composite(resized, (left, ADDITION_HEADER_HEIGHT))
+    return canvas
+
+
+def tracker_display_name(name: str) -> str:
+    """把协议内部 tracker 名转换成 Demo 中易读的标签。"""
+
+    return TRACKER_DISPLAY_NAMES.get(str(name), str(name).replace("_", " ").title())
+
+
+def addition_event_label(
+    *,
+    frame_index: int,
+    result: ProgressiveSequenceResult,
+    transition_order: tuple[str, ...],
+) -> str | None:
+    """返回当前帧需要持续显示的新增 Tracker 提示。"""
+
+    stage = int(result.stage_indices[frame_index])
+    if stage <= 0:
+        return None
+    if stage > len(transition_order):
+        raise ValueError(
+            f"stage={stage} 超出 transition_order 长度 {len(transition_order)}。"
+        )
+    selected = np.flatnonzero(result.stage_indices == stage)
+    stage_start = int(selected[0])
+    if int(frame_index) - stage_start >= ADDITION_EVENT_HOLD_FRAMES:
+        return None
+    return f"TRACKER ADDED  + {tracker_display_name(transition_order[stage - 1])}"
+
+
+def addition_stage_label(
+    stage_index: int,
+    transition_order: tuple[str, ...],
+) -> str:
+    """生成底部时间轴标签，显式说明每个边界增加了哪个 Tracker。"""
+
+    stage = int(stage_index)
+    if stage == 0:
+        return "3 trackers"
+    if stage < 0 or stage > len(transition_order):
+        raise ValueError(
+            f"stage_index={stage} 超出 transition_order 长度 {len(transition_order)}。"
+        )
+    return f"{3 + stage}  + {tracker_display_name(transition_order[stage - 1])}"
+
+
 def compose_frame(
     *,
     viewport_rgb: np.ndarray,
@@ -1000,9 +999,6 @@ def compose_frame(
     direction: str,
     transition_order: tuple[str, ...],
 ) -> np.ndarray:
-    image = Image.fromarray(np.asarray(viewport_rgb, dtype=np.uint8)).convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
     stage = int(result.stage_indices[frame_index])
     stage_count = int(np.max(result.stage_indices)) + 1
     tracker_count = int(result.tracker_available[frame_index].sum())
@@ -1011,6 +1007,14 @@ def compose_frame(
     is_dropout = direction == "dropout"
     is_reconnection = direction == "reconnection"
     is_core_only = direction == "core_only"
+    is_addition = direction == "addition"
+    image = (
+        build_addition_safe_area_viewport(viewport_rgb)
+        if is_addition
+        else Image.fromarray(np.asarray(viewport_rgb, dtype=np.uint8)).convert("RGBA")
+    )
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
     if is_dropout:
         direction_label = "Dynamic 6→3"
         change_label = "Dropped"
@@ -1027,30 +1031,86 @@ def compose_frame(
     if int(result.activation_blend_frames) > 0:
         direction_label += f" Soft-start {int(result.activation_blend_frames)}f"
 
-    draw.rounded_rectangle(
-        (18, 16, OUTPUT_WIDTH - 18, 92),
-        radius=16,
-        fill=(255, 255, 255, 226),
-        outline=(207, 213, 221, 240),
-        width=2,
-    )
-    draw.text((42, 29), "GT", font=load_font(24), fill=_rgba(METHOD_COLORS["GT"]))
-    draw.text(
-        (OUTPUT_WIDTH // 2 + 30, 25),
-        (
-            f"{direction_label}  |  Stage {stage + 1}/{stage_count}  |  "
-            f"{tracker_count} trackers"
-        ),
-        font=load_font(23),
-        fill=_rgba(METHOD_COLORS["Dynamic"]),
-    )
-    draw.text(
-        (OUTPUT_WIDTH // 2 + 30, 57),
-        f"{change_label}: {changed}",
-        font=load_font(16),
-        fill=(74, 83, 96, 255),
-    )
-    if frame_index == stage_start and stage > 0:
+    if is_addition:
+        # 标题栏完全位于安全区内；右侧第二行在切换后的 1.5 秒内改为橙色事件提示。
+        draw.rectangle(
+            (0, 0, OUTPUT_WIDTH, ADDITION_HEADER_HEIGHT),
+            fill=(255, 255, 255, 255),
+        )
+        draw.line(
+            (0, ADDITION_HEADER_HEIGHT - 1, OUTPUT_WIDTH, ADDITION_HEADER_HEIGHT - 1),
+            fill=(207, 213, 221, 255),
+            width=2,
+        )
+        draw.text((28, 21), "Ground Truth", font=load_font(22), fill=_rgba(METHOD_COLORS["GT"]))
+        title_x = OUTPUT_WIDTH // 2 + 24
+        draw.text(
+            (title_x, 12),
+            f"3 → 6 trackers  |  {tracker_count} active  |  Stage {stage + 1}/{stage_count}",
+            font=load_font(22),
+            fill=_rgba(METHOD_COLORS["Dynamic"]),
+        )
+        event_label = addition_event_label(
+            frame_index=frame_index,
+            result=result,
+            transition_order=transition_order,
+        )
+        if event_label is not None:
+            event_font = load_font(17)
+            event_box = draw.textbbox((0, 0), event_label, font=event_font)
+            event_width = event_box[2] - event_box[0]
+            draw.rounded_rectangle(
+                (title_x - 10, 43, title_x + event_width + 12, 72),
+                radius=8,
+                fill=(255, 244, 214, 255),
+                outline=(245, 158, 11, 255),
+                width=2,
+            )
+            draw.text(
+                (title_x, 47),
+                event_label,
+                font=event_font,
+                fill=(138, 82, 4, 255),
+            )
+        else:
+            active_additions = (
+                "None"
+                if stage == 0
+                else " · ".join(
+                    tracker_display_name(name) for name in transition_order[:stage]
+                )
+            )
+            draw.text(
+                (title_x, 48),
+                f"Added: {active_additions}",
+                font=load_font(16),
+                fill=(74, 83, 96, 255),
+            )
+    else:
+        draw.rounded_rectangle(
+            (18, 16, OUTPUT_WIDTH - 18, 92),
+            radius=16,
+            fill=(255, 255, 255, 226),
+            outline=(207, 213, 221, 240),
+            width=2,
+        )
+        draw.text((42, 29), "GT", font=load_font(24), fill=_rgba(METHOD_COLORS["GT"]))
+        draw.text(
+            (OUTPUT_WIDTH // 2 + 30, 25),
+            (
+                f"{direction_label}  |  Stage {stage + 1}/{stage_count}  |  "
+                f"{tracker_count} trackers"
+            ),
+            font=load_font(23),
+            fill=_rgba(METHOD_COLORS["Dynamic"]),
+        )
+        draw.text(
+            (OUTPUT_WIDTH // 2 + 30, 57),
+            f"{change_label}: {changed}",
+            font=load_font(16),
+            fill=(74, 83, 96, 255),
+        )
+    if not is_addition and frame_index == stage_start and stage > 0:
         draw.rounded_rectangle(
             (OUTPUT_WIDTH // 2 - 175, 108, OUTPUT_WIDTH // 2 + 175, 154),
             radius=12,
@@ -1072,13 +1132,13 @@ def compose_frame(
             fill=(138, 82, 4, 255),
         )
 
-    footer_top = OUTPUT_HEIGHT - 84
+    footer_top = OUTPUT_HEIGHT - (100 if is_addition else 84)
     draw.rectangle(
         (0, footer_top, OUTPUT_WIDTH, OUTPUT_HEIGHT),
         fill=(255, 255, 255, 232),
     )
     timeline_left, timeline_right = 48, OUTPUT_WIDTH - 48
-    timeline_y = footer_top + 18
+    timeline_y = footer_top + (59 if is_addition else 18)
     segment_colors = (
         (56, 189, 248, 255),
         (45, 212, 191, 255),
@@ -1094,18 +1154,87 @@ def compose_frame(
             round((selected[-1] + 1) / result.frame_count * (timeline_right - timeline_left))
         )
         draw.rectangle((left, timeline_y, right, timeline_y + 9), fill=segment_colors[stage_index])
+        if is_addition:
+            stage_text = addition_stage_label(stage_index, transition_order)
+            stage_font = load_font(14)
+            stage_box = draw.textbbox((0, 0), stage_text, font=stage_font)
+            stage_width = stage_box[2] - stage_box[0]
+            draw.text(
+                ((left + right - stage_width) // 2, footer_top + 19),
+                stage_text,
+                font=stage_font,
+                fill=(31, 41, 55, 255),
+            )
+            if stage_index > 0:
+                draw.line(
+                    (left, footer_top + 12, left, timeline_y + 14),
+                    fill=(245, 158, 11, 220),
+                    width=2,
+                )
     cursor_x = timeline_left + int(
         round(frame_index / max(1, result.frame_count - 1) * (timeline_right - timeline_left))
     )
     draw.ellipse((cursor_x - 5, timeline_y - 4, cursor_x + 5, timeline_y + 13), fill=(20, 27, 38, 255))
-    footer = (
-        f"source frame {result.frame_start + frame_index}  |  "
-        f"MPJRE {metrics['mpjre_deg']:.2f}°  MPJPE {metrics['mpjpe_cm']:.2f} cm  "
-        f"MPJVE {metrics['mpjve_cm_per_s']:.2f} cm/s  "
-        f"Jitter {metrics['pred_jitter_m_per_s3']:.2f} m/s³"
-    )
-    draw.text((48, footer_top + 41), footer, font=load_font(17), fill=(31, 41, 55, 255))
+    if not is_addition:
+        footer = (
+            f"source frame {result.frame_start + frame_index}  |  "
+            f"MPJRE {metrics['mpjre_deg']:.2f}°  MPJPE {metrics['mpjpe_cm']:.2f} cm  "
+            f"MPJVE {metrics['mpjve_cm_per_s']:.2f} cm/s  "
+            f"Jitter {metrics['pred_jitter_m_per_s3']:.2f} m/s³"
+        )
+        draw.text((48, footer_top + 41), footer, font=load_font(17), fill=(31, 41, 55, 255))
     return np.asarray(Image.alpha_composite(image, overlay).convert("RGB"), dtype=np.uint8)
+
+
+def build_smpl_tracker_glyph_anchors(
+    *,
+    result: ProgressiveSequenceResult,
+    sequences: dict[str, SmplMeshSequence],
+) -> np.ndarray:
+    """把 Tracker 约束残差迁移到实际渲染的 SMPL-H 骨架，返回 ``[T,6,3]``。
+
+    推理使用 body.fbx Tracker 世界坐标，而展示人物使用 SMPL-H。直接把前者画到
+    后者上会混入两套骨架的长度差，看起来像 Tracker 没有跟随身体。这里仅迁移
+    ``测量位置 - 部署关节位置`` 这一真实约束残差；未启用的 Tracker 不参与
+    推理，因此只贴在对应的 SMPL-H 挂点上，不展示一个并未输入模型的残差。
+    """
+
+    if "Dynamic" not in sequences:
+        raise KeyError("Tracker 图标锚点缺少 Dynamic SMPL-H 序列。")
+    tracker_joint_indices = np.asarray(TRACKER_TO_JOINT, dtype=np.int64)
+    dynamic_joints = np.asarray(
+        sequences["Dynamic"].joints_world[:, tracker_joint_indices],
+        dtype=np.float64,
+    )
+    measured_positions = np.asarray(result.tracker_positions, dtype=np.float64)
+    deployed_joints = np.asarray(
+        result.deployed_positions[:, tracker_joint_indices],
+        dtype=np.float64,
+    )
+    available = np.asarray(result.tracker_available, dtype=bool)
+    expected_shape = (result.frame_count, len(TRACKER_TO_JOINT), 3)
+    if not (
+        dynamic_joints.shape
+        == measured_positions.shape
+        == deployed_joints.shape
+        == expected_shape
+    ):
+        raise ValueError(
+            "Tracker/SMPL-H 图标锚点形状不一致："
+            f"dynamic={dynamic_joints.shape}, measured={measured_positions.shape}, "
+            f"deployed={deployed_joints.shape}, expected={expected_shape}。"
+        )
+    if available.shape != expected_shape[:2]:
+        raise ValueError(
+            f"tracker_available 应为 {expected_shape[:2]}，实际为 {available.shape}。"
+        )
+    measurement_residual = measured_positions - deployed_joints
+    anchors = dynamic_joints + np.where(
+        available[..., None], measurement_residual, 0.0
+    )
+    if not np.isfinite(anchors).all():
+        raise ValueError("SMPL-H Tracker 图标锚点含 NaN/Inf。")
+    return anchors.astype(np.float32)
 
 
 def render_view(
@@ -1116,7 +1245,7 @@ def render_view(
     sequences: dict[str, SmplMeshSequence],
     faces: np.ndarray,
     method_offsets: np.ndarray,
-    tracker_positions: np.ndarray,
+    tracker_glyph_anchors: np.ndarray,
     tracker_available: np.ndarray,
     camera_pose: np.ndarray,
 ) -> np.ndarray:
@@ -1139,16 +1268,38 @@ def render_view(
             add_mesh(body, create_material(pyrender, METHOD_COLORS[method_name], 0.92))
 
         dynamic_offset = np.asarray(method_offsets[1], dtype=np.float64)
-        tracker_frame = np.asarray(tracker_positions[frame_index], dtype=np.float64)
-        visible = build_visible_tracker_glyph_points(
-            tracker_frame + dynamic_offset,
-            np.asarray(camera_pose, dtype=np.float64)[:3, 3],
+        dynamic_vertices = (
+            np.asarray(
+                sequences["Dynamic"].vertices_world[frame_index], dtype=np.float64
+            )
+            + dynamic_offset
         )
+        tracker_frame = (
+            np.asarray(tracker_glyph_anchors[frame_index], dtype=np.float64)
+            + dynamic_offset
+        )
+        camera_position = np.asarray(camera_pose, dtype=np.float64)[:3, 3]
         mask = np.asarray(tracker_available[frame_index], dtype=bool)
-        active_cloud = create_sphere_cloud(visible[mask], radius=0.035)
+        # 按两种半径分别求人体表面交点，球心只向相机外移少量半径；相比原先
+        # 固定前移 12 cm，Tracker 会贴住手腕、腰部和脚部的可见皮肤表面。
+        active_points = build_surface_aligned_glyph_points(
+            tracker_frame[mask],
+            camera_position,
+            dynamic_vertices,
+            faces,
+            glyph_radius=0.035,
+        )
+        active_cloud = create_sphere_cloud(active_points, radius=0.035)
         if active_cloud is not None:
             add_mesh(active_cloud, create_material(pyrender, ACTIVE_TRACKER_COLOR, 0.48))
-        inactive_cloud = create_sphere_cloud(visible[~mask], radius=0.022)
+        inactive_points = build_surface_aligned_glyph_points(
+            tracker_frame[~mask],
+            camera_position,
+            dynamic_vertices,
+            faces,
+            glyph_radius=0.022,
+        )
+        inactive_cloud = create_sphere_cloud(inactive_points, radius=0.022)
         if inactive_cloud is not None:
             add_mesh(inactive_cloud, create_material(pyrender, INACTIVE_TRACKER_COLOR, 0.72))
         color, _ = renderer.render(scene, flags=pyrender.RenderFlags.NONE)
@@ -1176,9 +1327,12 @@ def render_video(
         raise ImportError("缺少 pyrender，无法执行 SMPL-H 离屏渲染。") from exc
 
     # 相机拟合纳入动态路可能出现的全部六点，后续 mask 切换不会改变视野尺度。
-    # 可视化始终显示物理 Tracker 的原始测量；runtime 插值仍用于 Soft 推理，
-    # 但不再用橙色球展示，以免混淆测量位置与模型的有效输入。
-    displayed_tracker_positions = result.tracker_positions
+    # 图标仅把原始测量相对部署关节的残差迁移到 SMPL-H；runtime 插值仍只用于
+    # Soft 推理，不会被误画成外部物理 Tracker 的真实位置。
+    displayed_tracker_positions = build_smpl_tracker_glyph_anchors(
+        result=result,
+        sequences=sequences,
+    )
     layout = build_presentation_layout(
         sequences=sequences,
         tracker_pos_world=displayed_tracker_positions,
@@ -1211,7 +1365,7 @@ def render_video(
                 sequences=sequences,
                 faces=faces,
                 method_offsets=layout.method_offsets,
-                tracker_positions=displayed_tracker_positions,
+                tracker_glyph_anchors=displayed_tracker_positions,
                 tracker_available=result.tracker_available,
                 camera_pose=layout.camera_poses[frame_index],
             )

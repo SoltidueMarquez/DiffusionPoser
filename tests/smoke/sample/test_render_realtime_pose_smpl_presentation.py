@@ -1,6 +1,10 @@
 import numpy as np
 
-from sample.realtime_pose_smpl_rendering import METHOD_ORDER, SmplMeshSequence
+from sample.realtime_pose_smpl_rendering import (
+    METHOD_ORDER,
+    SmplMeshSequence,
+    build_surface_aligned_glyph_points,
+)
 from sample.render_realtime_pose_smpl_presentation import (
     INTRO_FRAME_COUNT,
     METHOD_GAP_METERS,
@@ -72,6 +76,48 @@ def project_to_ndc(points_world: np.ndarray, camera_pose: np.ndarray, yfov: floa
         axis=-1,
     )
     return ndc, depth
+
+
+def test_surface_aligned_glyph_points_attach_to_visible_mesh_without_projection_shift():
+    """图标应贴到相机侧表面，同时保持关节锚点的屏幕投影位置。"""
+
+    import trimesh
+
+    body = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    camera_position = np.asarray([0.0, 0.0, 3.0], dtype=np.float64)
+    anchors = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, -0.2, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    radius = 0.1
+    points = build_surface_aligned_glyph_points(
+        anchor_points=anchors,
+        camera_position=camera_position,
+        body_vertices=body.vertices,
+        body_faces=body.faces,
+        glyph_radius=radius,
+        outward_offset_ratio=0.2,
+    )
+
+    anchor_rays = anchors - camera_position
+    point_rays = points - camera_position
+    np.testing.assert_allclose(
+        np.cross(anchor_rays, point_rays),
+        0.0,
+        atol=1e-6,
+    )
+    # 立方体的可见前表面为 z=1；中心再沿各自的斜射线
+    # 朝相机外移 0.02 m，所以 z 分量需按归一化射线计算。
+    normalized_rays = anchor_rays / np.linalg.norm(anchor_rays, axis=1, keepdims=True)
+    expected_z = 1.0 - normalized_rays[:, 2] * radius * 0.2
+    np.testing.assert_allclose(points[:, 2], expected_z, atol=1e-6)
+    assert np.all(
+        np.linalg.norm(point_rays, axis=1)
+        < np.linalg.norm(anchor_rays, axis=1)
+    )
 
 
 def test_shared_stage_offsets_camera_follow_and_frustum():
