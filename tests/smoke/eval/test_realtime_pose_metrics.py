@@ -5,7 +5,9 @@ import pytest
 
 from eval.realtime_pose_metrics import (
     aggregate_rpm_p2_mc_metrics,
+    aggregate_rpm_transition_jerk_segments,
     compute_rpm_p2_mc_metrics,
+    extract_rpm_transition_jerk_segments,
 )
 
 
@@ -91,3 +93,40 @@ def test_rpm_p2_mc_aggregation_is_sequence_weighted_and_skips_missing_derivative
     assert summary["mpjve_cm_per_s"] == pytest.approx(5.0)
     assert summary["sequence_counts"]["mpjre_deg"] == 2
     assert summary["sequence_counts"]["mpjve_cm_per_s"] == 1
+
+
+def test_rpm_transition_jerk_matches_released_curve_aggregation():
+    fps = 30.0
+    frame_count = 20
+    frame = np.arange(frame_count, dtype=np.float64)
+    predicted_positions = np.zeros((frame_count, 24, 3), dtype=np.float64)
+    predicted_positions[:, :, 0] = (frame**3 / fps**3)[:, None]
+    target_positions = np.zeros_like(predicted_positions)
+    gaps = (((6, 12),), ())
+
+    predicted = extract_rpm_transition_jerk_segments(
+        joint_positions=predicted_positions,
+        hand_gap_intervals=gaps,
+        fps=fps,
+        transition_seconds=0.1,
+    )
+    target = extract_rpm_transition_jerk_segments(
+        joint_positions=target_positions,
+        hand_gap_intervals=gaps,
+        fps=fps,
+        transition_seconds=0.1,
+    )
+    report = aggregate_rpm_transition_jerk_segments(
+        predicted_segments=[predicted],
+        target_segments=[target],
+    )
+
+    assert predicted["tracking_to_synthesis"].shape == (1, 3)
+    assert predicted["synthesis_to_tracking"].shape == (1, 3)
+    assert report["tracking_to_synthesis"]["event_count"] == 1
+    assert report["tracking_to_synthesis"]["pj_1e2_m_per_s3"] == pytest.approx(
+        0.06
+    )
+    assert report["tracking_to_synthesis"]["auj_1e2_m_per_s2"] == pytest.approx(
+        0.18
+    )

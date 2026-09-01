@@ -428,6 +428,9 @@ def create_longseq_runtime(
         ik_gap_high=args.ik_gap_high,
         ik_direction_support=args.ik_direction_support,
         ik_untracked_strength=args.ik_untracked_strength,
+        allow_missing_core_trackers=bool(
+            getattr(args, "allow_missing_core_trackers", False)
+        ),
     )
 
 
