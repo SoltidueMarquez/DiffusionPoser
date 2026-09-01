@@ -25,6 +25,8 @@ from data_loaders.realtime_pose_kinematics import (
 )
 from data_loaders.sensor_masking import (
     CORE_TRACKER_INDICES,
+    FOOT_TRACKER_INDICES,
+    HIP_TRACKER_INDEX,
     REALTIME_POSE_FPS,
     REALTIME_POSE_TARGET_DIM,
     TRACKER_COUNT,
@@ -117,6 +119,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="强制把 Hip availability 设为 false，适合 Hip Tracker 异常的录制。",
     )
+    runtime.add_argument(
+        "--ignore_feet",
+        action="store_true",
+        help="强制把左右脚 availability 设为 false，用三点模式执行完整推理。",
+    )
     # 训练 checkpoint 保存 50 个基础 timestep；Demo 固定用当前正式 10-step DDIM。
     parser.set_defaults(ts_respace="10")
     return parser
@@ -179,6 +186,28 @@ def load_unity_tracker_recording(path: str | Path) -> UnityTrackerRecording:
         rotations_xyzw=rotations.astype(np.float32),
         available=available,
         floor_y=float(payload.get("floorY", 0.0)),
+    )
+
+
+def apply_tracker_availability_overrides(
+    recording: UnityTrackerRecording,
+    *,
+    ignore_hip: bool,
+    ignore_feet: bool,
+) -> UnityTrackerRecording:
+    """只覆盖本次推理使用的 availability，不修改录制的测量值或原始 JSON。"""
+
+    available = np.asarray(recording.available, dtype=bool).copy()
+    if bool(ignore_hip):
+        available[:, HIP_TRACKER_INDEX] = False
+    if bool(ignore_feet):
+        available[:, list(FOOT_TRACKER_INDICES)] = False
+    return UnityTrackerRecording(
+        times=recording.times,
+        positions=recording.positions,
+        rotations_xyzw=recording.rotations_xyzw,
+        available=available,
+        floor_y=recording.floor_y,
     )
 
 
@@ -454,17 +483,22 @@ def main(argv: list[str] | None = None) -> Path:
             "use_ema",
             "warmup_frames",
             "ignore_hip",
+            "ignore_feet",
         },
     )
     fixseed(int(args.seed))
     device = resolve_device(args.device)
     print(f"[FLUID] device: {device}", flush=True)
 
-    raw_recording = load_unity_tracker_recording(args.input)
+    raw_recording = apply_tracker_availability_overrides(
+        load_unity_tracker_recording(args.input),
+        ignore_hip=bool(args.ignore_hip),
+        ignore_feet=bool(args.ignore_feet),
+    )
     if args.ignore_hip:
-        # 保留原始 JSON 不变，只在本次推理内屏蔽 Hip；双脚仍可继续参与 IK。
-        raw_recording.available[:, 3] = False
         print("[FLUID] Hip Tracker ignored for the full recording.", flush=True)
+    if args.ignore_feet:
+        print("[FLUID] Foot Trackers ignored for the full recording.", flush=True)
     recording = resample_tracker_recording(raw_recording)
     rest = load_body_fbx_rest(args.body_fbx_rest_json)
     dit, diffusion = create_model_and_diffusion(args)
