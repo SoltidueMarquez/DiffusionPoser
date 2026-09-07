@@ -55,6 +55,7 @@ from sample.realtime_pose_longseq_evaluator import (
 )
 from sample.realtime_pose_runtime import WorldPoseState
 from sample.tracker_activation_blending import (
+    DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M,
     TrackerActivationRamps,
     apply_tracker_activation_blend,
     interpolate_tracker_measurement,
@@ -233,6 +234,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "3→6 添加或 3→4 重连中新 Tracker 测量的渐入帧数；"
             "位置使用 LERP、旋转使用 SLERP，0 保持硬切换。"
+        ),
+    )
+    protocol.add_argument(
+        "--foot_ground_height_threshold",
+        default=DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M,
+        type=float,
+        help=(
+            "Foot Tracker 相对地面的触地高度阈值（米）；渐入期间原始测量低于"
+            "该阈值时，当帧结束插值并直接采用真实测量。"
         ),
     )
     protocol.add_argument("--stride", default=1, type=int)
@@ -512,6 +522,14 @@ def run_progressive_sequence(
                     else previous_result.resolved_pose.joint_rotations_world
                 ),
                 activation_ramps=activation_ramps,
+                floor_y=float(source["root_pos_world"][current, 1]),
+                foot_ground_height_threshold=float(
+                    getattr(
+                        args,
+                        "foot_ground_height_threshold",
+                        DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M,
+                    )
+                ),
             )
         )
 
@@ -895,6 +913,14 @@ def write_sidecars(
             "rotation": "slerp",
             "anchor": "previous_deployed_tracker_joint",
             "tracker_available_remains_binary": True,
+            "foot_ground_height_threshold_m": float(
+                getattr(
+                    args,
+                    "foot_ground_height_threshold",
+                    DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M,
+                )
+            ),
+            "grounded_foot_ends_blend": True,
         },
         "predictor_model_path": str(Path(args.predictor_model_path).resolve()),
         "dit_model_path": str(Path(args.dit_model_path).resolve()),
@@ -1484,6 +1510,8 @@ def main(argv: list[str] | None = None) -> list[dict[str, Path]]:
         raise ValueError("--stride 必须为正整数。")
     if int(args.activation_blend_frames) < 0:
         raise ValueError("--activation_blend_frames 不能为负数。")
+    if float(args.foot_ground_height_threshold) < 0.0:
+        raise ValueError("--foot_ground_height_threshold 不能为负数。")
     reconnect_after_frames = int(args.reconnect_after_frames)
     if reconnect_after_frames < 0:
         raise ValueError("--reconnect_after_frames 不能为负数。")

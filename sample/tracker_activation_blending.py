@@ -7,10 +7,19 @@ from data_loaders.realtime_pose_kinematics import (
     rotation_6d_forward_up_np,
     rotation_6d_to_matrix_np,
 )
-from data_loaders.sensor_masking import TRACKER_COUNT, TRACKER_TO_JOINT
+from data_loaders.sensor_masking import (
+    LEFT_FOOT_TRACKER_INDEX,
+    RIGHT_FOOT_TRACKER_INDEX,
+    TRACKER_COUNT,
+    TRACKER_TO_JOINT,
+)
 
 
 TrackerActivationRamps = dict[int, tuple[int, np.ndarray, np.ndarray]]
+DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M = 0.03
+FOOT_TRACKER_INDICES = frozenset(
+    (LEFT_FOOT_TRACKER_INDEX, RIGHT_FOOT_TRACKER_INDEX)
+)
 
 
 def smoothstep_activation_alpha(frame_offset: int, frame_count: int) -> float:
@@ -60,6 +69,26 @@ def interpolate_tracker_measurement(
     )
 
 
+def should_stop_foot_activation_blend(
+    *,
+    tracker_index: int,
+    measured_position: np.ndarray,
+    floor_y: float,
+    height_threshold: float,
+) -> bool:
+    """原始 Foot Tracker 已进入地面阈值时，提前结束本次渐入。"""
+
+    threshold = float(height_threshold)
+    if threshold < 0.0:
+        raise ValueError("Foot Tracker 触地高度阈值不能为负数。")
+    position = np.asarray(measured_position, dtype=np.float64)
+    if position.shape != (3,):
+        raise ValueError(f"Foot Tracker 位置应为 [3]，实际为 {position.shape}")
+    if int(tracker_index) not in FOOT_TRACKER_INDICES:
+        return False
+    return float(position[1] - float(floor_y)) <= threshold
+
+
 def apply_tracker_activation_blend(
     *,
     current_frame: int,
@@ -71,12 +100,16 @@ def apply_tracker_activation_blend(
     previous_joint_positions: np.ndarray | None,
     previous_joint_rotations: np.ndarray | None,
     activation_ramps: TrackerActivationRamps,
+    floor_y: float | None = None,
+    foot_ground_height_threshold: float = DEFAULT_FOOT_GROUND_HEIGHT_THRESHOLD_M,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, ...]]:
     """对本帧新接入的 Tracker 应用项目统一的 soft-start 策略。
 
     每条 ramp 固定锚定在重连前一帧的部署关节姿态；位置使用 LERP，旋转使用
     SLERP，权重在 ``blend_frames`` 帧内按 smoothstep 从锚点渐入真实测量。
-    ``activation_ramps`` 由调用方跨帧持有，并在本函数中原地更新。
+    ``activation_ramps`` 由调用方跨帧持有，并在本函数中原地更新。调用方提供
+    ``floor_y`` 时，Foot Tracker 的原始测量一旦进入地面阈值，就当帧结束渐入并
+    直接采用真实测量；非脚部 Tracker 与未提供地面的调用保持原策略。
     """
 
     frame = int(current_frame)
@@ -122,6 +155,16 @@ def apply_tracker_activation_blend(
         if frame_offset < 0:
             raise RuntimeError("Tracker activation ramp 起始帧晚于当前帧。")
         if frame_offset >= frame_count:
+            finished_ramps.append(tracker_index)
+            continue
+        # 触地判断读取插值前的物理测量；结束后 positions/rotations 保持当前真实值。
+        if floor_y is not None and should_stop_foot_activation_blend(
+            tracker_index=tracker_index,
+            measured_position=positions[tracker_index],
+            floor_y=float(floor_y),
+            height_threshold=foot_ground_height_threshold,
+        ):
+            alpha[tracker_index] = 1.0
             finished_ramps.append(tracker_index)
             continue
         weight = smoothstep_activation_alpha(frame_offset, frame_count)

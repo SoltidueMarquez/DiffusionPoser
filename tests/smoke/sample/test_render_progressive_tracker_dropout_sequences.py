@@ -31,6 +31,7 @@ from sample.render_progressive_tracker_dropout_sequences import (
     validate_reconnect_tracker,
     warmup_tracker_available,
 )
+from sample.tracker_activation_blending import apply_tracker_activation_blend
 
 
 def build_result_with_boundary_jump() -> ProgressiveSequenceResult:
@@ -184,6 +185,66 @@ def test_tracker_activation_blends_position_and_rotation() -> None:
     np.testing.assert_allclose(
         rotation_6d_to_matrix_np(rotation_6d), expected_rotation, atol=1e-6
     )
+
+
+def test_grounded_foot_ends_blend_while_hip_keeps_soft_start() -> None:
+    previous_available = np.array([True, True, True, False, False, False])
+    current_available = np.array([True, True, True, True, True, False])
+    measured_positions = np.zeros((6, 3), dtype=np.float32)
+    measured_positions[3] = [10.0, 0.0, 0.0]
+    measured_positions[4] = [20.0, 0.029, 0.0]
+    measured_rotations_6d = np.tile(
+        np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        (6, 1),
+    )
+    ramps = {}
+
+    positions, _, alpha, newly_added = apply_tracker_activation_blend(
+        current_frame=30,
+        blend_frames=10,
+        previous_available=previous_available,
+        current_available=current_available,
+        measured_positions=measured_positions,
+        measured_rotations_6d=measured_rotations_6d,
+        previous_joint_positions=np.zeros((24, 3), dtype=np.float32),
+        previous_joint_rotations=np.tile(
+            np.eye(3, dtype=np.float32)[None], (24, 1, 1)
+        ),
+        activation_ramps=ramps,
+        floor_y=0.0,
+        foot_ground_height_threshold=0.03,
+    )
+
+    expected_soft_alpha = smoothstep_activation_alpha(0, 10)
+    assert newly_added == (3, 4)
+    assert alpha[3] == pytest.approx(expected_soft_alpha)
+    assert positions[3, 0] == pytest.approx(10.0 * expected_soft_alpha)
+    assert 3 in ramps
+    assert alpha[4] == pytest.approx(1.0)
+    np.testing.assert_allclose(positions[4], measured_positions[4])
+    assert 4 not in ramps
+
+
+def test_ground_height_threshold_must_be_nonnegative() -> None:
+    with pytest.raises(ValueError, match="不能为负数"):
+        apply_tracker_activation_blend(
+            current_frame=30,
+            blend_frames=10,
+            previous_available=np.array([True, True, True, False, False, False]),
+            current_available=np.array([True, True, True, False, True, False]),
+            measured_positions=np.zeros((6, 3), dtype=np.float32),
+            measured_rotations_6d=np.tile(
+                np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+                (6, 1),
+            ),
+            previous_joint_positions=np.zeros((24, 3), dtype=np.float32),
+            previous_joint_rotations=np.tile(
+                np.eye(3, dtype=np.float32)[None], (24, 1, 1)
+            ),
+            activation_ramps={},
+            floor_y=0.0,
+            foot_ground_height_threshold=-0.01,
+        )
 
 
 def test_ten_frame_soft_start_uses_smoothstep_and_keeps_separate_filename() -> None:
