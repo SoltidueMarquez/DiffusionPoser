@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from export import export_sentis_denoiser
+from export.unity_onnx_models import SamplerLayerNorm
 from scripts import export_smpl_source_rest
 
 
@@ -32,8 +34,22 @@ def test_source_rest_offsets_keep_positive_grounded_pelvis():
     assert rest_offsets[0, 1] == 1.0
 
 
-def test_sentis_export_is_explicitly_out_of_scope_for_two_models(tmp_path):
-    with pytest.raises(NotImplementedError, match="双模型"):
-        export_sentis_denoiser.main(
-            ["--model_path", str(tmp_path / "model000000001.pt")]
-        )
+def test_unity_export_parser_accepts_two_models():
+    args = export_sentis_denoiser.build_arg_parser().parse_args([
+        '--model_path', 'dit.pt', '--predictor_model_path', 'predictor.pt',
+        '--normalizer_dir', 'normalizer', '--body_fbx_rest_json', 'rest.json',
+    ])
+    assert str(args.predictor_model_path) == 'predictor.pt'
+    assert args.ts_respace == '10'
+
+
+@pytest.mark.parametrize('shape', [(1, 24, 192), (24, 1, 192)])
+def test_sampler_layer_norm_preserves_adaln_math(shape):
+    generator = torch.Generator().manual_seed(10)
+    value = torch.randn(shape, generator=generator)
+    scale = torch.randn(shape[0], 1, shape[-1], generator=generator)
+    shift = torch.randn(shape[0], 1, shape[-1], generator=generator)
+    reference = torch.nn.LayerNorm(shape[-1], elementwise_affine=False, eps=1e-5)
+    actual = SamplerLayerNorm(reference.eps)(value) * (1 + scale) + shift
+    expected = reference(value) * (1 + scale) + shift
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)

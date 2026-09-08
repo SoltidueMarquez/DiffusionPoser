@@ -296,3 +296,67 @@ Predictor + 单帧 DiT runtime，并输出 Unity 可直接回放的 JSON。每�
 固定顺序的 `localRotations [24,4]`。该 Demo 文件不包含 schema 或版本字段。
 录制中的 Hip 异常时可传入 `--ignore_hip`，它只在本次推理中把 Hip availability
 全程设为 false，不修改原始 JSON；Head、双手和双脚仍按五点配置进入 runtime。
+
+## FLUIDUnity ONNX 部署
+
+`export.export_sentis_denoiser` 导出 batch=1、FP32、opset 15 的两个模型。
+`predictor.onnx` 输入归一化的 `motion_context [1,10,144]` 和
+`core_tracker_context [1,11,54]`，输出归一化的 `predictor_pose_horizon [1,11,144]`。
+历史 Pose 必须每帧转换到当前 Head-yaw 坐标系；缺失的 sparse 特征在归一化后
+置零，速度有效性同时依赖相邻帧。上述特征处理由调用端完成。
+
+`pose_sampler.onnx` 输入如下，除 `constraint_type` 为 int64 外全部为 float32：
+
+| 输入 | 形状与语义 |
+| --- | --- |
+| motion_context | [1,10,144]，归一化历史 Pose |
+| predictor_pose_horizon | [1,11,144]，Predictor 输出 |
+| current_tracker_raw | [1,6,10]，当前 Head-yaw 系位置、forward/up 6D 旋转、0/1 availability |
+| ik_residual | [1,24,6]，归一化 IK 姿态减 Predictor 当前姿态 |
+| ik_gap / ik_confidence / denoise_strength | 各 [1,24]，现有 IK 条件 |
+| constraint_type | [1,24]，现有 IK 约束类别索引 |
+| noise | [1,144]，显式标准正态初始噪声 |
+
+输出 `deployed_pose [1,144]` 仍在归一化域。调用端反归一化后使用现有
+Head-anchored resolver 和 body rest 转换为 Unity 姿态，并反馈部署旋转到历史。
+IK、历史管理与显示插值不在 ONNX 图中。
+
+Sampler 固定采用 50 个基础 diffusion timestep、`ts_respace="10"`、`eta=0`；
+实际 timestep 映射和系数作为常量保存。条件编码一次，10 次 DiT 共享权重，
+仅最后一步投影，不再次乘 denoise strength，也不在图中生成随机数。
+部署副本将 DiT block 的无仿射 LayerNorm 表达为中心化值乘方差的逆平方根，
+保留原 eps 和 AdaLN 广播运算，避免 Unity Inference 2.6.1 错融合三维 scale/bias。
+训练模型及用于对照的原 PyTorch 模型不做替换。
+部署副本的时间 Attention 保留原 Q/K/V 和输出投影，用 `(K @ Qᵀ)ᵀ` 与
+`(Vᵀ @ Pᵀ)ᵀ` 等价表达两次矩阵乘；保持双侧缩放和原时间轴 Softmax，
+避免 Unity 的 M=1 向量批乘路径。此替换不涉及空间或 Tracker Attention，
+不改变部署输入输出、权重、精度及采样步数。
+同一次 Sampler 调用中，各 DiT block 的时间上下文归一化及 K/V 联合投影
+在去噪循环外各执行一次，结果通过局部 tuple 传给 10 步；Q 仍逐步计算。
+K/V 不写入跨调用状态，不同 block 不共享，下一 tick 从新条件重新计算。
+`runtime_config.json` 的 normalizer 保存六组已加载统计和单独的
+`normalizer_eps`：Pose 使用 pose_scale 直接相除，Tracker/sparse 使用 std+eps。
+`ik` 保存实际解析参数，`ik_position_solved_quality=null` 表示沿用几何计算的
+quality。骨架文件原样复制为 `body_fbx_rest.json`。
+
+在仓库根目录执行：
+
+```powershell
+conda run -n diffusionposer5070 python -m export.export_sentis_denoiser `
+  --predictor_model_path artifacts/unity_demo/predictor/model_latest.pt `
+  --model_path artifacts/unity_demo/dit/ema000100000.pt `
+  --normalizer_dir artifacts/unity_demo/normalizer `
+  --ik_calibration_path artifacts/unity_demo/ik_calibration.json `
+  --body_fbx_rest_json ../FLUIDUnity/Assets/StreamingAssets/FLUID/body_fbx_rest.json `
+  --output_dir output/unity_onnx
+```
+
+将模块名换为 `export.check_unity_onnx`，其余参数相同，即执行最小对照。
+默认录制为 `recording_20260829_164358.json`，也可用 `--input` 指定。
+对照固定忽略 Hip，处理 90 个重采样帧、从第 12 帧开始推理，跳过 30 个推理
+输出后比较连续 10 帧，容差为 atol=1e-4、rtol=1e-3。闭环历史使用 ONNX 输出；
+原 PyTorch sampler 在相同输入下产生参考，不改变模型采样语义。
+输出 `comparison.json`、`onnx_pose_result.json` 和 `reference_inputs.npz`。
+NPZ 各输入带首轴 10（对照 tick），其后保留原 batch 轴；参考输出键为
+`expected_predictor`、`expected_deployed_pose`，供 Unity 导入对照复用。
+CPU ONNX 对照不代表 Unity GPU 兼容性或性能验收。
