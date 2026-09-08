@@ -1,0 +1,17 @@
+{
+  "sample_count": 20000,
+  "predictor_model_path": "/home/asus/Datasets/DiffusionPoserArtifacts/predictor/runs/predictor_rpm_hand_dropout/model_latest.pt",
+  "recommended_parameters": {
+    "ik_direction_only_quality": 0.9710166674402457,
+    "ik_residual_scale": 0.001,
+    "ik_gap_low": 0.005980208516120911,
+    "ik_gap_high": 0.07033716887235641
+  },
+  "diagnostics": {
+    "median_direction_rotation_error_deg": 1.6851631617674692,
+    "median_endpoint_residual_ratio": 0.0003988471580669284,
+    "ik_gap_unit": "radian",
+    "updated_joint_gap_count": 273024,
+    "tracker_configuration_count": 8
+  }
+}
