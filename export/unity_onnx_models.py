@@ -10,18 +10,28 @@ from torch.nn import functional as F
 from diffusion.realtime_pose_inpainting import build_tracker_geometry_condition
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart
 from model.realtime_pose_current_dit import _modulate
+from model.realtime_pose_current_dit import PreparedCurrentConditioning
 
 SAMPLER_INPUTS = ['motion_context', 'predictor_pose_horizon', 'current_tracker_raw',
                  'ik_residual', 'ik_gap', 'ik_confidence', 'denoise_strength',
                  'constraint_type', 'noise']
 
 
-def example_inputs():
+def example_inputs(collision_postprocess=False):
     """静态形状示例；零输入只用于追踪，不代表真实初始化姿态。"""
-    return (torch.zeros(1, 10, 144), torch.zeros(1, 11, 144),
+    values = (torch.zeros(1, 10, 144), torch.zeros(1, 11, 144),
             torch.ones(1, 6, 10), torch.zeros(1, 24, 6),
             torch.zeros(1, 24), torch.ones(1, 24), torch.ones(1, 24),
             torch.zeros(1, 24, dtype=torch.long), torch.zeros(1, 144))
+    if not collision_postprocess:
+        return values
+    boxes = torch.zeros(1, 2, 15)
+    boxes[..., 3:12] = torch.eye(3).flatten()
+    boxes[..., 12:] = torch.tensor([.033, .0095, .1325])
+    display = torch.zeros(1, 106)
+    display[:, 6] = 1
+    display[:, 10:].reshape(1, 24, 4)[..., 3] = 1
+    return values + (boxes, torch.zeros(1, 2, 2, dtype=torch.long), torch.zeros(1, 4), display)
 
 
 class SamplerTemporalAttention(nn.Module):
@@ -135,7 +145,7 @@ class SamplerLayerNorm(nn.Module):
 
 
 class PoseSampler(nn.Module):
-    def __init__(self, dit, diffusion, normalizer):
+    def __init__(self, dit, diffusion, normalizer, collision_postprocess=None):
         super().__init__()
         # 不改传入的原模型；数值对照仍必须以未经部署替换的 PyTorch 为参考。
         self.dit = deepcopy(dit)
@@ -144,6 +154,7 @@ class PoseSampler(nn.Module):
             for name in ('spatial_norm', 'temporal_norm', 'mlp_norm'):
                 setattr(block, name, SamplerLayerNorm(getattr(block, name).eps))
         self.steps = diffusion.num_timesteps
+        self.collision_postprocess = collision_postprocess
         for name in ('pose_mean', 'pose_scale', 'tracker_mean'):
             self.register_buffer(name, getattr(normalizer, name).clone())
         self.register_buffer('tracker_scale', normalizer.tracker_std + normalizer.eps)
@@ -152,9 +163,12 @@ class PoseSampler(nn.Module):
         self.register_buffer('recip', torch.tensor(diffusion.sqrt_recip_alphas_cumprod, dtype=torch.float32))
         self.register_buffer('recipm1', torch.tensor(diffusion.sqrt_recipm1_alphas_cumprod, dtype=torch.float32))
         self.register_buffer('alpha_prev', torch.tensor(diffusion.alphas_cumprod_prev, dtype=torch.float32))
+        if collision_postprocess is not None:
+            self.register_buffer('collision_variance', torch.tensor(1 - diffusion.alphas_cumprod, dtype=torch.float32))
 
     def forward(self, motion_context, predictor_pose_horizon, current_tracker_raw,
-                ik_residual, ik_gap, ik_confidence, denoise_strength, constraint_type, noise):
+                ik_residual, ik_gap, ik_confidence, denoise_strength, constraint_type, noise,
+                armrest_geometry=None, contact_mode=None, seated_context=None, display_from_pose=None):
         """输入 batch=1；输出归一化的 [1,144]，历史与 IK 留在调用端。"""
         geometry = build_tracker_geometry_condition(
             current_tracker_raw, self.tracker_mean, self.tracker_scale)
@@ -163,12 +177,16 @@ class PoseSampler(nn.Module):
             current_tracker_raw[..., 9] > 0.5, ik_residual, ik_gap,
             ik_confidence, denoise_strength, constraint_type)
         prior = predictor_pose_horizon[:, 0]
-        # 每次 forward 都从本次条件重新准备；10 步共享，同 block 之外不共用。
+        # 每次 forward 都从本次条件重新准备；各采样步共享，同 block 之外不共用。
         temporal_kv = prepare_temporal_kv(self.dit, condition.temporal_context)
         state = noise
         for index in reversed(range(self.steps)):
             residual = forward_sampler_dit(
                 self.dit, state, self.timesteps[index:index + 1], condition, temporal_kv)
+            if self.collision_postprocess is not None:
+                residual = self.collision_postprocess(
+                    prior, residual, current_tracker_raw, armrest_geometry, contact_mode,
+                    seated_context, display_from_pose, self.collision_variance[index])
             # 原实现只在最终步投影；eta=0 不需要逐步生成随机噪声。
             if index == 0:
                 return project_realtime_pose_xstart(
@@ -177,3 +195,47 @@ class PoseSampler(nn.Module):
             state = (residual * torch.sqrt(self.alpha_prev[index])
                      + torch.sqrt(1 - self.alpha_prev[index]) * eps)
         raise RuntimeError('采样步数必须为正数。')
+
+
+class SamplerCondition(nn.Module):
+    """每个请求准备一次条件；K/V 按 block 展平为独立 ONNX 输出。"""
+
+    def __init__(self, sampler):
+        super().__init__()
+        self.sampler = sampler
+        self.output_names = ['joint_condition', 'tracker_tokens', 'tracker_available'] + [
+            f'{kind}_{i}' for i in range(len(sampler.dit.blocks)) for kind in ('key', 'value')]
+
+    def forward(self, motion_context, predictor_pose_horizon, current_tracker_raw,
+                ik_residual, ik_gap, ik_confidence, denoise_strength, constraint_type):
+        s = self.sampler
+        geometry = build_tracker_geometry_condition(current_tracker_raw, s.tracker_mean, s.tracker_scale)
+        condition = s.dit.prepare_conditioning(motion_context, predictor_pose_horizon, geometry,
+            current_tracker_raw[..., 9] > .5, ik_residual, ik_gap, ik_confidence, denoise_strength, constraint_type)
+        kv = prepare_temporal_kv(s.dit, condition.temporal_context)
+        # int32 在 Unity 中由 Tensor<int> 承载，单步入口恢复 bool mask。
+        return (condition.joint_condition_tokens, condition.tracker_tokens,
+                condition.tracker_available.to(torch.int32), *(v for pair in kv for v in pair))
+
+
+class SamplerDenoiseStep(nn.Module):
+    def __init__(self, sampler):
+        super().__init__()
+        self.dit = sampler.dit
+
+    def forward(self, state, timestep, joint_condition, tracker_tokens, tracker_available, *kv):
+        condition = PreparedCurrentConditioning(joint_condition_tokens=joint_condition,
+            temporal_context=None, tracker_tokens=tracker_tokens, tracker_available=tracker_available > 0,
+            denoise_strength=None)
+        return forward_sampler_dit(self.dit, state, timestep, condition, tuple(zip(kv[::2], kv[1::2])))
+
+
+class SamplerProjection(nn.Module):
+    def __init__(self, sampler):
+        super().__init__()
+        self.register_buffer('pose_mean', sampler.pose_mean)
+        self.register_buffer('pose_scale', sampler.pose_scale)
+
+    def forward(self, predictor_pose_horizon, edited_residual, current_tracker_raw):
+        return project_realtime_pose_xstart(predictor_pose_horizon[:, 0] + edited_residual,
+            current_tracker_raw, self.pose_mean, self.pose_scale)

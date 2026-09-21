@@ -360,3 +360,93 @@ conda run -n diffusionposer5070 python -m export.export_sentis_denoiser `
 NPZ 各输入带首轴 10（对照 tick），其后保留原 batch 轴；参考输出键为
 `expected_predictor`、`expected_deployed_pose`，供 Unity 导入对照复用。
 CPU ONNX 对照不代表 Unity GPU 兼容性或性能验收。
+
+### 椅子扶手的可选残差碰撞后处理
+
+该功能只存在于部署模块，普通 Python 采样与训练不接入。
+`--collision_postprocess` 默认关闭；开启后必须传 Unity 编辑器标定的
+`--collision_profile` 与 `--ts_respace 5`。开启后导出 `pose_sampler_condition.onnx`、
+`pose_sampler_step.onnx`、`pose_sampler_projection.onnx` 和 `collision_compute.json`；
+普通五步模型仍为 `pose_sampler_5step.onnx`。碰撞链不接受单个 `--sampler_filename`。
+Unity 在推理启动时选择模型，修改开关后需重启推理，不在运行中切换模型。
+开启却缺模型、标定或匹配的配置时终止并报告错误。
+
+碰撞命令链保留普通 sampler 的全部外部输入，另加下列 GPU 快照；输出仍为
+`deployed_pose [1,144]`，历史仍使用 sampler 输出，显示补偿不写回历史。
+
+| 新增输入 | 类型、形状与含义 |
+| --- | --- |
+| armrest_geometry | float32 [1,2,15]；两个 OBB 各为中心 xyz、单位轴 x/y/z 各 xyz、半尺寸 xyz |
+| contact_mode | Unity int32 [1,2,2]（Python 参考为 int64）；上肢×扶手，0 停用、1 盒体避碰、2 盒体及有限上表面约束 |
+| seated_context | float32 [1,4]；水平座面高度、支撑权重、骨盆接触偏移、最大向上托举量 |
+| display_from_pose | float32 [1,106]；未施加坐姿补偿的显示姿态：根位置 3、根四元数 4、骨盆局部位置 3、24 个局部四元数 96 |
+
+四项快照只进入碰撞 Shader，不进入 DiT。分段网络内部接口固定 batch=1：
+
+- 条件模型输入为普通 sampler 去掉 `noise` 的八项输入。输出 `joint_condition [1,24,D]`、
+  `tracker_tokens [1,6,D]`、`tracker_available [1,6]`（int32），以及每个 block 的
+  `key_i [24,H,20,D/H]` 与 `value_i [24,H,D/H,20]`；D/H 取导出模型的配置。
+- 单步模型输入上述全部缓存、`state [1,144]` 和 `timestep [1]`（ONNX int64，Unity Tensor<int>），
+  输出 `predicted_residual [1,144]`。五个固定 Worker 使用同一模型资产和同一条件缓存。
+- 投影模型输入 `predictor_pose_horizon [1,11,144]`、`edited_residual [1,144]`、
+  `current_tracker_raw [1,6,10]`，输出 `deployed_pose [1,144]`。
+- `collision_compute.json` 保存 `models`、`condition_tensors`（名称、形状、类型）、
+  `sampling_steps`、执行顺序下的 `timesteps`、每步 `ddim` 系数
+  （recip、recipm1、sqrt_alpha_prev、sqrt_one_minus_alpha_prev、variance）、
+  `pose_mean/pose_scale` 和原有 settings/profile/parents/restLocalPositions。
+
+初始化时录制并复用一个 CommandBuffer：Predictor、GPU IK、条件准备一次，随后五次
+单步 DiT、碰撞 Shader、DDIM，最后投影。中间没有 CPU 读回或跨帧等待；请求结束只读回
+最终姿态。当前普通模型关闭路径不改变。旧碰撞 ONNX 已移除；编辑器对照使用普通模型、分段旁路与当前 Shader 链。
+
+位置和 OBB 统一到本次推理的 Head-yaw 坐标系，长度单位为角色坐标中的米；
+四元数采用 Unity xyzw。根位置/旋转是该 Head-yaw 系中的全局量，骨盆位置与
+骨骼四元数仍为各自父节点局部量。环境世界坐标先通过实际角色显示父节点的
+逆变换，再去除本次 Head 位置和 yaw；不重复应用 Tracker 已包含的 bodyScale。
+仅支持正的统一角色缩放、保持竖直的角色父坐标系与水平座面/扶手；拒绝退化
+或剪切 OBB。模型骨架及代理使用标定时的角色尺度，不逐帧读取蒙皮。
+
+`collision_profile.json` 保存 `forearmRadii [2]`、腕局部的
+`palmSpheres [2,3,4]`（中心 xyz、半径）和 `restLocalPositions [24,3]`。
+模型配套 JSON 保存标定、骨架父节点和实际优化参数；Shader 从配置上传一次常量，
+启动时核对 normalizer、骨架和模型名称。编辑标定后必须重新导出。
+角色骨架必须是当前 SMPL24 层级。模型、配套 JSON 与标定作为 Unity 普通资源
+放在 `Assets/FLUID/Models`，由 Inspector 引用；不作为 StreamingAssets TextAsset 加载。
+
+每个 DiT 干净残差输出后，仅编辑左右肩/肘索引 16、17、18、19 对应的
+24 个**归一化** rotation6D 残差分量；Predictor 固定。默认内层 5 次更新，
+中心差分步幅 0.001、初始步长 0.0001、测量尺度 0.01，
+`h_k=h_0(1-0.99*k/5)`。先验方差为当前 respaced sampler 的
+`max(1-alpha_bar_t, 0.000001)`，无 Langevin 噪声。平方误差求和，
+腕位置误差只惩罚超过 0.02 的部分，安全间隙 0.002。
+更新统一为 `r_A <- r_A - h_k * grad_A(E)`，其中
+`E = ||r_A-r_hat_A||^2/(2*sigma_t^2) + (sum(d^2)+sum(e_track^2))/(2*m^2)`。
+只保留能量中的单一保真项，不再使用额外混合回拉或 `postedit_w` 参数；
+最佳候选筛选也使用该能量，不另设保真上限或跟踪损失权重。
+当前几何损失可分成互不依赖的左右臂两项，因此同时扰动左右臂对应分量，
+分别读取各臂损失，以 25 个候选（原点及 12 对正负扰动）计算全部 24 维中心
+差分；每条手臂仍检查两个扶手。若后续增加双臂互碰或其他跨臂耦合损失，
+必须同步修改差分计算，不能直接沿用该配对方式。
+内层仅维护活动残差切片；每个 diffusion step 复用固定的头、脊柱和肩部几何，
+各候选仍重新计算肩肘旋转、显示插值和双臂 IK。
+上述距离均为角色坐标米制；统一缩放角色后世界距离也随之缩放。
+如要求任意角色缩放下仍固定世界 2 mm，须按该缩放重新导出间隙常量，当前
+四个输入不另传尺度标量。
+
+小臂采用整条肘腕线段与 OBB 的最小有符号距离减半径；手掌为三球，
+直接计算球心的 OBB 有符号距离减半径，不执行退化线段的分段计算。
+上方模式在有限的、按代理半径扩展的扶手 xz 范围内约束上表面。
+碰撞评估包含旋转投影、Tracker 旋转覆盖、0.25/0.5/0.75/1.0 的局部姿态
+插值，以及骨盆托举、脊柱 CCD 和双臂 IK。脚部继续使用现有 Unity 实现。
+每次优化比较初始残差及有限的有效迭代，保留最低目标值；初始无碰撞则原样返回。
+Shader 在 GPU 上记录无碰撞标记，跳过余下无效候选评估；不增加 CPU 往返。
+编辑后的残差参与 epsilon 重算和 DDIM 更新，五步仍只调用五次 DiT。
+
+Unity 的接触状态使用上次有效显示上肢和当前 Tracker，默认接近 0.03、
+抬离 0.05、范围滞回 0.02；单次推理内固定。ONNX 的显示过渡只使用请求时
+快照；四个采样点不保证连续轨迹零穿透。实际显示诊断单独写入会话目录的
+`collision_*.jsonl`，含配置、环境快照、穿透/约束剩余量、腕误差/位置、
+推理耗时、显示延迟和跳过样本计数；关闭时只写关闭标记，不执行几何检查。
+实际显示不再追加推手修正。
+
+标定、导出、检查命令与本机验收结果见 [部署说明](export/collision_postprocess.md)。

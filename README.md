@@ -147,4 +147,6 @@ conda run -n diffusionposer5070 python -m sample.evaluate_longseq_eval_set `
 conda run -n diffusionposer5070 pytest tests/smoke
 ```
 
-本轮不包含 Tracker 断线/重连、PCAF、future tracker 和 Unity/Sentis 双模型导出。
+Unity/ONNX 部署契约见 [contract.md](contract.md#fluidunity-onnx-部署)。
+椅子扶手的可选残差碰撞后处理见 [标定、导出和验收说明](export/collision_postprocess.md)，
+默认关闭，仅接入部署链路；当前实验初值尚未达到 30 Hz 性能目标。

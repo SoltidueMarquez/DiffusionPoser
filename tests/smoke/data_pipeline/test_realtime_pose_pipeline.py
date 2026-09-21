@@ -51,9 +51,7 @@ def test_predictor_and_dit_use_single_predictor_checkpoint(tmp_path):
     args = _args(tmp_path)
     predictor = pipeline.build_predictor_args(args)
     dit = pipeline.build_train_args(args)
-    assert dit[dit.index("--predictor_model_path") + 1].endswith(
-        "predictor/model_latest.pt"
-    )
+    assert Path(dit[dit.index("--predictor_model_path") + 1]) == tmp_path / "predictor" / "model_latest.pt"
     assert predictor[predictor.index("--checkpoint_max_keep") + 1] == "3"
     assert predictor[predictor.index("--num_steps") + 1] == "100000"
     assert dit[dit.index("--num_steps") + 1] == "1000000"

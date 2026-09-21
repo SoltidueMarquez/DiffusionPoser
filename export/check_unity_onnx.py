@@ -24,6 +24,8 @@ def main(argv=None):
         'sample/assets/unity_recordings/recording_20260829_164358.json'))
     args = parse_and_load_from_model(parser, argv,
         ignore_keys={'normalizer_dir', 'output_dir', 'body_fbx_rest_json', 'input'})
+    if args.collision_postprocess:
+        raise ValueError('碰撞部署请使用 export.check_collision_sampler，普通离线对照不接入环境后处理。')
     torch.set_num_threads(1)
     predictor, dit, diffusion, normalizer = load_models(args)
     sessions = []
