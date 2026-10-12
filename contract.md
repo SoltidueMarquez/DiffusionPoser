@@ -372,16 +372,19 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 开启却缺模型、标定或匹配的配置时终止并报告错误。
 
 碰撞命令链保留普通 sampler 的全部外部输入，另加下列 GPU 快照；输出仍为
-`deployed_pose [1,144]`，历史仍使用 sampler 输出，显示补偿不写回历史。
+`deployed_pose [1,144]`，另有 posterior correction 求出的头部高度偏移。旋转历史仍使用 sampler 输出；高度单独保存在已接受的序列状态，显示层脚部补偿不写回历史。
 
 | 新增输入 | 类型、形状与含义 |
 | --- | --- |
 | armrest_geometry | float32 [1,2,15]；两个 OBB 各为中心 xyz、单位轴 x/y/z 各 xyz、半尺寸 xyz |
 | contact_mode | Unity int32 [1,2,2]（Python 参考为 int64）；上肢×扶手，0 停用、1 盒体避碰、2 盒体及有限上表面约束 |
-| seated_context | float32 [1,4]；依次为座面高度、支撑权重、骨盆接触偏移、最大托举量；骨盆软锚定已移除 |
+| seated_context | float32 [1,16]；前 15 项为座面 OBB（中心、三轴、半尺寸），最后一项为接触模式 0/1/2；不再包含骨盆托举或软锚定 |
 | display_from_pose | float32 [1,106]；未施加坐姿补偿的显示姿态：根位置 3、根四元数 4、骨盆局部位置 3、24 个局部四元数 96 |
+| head_height_context | float32 [1,3]；上一次接受的头部 Y 偏移（角色米制）、与本次输入的时间差（秒，最大 0.1）、上次前后偏移（米）；新序列为 0、1/30、0 |
 
-四项快照只进入碰撞 Shader，不进入 DiT。分段网络内部接口固定 batch=1：
+| correction_context | float32 [1,366]；前360项为五个采样阶段各72个已接受姿态修正量，第360项为时序有效权重，第361–365项为各阶段实际骨盆前后修正位移(m)。只使用每阶段后48个脊柱／髋／膝坐标；首帧及重置为全零 |
+
+六项快照只进入碰撞 Shader，不进入 DiT。分段网络内部接口固定 batch=1：
 
 - 条件模型输入为普通 sampler 去掉 `noise` 的八项输入。输出 `joint_condition [1,24,D]`、
   `tracker_tokens [1,6,D]`、`tracker_available [1,6]`（int32），以及每个 block 的
@@ -399,6 +402,10 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 单步 DiT、碰撞 Shader、DDIM，最后投影。中间没有 CPU 读回或跨帧等待；请求结束只读回
 最终姿态。当前普通模型关闭路径不改变。旧碰撞 ONNX 已移除；编辑器对照使用普通模型、分段旁路与当前 Shader 链。
 
+头部高度以独立变量 `dy` 与残差共同求解，角色米制上限 `head_y_limit`（场景当前试用 0.05）。候选和最终重建均使用 `pelvis.y=tracker_head_y-relative_head_y+dy`；头部侧向位置和跟踪旋转继续硬投影，前后自由度见下文。测量项新增 `head_y_weight*dy^2+head_y_smooth_weight*(dy-dy_prev)^2`，同样除以 `2*m^2`，当前权重 1／0.5。每帧边界同时满足 `abs(dy)<=limit` 与 `abs(dy-dy_prev)<=head_y_speed*min(dt,0.1)`，当前速度 0.15 m/s；平滑的是误差偏移，不滤波原始头部运动。优化坐标为 `dy/0.1`，使用相同中心差分与步长，无扩散残差先验；每个采样阶段以上一阶段高度热启动，最佳候选联合保存姿态与高度。场景设置上限为 0 时恢复硬高度，旁路输出高度严格为 0。回零为软损失，其他目标仍可能使离座后的高度偏移非零。
+
+Compute 增加高度和前后各一对差分候选，总计 149×4；Work 为 377 float（前373项保存姿态、高度、回退与骨盆位移状态，后4项保存前后自由度），Values 为 596 float4。投影后 Pack 将 144 维姿态、dy 与五阶段 360 维姿态修正及5个米制骨盆修正再加末尾前后偏移打包为 511 float，一次最终 GPU 读回；`GpuIkStep.Output` 仍为 144 维，另提供 `HeadYOffset` 和 `Corrections[365]`，`FluidSequenceRuntime.Finish` 接收二者并仅在结果接受时提交历史。高度不改写 tracker、HMD 相机、训练输入或 ONNX 形状；无需重训/重导出网络。Python 参考启用高度时使用 `forward_with_height` 返回 `(edited_residual, dy)` 并将 dy 传入几何；仅返回残差的 `forward` 在非零高度上限或修正量时序权重下拒绝执行，防止调用者静默丢弃高度。分段参考链另以 `height_offset` 暴露末阶段结果。
+
 位置和 OBB 统一到本次推理的 Head-yaw 坐标系，长度单位为角色坐标中的米；
 四元数采用 Unity xyzw。根位置/旋转是该 Head-yaw 系中的全局量，骨盆位置与
 骨骼四元数仍为各自父节点局部量。环境世界坐标先通过实际角色显示父节点的
@@ -407,43 +414,51 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 或剪切 OBB。模型骨架及代理使用标定时的角色尺度，不逐帧读取蒙皮。
 
 `collision_profile.json` 保存 `capsules [2,4]`（左右臂 × 肘侧/中段/腕侧/手掌）和
-`restLocalPositions [24,3]`。每个胶囊含 `bone`、骨骼局部端点 `start/end [3]`、
+`seatCapsules [3]`（臀部、左大腿、右大腿，骨骼 0/1/2）以及 `restLocalPositions [24,3]`。每个胶囊含 `bone`、骨骼局部端点 `start/end [3]`、
 正半径 `radius`；骨骼顺序固定为 `[[18,18,18,20],[19,19,19,21]]`。几何由 PuppetMaster
-生成工具创建的 CapsuleCollider 导出，全身其他 Collider 不进入配置或计算。
+生成工具创建的 CapsuleCollider 导出，其余全身 Collider 不进入配置或计算。
 模型配套 JSON 保存骨架父节点和实际优化参数；Shader 从配置上传一次常量。
 编辑 Collider 后重新导出 profile 并同步 `collision_compute.json.profile`；现有
 condition/step/projection 分段 ONNX 不含碰撞几何常量，因此无需重训或重新导出它们。
 角色骨架必须是当前 SMPL24 层级。模型、配套 JSON 与标定作为 Unity 普通资源
 放在 `Assets/FLUID/Models`，由 Inspector 引用；不作为 StreamingAssets TextAsset 加载。
 
-每个 DiT 干净残差输出后，仅编辑左右肩/肘索引 16、17、18、19 对应的
-24 个**归一化** rotation6D 残差分量；Predictor 固定。默认内层 5 次更新，
+每个 DiT 干净残差输出后，编辑关节 16、17、18、19、3、6、9、12、1、2、4、5 对应的
+72 个**归一化** rotation6D 残差分量；Predictor 固定。默认内层 5 次更新，
 中心差分步幅 0.001、初始步长 0.0001、测量尺度 0.01，
-`h_k=h_0(1-0.99*k/5)`。先验方差为当前 respaced sampler 的
+`h_k=h_0(1-0.99*k/steps)`。先验方差为当前 respaced sampler 的
 `max(1-alpha_bar_t, 0.000001)`，无 Langevin 噪声。平方误差求和，
-腕位置误差只惩罚超过 0.02 的部分，安全间隙 0.002。
+双腕、Hip、双脚的有效位置误差只惩罚超过 0.02 的部分，安全间隙 0.002。
+每个阶段先比较原始残差与“原始残差＋上次已接受的同阶段修正”两个起点，仅在当前目标激活且总能量严格降低时使用历史候选。每轮按原步长、1/2、1/4、1/8 评估四个候选，选第一个有限且总能量不增加的结果；均不满足时保留更新前姿态及高度。高度候选仍投影到原有位置／速度边界；20次内循环与5次DiT调用不变。四候选各计算四个显示插值位置，使用独立几何 kernel 并行评估，再统一验收，不增加CPU读回。诊断 Trace[1100+3*k:1103+3*k]（前20轮）记录起点能量、接受能量和步长比例（失败为0）。
 更新统一为 `r_A <- r_A - h_k * grad_A(E)`，其中
-`E = ||r_A-r_hat_A||^2/(2*sigma_t^2) + (sum(d^2)+sum(e_track^2))/(2*m^2)`。
-只保留能量中的单一保真项，不再使用额外混合回拉或 `postedit_w` 参数；
-最佳候选筛选也使用该能量，不另设保真上限或跟踪损失权重。
-当前几何损失可分成互不依赖的左右臂两项，因此同时扰动左右臂对应分量，
-分别读取各臂损失，以 25 个候选（原点及 12 对正负扰动）计算全部 24 维中心
-差分；每条手臂仍检查两个扶手。若后续增加双臂互碰或其他跨臂耦合损失，
-必须同步修改差分计算，不能直接沿用该配对方式。
-内层仅维护活动残差切片；每个 diffusion step 复用固定的头、脊柱和肩部几何，
-各候选仍重新计算肩肘旋转、显示插值和双臂 IK。
+`E = ||r_A-r_hat_A||^2/(2*sigma_t^2) + (sum(d^2)+back_collision+torso_curve+chest_head+sum(e_wrist^2)+body_tracking_weight*sum(e_body^2)+spine_bend+head_y_weight*dy^2+head_y_smooth_weight*(dy-dy_prev)^2)/(2*m^2)`。
+另加修正量时序项 `0.5*correction_smooth_weight*w*sum((delta-delta_prev)^2)`，其中 `delta=r_A-r_hat_A`，只作用于脊柱 3/6/9/12、髋 1/2、膝 4/5。每个采样阶段使用上一已接受帧的同阶段修正，解析梯度为 `weight*w*(delta-delta_prev)`，最佳候选使用同一能量；当前场景权重 500，设为 0 关闭。新序列及超过 0.1 s 的间隔不施加此项；有效间隔权重 `w=min(1,(1/30)/dt)`。历史方向差向量先乘 pose_scale、旋转到本帧 Head-yaw，再除 pose_scale；不使用归一化均值。旁路和无活动目标输出零修正，未接受的 GPU 请求不推进历史。Python 单阶段 `forward_with_height` 的 `correction_context [1,74]` 接收当前阶段72姿态量、有效权重与实际骨盆位移；分段参考的 `corrections [1,365]` 供调用端在接受后存储。此项约束修正变化而非锁定上一帧绝对姿态。
+骨盆前后连续性项沿座面局部 Z 的水平归一化方向 n，保存每阶段 `d=dot(n,p_selected-p_original)`，在下一已接受帧相同阶段以 `p_original_current+n*d_previous` 的前后投影为目标。令 `e=dot(n,p_candidate-p_original_current)-d_previous`，增加平滑目标 `pelvis_forward_smooth_weight*w*release*e²/(2*m²)`。每次步长回退额外要求总能量下降至少覆盖 `pelvis_forward_smooth_weight*w*release*pelvis_forward_update_cost*abs(dot(n,p_trial-p_current))/(2*m²)`；该位移代价只参与接受判断，不参与有限差分梯度，避免绝对值零点干扰方向。小收益移动被拒绝，足够大的碰撞收益仍允许更新，不另加显示平滑或固定锚点。仅座面顶面模式启用；目标与当前显示骨盆前后距离/dt 在 0.15 m/s 以下全权重，0.15–0.6 m/s 线性释放，0.6 m/s 以上关闭。新序列、跟踪中断和丢弃请求沿用原历史提交规则，旁路／无活动目标写零位移。米制位移是椅子轴上的标量，不随 Head-yaw 旋转；姿态修正仍执行原坐标变换。有限差分、热启动和步长回退共用此目标。Trace[1012:1016] 记录原始前后位置、目标、有效权重、最终位移；重跑 head_height.json 另记录五阶段 pelvisForwardCorrections。网络 ONNX 不变，部署上下文及一次读回扩展为上述形状，需同步更新两端；旧形状不混用。
+
+仍保留扩散残差先验，不使用额外混合回拉或 `postedit_w` 参数；
+最佳候选筛选也使用该能量，不另设保真上限。`e_body` 为 Hip／双脚的有效位置误差，默认 `body_tracking_weight=0.15`；双腕权重仍为 1，跟踪旋转不变，头部 Y 按上述有界软约束处理。
+躯干与双臂、下肢共同参与损失，149 个候选（原点、72 对姿态扰动及高度、前后各一对扰动）计算共同目标的中心差分。
+各候选重新计算跟踪旋转投影、头部定位、骨盆位置、局部姿态插值和全身 FK；仅非活动全局旋转可复用。
+脊柱分配项使用终点 3/6/9/12/15 的父子局部单位四元数（统一到 w>=0），取局部俯仰代理量 `b=2*q.x`。
+对相邻骨段加入 `spine_bend_scale^2 * sum(max(abs(b[i+1]-b[i])-spine_bend_tolerance,0)^2)`。
+头部 15 的全局旋转仍由跟踪器固定，只通过其父子关系参与损失，不新增活动变量。
+默认尺度 0.45 米、容差 0.15（小角度约 8.6°），保留站立录制的自然差异，抑制坐下时局部大幅反折；这是部署姿态正则，不是人体关节硬限位。
+它取代相对原始残差的局部旋转保真项，避免把已有折叠当作应保留的参考；即使无碰撞，超出容差也参与同一 posterior correction，并沿原采样路径反馈历史。
+新增累计躯干项 `torso_curve_scale^2 * max(sum(abs(b[0:4]))-torso_curve_limit,0)^2`，默认 0.2／0.7；刚体整体前倾不产生额外局部弯曲。胸—头项从 `inverse(q[9])*q[15]` 的单位四元数提取 `abs(2*q.x)`，超过 `chest_head_limit=0.35` 后平方惩罚，尺度 `chest_head_scale=0.15`。两项同样进入激活判定，不能被“无接触”提前退出跳过；都只在最终候选姿态计算。
+`profile.backCapsules` 存储预留躯干 Collider 的骨骼局部胶囊（当前骨骼 3、9），`profile.backrest[15]` 为靠背在座面坐标系中的中心、三轴、半尺寸，长度采用角色米制。GPU 从原 `seated_context` 的座面 OBB 转换至靠背局部系；靠背无需额外动态几何输入。背部胶囊逐个对靠背 OBB 计算穿透平方损失，并按有限 x/y 范围限制靠背 +Z 前表面，避免穿到后侧。座面上下文 mode=0 同时关闭靠背。形状与靠背相对位置变动须重新导出；运行时不使用 PhysX 解算，也不拟合网格。
 上述距离均为角色坐标米制；统一缩放角色后世界距离也随之缩放。
 如要求任意角色缩放下仍固定世界 2 mm，须按该缩放重新导出间隙常量，当前
-四个输入不另传尺度标量。
+上述输入不另传尺度标量。
 
 小臂和手掌都采用胶囊轴线与 OBB 的最小有符号距离减半径；端点按各候选
-的绑定骨骼位置和旋转变换，小臂保留轴向扭转及坐姿 IK 后的完整旋转。
+的绑定骨骼位置和旋转变换，小臂保留轴向扭转的完整旋转。
 每臂对每个扶手取三段小臂平方惩罚的最大值，再加手掌惩罚，避免重叠段重复计权。
-上方模式在有限的、按代理半径扩展的扶手 xz 范围内约束上表面。
+臀部和双侧大腿与座面配对，三个独立部位的平方穿透相加，再乘 `seat_collision_weight`（参考默认 1，场景当前 2），避免最深接触遮蔽另一侧梯度；不增加向下吸附。该权重只乘座面接触项，不放大靠背、扶手、跟踪或姿态正则，GPU 与 Python 参考一致；诊断穿透仍报告未加权的实际代理距离。
+上方模式在有限的、按代理半径扩展的座面/扶手 xz 范围内约束上表面。
 碰撞评估包含旋转投影、Tracker 旋转覆盖、0.25/0.5/0.75/1.0 的局部姿态
-插值，以及骨盆托举、脊柱 CCD 和双臂 IK。脚部继续使用现有 Unity 实现。
-每次优化比较初始残差及有限的有效迭代，保留最低目标值；初始无碰撞则原样返回。
-Shader 在 GPU 上记录无碰撞标记，跳过余下无效候选评估；不增加 CPU 往返。
+插值和 FK；独立骨盆托举及对应脊柱 CCD、双臂补偿已删除。脚锁、腿部 IK 和防穿地仍在显示端执行。
+每次优化比较初始残差及有限的有效迭代，保留最低目标值；初始无碰撞且脊柱分配在容差内则原样返回。
+Shader 在 GPU 上记录无约束违例标记，跳过余下无效候选评估；不增加 CPU 往返。
 编辑后的残差参与 epsilon 重算和 DDIM 更新，五步仍只调用五次 DiT。
 
 Unity 的接触状态使用上次有效显示上肢和当前 Tracker，默认接近 0.03、
@@ -454,3 +469,11 @@ Unity 的接触状态使用上次有效显示上肢和当前 Tracker，默认接
 实际显示不再追加推手修正。
 
 标定、导出、检查命令与本机验收结果见 [部署说明](export/collision_postprocess.md)。
+
+
+坐姿头部前后自由度（2026-10-12）：沿座面局部 Z 的水平归一化方向 n，候选根位置增加 n*df，保持侧向位置、头部跟踪旋转和原 Y 自由度。当前场景 head_forward_limit=0（前后硬定位；此前0.02 m为试验值）、head_forward_weight=1、head_forward_smooth_weight=0.5、head_forward_speed=0.05 m/s。优化坐标 df/0.1，共同测量增加 (weight*df²+smooth*(df-df_prev)²)/(2*m²)。顶面接触模式2内服从位置/速度边界；离开模式2后按速度上限向0释放。五个采样阶段共用本帧速度边界，上一阶段值热启动，最佳候选同时保存姿态、dy、df；10次迭代。HeightOutput=[dy,df]，Pack[510]=df。GpuIkStep 另提供 HeadForwardOffset 和本次提交时的 HeadForwardAxis（Head-yaw 局部坐标），Finish 转回世界方向重建根位置；只在接受结果时提交 df 历史。新序列清零，丢弃请求不提交；旁路输出0。Python forward_with_height 的 forward_context/initial_forward 分别为上次接受值与本阶段初值，前后结果通过 forward_result["offset"] 返回；分段参考 chain.forward_offset 暴露最终值。此变量不修改 tracker 输入或 HMD 相机，网络形状不变。Trace[1030+2*k:1032+2*k] 保存前5轮 df/0.1 与梯度，Trace[1020:1022] 保存末次候选归一化 df 和最终输出米制 df。
+
+
+骨盆前后历史基准修正（2026-10-12）：每阶段 p_original_current 使用该阶段未修正残差重建、且不含头部前后偏移的骨盆位置。GPU 从初始候选的座椅轴投影扣除 df_initial；Python 用 forward=0 重建基准。于是 d=dot(n,p_selected-p_original_current) 包含姿态变化与完整 df_selected，而非只包含 df_selected-df_initial。时序目标、动作释放判断和历史提交共用这个基准；不新增字段或权重，10次迭代和头部±2cm保持。已有运行中的旧语义历史不能沿用，更新代码后重新启动推理。
+
+当前保留较稳回放配置：10次迭代，头部前后自由度关闭，Y上限0.05m，阶段位置差释放判断。原始tracker运动释放试验已撤回，运行时与Python恢复上述3项/2项头部上下文；原网络不变。

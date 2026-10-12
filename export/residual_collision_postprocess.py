@@ -12,8 +12,8 @@ from data_loaders.realtime_pose_kinematics import SMPL_PARENTS
 from diffusion.realtime_pose_projection import project_realtime_pose_xstart, project_rotation_6d_to_so3
 
 
-ACTIVE_JOINTS = (16, 17, 18, 19)
-COLLISION_INPUTS = ['armrest_geometry', 'contact_mode', 'seated_context', 'display_from_pose']
+ACTIVE_JOINTS = (16, 17, 18, 19, 3, 6, 9, 12, 1, 2, 4, 5)
+COLLISION_INPUTS = ['armrest_geometry', 'contact_mode', 'seated_context', 'display_from_pose', 'head_height_context', 'correction_context']
 
 
 @dataclass(frozen=True)
@@ -24,15 +24,41 @@ class CollisionSettings:
     difference_step: float = 1e-3
     margin: float = .002
     tracking_tolerance: float = .02
+    spine_bend_scale: float = .45
+    spine_bend_tolerance: float = .15
+    body_tracking_weight: float = .15
+    torso_curve_scale: float = .2
+    torso_curve_limit: float = .7
+    chest_head_scale: float = .15
+    chest_head_limit: float = .35
+    head_forward_limit: float = 0.
+    head_forward_weight: float = 1.
+    head_forward_smooth_weight: float = .5
+    head_forward_speed: float = .05
+    head_y_limit: float = 0.
+    head_y_weight: float = 1.
+    head_y_smooth_weight: float = .5
+    head_y_speed: float = .15
+    seat_collision_weight: float = 1.
+    correction_smooth_weight: float = 0.
+    pelvis_forward_smooth_weight: float = 0.
+    pelvis_forward_update_cost: float = 0.
 
     def validate(self):
+        if not all(torch.isfinite(torch.tensor(v)) and v >= 0 for v in
+                   (self.head_forward_limit, self.head_forward_weight, self.head_forward_smooth_weight, self.head_forward_speed, self.head_y_limit, self.head_y_weight, self.head_y_smooth_weight, self.head_y_speed, self.seat_collision_weight, self.correction_smooth_weight, self.pelvis_forward_smooth_weight, self.pelvis_forward_update_cost)):
+            raise ValueError('头部高度边界、权重和速度必须为有限非负数。')
+        if self.head_forward_limit > 0 and (self.head_forward_weight <= 0 or self.head_forward_speed <= 0):
+            raise ValueError("前后自由度需要正回零权重和速度上限。")
+        if self.head_y_limit > 0 and (self.head_y_weight <= 0 or self.head_y_speed <= 0):
+            raise ValueError('启用高度自由度时必须保留回零权重和正速度上限。')
         if self.steps < 1:
             raise ValueError('碰撞迭代次数必须为正。')
         if not all(torch.isfinite(torch.tensor(v)) and v > 0 for v in
                    (self.h, self.m, self.difference_step)):
             raise ValueError('PostEdit 步长、测量尺度和差分步幅必须为有限正数。')
         if not all(torch.isfinite(torch.tensor(v)) and v >= 0 for v in
-                   (self.margin, self.tracking_tolerance)):
+                   (self.margin, self.tracking_tolerance, self.spine_bend_scale, self.spine_bend_tolerance, self.body_tracking_weight, self.torso_curve_scale, self.torso_curve_limit, self.chest_head_scale, self.chest_head_limit)):
             raise ValueError('碰撞间隙和跟踪容差必须为有限非负数。')
 
 
@@ -49,6 +75,22 @@ def load_collision_profile(path: Path, rest: dict) -> dict:
             radius = torch.tensor(capsule['radius'])
             if endpoints.shape != (2, 3) or not torch.isfinite(endpoints).all() or not torch.isfinite(radius) or radius <= 0:
                 raise ValueError('胶囊端点必须有限，半径必须为有限正数。')
+    seat = profile.get('seatCapsules', [])
+    if len(seat) != 3 or [c['bone'] for c in seat] != [0, 1, 2]:
+        raise ValueError('seatCapsules 必须为臀部、左大腿、右大腿。')
+    for c in seat:
+        endpoints = torch.tensor([c['start'], c['end']])
+        if endpoints.shape != (2, 3) or not torch.isfinite(endpoints).all() or not 0 < c['radius'] < float('inf'):
+            raise ValueError('座面接触胶囊参数无效。')
+    back=profile.get('backCapsules', [])
+    for c in back:
+        endpoints=torch.tensor([c['start'],c['end']])
+        if c['bone'] not in (3,6,9) or endpoints.shape!=(2,3) or not torch.isfinite(endpoints).all() or not 0<c['radius']<float('inf'):
+            raise ValueError('背部胶囊参数无效。')
+    if back:
+        box=torch.tensor(profile.get('backrest') or [])
+        if box.shape!=(15,) or not torch.isfinite(box).all() or not (box[12:]>0).all():
+            raise ValueError('靠背 OBB 参数无效。')
     # 标定必须绑定同一套骨架，避免把另一个角色的几何静默带入图中。
     offsets = torch.tensor(profile['restLocalPositions'], dtype=torch.float32)
     expected = torch.tensor(rest['restLocalPositions'], dtype=torch.float32)
@@ -252,32 +294,30 @@ class ResidualCollisionPostprocess(nn.Module):
         self.register_buffer('fractions', torch.tensor([.25, .5, .75, 1.]))
         active = [j * 6 + k for j in ACTIVE_JOINTS for k in range(6)]
         self.register_buffer('directions', torch.eye(144)[active])
-        # 肩/肘各六维，同时扰动左右臂的同一分量；损失按手臂分开归约。
-        paired = torch.eye(12).reshape(12, 2, 1, 6).expand(-1, -1, 2, -1).reshape(12, 24)
-        self.register_buffer('difference_offsets', torch.cat([torch.zeros(1, 24), paired, -paired])
-                             * self.settings.difference_step)
+        self.register_buffer('active_indices', torch.tensor(active))
+        self.register_buffer('difference_offsets', torch.cat([torch.zeros(1, len(active)), torch.eye(len(active)), -torch.eye(len(active))]) * self.settings.difference_step)
+        seat = profile['seatCapsules']
+        self.register_buffer('seat_start', torch.tensor([c['start'] for c in seat], dtype=torch.float32))
+        self.register_buffer('seat_end', torch.tensor([c['end'] for c in seat], dtype=torch.float32))
+        self.register_buffer('seat_radii', torch.tensor([c['radius'] for c in seat], dtype=torch.float32))
+        back = profile.get('backCapsules', [])
+        self.back_count = len(back)
+        self.register_buffer('back_bones', torch.tensor([c['bone'] for c in back], dtype=torch.long))
+        self.register_buffer('back_start', torch.tensor([c['start'] for c in back], dtype=torch.float32).reshape(-1,3))
+        self.register_buffer('back_end', torch.tensor([c['end'] for c in back], dtype=torch.float32).reshape(-1,3))
+        self.register_buffer('back_radii', torch.tensor([c['radius'] for c in back], dtype=torch.float32))
+        self.register_buffer('backrest', torch.tensor(profile.get('backrest') or [0.]*15, dtype=torch.float32))
         self.register_buffer('parent_indices', torch.tensor(self.parents[1:], dtype=torch.long))
-        masks = []
-        for joint in range(24):
-            row = []
-            for child in range(24):
-                ancestor = child
-                while ancestor >= 0 and ancestor != joint:
-                    ancestor = self.parents[ancestor]
-                row.append(ancestor == joint)
-            masks.append(row)
-        self.register_buffer('descendants', torch.tensor(masks, dtype=torch.bool))
-
-    def target_components(self, normalized, tracker, display=None):
+    def target_components(self, normalized, tracker, display=None, height=None, forward=None):
         """一次投影后同时准备显示局部旋转和几何所需的全局旋转。"""
         count = normalized.shape[0]
         projected = project_realtime_pose_xstart(normalized, tracker.expand(count, -1, -1), self.pose_mean, self.pose_scale)
         raw = (projected * self.pose_scale + self.pose_mean).reshape(count, 24, 6)
         world = rotations_from_6d(raw)
-        forward = raw[:, 0, :3]
-        right = cross3(raw[:, 0, 3:], forward)
-        planar = torch.stack([forward[:, 0] - right[:, 2], torch.zeros_like(forward[:, 0]),
-                              right[:, 0] + forward[:, 2]], -1)
+        basis_forward = raw[:, 0, :3]
+        right = cross3(raw[:, 0, 3:], basis_forward)
+        planar = torch.stack([basis_forward[:, 0] - right[:, 2], torch.zeros_like(basis_forward[:, 0]),
+                              right[:, 0] + basis_forward[:, 2]], -1)
         fallback = torch.zeros_like(planar) + planar.new_tensor([0., 0., 1.])
         if display is not None:
             fallback = qrotate(qnormalize(display[:, 3:7]).expand(count, -1), fallback)
@@ -289,83 +329,26 @@ class ResidualCollisionPostprocess(nn.Module):
         # 根锚点只依赖骨盆到头的链路，无需先构造其余关节的位置。
         head_relative = qrotate(world[:, [0, 3, 6, 9, 12]], self.offsets[None, [3, 6, 9, 12, 15]]).sum(1)
         hip = tracker[:, 0, 1] - head_relative[:, 1]
+        if height is not None:
+            hip = hip + height.reshape(-1)
         pelvis = torch.stack([torch.zeros_like(hip) + self.offsets[0, 0], hip,
                               torch.zeros_like(hip) + self.offsets[0, 2]], -1)
         head = head_relative + qrotate(root_q, pelvis)
         root = torch.stack([-head[:, 0], torch.zeros_like(hip), -head[:, 2]], -1)
+        if forward is not None: root=root+forward
         return root, root_q, pelvis, local, world
 
-    def target_frame(self, normalized, tracker, display=None):
-        root, root_q, pelvis, local, _ = self.target_components(normalized, tracker, display)
+    def target_frame(self, normalized, tracker, display=None, height=None, forward=None):
+        root, root_q, pelvis, local, _ = self.target_components(normalized, tracker, display, height, forward)
         return torch.cat([root, root_q, pelvis, local.reshape(-1, 96)], -1)
 
-    def rotate_subtree(self, positions, rotations, joint, delta):
-        center = positions[:, joint:joint + 1]
-        mask = self.descendants[joint][None, :, None]
-        positions = torch.where(mask, center + qrotate(delta[:, None], positions - center), positions)
-        rotations = torch.where(mask, qmul(delta[:, None], rotations), rotations)
-        return positions, rotations
-
-    def solve_arm(self, positions, rotations, shoulder, goal, wrist_q):
-        elbow, wrist = shoulder + 2, shoulder + 4
-        a, b, c = positions[:, shoulder], positions[:, elbow], positions[:, wrist]
-        ab, bc = norm(b - a), norm(c - b)
-        delta = goal - a
-        distance = norm(delta).maximum((ab - bc).abs() + .0001).minimum(ab + bc - .0001)
-        axis = unit(delta)
-        bend = b - a - ((b - a) * axis).sum(-1, keepdim=True) * axis
-        forward = qrotate(rotations[:, shoulder], torch.zeros_like(a) + a.new_tensor([0., 0., 1.]))
-        fallback = forward - (forward * axis).sum(-1, keepdim=True) * axis
-        secondary = cross3(axis, torch.where(axis[:, :1].abs() < .9,
-                                torch.zeros_like(a) + a.new_tensor([1., 0., 0.]),
-                                torch.zeros_like(a) + a.new_tensor([0., 1., 0.])))
-        fallback = torch.where(fallback.square().sum(-1, keepdim=True) < 1e-8, secondary, fallback)
-        bend = unit(torch.where(bend.square().sum(-1, keepdim=True) < 1e-8, fallback, bend))
-        x = (ab.square() - bc.square() + distance.square()) / (2 * distance.clamp_min(1e-6))
-        middle = a + axis * x + bend * (ab.square() - x.square()).clamp_min(0).sqrt()
-        valid = (ab > 1e-5) & (bc > 1e-5) & (delta.square().sum(-1, keepdim=True) >= 1e-10)
-        original_p, original_q = positions, rotations
-        positions, rotations = self.rotate_subtree(positions, rotations, shoulder, from_to(b - a, middle - a))
-        positions, rotations = self.rotate_subtree(positions, rotations, elbow,
-            from_to(positions[:, wrist] - positions[:, elbow], a + axis * distance - positions[:, elbow]))
-        positions, rotations = self.rotate_subtree(positions, rotations, wrist,
-                                                   qmul(wrist_q, qconjugate(rotations[:, wrist])))
-        return torch.where(valid[:, None], positions, original_p), torch.where(valid[:, None], rotations, original_q)
-
-    @staticmethod
-    def seat_correction(pelvis, context):
-        """context [B,4]：座面高度、支撑权重、骨盆接触偏移、最大托举量。"""
-        lift = (context[:, 0] + context[:, 2] - pelvis[:, 1]).clamp_min(0).minimum(context[:, 3].clamp_min(0)) * context[:, 1].clamp(0, 1)
-        return lift[:, None] * pelvis.new_tensor([0., 1., 0.])
-
-    def seat_torso(self, positions, rotations, context):
-        original_p, original_q = positions, rotations
-        head, head_q = positions[:, 15], rotations[:, 15]
-        correction = self.seat_correction(positions[:, 0], context)
-        lift = correction.square().sum(-1) > 0
-        positions = positions + correction[:, None]
-        for _ in range(3):
-            for joint in (9, 6, 3):
-                positions, rotations = self.rotate_subtree(positions, rotations, joint,
-                    from_to(positions[:, 15] - positions[:, joint], head - positions[:, joint]))
-        positions, rotations = self.rotate_subtree(positions, rotations, 15, qmul(head_q, qconjugate(rotations[:, 15])))
-        return (torch.where(lift[:, None, None] > 0, positions, original_p),
-                torch.where(lift[:, None, None] > 0, rotations, original_q), lift)
-
     def seated_geometry(self, frame, context):
-        positions, rotations = forward_kinematics(frame[:, :3], qnormalize(frame[:, 3:7]), frame[:, 7:10],
+        # 座面由 posterior correction 处理；显示 FK 不再施加独立托举。
+        return forward_kinematics(frame[:, :3], qnormalize(frame[:, 3:7]), frame[:, 7:10],
                            qnormalize(frame[:, 10:].reshape(-1, 24, 4)), self.offsets, self.parents)
-        original_p, original_q = positions, rotations
-        left, right = positions[:, 20], positions[:, 21]
-        left_q, right_q = rotations[:, 20], rotations[:, 21]
-        positions, rotations, lift = self.seat_torso(positions, rotations, context)
-        positions, rotations = self.solve_arm(positions, rotations, 16, left, left_q)
-        positions, rotations = self.solve_arm(positions, rotations, 17, right, right_q)
-        return (torch.where(lift[:, None, None] > 0, positions, original_p),
-                torch.where(lift[:, None, None] > 0, rotations, original_q))
 
-    def interpolated_frames(self, normalized, tracker, display_from_pose):
-        target = self.target_frame(normalized, tracker, display_from_pose)
+    def interpolated_frames(self, normalized, tracker, display_from_pose, height=None, forward=None):
+        target = self.target_frame(normalized, tracker, display_from_pose, height, forward)
         count = target.shape[0]
         t = self.fractions[None, :, None]
         begin, end = display_from_pose[:, None], target[:, None]
@@ -375,114 +358,83 @@ class ResidualCollisionPostprocess(nn.Module):
         local = qslerp(begin[..., 10:].reshape(1, 1, 24, 4), end[..., 10:].reshape(count, 1, 24, 4), t[..., None])
         return torch.cat([root, root_q, pelvis, local.reshape(count, 4, 96)], -1).reshape(-1, 106)
 
-    def display_geometry(self, normalized, tracker, seated_context, display_from_pose):
+    def display_geometry(self, normalized, tracker, seated_context, display_from_pose, height=None, forward=None):
         count = normalized.shape[0]
-        frame = self.interpolated_frames(normalized, tracker, display_from_pose)
-        context = seated_context[:, None].expand(count, 4, 4).reshape(-1, 4)
+        frame = self.interpolated_frames(normalized, tracker, display_from_pose, height, forward)
+        context = seated_context
         positions, rotations = self.seated_geometry(frame, context)
         return positions.reshape(count, 4, 24, 3), rotations.reshape(count, 4, 24, 4)
 
-    def prepare_geometry(self, reference, tracker, context, display):
-        """只准备头、脊柱和肩部；内层编辑不改变这些量，腿和手指无需进入图。"""
-        root, root_q, pelvis, local, global_q = self.target_components(reference, tracker, display)
-        t = self.fractions[:, None]
-        root = display[:, :3] + t * (root - display[:, :3])
-        pelvis = display[:, 7:10] + t * (pelvis - display[:, 7:10])
-        root_q = qnormalize(qslerp(display[:, 3:7], root_q, t))
-        start_local = display[:, 10:].reshape(1, 24, 4)
-        joints = [0, 3, 6, 9, 12, 13, 14]
-        interpolated = qnormalize(qslerp(start_local[:, joints], local[:, joints], t[:, None]))
-        p = root + qrotate(root_q, pelvis)
-        q = qmul(root_q, interpolated[:, 0])
-        correction = self.seat_correction(p, context)
-        lift = (correction.square().sum(-1) > 0)[:, None]
-        spine = []
-        for index, joint in enumerate((3, 6, 9), start=1):
-            p = p + qrotate(q, self.offsets[joint])
-            q = qmul(q, interpolated[:, index])
-            spine.append(p)
-        # Spine3 下的颈部和双侧锁骨可以一次并行计算。
-        children_q = qmul(q[:, None], interpolated[:, 4:])
-        children_p = p[:, None] + qrotate(q[:, None], self.offsets[None, [12, 13, 14]])
-        head = children_p[:, 0] + qrotate(children_q[:, 0], self.offsets[15])
-        before_parent = children_q[:, 1:]
-        shoulders = children_p[:, 1:] + qrotate(before_parent, self.offsets[None, [16, 17]])
-        # CCD 只需三个支点、头和双肩的位置；锁骨的旋转变化由共同的 delta 累积。
-        points = torch.cat([torch.stack(spine, 1), head[:, None], shoulders], 1)
-        points = points + correction[:, None]
-        identity = torch.zeros_like(root_q) + root_q.new_tensor([0., 0., 0., 1.])
-        delta_q = identity
-        for _ in range(3):
-            for joint in (2, 1, 0):
-                center = points[:, joint:joint + 1]
-                delta = from_to(points[:, 3] - center[:, 0], head - center[:, 0])
-                # 紧凑数组按祖先顺序排列；当前支点后面的点都是后代。
-                tail = center + qrotate(delta[:, None], points[:, joint + 1:] - center)
-                points = torch.cat([points[:, :joint + 1], tail], 1)
-                delta_q = qmul(delta, delta_q)
-        supported = torch.where(lift[:, None] > 0, points[:, 4:], shoulders)
-        delta_q = torch.where(lift > 0, delta_q, identity)
-        return (global_q[:, [13, 14]], global_q[:, [20, 21]], start_local[:, 16:22],
-                before_parent, shoulders, supported, delta_q[:, None], lift[:, 0])
+    def pelvis_reference(self, base_pose, tracker, context, display, height, height_context, history):
+        # 原始基准不包含头部前后热启动值，历史覆盖头部平移与姿态调整的总修正。
+        axis=context[:,9:12]*context.new_tensor([1.,0.,1.])
+        axis=axis/axis.norm(dim=-1,keepdim=True).clamp_min(1e-6)
+        root,rotation,pelvis,_,_=self.target_components(base_pose,tracker,display,height)
+        target=((root+qrotate(rotation,pelvis))*axis).sum(-1)+history[:,73]
+        before=display[:,:3]+qrotate(qnormalize(display[:,3:7]),display[:,7:10])
+        speed=(target-(before*axis).sum(-1)).abs()/height_context[:,1].clamp_min(.001)
+        weight=self.settings.pelvis_forward_smooth_weight*history[:,72]*(context[:,15]>1.5)*((.6-speed)/.45).clamp(0,1)
+        return axis,target,weight
 
-    def cached_upper_geometry(self, active_pose, cache):
-        """active_pose [N,24]：只解码肩肘，再求六个上肢局部旋转及双臂 IK。"""
-        parent, wrist, start_local, before_parent, before_shoulder, after_shoulder, delta_q, lift = cache
-        count = active_pose.shape[0]
-        raw = (active_pose * self.pose_scale[96:120] + self.pose_mean[96:120]).reshape(count, 4, 6)
-        global_q = rotations_from_6d(project_rotation_6d_to_so3(raw))
-        shoulder_q, elbow_q = global_q[:, :2], global_q[:, 2:]
-        target_local = torch.cat([qmul(qconjugate(parent), shoulder_q), qmul(qconjugate(shoulder_q), elbow_q),
-                                  qmul(qconjugate(elbow_q), wrist)], 1)
-        local = qslerp(start_local[:, None], target_local[:, None], self.fractions[None, :, None, None])
-        shoulder = qmul(before_parent[None], local[:, :, :2])
-        elbow = qmul(shoulder, local[:, :, 2:4])
-        wrist_q = qmul(elbow, local[:, :, 4:6])
-        e = before_shoulder[None] + qrotate(shoulder, self.offsets[None, None, [18, 19]].expand(count, 4, -1, -1))
-        w = e + qrotate(elbow, self.offsets[None, None, [20, 21]].expand(count, 4, -1, -1))
-        a = after_shoulder[None].expand(count, -1, -1, -1)
-        b = a + qrotate(delta_q[None], e - before_shoulder[None])
-        c = a + qrotate(delta_q[None], w - before_shoulder[None])
-        ab, bc = norm(b - a), norm(c - b)
-        goal_delta = w - a
-        distance = norm(goal_delta).maximum((ab - bc).abs() + .0001).minimum(ab + bc - .0001)
-        axis = unit(goal_delta)
-        bend = b - a - ((b - a) * axis).sum(-1, keepdim=True) * axis
-        forward = qrotate(qmul(delta_q[None], shoulder), torch.zeros_like(a) + a.new_tensor([0., 0., 1.]))
-        fallback = forward - (forward * axis).sum(-1, keepdim=True) * axis
-        secondary = cross3(axis, torch.where(axis[..., :1].abs() < .9,
-                                torch.zeros_like(a) + a.new_tensor([1., 0., 0.]),
-                                torch.zeros_like(a) + a.new_tensor([0., 1., 0.])))
-        fallback = torch.where(fallback.square().sum(-1, keepdim=True) < 1e-8, secondary, fallback)
-        bend = unit(torch.where(bend.square().sum(-1, keepdim=True) < 1e-8, fallback, bend))
-        x = (ab.square() - bc.square() + distance.square()) / (2 * distance.clamp_min(1e-6))
-        middle = a + axis * x + bend * (ab.square() - x.square()).clamp_min(0).sqrt()
-        valid = (ab > 1e-5) & (bc > 1e-5) & (goal_delta.square().sum(-1, keepdim=True) >= 1e-10)
-        supported_e = torch.where(valid, middle, b)
-        supported_w = torch.where(valid, a + axis * distance, c)
-        supported_q = torch.where(valid, wrist_q, qmul(delta_q[None], wrist_q))
-        mask = lift[None, :, None, None] > 0
-        # 小臂偏心胶囊需要完整旋转，不能只用肘腕连线丢弃轴向扭转。
-        first_delta = from_to(b - a, supported_e - a)
-        second_delta = from_to(qrotate(first_delta, c - b), supported_w - supported_e)
-        supported_elbow = qmul(second_delta, qmul(first_delta, qmul(delta_q[None], elbow)))
-        supported_elbow = torch.where(valid, supported_elbow, qmul(delta_q[None], elbow))
-        return (torch.where(mask, supported_e, e), torch.where(mask, supported_w, w),
-                torch.where(mask, supported_q, wrist_q), torch.where(mask, supported_elbow, elbow))
-
-    def measurement(self, normalized, tracker, boxes, modes, context, display, cache=None):
-        if cache is None:
-            positions, rotations = self.display_geometry(normalized, tracker, context, display)
-            e, w, q = positions[:, :, [18, 19]], positions[:, :, [20, 21]], rotations[:, :, [20, 21]]
-            eq = rotations[:, :, [18, 19]]
-        else:
-            e, w, q, eq = self.cached_upper_geometry(normalized[:, 96:120], cache)
-        loss, penetration = self.geometry_loss(e, w, q, eq, tracker, boxes, modes)
-        return loss.sum(-1), penetration
-
-    def arm_measurement(self, active_pose, tracker, boxes, modes, cache):
-        e, w, q, eq = self.cached_upper_geometry(active_pose, cache)
-        return self.geometry_loss(e, w, q, eq, tracker, boxes, modes)
+    def measurement(self, normalized, tracker, boxes, modes, context, display, height=None, previous_height=None, pelvis_reference=None, forward=None, previous_forward=None):
+        positions, rotations = self.display_geometry(normalized, tracker, context, display, height, forward)
+        e, w, q = positions[:, :, [18, 19]], positions[:, :, [20, 21]], rotations[:, :, [20, 21]]
+        loss, penetration = self.geometry_loss(e, w, q, rotations[:, :, [18, 19]], tracker, boxes, modes)
+        origins, quat = positions[:, :, :3], rotations[:, :, :3]
+        start = origins + qrotate(quat, self.seat_start)
+        end = origins + qrotate(quat, self.seat_end)
+        axes = context[:, 3:12].reshape(-1, 3, 3)
+        def local(point):
+            return ((point - context[:, None, None, :3]).unsqueeze(-2) * axes[:, None, None]).sum(-1)
+        a, b = local(start), local(end)
+        half = context[:, None, None, 12:15]
+        gap = segment_box_sdf(a, b, half) - self.seat_radii
+        gap = torch.where(context[:, 15:16, None] > 1.5, gap.minimum(top_gap(a, b, half, self.seat_radii)), gap)
+        violation = torch.where(context[:, 15:16, None] > 0, (self.settings.margin - gap).clamp_min(0), torch.zeros_like(gap))
+        # 三个独立接触部位分别求和，避免最深的一个遮蔽另一侧大腿的梯度。
+        seat_loss = self.settings.seat_collision_weight * violation.square().sum((1, 2))
+        if self.back_count:
+            origins, quat = positions[:, :, self.back_bones], rotations[:, :, self.back_bones]
+            a, b = local(origins + qrotate(quat, self.back_start)), local(origins + qrotate(quat, self.back_end))
+            back_axes = self.backrest[3:12].reshape(3,3)
+            a = ((a-self.backrest[:3]).unsqueeze(-2)*back_axes).sum(-1)
+            b = ((b-self.backrest[:3]).unsqueeze(-2)*back_axes).sum(-1)
+            half = self.backrest[12:15]
+            gap = (segment_box_sdf(a,b,half)-self.back_radii).minimum(top_gap(a[..., [0,2,1]],b[..., [0,2,1]],half[[0,2,1]],self.back_radii))
+            back_v = torch.where(context[:,15:16,None]>0,(self.settings.margin-gap).clamp_min(0),torch.zeros_like(gap))
+            seat_loss = seat_loss + back_v.square().sum((1,2))
+            penetration = penetration.maximum(back_v.flatten(1).amax(-1))
+        error = norm(positions[:, -1, [0, 10, 11]] - tracker[:, [3, 4, 5], :3]).squeeze(-1)
+        error = (error - self.settings.tracking_tolerance).clamp_min(0) * tracker[:, [3, 4, 5], 9]
+        world = rotations[:, -1]
+        # 头部仍使用跟踪旋转；末端父子差使颈部不能靠相对头部后仰逃避分配约束。
+        local = qnormalize(qmul(qconjugate(world[:, [0,3,6,9,12]]), world[:, [3,6,9,12,15]]))
+        bend = 2*local[..., 0]*torch.where(local[..., 3] < 0, -1., 1.)
+        excess = (abs(bend[:, 1:]-bend[:, :-1])-self.settings.spine_bend_tolerance).clamp_min(0)
+        spine_loss = self.settings.spine_bend_scale**2*excess.square().sum(-1)
+        penetration = penetration.maximum(self.settings.spine_bend_scale*excess.amax(-1))
+        curve = (bend[:, :4].abs().sum(-1)-self.settings.torso_curve_limit).clamp_min(0)*self.settings.torso_curve_scale
+        chest_head = qnormalize(qmul(qconjugate(world[:,9]),world[:,15]))
+        neck = (abs(2*chest_head[:,0])-self.settings.chest_head_limit).clamp_min(0)*self.settings.chest_head_scale
+        spine_loss = spine_loss + curve.square() + neck.square()
+        penetration = penetration.maximum(curve).maximum(neck)
+        total = loss.sum(-1) + (seat_loss + spine_loss + self.settings.body_tracking_weight*error.square().sum(-1)) / (2 * self.settings.m ** 2)
+        if height is not None:
+            y = height.reshape(-1)
+            previous = 0. if previous_height is None else previous_height.reshape(-1)
+            total = total + (self.settings.head_y_weight*y.square()+self.settings.head_y_smooth_weight*(y-previous).square())/(2*self.settings.m**2)
+            penetration = penetration.maximum(y.abs())
+        if forward is not None:
+            axis=context[:,9:12]*context.new_tensor([1.,0.,1.]);axis=axis/axis.norm(dim=-1,keepdim=True).clamp_min(1e-6)
+            f=(forward*axis).sum(-1);previous_f=0. if previous_forward is None else previous_forward.reshape(-1)
+            total=total+(self.settings.head_forward_weight*f.square()+self.settings.head_forward_smooth_weight*(f-previous_f).square())/(2*self.settings.m**2)
+            penetration=penetration.maximum(f.abs())
+        if pelvis_reference is not None:
+            axis,target,weight=pelvis_reference
+            forward=(positions[:,-1,0]*axis).sum(-1)
+            error=forward-target
+            total=total+weight*(error.square())/(2*self.settings.m**2)
+        return total, penetration.maximum(violation.flatten(1).amax(-1))
 
     def geometry_loss(self, e, w, q, eq, tracker, boxes, modes):
         """几何 [N,4,2,...]，返回独立的左右臂损失 [N,2]；不合并跨臂项。"""
@@ -504,38 +456,115 @@ class ResidualCollisionPostprocess(nn.Module):
         return loss, penetration.reshape(count, -1).amax(-1)
 
     def forward(self, prior, residual, tracker, boxes, modes, context, display, variance):
-        reference = residual[:, 96:120]
-        current = reference
-        cache = self.prepare_geometry(prior + residual, tracker, context, display)
-        prior_active = prior[:, 96:120]
+        if self.settings.head_forward_limit > 0 or self.settings.head_y_limit > 0 or self.settings.correction_smooth_weight > 0 or self.settings.pelvis_forward_smooth_weight > 0:
+            raise ValueError('启用高度或修正量时序约束必须使用 forward_with_height 并传递相应状态。')
+        edited,_ = self.forward_with_height(prior,residual,tracker,boxes,modes,context,display,variance,
+                                          prior.new_tensor([[0.,1/30]]))
+        return edited
+
+    def forward_with_height(self, prior, residual, tracker, boxes, modes, context, display, variance,
+                            height_context, initial_height=None, trace=None, correction_context=None, forward_context=None, initial_forward=None, forward_result=None):
+        """高度上下文 [1,2] = 上次接受的偏移(m)、时间差(s)；返回残差及高度；forward_result["offset"] 保存前后偏移(m)。"""
+        reference = residual[:, self.active_indices]
+        # 当前采样阶段的历史 [1,74]：72 个归一化修正量及有效权重，只约束后48个脊柱/腿部坐标。
+        history = prior.new_zeros(1,74) if correction_context is None else correction_context
+        def temporal(current):
+            error = current[:,24:72]-reference[:,24:]-history[:,24:72]
+            weight = self.settings.correction_smooth_weight*history[:,72:73]
+            return .5*weight[:,0]*error.square().sum(-1), torch.nn.functional.pad(weight*error,(24,2))
+        previous = height_context[:, :1]
+        height = previous if initial_height is None else initial_height.reshape(1,1)
+        height = height.clamp(-self.settings.head_y_limit, self.settings.head_y_limit)
+        previous_f=prior.new_zeros(1,1) if forward_context is None else forward_context.reshape(1,1)
+        step_f=self.settings.head_forward_speed*height_context[:,1:2].clamp(0,.1)
+        lo_f=(previous_f-step_f).clamp_min(-self.settings.head_forward_limit)/.1
+        hi_f=(previous_f+step_f).clamp_max(self.settings.head_forward_limit)/.1
+        release=previous_f.sign()*(previous_f.abs()-step_f).clamp_min(0)/.1
+        lo_f=torch.where(context[:,15:16]>1.5,lo_f,release);hi_f=torch.where(context[:,15:16]>1.5,hi_f,release)
+        f=previous_f if initial_forward is None else initial_forward.reshape(1,1)
+        f=(f/.1).maximum(lo_f).minimum(hi_f)
+        axis=context[:,9:12]*context.new_tensor([1.,0.,1.]);axis=axis/axis.norm(dim=-1,keepdim=True).clamp_min(1e-6)
+        current = torch.cat([reference, height/.1,f], -1)
+        offsets = torch.cat([torch.nn.functional.pad(self.difference_offsets,(0,2)),
+                             torch.cat([torch.zeros(4,72,device=prior.device), prior.new_tensor([[1.,0.],[-1.,0.],[0.,1.],[0.,-1.]])*self.settings.difference_step],-1)])
         variance = variance.clamp_min(1e-6)
-        epsilon = self.settings.difference_step
+        delta = self.settings.head_y_speed*height_context[:,1:2].clamp(0,.1)
+        lo = (previous-delta).clamp_min(-self.settings.head_y_limit)/.1
+        hi = (previous+delta).clamp_max(self.settings.head_y_limit)/.1
+        warm = current+torch.nn.functional.pad(history[:,24:72]*(history[:,72:73]>0),(24,2))
+        pelvis_reference=self.pelvis_reference(prior+residual,tracker,context,display,height,height_context,history)
+        def evaluate(candidates):
+            pose = prior+residual+(candidates[:,:72]-reference)@self.directions
+            options=dict(forward=axis*candidates[:,73:74]*.1,previous_forward=previous_f) if self.settings.head_forward_limit>0 else {}
+            return self.measurement(pose,tracker,boxes,modes,context,display,candidates[:,72]*.1,previous,pelvis_reference,**options)
+        starts = torch.cat([current,warm])
+        start_loss,start_penetration = evaluate(starts)
+        start_energy = start_loss+(starts[:,:72]-reference).square().sum(-1)/(2*variance)+temporal(starts)[0]
+        use_warm=(start_penetration[:1]>0) & torch.isfinite(start_energy[1:]) & (start_energy[1:]<start_energy[:1])
+        current=torch.where(use_warm[:,None],warm,current)
+        def forward_position(candidate):
+            pose=prior+residual+(candidate[:,:72]-reference)@self.directions
+            root,rq,pp,_,_=self.target_components(pose,tracker,display,candidate[:,72:73]*.1,axis*candidate[:,73:74]*.1)
+            return ((root+qrotate(rq,pp))*pelvis_reference[0]).sum(-1)
         for k in range(self.settings.steps):
-            candidates = current + self.difference_offsets
-            values, penetration = self.arm_measurement(prior_active + candidates, tracker, boxes, modes, cache)
-            energy = values[:1].sum(-1) + (current - reference).square().sum(-1) / (2 * variance)
+            values, penetration = evaluate(current+offsets)
+            temporal_energy,temporal_gradient = temporal(current)
+            energy = values[:1]+(current[:,:72]-reference).square().sum(-1)/(2*variance)+temporal_energy
             if k == 0:
-                active = penetration[:1, None] > 0
+                active = penetration[:1,None] > 0
                 best, best_energy = current, energy
             else:
-                better = (torch.isfinite(energy) & (energy < best_energy))[:, None]
-                best = torch.where(better, current, best)
-                best_energy = torch.where(better[:, 0], energy, best_energy)
-            # [12,2] -> [肩/肘,左/右,6]，恢复连续的 24 个活动分量。
-            paired_gradient = (values[1:13] - values[13:]) / (2 * epsilon)
-            geometry_gradient = paired_gradient.reshape(2, 6, 2).permute(0, 2, 1).reshape(1, 24)
-            gradient = geometry_gradient + (current - reference) / variance
-            h = self.settings.h * (1 - .99 * k / self.settings.steps)
-            # 只保留能量中的先验回拉，更新与最佳候选筛选使用同一个目标。
-            proposed = current - h * gradient
-            proposed = torch.where(active, proposed, reference)
-            valid = torch.isfinite(proposed).all(-1, keepdim=True)
-            proposed = torch.where(valid, proposed, current)
-            current = proposed
-        measured, _ = self.arm_measurement(prior_active + current, tracker, boxes, modes, cache)
-        energy = measured.sum(-1) + (current - reference).square().sum(-1) / (2 * variance)
-        better = (torch.isfinite(energy) & (energy < best_energy))[:, None]
-        best = torch.where(better, current, best)
-        edited = torch.where(active, best, reference)
-        # 只在输出时写回活动切片；其他 120 维直接复用输入，精确保留。
-        return torch.cat([residual[:, :96], edited, residual[:, 120:]], -1)
+                better = (torch.isfinite(energy) & (energy < best_energy))[:,None]
+                best = torch.where(better,current,best)
+                best_energy = torch.where(better[:,0],energy,best_energy)
+            g = torch.cat([values[1:73]-values[73:145],values[145:146]-values[146:147],values[147:148]-values[148:149]])[None]/(2*self.settings.difference_step)
+            g = g+torch.nn.functional.pad((current[:,:72]-reference)/variance,(0,2))
+            g = g+temporal_gradient
+            if trace is not None and k < 5:
+                trace[k*146:k*146+72]=current[0,:72]
+                trace[k*146+72:k*146+144]=g[0,:72]
+                trace[k*146+144]=energy[0];trace[k*146+145]=best_energy[0]
+                trace[1000+k*2]=current[0,72];trace[1001+k*2]=g[0,72]
+                trace[1030+k*2]=current[0,73];trace[1031+k*2]=g[0,73]
+            proposed = current-self.settings.h*(1-.99*k/self.settings.steps)*g
+            # 原步长及三次折半，仅接受总能量不增加的更新；不新增跨帧状态。
+            direction = proposed-current
+            accepted = current
+            accepted_energy = energy
+            accepted_scale = current.new_zeros(1)
+            pending = active & torch.isfinite(direction).all(-1,keepdim=True)
+            direction = torch.where(pending,direction,torch.zeros_like(direction))
+            base_forward=forward_position(current)
+            for attempt in range(4):
+                trial = current+direction*(.5**attempt)
+                trial = torch.cat([trial[:,:72],trial[:,72:73].maximum(lo).minimum(hi),trial[:,73:74].maximum(lo_f).minimum(hi_f)],-1)
+                trial_loss,_ = evaluate(trial)
+                trial_energy = trial_loss+(trial[:,:72]-reference).square().sum(-1)/(2*variance)+temporal(trial)[0]
+                movement_cost=pelvis_reference[2]*self.settings.pelvis_forward_update_cost*(forward_position(trial)-base_forward).abs()/(2*self.settings.m**2)
+                take = pending & (torch.isfinite(trial_energy) & (trial_energy+movement_cost<=energy))[:,None]
+                accepted = torch.where(take,trial,accepted)
+                accepted_energy = torch.where(take[:,0],trial_energy,accepted_energy)
+                accepted_scale = torch.where(take[:,0],.5**attempt,accepted_scale)
+                pending = pending & ~take
+            if trace is not None and k<20:
+                trace[1100+k*3]=energy[0];trace[1101+k*3]=accepted_energy[0];trace[1102+k*3]=accepted_scale[0]
+            current = accepted
+        measured,_ = evaluate(current)
+        energy = measured+(current[:,:72]-reference).square().sum(-1)/(2*variance)+temporal(current)[0]
+        best = torch.where((torch.isfinite(energy) & (energy<best_energy))[:,None],current,best)
+        edited = torch.where(active,best[:,:72],reference)
+        if trace is not None:
+            trace[800:872]=current[0,:72];trace[872:944]=edited[0]
+            trace[1020]=current[0,73];trace[1021]=best[0,73]*.1 if active.item() else 0
+            trace[1010]=current[0,72];trace[1011]=best[0,72]*.1 if active.item() else 0
+            base_position=pelvis_reference[1]-history[:,73]
+            best_pose=prior+residual+(edited-reference)@self.directions
+            root,rq,pp,_,_=self.target_components(best_pose,tracker,display,best[:,72:73]*.1,axis*best[:,73:74]*.1)
+            selected=((root+qrotate(rq,pp))*pelvis_reference[0]).sum(-1)
+            trace[1012]=base_position[0];trace[1013]=pelvis_reference[1][0];trace[1014]=pelvis_reference[2][0]
+            trace[1015]=selected[0]-base_position[0] if active.item() else 0
+            pose=prior+residual+(current[:,:72]-reference)@self.directions
+            p,q=self.display_geometry(pose,tracker,context,display,current[:,72]*.1,axis*current[:,73:74]*.1)
+            trace[2000:]=torch.cat([p,q],-1).flatten()
+        if forward_result is not None: forward_result["offset"]=torch.where(active,best[:,73:74]*.1,torch.zeros_like(previous_f))
+        return residual.scatter(1,self.active_indices[None],edited),torch.where(active,best[:,72:73]*.1,torch.zeros_like(previous))

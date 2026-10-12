@@ -7,7 +7,7 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
-from export.residual_collision_postprocess import CollisionSettings, ResidualCollisionPostprocess
+from export.residual_collision_postprocess import CollisionSettings, ResidualCollisionPostprocess, qrotate
 
 
 class CollisionChainReference:
@@ -30,17 +30,46 @@ class CollisionChainReference:
             ('current_tracker_raw', 'armrest_geometry', 'contact_mode', 'seated_context', 'display_from_pose')]
         self.steps = []
         with torch.no_grad():
+            height_context=torch.from_numpy(feed.get('head_height_context',np.array([[0.,1/30,0.]],np.float32)))
+            if tuple(height_context.shape)!=(1,3):raise ValueError("head_height_context requires [dy,dt,df]")
+            forward_context=height_context[:,2:3]
+            height_context=height_context[:,:2]
+            forward=forward_context.clone()
+            height=height_context[:,:1].clone()
+            corrections=torch.from_numpy(feed.get("correction_context",np.zeros((1,366),np.float32)))
+            self.corrections=np.zeros((1,365),np.float32)
             for i, (t, ddim) in enumerate(zip(self.manifest['timesteps'], self.manifest['ddim'])):
                 residual = self.sessions['step'].run(None, dict(state=state, timestep=np.array([t], np.int64), **cached))[0]
                 values = (torch.from_numpy(prior), torch.from_numpy(residual), tracker, boxes, modes, context, display,
                           torch.tensor(ddim['variance']))
-                edited = residual if bypass else self.post(*values).numpy()
+                initial_height=height.clone();initial_forward=forward.clone();forward_result={}
+                history=torch.cat([corrections[:,i*72:(i+1)*72],corrections[:,360:361],corrections[:,361+i:362+i]],-1)
+                if bypass:
+                    edited=residual;height=torch.zeros_like(height);forward=torch.zeros_like(forward)
+                elif self.post.settings.head_forward_limit>0 or self.post.settings.head_y_limit>0 or self.post.settings.correction_smooth_weight>0 or self.post.settings.pelvis_forward_smooth_weight>0:
+                    edited,height=self.post.forward_with_height(*values,height_context,initial_height,correction_context=history,forward_context=forward_context,initial_forward=initial_forward,forward_result=forward_result)
+                    forward=forward_result["offset"]
+                    edited=edited.numpy()
+                else:
+                    edited=self.post(*values).numpy();height=torch.zeros_like(height)
+                self.corrections[:,i*72+24:(i+1)*72]=(edited-residual)[:,self.post.active_indices.numpy()[24:]]
+                axis=context[:,9:12]*context.new_tensor([1.,0.,1.]);axis=axis/axis.norm(dim=-1,keepdim=True).clamp_min(1e-6)
+                def pelvis_forward(r,h,f):
+                    root,rq,pp,_,_=self.post.target_components(torch.from_numpy(prior+r),tracker,display,h,axis*f)
+                    return ((root+qrotate(rq,pp))*axis).sum(-1)
+                self.corrections[:,360+i]=(pelvis_forward(edited,height,forward)-pelvis_forward(residual,initial_height,torch.zeros_like(initial_forward))).numpy()
                 self.steps.append(dict(step=i, state=state.tolist(), inputs={k:v.tolist() for k,v in zip(
                     ['prior', 'residual', 'tracker', 'boxes', 'modes', 'context', 'display', 'variance'], values)},
                     expected=edited.tolist()))
+                if self.post.settings.head_forward_limit>0 or self.post.settings.head_y_limit>0 or self.post.settings.correction_smooth_weight>0 or self.post.settings.pelvis_forward_smooth_weight>0:
+                    self.steps[-1]['inputs'].update(height_context=height_context.tolist(),initial_height=initial_height.tolist(),correction_context=history.tolist(),forward_context=forward_context.tolist(),initial_forward=initial_forward.tolist())
+                    self.steps[-1]['expected_height']=height.tolist()
+                    self.steps[-1]['expected_forward']=forward.tolist()
                 if i < len(self.manifest['timesteps'])-1:
                     eps = (np.float32(ddim['recip'])*state-edited)/np.float32(ddim['recipm1'])
                     state = edited*np.float32(ddim['sqrt_alpha_prev'])+np.float32(ddim['sqrt_one_minus_alpha_prev'])*eps
+            self.forward_offset=forward.numpy()
+            self.height_offset=height.numpy()
             return self.sessions['projection'].run(None, dict(predictor_pose_horizon=feed['predictor_pose_horizon'],
                 edited_residual=edited, current_tracker_raw=feed['current_tracker_raw']))
 
@@ -51,35 +80,18 @@ def trace_reference(post, row):
     prior, residual, tracker, boxes, modes, context, display, variance = [torch.tensor(source[k],
         dtype=torch.long if k == 'modes' else torch.float32) for k in
         ['prior', 'residual', 'tracker', 'boxes', 'modes', 'context', 'display', 'variance']]
-    cache = post.prepare_geometry(prior+residual, tracker, context, display)
-    current = reference = residual[:, 96:120]
-    trace = torch.zeros(2600); best = current; best_energy = torch.tensor([float('inf')])
-    variance = variance.clamp_min(1e-6)
-    active = None
-    for k in range(post.settings.steps+1):
-        candidates = prior[:, 96:120]+(current+post.difference_offsets)
-        loss, penetration = post.arm_measurement(candidates, tracker, boxes, modes, cache)
-        energy = loss[:1].sum(-1)+(current-reference).square().sum(-1)/(2*variance)
-        if k == 0:
-            active = bool(penetration[0] > 0)
-        if torch.isfinite(energy).all() and energy < best_energy:
-            best, best_energy = current.clone(), energy
-        if k == post.settings.steps:
-            e,w,q,eq = post.cached_upper_geometry(candidates, cache)
-            trace[600:] = torch.cat([e,w,q], -1).flatten()
-            trace[548:580] = eq[0].flatten()
-            trace[500:524] = current.flatten();trace[524:548] = (best if active else reference).flatten()
-            break
-        grad = ((loss[1:13]-loss[13:])/(2*post.settings.difference_step)).reshape(2,6,2).permute(0,2,1).reshape(1,24)
-        grad = grad+(current-reference)/variance
-        trace[k*100:k*100+24] = current.flatten();trace[k*100+24:k*100+48] = grad.flatten()
-        trace[k*100+48] = energy;trace[k*100+49] = best_energy
-        proposed = current-post.settings.h*(1-.99*k/post.settings.steps)*grad
-        current = proposed if active and torch.isfinite(proposed).all() else current
-    row['trace'] = trace.tolist();row['active'] = active
-    # 首先确认诊断代码没有与正式参考算法分叉。
-    expected = torch.tensor(row['expected'])[:, 96:120]
-    torch.testing.assert_close(trace[524:548], expected.flatten(), atol=1e-5, rtol=1e-4)
+    trace = torch.zeros(2672)
+    hc=torch.tensor(source.get('height_context',[[0.,1/30]]))
+    initial=torch.tensor(source.get('initial_height',hc[:,:1].tolist()))
+    fc=torch.tensor(source.get("forward_context",[[0.]]));fi=torch.tensor(source.get("initial_forward",fc.tolist()));fr={}
+    expected,height=post.forward_with_height(prior,residual,tracker,boxes,modes,context,display,variance,hc,initial,trace,
+        torch.tensor(source['correction_context']) if 'correction_context' in source else None,fc,fi,fr)
+    axis=context[:,9:12]*torch.tensor([1.,0.,1.]);axis=axis/axis.norm(dim=-1,keepdim=True).clamp_min(1e-6)
+    _,penetration=post.measurement(prior+residual,tracker,boxes,modes,context,display,initial,hc[:,:1],forward=axis*fi,previous_forward=fc)
+    row['active']=bool(penetration[0]>0);row['trace']=trace.tolist()
+    torch.testing.assert_close(expected,torch.tensor(row['expected']),atol=1e-5,rtol=1e-4)
+    row['expected_height']=height.tolist()
+    row['expected_forward']=fr['offset'].tolist()
 
 
 def main():

@@ -31,7 +31,7 @@ def example_inputs(collision_postprocess=False):
     display = torch.zeros(1, 106)
     display[:, 6] = 1
     display[:, 10:].reshape(1, 24, 4)[..., 3] = 1
-    return values + (boxes, torch.zeros(1, 2, 2, dtype=torch.long), torch.zeros(1, 4), display)
+    return values + (boxes, torch.zeros(1, 2, 2, dtype=torch.long), torch.zeros(1, 16), display)
 
 
 class SamplerTemporalAttention(nn.Module):
