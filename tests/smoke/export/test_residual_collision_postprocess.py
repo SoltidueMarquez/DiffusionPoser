@@ -25,8 +25,10 @@ def collision_fixture(settings=None):
     offsets[20, 0], offsets[21, 0] = -.25, .25
     offsets[22, 0], offsets[23, 0] = -.08, .08
     rest = dict(parents=parents, restLocalPositions=offsets.tolist())
-    profile = dict(forearmRadii=[.035, .035], restLocalPositions=offsets.tolist(),
-                   palmSpheres=[[[sign * x, 0., 0., .025] for x in (.02, .05, .08)] for sign in (-1, 1)])
+    profile = dict(restLocalPositions=offsets.tolist(), capsules=[
+        [dict(bone=18+h, start=[sign*(.02+.07*k), .005, .003], end=[sign*(.02+.07*(k+1)), .005, .003], radius=.035) for k in range(3)] +
+        [dict(bone=20+h, start=[sign*.02, 0., 0.], end=[sign*.08, 0., 0.], radius=.025)]
+        for h, sign in enumerate((-1, 1))])
     module = ResidualCollisionPostprocess(rest, profile, torch.zeros(144), torch.ones(144), settings)
     pose = torch.tensor([0., 0., 1., 0., 1., 0.]).repeat(1, 24)
     tracker = torch.zeros(1, 6, 10)
@@ -41,7 +43,7 @@ def collision_fixture(settings=None):
     boxes[:, :, 3:12] = torch.eye(3).flatten()
     boxes[:, :, 12:] = torch.tensor([.12, .0095, .05])
     modes = torch.full((1, 2, 2), 2, dtype=torch.long)
-    context = torch.zeros(1, 4)
+    context = torch.zeros(1, 14)
     return module, pose, tracker, boxes, modes, context, display
 
 
@@ -75,8 +77,8 @@ def test_top_mode_does_not_push_through_thin_armrest_or_use_infinite_plane():
 
 
 @pytest.mark.parametrize('mode', [0, 1, 2])
-def test_direct_sphere_gap_matches_segment_reference(mode):
-    """用原来的通用线段计算核对球体快路径，覆盖盒内、边缘和有限上表面。"""
+def test_capsule_gap_matches_segment_reference(mode):
+    """核对胶囊与退化胶囊，覆盖盒内、边缘和有限上表面。"""
     from export.residual_collision_postprocess import top_gap
 
     module, _, _, boxes, modes, _, _ = collision_fixture()
@@ -99,6 +101,17 @@ def test_direct_sphere_gap_matches_segment_reference(mode):
         expected = torch.full_like(expected, 1e3)
     torch.testing.assert_close(primitive_gaps(start, end, module.radii, boxes, modes), expected,
                                atol=1e-7, rtol=1e-6)
+
+
+def test_overlapping_forearm_segments_do_not_triple_penalty():
+    module, pose, tracker, boxes, modes, context, display = collision_fixture()
+    repeated = deepcopy(module)
+    # 三个相同的完整胶囊与三个共线分段表示同一表面，不应产生三倍惩罚。
+    repeated.capsule_start[:, :3] = module.capsule_start[:, :1]
+    repeated.capsule_end[:, :3] = module.capsule_end[:, 2:3]
+    expected = module.measurement(pose, tracker, boxes, modes, context, display)
+    actual = repeated.measurement(pose, tracker, boxes, modes, context, display)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
 
 
 def test_larger_step_improves_reachable_contact_without_changing_tracking_weight():
@@ -138,7 +151,7 @@ def test_postprocess_only_changes_active_residual_and_reduces_penetration():
 def test_degenerate_pose_and_unreachable_tracker_remain_finite():
     module, prior, tracker, boxes, modes, context, display = collision_fixture(CollisionSettings(steps=1))
     prior.zero_(); tracker[:, 1:3, :3] *= 10
-    context[:] = torch.tensor([1.0, 1., .1, .18])
+    context[:, :4] = torch.tensor([1.0, 1., .1, .18])
     result = module(prior, torch.zeros_like(prior), tracker, boxes, modes, context, display, torch.tensor(0.))
     assert torch.isfinite(result).all()
 
@@ -167,7 +180,7 @@ def test_paired_arm_differences_match_independent_full_pose_gradient():
     current = prior + torch.randn(prior.shape, generator=generator) * .04
     tracker[:, 1, 1] += .06
     tracker[:, 2, 2] += .08
-    context[:] = torch.tensor([.93, .8, .1, .18])
+    context[:, :4] = torch.tensor([.93, .8, .1, .18])
     modes[:] = torch.tensor([[[1, 2], [2, 0]]])
     cache = module.prepare_geometry(current, tracker, context, display)
     paired, _ = module.arm_measurement(current[:, 96:120] + module.difference_offsets,
@@ -191,29 +204,34 @@ def test_compact_torso_cache_matches_full_fk_with_rotated_spine():
     generator = torch.Generator().manual_seed(62)
     current = prior + torch.randn(prior.shape, generator=generator) * .18
     display = module.target_frame(prior + torch.randn(prior.shape, generator=generator) * .12, tracker)
-    context[:] = torch.tensor([1.03, .8, .1, .18])
+    context[:, :4] = torch.tensor([1.03, .8, .1, .18])
     cache = module.prepare_geometry(current, tracker, context, display)
     candidates = current + torch.randn((7, 24), generator=generator) @ module.directions * .04
     expected_p, expected_q = module.display_geometry(candidates, tracker, context, display)
-    elbows, wrists, rotations = module.cached_upper_geometry(candidates[:, 96:120], cache)
+    elbows, wrists, rotations, elbow_rotations = module.cached_upper_geometry(candidates[:, 96:120], cache)
     torch.testing.assert_close(elbows, expected_p[:, :, [18, 19]], atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(wrists, expected_p[:, :, [20, 21]], atol=2e-5, rtol=2e-5)
     assert (rotations * expected_q[:, :, [20, 21]]).sum(-1).abs().min() > .99999
+    assert (elbow_rotations * expected_q[:, :, [18, 19]]).sum(-1).abs().min() > .99999
 
 
 @pytest.mark.parametrize('lift', [0., .1])
-def test_cached_arm_geometry_matches_full_seated_fk(lift):
+@pytest.mark.parametrize('anchored', [False, True])
+def test_cached_arm_geometry_matches_full_seated_fk(lift, anchored):
     module, prior, tracker, boxes, modes, context, display = collision_fixture()
-    context[:] = torch.tensor([.9 + lift, .7, 0., .18])
+    context[:, :4] = torch.tensor([.9 + lift, .7, 0., .18])
+    if anchored:
+        context[:, 4:] = torch.tensor([.08, .85 + lift, -.06, .8, .025, .05, .015, .005, .06, 1.])
     # 候选只改变四个全局旋转，躯干和坐姿支撑可在内层迭代间复用。
     cache = module.prepare_geometry(prior, tracker, context, display)
     generator = torch.Generator().manual_seed(51)
     candidates = prior + torch.randn((9, 24), generator=generator) @ module.directions * .04
     positions, rotations = module.display_geometry(candidates, tracker, context, display)
-    elbows, wrists, quaternions = module.cached_upper_geometry(candidates[:, 96:120], cache)
+    elbows, wrists, quaternions, elbow_rotations = module.cached_upper_geometry(candidates[:, 96:120], cache)
     torch.testing.assert_close(elbows, positions[:, :, [18, 19]], atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(wrists, positions[:, :, [20, 21]], atol=1e-4, rtol=1e-4)
     assert (quaternions * rotations[:, :, [20, 21]]).sum(-1).abs().min() > .9999
+    assert (elbow_rotations * rotations[:, :, [18, 19]]).sum(-1).abs().min() > .9999
 
 
 class GeometryGraph(torch.nn.Module):
@@ -231,7 +249,7 @@ def test_geometry_onnx_matches_pytorch(tmp_path):
     onnx = pytest.importorskip('onnx')
     torch.set_num_threads(1)
     module, pose, tracker, boxes, modes, context, display = collision_fixture()
-    context[:] = torch.tensor([.92, .7, .1, .18])
+    context[:, :4] = torch.tensor([.92, .7, .1, .18])
     graph = GeometryGraph(module).eval()
     inputs = (pose, tracker, boxes, modes, context, display)
     path = tmp_path / 'collision_geometry.onnx'
@@ -295,7 +313,7 @@ def test_uniform_change_of_length_units_preserves_objective():
     expected = module.measurement(pose, tracker, boxes, modes, context, display)
     for scale in (.75, 1.3):
         scaled = deepcopy(module)
-        scaled.offsets *= scale; scaled.palms *= scale; scaled.radii *= scale
+        scaled.offsets *= scale; scaled.capsule_start *= scale; scaled.capsule_end *= scale; scaled.radii *= scale
         scaled.settings = replace(module.settings, m=module.settings.m*scale,
             margin=module.settings.margin*scale, tracking_tolerance=module.settings.tracking_tolerance*scale)
         scaled_tracker = tracker.clone(); scaled_tracker[..., :3] *= scale

@@ -65,8 +65,9 @@ def trace_reference(post, row):
         if torch.isfinite(energy).all() and energy < best_energy:
             best, best_energy = current.clone(), energy
         if k == post.settings.steps:
-            e,w,q = post.cached_upper_geometry(candidates, cache)
+            e,w,q,eq = post.cached_upper_geometry(candidates, cache)
             trace[600:] = torch.cat([e,w,q], -1).flatten()
+            trace[548:580] = eq[0].flatten()
             trace[500:524] = current.flatten();trace[524:548] = (best if active else reference).flatten()
             break
         grad = ((loss[1:13]-loss[13:])/(2*post.settings.difference_step)).reshape(2,6,2).permute(0,2,1).reshape(1,24)

@@ -56,7 +56,7 @@ def main():
                 next_current=trace[(k+1)*100:(k+1)*100+24].reshape(1,24)
                 torch.testing.assert_close(proposed,next_current,atol=2e-6,rtol=1e-5)
             current=trace[500:524].reshape(1,24)
-            e,w,_=post.cached_upper_geometry(v['prior'][:,96:120]+(current+post.difference_offsets),cache)
+            e,w,_,_=post.cached_upper_geometry(v['prior'][:,96:120]+(current+post.difference_offsets),cache)
             observed=trace[600:].reshape(25,4,2,10)
             geometry_error=float(torch.maximum((e-observed[...,:3]).norm(dim=-1),(w-observed[...,3:6]).norm(dim=-1)).max())
             assert geometry_error<=.001,(index,geometry_error)

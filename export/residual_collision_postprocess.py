@@ -38,13 +38,17 @@ class CollisionSettings:
 
 def load_collision_profile(path: Path, rest: dict) -> dict:
     profile = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    for name, shape in [('forearmRadii', (2,)), ('palmSpheres', (2, 3, 4))]:
-        value = torch.tensor(profile[name], dtype=torch.float32)
-        if tuple(value.shape) != shape or not torch.isfinite(value).all():
-            raise ValueError(f'{name} 必须为有限的 {shape} 数组。')
-        radii = value if name == 'forearmRadii' else value[..., 3]
-        if (radii <= 0).any():
-            raise ValueError(f'{name} 的半径必须为正。')
+    capsules = profile.get('capsules', [])
+    if len(capsules) != 2 or any(len(arm) != 4 for arm in capsules):
+        raise ValueError('capsules 必须为 [左右臂, 肘侧/中段/腕侧/手掌]。')
+    for h, arm in enumerate(capsules):
+        for k, capsule in enumerate(arm):
+            if capsule['bone'] != 18 + h + (0 if k < 3 else 2):
+                raise ValueError('计算胶囊只支持 SMPL24 小臂和腕骨骼。')
+            endpoints = torch.tensor([capsule['start'], capsule['end']], dtype=torch.float32)
+            radius = torch.tensor(capsule['radius'])
+            if endpoints.shape != (2, 3) or not torch.isfinite(endpoints).all() or not torch.isfinite(radius) or radius <= 0:
+                raise ValueError('胶囊端点必须有限，半径必须为有限正数。')
     # 标定必须绑定同一套骨架，避免把另一个角色的几何静默带入图中。
     offsets = torch.tensor(profile['restLocalPositions'], dtype=torch.float32)
     expected = torch.tensor(rest['restLocalPositions'], dtype=torch.float32)
@@ -213,7 +217,7 @@ def top_gap(a, b, half, radius):
 
 
 def primitive_gaps(start, end, radii, boxes, modes):
-    """start/end [N,2,4,3]；box [1,2,15]；返回 [N,2,4,2] 间隙。"""
+    """start/end [N,2,2,3]；box [1,2,15]；返回 [N,2,2,2] 间隙。"""
     axes = boxes[..., 3:12].reshape(-1, 2, 3, 3)
     def local(point):
         delta = point.unsqueeze(-2) - boxes[:, None, None, :, :3]
@@ -221,10 +225,7 @@ def primitive_gaps(start, end, radii, boxes, modes):
     a, b = local(start), local(end)
     half = boxes[:, None, None, :, 12:15]
     radius = radii[None, :, :, None]
-    # 代理轴依次为胶囊、三个球；球心距离与退化线段等价，无需重复分段和排序。
-    capsule = segment_box_sdf(a[:, :, :1], b[:, :, :1], half)
-    spheres = box_sdf(a[:, :, 1:], half)
-    gap = torch.cat([capsule, spheres], dim=2) - radius
+    gap = segment_box_sdf(a, b, half) - radius
     top = top_gap(a, b, half, radius)
     gap = torch.where(modes[:, :, None, :] == 2, gap.minimum(top), gap)
     return torch.where(modes[:, :, None, :] > 0, gap, torch.full_like(gap, 1e3))
@@ -244,9 +245,10 @@ class ResidualCollisionPostprocess(nn.Module):
         self.register_buffer('offsets', torch.tensor(rest['restLocalPositions'], dtype=torch.float32))
         self.register_buffer('pose_mean', pose_mean.clone())
         self.register_buffer('pose_scale', pose_scale.clone())
-        self.register_buffer('palms', torch.tensor(profile['palmSpheres'], dtype=torch.float32))
-        radii = torch.cat([torch.tensor(profile['forearmRadii'])[:, None], self.palms[..., 3]], -1)
-        self.register_buffer('radii', radii)
+        capsules = profile['capsules']
+        self.register_buffer('capsule_start', torch.tensor([[c['start'] for c in arm] for arm in capsules], dtype=torch.float32))
+        self.register_buffer('capsule_end', torch.tensor([[c['end'] for c in arm] for arm in capsules], dtype=torch.float32))
+        self.register_buffer('radii', torch.tensor([[c['radius'] for c in arm] for arm in capsules], dtype=torch.float32))
         self.register_buffer('fractions', torch.tensor([.25, .5, .75, 1.]))
         active = [j * 6 + k for j in ACTIVE_JOINTS for k in range(6)]
         self.register_buffer('directions', torch.eye(144)[active])
@@ -330,11 +332,30 @@ class ResidualCollisionPostprocess(nn.Module):
                                                    qmul(wrist_q, qconjugate(rotations[:, wrist])))
         return torch.where(valid[:, None], positions, original_p), torch.where(valid[:, None], rotations, original_q)
 
+    @staticmethod
+    def seat_correction(pelvis, context):
+        """context [B,14] 与 Unity 的座面托举、软骨盆锚点快照一致。"""
+        lift = (context[:, 0] + context[:, 2] - pelvis[:, 1]).clamp_min(0).minimum(context[:, 3].clamp_min(0)) * context[:, 1].clamp(0, 1)
+        delta = context[:, 4:7] - pelvis
+        planar = delta * delta.new_tensor([1., 0., 1.])
+        distance = planar.norm(dim=-1)
+        excess = (distance - context[:, 8].clamp_min(0)).clamp_min(0)
+        limit = context[:, 9].clamp_min(0)
+        amount = limit * (1 - torch.exp(-excess.square() / limit.square().clamp_min(1e-12)))
+        horizontal = planar * torch.where(distance > 1e-6, amount / distance.clamp_min(1e-6), torch.zeros_like(distance))[:, None]
+        vertical = (delta[:, 1].abs() - context[:, 11].clamp_min(0)).clamp_min(0)
+        cap = torch.where(delta[:, 1] >= 0, context[:, 12], context[:, 10]).clamp_min(0)
+        height = delta[:, 1].sign() * cap * (1 - torch.exp(-vertical.square() / cap.square().clamp_min(1e-12)))
+        up = pelvis.new_tensor([0., 1., 0.])
+        anchored = (horizontal + height[:, None] * up) * context[:, 7:8].clamp(0, 1)
+        return torch.where(context[:, 13:14] > 0, anchored, lift[:, None] * up)
+
     def seat_torso(self, positions, rotations, context):
         original_p, original_q = positions, rotations
         head, head_q = positions[:, 15], rotations[:, 15]
-        lift = (context[:, 0] + context[:, 2] - positions[:, 0, 1]).clamp_min(0).minimum(context[:, 3].clamp_min(0)) * context[:, 1].clamp(0, 1)
-        positions = positions + lift[:, None, None] * positions.new_tensor([0., 1., 0.])
+        correction = self.seat_correction(positions[:, 0], context)
+        lift = correction.square().sum(-1) > 0
+        positions = positions + correction[:, None]
         for _ in range(3):
             for joint in (9, 6, 3):
                 positions, rotations = self.rotate_subtree(positions, rotations, joint,
@@ -369,7 +390,7 @@ class ResidualCollisionPostprocess(nn.Module):
     def display_geometry(self, normalized, tracker, seated_context, display_from_pose):
         count = normalized.shape[0]
         frame = self.interpolated_frames(normalized, tracker, display_from_pose)
-        context = seated_context[:, None].expand(count, 4, 4).reshape(-1, 4)
+        context = seated_context[:, None].expand(count, 4, 14).reshape(-1, 14)
         positions, rotations = self.seated_geometry(frame, context)
         return positions.reshape(count, 4, 24, 3), rotations.reshape(count, 4, 24, 4)
 
@@ -385,8 +406,8 @@ class ResidualCollisionPostprocess(nn.Module):
         interpolated = qnormalize(qslerp(start_local[:, joints], local[:, joints], t[:, None]))
         p = root + qrotate(root_q, pelvis)
         q = qmul(root_q, interpolated[:, 0])
-        lift = (context[:, 0] + context[:, 2] - p[:, 1]).clamp_min(0).minimum(context[:, 3].clamp_min(0))
-        lift = lift[:, None] * context[:, 1:2].clamp(0, 1)
+        correction = self.seat_correction(p, context)
+        lift = (correction.square().sum(-1) > 0)[:, None]
         spine = []
         for index, joint in enumerate((3, 6, 9), start=1):
             p = p + qrotate(q, self.offsets[joint])
@@ -400,7 +421,7 @@ class ResidualCollisionPostprocess(nn.Module):
         shoulders = children_p[:, 1:] + qrotate(before_parent, self.offsets[None, [16, 17]])
         # CCD 只需三个支点、头和双肩的位置；锁骨的旋转变化由共同的 delta 累积。
         points = torch.cat([torch.stack(spine, 1), head[:, None], shoulders], 1)
-        points = points + lift[:, None] * points.new_tensor([0., 1., 0.])
+        points = points + correction[:, None]
         identity = torch.zeros_like(root_q) + root_q.new_tensor([0., 0., 0., 1.])
         delta_q = identity
         for _ in range(3):
@@ -453,34 +474,45 @@ class ResidualCollisionPostprocess(nn.Module):
         supported_w = torch.where(valid, a + axis * distance, c)
         supported_q = torch.where(valid, wrist_q, qmul(delta_q[None], wrist_q))
         mask = lift[None, :, None, None] > 0
-        return torch.where(mask, supported_e, e), torch.where(mask, supported_w, w), torch.where(mask, supported_q, wrist_q)
+        # 小臂偏心胶囊需要完整旋转，不能只用肘腕连线丢弃轴向扭转。
+        first_delta = from_to(b - a, supported_e - a)
+        second_delta = from_to(qrotate(first_delta, c - b), supported_w - supported_e)
+        supported_elbow = qmul(second_delta, qmul(first_delta, qmul(delta_q[None], elbow)))
+        supported_elbow = torch.where(valid, supported_elbow, qmul(delta_q[None], elbow))
+        return (torch.where(mask, supported_e, e), torch.where(mask, supported_w, w),
+                torch.where(mask, supported_q, wrist_q), torch.where(mask, supported_elbow, elbow))
 
     def measurement(self, normalized, tracker, boxes, modes, context, display, cache=None):
         if cache is None:
             positions, rotations = self.display_geometry(normalized, tracker, context, display)
             e, w, q = positions[:, :, [18, 19]], positions[:, :, [20, 21]], rotations[:, :, [20, 21]]
+            eq = rotations[:, :, [18, 19]]
         else:
-            e, w, q = self.cached_upper_geometry(normalized[:, 96:120], cache)
-        loss, penetration = self.geometry_loss(e, w, q, tracker, boxes, modes)
+            e, w, q, eq = self.cached_upper_geometry(normalized[:, 96:120], cache)
+        loss, penetration = self.geometry_loss(e, w, q, eq, tracker, boxes, modes)
         return loss.sum(-1), penetration
 
     def arm_measurement(self, active_pose, tracker, boxes, modes, cache):
-        e, w, q = self.cached_upper_geometry(active_pose, cache)
-        return self.geometry_loss(e, w, q, tracker, boxes, modes)
+        e, w, q, eq = self.cached_upper_geometry(active_pose, cache)
+        return self.geometry_loss(e, w, q, eq, tracker, boxes, modes)
 
-    def geometry_loss(self, e, w, q, tracker, boxes, modes):
+    def geometry_loss(self, e, w, q, eq, tracker, boxes, modes):
         """几何 [N,4,2,...]，返回独立的左右臂损失 [N,2]；不合并跨臂项。"""
         count = e.shape[0]
-        wrists, elbows, wrist_q = w.reshape(-1, 2, 3), e.reshape(-1, 2, 3), q.reshape(-1, 2, 4)
-        centers = wrists[:, :, None] + qrotate(wrist_q[:, :, None], self.palms[None, :, :, :3].expand(wrists.shape[0], -1, -1, -1))
-        start = torch.cat([elbows[:, :, None], centers], 2)
-        end = torch.cat([wrists[:, :, None], centers], 2)
+        # [候选×插值, 左右臂, 肘侧/中段/腕侧/手掌, xyz/xyzw]
+        origins = torch.stack([e, e, e, w], dim=-2).reshape(-1, 2, 4, 3)
+        rotations = torch.stack([eq, eq, eq, q], dim=-2).reshape(-1, 2, 4, 4)
+        start = origins + qrotate(rotations, self.capsule_start[None].expand_as(origins))
+        end = origins + qrotate(rotations, self.capsule_end[None].expand_as(origins))
         gaps = primitive_gaps(start, end, self.radii, boxes, modes)
         penetration = (self.settings.margin - gaps).clamp_min(0).reshape(count, 4, 2, 4, 2)
         # 只约束最终候选的手腕；过渡起点的跟踪延迟不能通过让终点过冲补偿。
         error = norm(w[:, -1] - tracker[:, [1, 2], :3]).squeeze(-1)
         error = (error - self.settings.tracking_tolerance).clamp_min(0) * tracker[:, [1, 2], 9]
-        loss = (penetration.square().sum((1, 3, 4)) + error.square()) / (2 * self.settings.m ** 2)
+        # 延续远端三段小臂的聚合方式，重叠胶囊不重复累加惩罚。
+        squared = penetration.square()
+        contact = squared[..., :3, :].amax(dim=3) + squared[..., 3, :]
+        loss = (contact.sum((1, 3)) + error.square()) / (2 * self.settings.m ** 2)
         return loss, penetration.reshape(count, -1).amax(-1)
 
     def forward(self, prior, residual, tracker, boxes, modes, context, display, variance):

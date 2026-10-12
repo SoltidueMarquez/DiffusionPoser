@@ -8,10 +8,13 @@
 ## 标定与导出
 
 1. 在相邻 FLUIDUnity 工程执行菜单 `FLUID/Collision/Setup chair scene and calibrate proxies`。
-   它打开并保存 `VRSeated` 场景，绑定两个现有扶手 BoxCollider，读取蒙皮一次，
-   写入 `Assets/FLUID/Models/collision_profile.json`。选中组件可查看 Gizmos。
-   代理包络以覆盖对应蒙皮顶点为目标，三球近似可能偏保守；先检查 Gizmos，
-   调整代理后必须重新导出模型。该菜单用于编辑模式，勿用于覆盖未保存的场景编辑。
+   它打开并保存 `VRSeated` 场景，首次用 PuppetMaster 的生成工具创建全身胶囊。
+   `FluidBodyColliders` 的八个计算胶囊为每侧三段小臂和一个手掌；其余形状仅随骨骼显示，
+   所有 Collider 停用 PhysX。再次执行菜单只读取已有形状，写入
+   `Assets/FLUID/Models/collision_profile.json` 并同步 `collision_compute.json.profile`。
+   调整 Collider 后先保存场景，再执行菜单；几何变更不需要重导出分段 ONNX。
+   选中 `FluidBodyColliders` 所在对象查看全身 Gizmos，青色参与计算，橙色仅预留。
+   自动形状不保证包住所有蒙皮顶点，需要检查贴合程度。菜单会重开场景，先保存编辑。
 2. 在 DiffusionPoser 根目录导出碰撞命令链的三个网络与配置：
 
 ```powershell
@@ -24,11 +27,11 @@ conda run -n diffusionposer5070 python -m export.export_sentis_denoiser `
   --collision_profile ../FLUIDUnity/Assets/FLUID/Models/collision_profile.json `
   --output_dir output/collision_deployment --ts_respace 5 --sampler_only `
   --collision_postprocess `
-  --postedit_h 0.0002 --postedit_m 0.005 --collision_tracking_tolerance 0.08
+  --postedit_h 0.0002 --postedit_m 0.0028 --collision_tracking_tolerance 0.02
 ```
 
 当前采用单一保真项的确定性梯度更新，移除额外混合回拉；具体公式和默认参数见契约。
-手掌球使用与退化线段等价的直接距离，胶囊仍覆盖整条轴线。
+小臂、手掌均计算完整胶囊轴线，支持骨骼局部偏移和旋转。
 速度优化利用左右臂损失独立性，把每轮 49 个候选合并为 25 个，仍计算全部
 24 维中心差分。内层只维护 24 维活动状态，几何准备仅保留必要的脊柱/肩部
 链路，复用旋转投影。部署时由 Shader 合并执行这些几何计算，Python 保留作参考。

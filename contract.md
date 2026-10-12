@@ -378,7 +378,7 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 | --- | --- |
 | armrest_geometry | float32 [1,2,15]；两个 OBB 各为中心 xyz、单位轴 x/y/z 各 xyz、半尺寸 xyz |
 | contact_mode | Unity int32 [1,2,2]（Python 参考为 int64）；上肢×扶手，0 停用、1 盒体避碰、2 盒体及有限上表面约束 |
-| seated_context | float32 [1,4]；水平座面高度、支撑权重、骨盆接触偏移、最大向上托举量 |
+| seated_context | float32 [1,14]；0–3 为座面高度、支撑权重、骨盆接触偏移、最大托举量；4–6 为骨盆锚点，7 为锚点权重，8–12 为自由半径、水平上限、向下上限、高度容差、向上上限，13 为锚点启用标记 |
 | display_from_pose | float32 [1,106]；未施加坐姿补偿的显示姿态：根位置 3、根四元数 4、骨盆局部位置 3、24 个局部四元数 96 |
 
 四项快照只进入碰撞 Shader，不进入 DiT。分段网络内部接口固定 batch=1：
@@ -406,10 +406,13 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 仅支持正的统一角色缩放、保持竖直的角色父坐标系与水平座面/扶手；拒绝退化
 或剪切 OBB。模型骨架及代理使用标定时的角色尺度，不逐帧读取蒙皮。
 
-`collision_profile.json` 保存 `forearmRadii [2]`、腕局部的
-`palmSpheres [2,3,4]`（中心 xyz、半径）和 `restLocalPositions [24,3]`。
-模型配套 JSON 保存标定、骨架父节点和实际优化参数；Shader 从配置上传一次常量，
-启动时核对 normalizer、骨架和模型名称。编辑标定后必须重新导出。
+`collision_profile.json` 保存 `capsules [2,4]`（左右臂 × 肘侧/中段/腕侧/手掌）和
+`restLocalPositions [24,3]`。每个胶囊含 `bone`、骨骼局部端点 `start/end [3]`、
+正半径 `radius`；骨骼顺序固定为 `[[18,18,18,20],[19,19,19,21]]`。几何由 PuppetMaster
+生成工具创建的 CapsuleCollider 导出，全身其他 Collider 不进入配置或计算。
+模型配套 JSON 保存骨架父节点和实际优化参数；Shader 从配置上传一次常量。
+编辑 Collider 后重新导出 profile 并同步 `collision_compute.json.profile`；现有
+condition/step/projection 分段 ONNX 不含碰撞几何常量，因此无需重训或重新导出它们。
 角色骨架必须是当前 SMPL24 层级。模型、配套 JSON 与标定作为 Unity 普通资源
 放在 `Assets/FLUID/Models`，由 Inspector 引用；不作为 StreamingAssets TextAsset 加载。
 
@@ -433,8 +436,9 @@ Unity 在推理启动时选择模型，修改开关后需重启推理，不在�
 如要求任意角色缩放下仍固定世界 2 mm，须按该缩放重新导出间隙常量，当前
 四个输入不另传尺度标量。
 
-小臂采用整条肘腕线段与 OBB 的最小有符号距离减半径；手掌为三球，
-直接计算球心的 OBB 有符号距离减半径，不执行退化线段的分段计算。
+小臂和手掌都采用胶囊轴线与 OBB 的最小有符号距离减半径；端点按各候选
+的绑定骨骼位置和旋转变换，小臂保留轴向扭转及坐姿 IK 后的完整旋转。
+每臂对每个扶手取三段小臂平方惩罚的最大值，再加手掌惩罚，避免重叠段重复计权。
 上方模式在有限的、按代理半径扩展的扶手 xz 范围内约束上表面。
 碰撞评估包含旋转投影、Tracker 旋转覆盖、0.25/0.5/0.75/1.0 的局部姿态
 插值，以及骨盆托举、脊柱 CCD 和双臂 IK。脚部继续使用现有 Unity 实现。

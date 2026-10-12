@@ -39,7 +39,7 @@ def build_fixtures(module, rest):
         prior = pose + (torch.randn((1, 24), generator=generator) @ module.directions) * (.02 * case)
         observed = tracker.clone()
         display = module.target_frame(pose, observed)
-        context = torch.tensor([[float(display[0, 8]) - .1 + (.08 if case % 2 else 0), .7, .1, .18]])
+        context = torch.tensor([[float(display[0, 8]) - .1 + (.08 if case % 2 else 0), .7, .1, .18] + [0.] * 10])
         positions, _ = module.display_geometry(prior, observed, context, display)
         boxes = torch.zeros(1, 2, 15)
         boxes[..., 3:12] = torch.eye(3).flatten()
