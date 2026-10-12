@@ -43,7 +43,7 @@ def collision_fixture(settings=None):
     boxes[:, :, 3:12] = torch.eye(3).flatten()
     boxes[:, :, 12:] = torch.tensor([.12, .0095, .05])
     modes = torch.full((1, 2, 2), 2, dtype=torch.long)
-    context = torch.zeros(1, 14)
+    context = torch.zeros(1, 4)
     return module, pose, tracker, boxes, modes, context, display
 
 
@@ -216,12 +216,9 @@ def test_compact_torso_cache_matches_full_fk_with_rotated_spine():
 
 
 @pytest.mark.parametrize('lift', [0., .1])
-@pytest.mark.parametrize('anchored', [False, True])
-def test_cached_arm_geometry_matches_full_seated_fk(lift, anchored):
+def test_cached_arm_geometry_matches_full_seated_fk(lift):
     module, prior, tracker, boxes, modes, context, display = collision_fixture()
     context[:, :4] = torch.tensor([.9 + lift, .7, 0., .18])
-    if anchored:
-        context[:, 4:] = torch.tensor([.08, .85 + lift, -.06, .8, .025, .05, .015, .005, .06, 1.])
     # 候选只改变四个全局旋转，躯干和坐姿支撑可在内层迭代间复用。
     cache = module.prepare_geometry(prior, tracker, context, display)
     generator = torch.Generator().manual_seed(51)

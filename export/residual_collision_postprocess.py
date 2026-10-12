@@ -334,21 +334,9 @@ class ResidualCollisionPostprocess(nn.Module):
 
     @staticmethod
     def seat_correction(pelvis, context):
-        """context [B,14] 与 Unity 的座面托举、软骨盆锚点快照一致。"""
+        """context [B,4]：座面高度、支撑权重、骨盆接触偏移、最大托举量。"""
         lift = (context[:, 0] + context[:, 2] - pelvis[:, 1]).clamp_min(0).minimum(context[:, 3].clamp_min(0)) * context[:, 1].clamp(0, 1)
-        delta = context[:, 4:7] - pelvis
-        planar = delta * delta.new_tensor([1., 0., 1.])
-        distance = planar.norm(dim=-1)
-        excess = (distance - context[:, 8].clamp_min(0)).clamp_min(0)
-        limit = context[:, 9].clamp_min(0)
-        amount = limit * (1 - torch.exp(-excess.square() / limit.square().clamp_min(1e-12)))
-        horizontal = planar * torch.where(distance > 1e-6, amount / distance.clamp_min(1e-6), torch.zeros_like(distance))[:, None]
-        vertical = (delta[:, 1].abs() - context[:, 11].clamp_min(0)).clamp_min(0)
-        cap = torch.where(delta[:, 1] >= 0, context[:, 12], context[:, 10]).clamp_min(0)
-        height = delta[:, 1].sign() * cap * (1 - torch.exp(-vertical.square() / cap.square().clamp_min(1e-12)))
-        up = pelvis.new_tensor([0., 1., 0.])
-        anchored = (horizontal + height[:, None] * up) * context[:, 7:8].clamp(0, 1)
-        return torch.where(context[:, 13:14] > 0, anchored, lift[:, None] * up)
+        return lift[:, None] * pelvis.new_tensor([0., 1., 0.])
 
     def seat_torso(self, positions, rotations, context):
         original_p, original_q = positions, rotations
@@ -390,7 +378,7 @@ class ResidualCollisionPostprocess(nn.Module):
     def display_geometry(self, normalized, tracker, seated_context, display_from_pose):
         count = normalized.shape[0]
         frame = self.interpolated_frames(normalized, tracker, display_from_pose)
-        context = seated_context[:, None].expand(count, 4, 14).reshape(-1, 14)
+        context = seated_context[:, None].expand(count, 4, 4).reshape(-1, 4)
         positions, rotations = self.seated_geometry(frame, context)
         return positions.reshape(count, 4, 24, 3), rotations.reshape(count, 4, 24, 4)
 

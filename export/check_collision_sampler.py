@@ -71,7 +71,7 @@ def main(argv=None):
                 device=torch.device('cpu'), eta=0, clip_denoised=False)['deployed_pred_pose']
             torch.testing.assert_close(baseline, original, atol=1e-4, rtol=1e-3)
             display = post.target_frame(baseline, tracker)
-            context = torch.tensor([[0., 0., .1, .18] + [0.] * 10])
+            context = torch.tensor([[0., 0., .1, .18]])
             positions, _ = post.display_geometry(baseline, tracker, context, display)
             boxes = torch.zeros(1, 2, 15); boxes[..., 3:12] = torch.eye(3).flatten()
             boxes[..., 12:] = torch.tensor([.033, .0095, .1325])
