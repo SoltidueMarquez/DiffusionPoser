@@ -39,15 +39,18 @@ class CollisionSettings:
     head_y_weight: float = 1.
     head_y_smooth_weight: float = .5
     head_y_speed: float = .15
-    seat_friction_weight: float = 0.
+    hip_seat_anchor_weight: float = 0.
+    hip_seat_anchor_forward_weight: float | None = None
     seat_collision_weight: float = 1.
     correction_smooth_weight: float = 0.
     pelvis_forward_smooth_weight: float = 0.
     pelvis_forward_update_cost: float = 0.
 
     def validate(self):
+        if self.hip_seat_anchor_forward_weight is not None and (not torch.isfinite(torch.tensor(self.hip_seat_anchor_forward_weight)) or self.hip_seat_anchor_forward_weight<0):
+            raise ValueError("Hip forward anchor weight must be finite and nonnegative.")
         if not all(torch.isfinite(torch.tensor(v)) and v >= 0 for v in
-                   (self.head_forward_limit, self.head_forward_weight, self.head_forward_smooth_weight, self.head_forward_speed, self.head_y_limit, self.head_y_weight, self.head_y_smooth_weight, self.head_y_speed, self.seat_collision_weight, self.seat_friction_weight, self.correction_smooth_weight, self.pelvis_forward_smooth_weight, self.pelvis_forward_update_cost)):
+                   (self.head_forward_limit, self.head_forward_weight, self.head_forward_smooth_weight, self.head_forward_speed, self.head_y_limit, self.head_y_weight, self.head_y_smooth_weight, self.head_y_speed, self.seat_collision_weight, self.hip_seat_anchor_weight, self.correction_smooth_weight, self.pelvis_forward_smooth_weight, self.pelvis_forward_update_cost)):
             raise ValueError('头部高度边界、权重和速度必须为有限非负数。')
         if self.head_forward_limit > 0 and (self.head_forward_weight <= 0 or self.head_forward_speed <= 0):
             raise ValueError("前后自由度需要正回零权重和速度上限。")
@@ -377,7 +380,7 @@ class ResidualCollisionPostprocess(nn.Module):
         weight=self.settings.pelvis_forward_smooth_weight*history[:,72]*(context[:,15]>1.5)*((.6-speed)/.45).clamp(0,1)
         return axis,target,weight
 
-    def measurement(self, normalized, tracker, boxes, modes, context, display, height=None, previous_height=None, pelvis_reference=None, forward=None, previous_forward=None, friction_context=None):
+    def measurement(self, normalized, tracker, boxes, modes, context, display, height=None, previous_height=None, pelvis_reference=None, forward=None, previous_forward=None, hip_anchor_context=None):
         positions, rotations = self.display_geometry(normalized, tracker, context, display, height, forward)
         e, w, q = positions[:, :, [18, 19]], positions[:, :, [20, 21]], rotations[:, :, [20, 21]]
         loss, penetration = self.geometry_loss(e, w, q, rotations[:, :, [18, 19]], tracker, boxes, modes)
@@ -394,12 +397,14 @@ class ResidualCollisionPostprocess(nn.Module):
         violation = torch.where(context[:, 15:16, None] > 0, (self.settings.margin - gap).clamp_min(0), torch.zeros_like(gap))
         # 三个独立接触部位分别求和，避免最深的一个遮蔽另一侧大腿的梯度。
         seat_loss = self.settings.seat_collision_weight * violation.square().sum((1, 2))
-        if friction_context is not None and self.settings.seat_friction_weight > 0:
-            drift = .5*(a[:, -1, :, 2]+b[:, -1, :, 2])-friction_context[:, 3:6]
-            weight = self.settings.seat_friction_weight*friction_context[:, :3]*(context[:, 15:16]>1.5)
-            friction = weight.sqrt()*drift
-            seat_loss = seat_loss+friction.square().sum(-1)
-            penetration = penetration.maximum(friction.abs().amax(-1))
+        forward_weight=self.settings.hip_seat_anchor_weight if self.settings.hip_seat_anchor_forward_weight is None else self.settings.hip_seat_anchor_forward_weight
+        if hip_anchor_context is not None and max(self.settings.hip_seat_anchor_weight,forward_weight) > 0:
+            hip_local=local(positions[:, :, :1])[:, -1, 0]
+            drift=hip_local[:, [0,2]]-hip_anchor_context[:, 1:3]
+            weight=hip_anchor_context.new_tensor([self.settings.hip_seat_anchor_weight,forward_weight])*hip_anchor_context[:, :1]*(context[:, 15:16]>1.5)
+            anchor=weight.sqrt()*drift
+            seat_loss=seat_loss+anchor.square().sum(-1)
+            penetration=penetration.maximum(anchor.abs().amax(-1))
         if self.back_count:
             origins, quat = positions[:, :, self.back_bones], rotations[:, :, self.back_bones]
             a, b = local(origins + qrotate(quat, self.back_start)), local(origins + qrotate(quat, self.back_end))
@@ -470,7 +475,7 @@ class ResidualCollisionPostprocess(nn.Module):
         return edited
 
     def forward_with_height(self, prior, residual, tracker, boxes, modes, context, display, variance,
-                            height_context, initial_height=None, trace=None, correction_context=None, forward_context=None, initial_forward=None, forward_result=None, friction_context=None):
+                            height_context, initial_height=None, trace=None, correction_context=None, forward_context=None, initial_forward=None, forward_result=None, hip_anchor_context=None):
         """高度上下文 [1,2] = 上次接受的偏移(m)、时间差(s)；返回残差及高度；forward_result["offset"] 保存前后偏移(m)。"""
         reference = residual[:, self.active_indices]
         # 当前采样阶段的历史 [1,74]：72 个归一化修正量及有效权重，只约束后48个脊柱/腿部坐标。
@@ -503,7 +508,7 @@ class ResidualCollisionPostprocess(nn.Module):
         def evaluate(candidates):
             pose = prior+residual+(candidates[:,:72]-reference)@self.directions
             options=dict(forward=axis*candidates[:,73:74]*.1,previous_forward=previous_f) if self.settings.head_forward_limit>0 else {}
-            if friction_context is not None: options["friction_context"]=friction_context
+            if hip_anchor_context is not None: options["hip_anchor_context"]=hip_anchor_context
             return self.measurement(pose,tracker,boxes,modes,context,display,candidates[:,72]*.1,previous,pelvis_reference,**options)
         starts = torch.cat([current,warm])
         start_loss,start_penetration = evaluate(starts)

@@ -478,4 +478,6 @@ Unity 的接触状态使用上次有效显示上肢和当前 Tracker，默认接
 
 当前保留较稳回放配置：10次迭代，头部前后自由度关闭，Y上限0.05m，阶段位置差释放判断。原始tracker运动释放试验已撤回，运行时与Python恢复上述3项/2项头部上下文；原网络不变。
 
-座面切向阻尼：Compute 链可选 `FrictionContact[6]` / Python `forward_with_height(..., friction_context=...)`，前三项为非负接触权重，后三项为稳定接触首次激活时保存的、当前座面坐标系下三个胶囊中心的 z 坐标（臀部、左大腿、右大腿）。仅最终插值姿态且顶面模式时，测量损失增加 `seat_friction_weight * sum(w * (z-target)^2) / (2*m^2)`，同一输入五阶段共享，接触期间跨帧保持，释放至零或失去接触后重新捕获；默认权重0，缺省上下文为零，Unity 当前配置为4。CPU 从有效原始 Head/Hip 的稳定运动判断接触权重；不改变原有历史修正释放，不修改已导出的 ONNX 输入。
+Hip 水平位置软约束（替代座面胶囊切向阻尼）：Compute 链可选 `HipSeatAnchor[3]` / Python `forward_with_height(..., hip_anchor_context=...)`，内容为 `[接触权重, 座面局部参考X, 座面局部参考Z]`。仅最终插值姿态且顶面模式时，测量损失增加 `w * (hip_seat_anchor_weight*(HipX-Xref)^2+hip_seat_anchor_forward_weight*(HipZ-Zref)^2)/(2*m^2)`；不添加 Y 或旋转损失。CPU 在稳定接触首次激活时保存显示 Hip 位置，五个阶段共用且接触期间跨帧保持，释放至零或失去接触后重新捕获。左右权重默认0，前后权重缺省或null时沿用左右权重；缺省上下文为零，Unity 当前左右4、前后16。原有历史修正释放和已导出的 ONNX 输入不变。
+
+Hip 锚定释放由 Unity 根据原始 Hip 的座面坐标判断：累计水平位移2.5cm、水平速度10cm/s持续0.1秒、或上升3cm且向上速度5cm/s持续0.08秒触发0.08秒释放。模型位置参考与原始 tracker 动作参考分别保存；Head 相对 Hip 速度不再触发释放，求解器接口不变。

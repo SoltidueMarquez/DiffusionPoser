@@ -664,17 +664,19 @@ def test_pelvis_history_includes_head_forward_warm_start():
     torch.testing.assert_close(trace[1015]-(selected-(base+.012)),torch.tensor(.012),atol=1e-6,rtol=0)
 
 
-def test_seat_friction_tracks_material_centres_and_releases():
-    module,pose,tracker,boxes,modes,context,display=collision_fixture(CollisionSettings(seat_friction_weight=2.))
+@pytest.mark.parametrize('shift',[(.01,0.),(0.,.01),(.01,.01)])
+@pytest.mark.parametrize('forward_weight',[None,16.])
+def test_hip_anchor_horizontal_loss_and_release(shift,forward_weight):
+    module,pose,tracker,boxes,modes,context,display=collision_fixture(CollisionSettings(hip_seat_anchor_weight=4.,hip_seat_anchor_forward_weight=forward_weight))
     context[:,15]=2
-    p,q=module.display_geometry(pose,tracker,context,display)
-    centre=p[:,-1,:3]+qrotate(q[:,-1,:3],(module.seat_start+module.seat_end)*.5)
-    z=((centre-context[:,None,:3])*context[:,None,9:12]).sum(-1)
-    friction=torch.cat([torch.full((1,3),1/3),z+.01],-1)
-    def loss(c,f):return module.measurement(pose,tracker,boxes,modes,c,display,friction_context=f)[0]
+    p,_=module.display_geometry(pose,tracker,context,display)
+    hip=((p[:,-1,0]-context[:,:3]).unsqueeze(-2)*context[:,3:12].reshape(-1,3,3)).sum(-1)
+    anchor=torch.cat([torch.ones(1,1),hip[:,[0,2]]+torch.tensor(shift)],-1)
+    def loss(c,a):return module.measurement(pose,tracker,boxes,modes,c,display,hip_anchor_context=a)[0]
     baseline=loss(context,None)
-    torch.testing.assert_close(loss(context,friction)-baseline,torch.tensor([2*.01**2/(2*module.settings.m**2)]),atol=.002,rtol=1e-4)
-    friction[:,:3]=0
-    torch.testing.assert_close(loss(context,friction),baseline,atol=0,rtol=0)
-    friction[:,:3]=1/3;context[:,15]=1
-    torch.testing.assert_close(loss(context,friction),loss(context,None),atol=0,rtol=0)
+    expected=(4*shift[0]**2+(4 if forward_weight is None else forward_weight)*shift[1]**2)/(2*module.settings.m**2)
+    torch.testing.assert_close(loss(context,anchor)-baseline,torch.tensor([expected]),atol=.002,rtol=1e-4)
+    anchor[:,0]=0
+    torch.testing.assert_close(loss(context,anchor),baseline,atol=0,rtol=0)
+    anchor[:,0]=1;context[:,15]=1
+    torch.testing.assert_close(loss(context,anchor),loss(context,None),atol=0,rtol=0)
