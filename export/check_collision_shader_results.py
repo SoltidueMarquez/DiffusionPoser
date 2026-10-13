@@ -67,15 +67,15 @@ def main():
                 previous=height_context[:,:1] if height_context is not None else None
                 f=trace[1030+k*2]*.1
                 options=dict(forward=axis*f,previous_forward=previous_forward)
-                loss,_=post.measurement(candidates,v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],height,previous,pelvis_reference,**options)
+                loss,_=post.measurement(candidates,v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],height,previous,pelvis_reference,friction_context=v.get("friction_context"),**options)
                 if height_context is not None:
                     dy=height+torch.tensor([post.settings.difference_step,-post.settings.difference_step])*.1
-                    hy,_=post.measurement(candidates[:1].expand(2,-1),v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],dy,previous,pelvis_reference,**options)
+                    hy,_=post.measurement(candidates[:1].expand(2,-1),v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],dy,previous,pelvis_reference,friction_context=v.get("friction_context"),**options)
                     hg=(hy[0]-hy[1])/(2*post.settings.difference_step)
                     height_bound=32*torch.finfo(torch.float32).eps*hy.abs().max().clamp_min(1)/post.settings.difference_step
                     assert abs(float(hg-trace[1001+k*2]))<=float(height_bound)+.025*abs(float(hg)),(index,k,float(hg),float(trace[1001+k*2]))
                 df=f+torch.tensor([[post.settings.difference_step],[-post.settings.difference_step]])*.1
-                fl,_=post.measurement(candidates[:1].expand(2,-1),v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],height,previous,pelvis_reference,axis*df,previous_forward)
+                fl,_=post.measurement(candidates[:1].expand(2,-1),v['tracker'],v['boxes'],v['modes'],v['context'],v['display'],height,previous,pelvis_reference,axis*df,previous_forward,friction_context=v.get("friction_context"))
                 fg=(fl[0]-fl[1])/(2*post.settings.difference_step)
                 fb=32*torch.finfo(torch.float32).eps*fl.abs().max().clamp_min(1)/post.settings.difference_step
                 assert abs(float(fg-trace[1031+k*2]))<=float(fb)+.025*abs(float(fg)),(index,k,'forward gradient')

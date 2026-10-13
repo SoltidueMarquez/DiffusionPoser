@@ -477,3 +477,5 @@ Unity 的接触状态使用上次有效显示上肢和当前 Tracker，默认接
 骨盆前后历史基准修正（2026-10-12）：每阶段 p_original_current 使用该阶段未修正残差重建、且不含头部前后偏移的骨盆位置。GPU 从初始候选的座椅轴投影扣除 df_initial；Python 用 forward=0 重建基准。于是 d=dot(n,p_selected-p_original_current) 包含姿态变化与完整 df_selected，而非只包含 df_selected-df_initial。时序目标、动作释放判断和历史提交共用这个基准；不新增字段或权重，10次迭代和头部±2cm保持。已有运行中的旧语义历史不能沿用，更新代码后重新启动推理。
 
 当前保留较稳回放配置：10次迭代，头部前后自由度关闭，Y上限0.05m，阶段位置差释放判断。原始tracker运动释放试验已撤回，运行时与Python恢复上述3项/2项头部上下文；原网络不变。
+
+座面切向阻尼：Compute 链可选 `FrictionContact[6]` / Python `forward_with_height(..., friction_context=...)`，前三项为非负接触权重，后三项为稳定接触首次激活时保存的、当前座面坐标系下三个胶囊中心的 z 坐标（臀部、左大腿、右大腿）。仅最终插值姿态且顶面模式时，测量损失增加 `seat_friction_weight * sum(w * (z-target)^2) / (2*m^2)`，同一输入五阶段共享，接触期间跨帧保持，释放至零或失去接触后重新捕获；默认权重0，缺省上下文为零，Unity 当前配置为4。CPU 从有效原始 Head/Hip 的稳定运动判断接触权重；不改变原有历史修正释放，不修改已导出的 ONNX 输入。
