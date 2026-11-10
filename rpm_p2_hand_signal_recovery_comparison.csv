@@ -1,0 +1,5 @@
+benchmark,method,configuration,result_source,mpjre_deg,mpjpe_cm,mpjve_cm_per_s,jitter_x1e2_m_per_s3,pj_t_to_s_x1e2_m_per_s3,auj_t_to_s_x1e2_m_per_s2,pj_s_to_t_x1e2_m_per_s3,auj_s_to_t_x1e2_m_per_s2,transition_window_note
+A-P2 Hand Tracking,HMD-Poser,RPM paper baseline,RPM CVPR 2025 Table 2,5.600000,6.420000,29.350000,2.520000,9.040000,55.580000,71.130000,174.800000,"Paper text reports 1 s; released evaluator defaults to 0.5 s"
+A-P2 Hand Tracking,RPM-Reactive,RPM paper reactive,RPM CVPR 2025 Table 2,5.680000,7.800000,31.540000,1.640000,6.060000,11.730000,10.920000,32.810000,"Paper text reports 1 s; released evaluator defaults to 0.5 s"
+A-P2 Hand Tracking,RPM-Smooth,RPM paper smooth,RPM CVPR 2025 Table 2,5.920000,8.370000,34.040000,1.440000,4.740000,6.430000,7.310000,11.930000,"Paper text reports 1 s; released evaluator defaults to 0.5 s"
+A-P2 Hand Tracking,Ours,Dropout-trained Predictor+DiT; soft10f; DDIM10,prior_residual_rpm_p2_hand_recovery_soft10f_dropout_trained_full.json,5.657195,7.263918,28.532538,1.000579,4.512720,22.790492,6.888798,11.857691,"0.5 s following the released evaluator default"
