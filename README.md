@@ -5,6 +5,9 @@
 先验和当前可用 Tracker 执行 IK-Inpainting，只恢复当前 144D Pose。字段、维度和
 参考系语义以 [contract.md](contract.md) 为准。
 
+LM 与 ΠGDM 场景引导的独立复现入口、固定配置和必要输入见
+[实验说明](experiments/scene_guidance/README.md)。
+
 ## 产物目录
 
 ```text

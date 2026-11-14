@@ -1,0 +1,25 @@
+{
+  "protocol": "snapshot",
+  "model_path": "artifacts/unity_demo/dit/ema000100000.pt",
+  "normalizer_dir": "artifacts/unity_demo/normalizer",
+  "body_fbx_rest_json": "experiments/scene_guidance/inputs/body_fbx_rest.json",
+  "collision_profile": "experiments/scene_guidance/inputs/collision_profile.json",
+  "replay_inputs": "experiments/scene_guidance/inputs/captured_replay_inputs.json",
+  "output_dir": "output/scene_guidance_snapshot",
+  "device": "cuda:0",
+  "ts_respace": "5",
+  "tune": false,
+  "tune_frames": 20,
+  "split_strategy": "uniform",
+  "seeds": [10, 20, 30],
+  "warmup": 20,
+  "repeats": 5,
+  "measurement_scale": 0.0005,
+  "margin": 0.002,
+  "guidance_configs": [
+    {"method": "none"},
+    {"method": "postedit", "iterations": 5, "step_size": 0.000074},
+    {"method": "lm", "iterations": 5, "damping": 0.001},
+    {"method": "pigdm", "strength": 10.0, "covariance_scale": 0.1}
+  ]
+}

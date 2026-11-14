@@ -1,0 +1,25 @@
+{
+  "hash_algorithm": "SHA256; .json/.py normalize CRLF to LF",
+  "provenance": {
+    "captured_replay_inputs": "65 cached sampler frames; retained INPUT_SHAPES fields without changing numeric values",
+    "original_replay_sha256": "7fdcc01fcaa865d1e49539fa6f1af02dcd2d4524f2cf326f6423ca0b5e902df2",
+    "chair_probe": "Existing constructed seated/armrest tracker sequence; no full-body ground truth",
+    "geometry": "Frozen body_fbx_rest and collision_profile copied from FLUIDUnity"
+  },
+  "sha256": {
+    "artifacts/unity_demo/dit/ema000100000.pt": "dc12a09062996570d1262a028fd4aab4c35585ea000a75cf95cf165722ef25b6",
+    "artifacts/unity_demo/dit/args.json": "c6ccbe9d94864b880747ea2eb1cd84e291df978d5acf0d54b8dfd40ccd7c96ba",
+    "experiments/scene_guidance/inputs/body_fbx_rest.json": "361e1258fd51861d5d40d74b6ee94b63c759010efbc2f0b37973bf566f563d8a",
+    "experiments/scene_guidance/inputs/collision_profile.json": "63616b85846b7c68de374fb553324d239a27d6734d0a7a87522f43e281016519",
+    "experiments/scene_guidance/inputs/captured_replay_inputs.json": "e568d0dbccfd5246a7efff669c9bddb18699f75eb8725e7540b6d9ba7457598e",
+    "artifacts/unity_demo/normalizer/pose_mean.pt": "fd234d7ec20fa82775766a011b68526e5dd35b6466d916280d99cfc0fa9cddf1",
+    "artifacts/unity_demo/normalizer/pose_scale.pt": "061920bf340e66e8047faee8ed18ee0ad8d07c8471773c984b0968ba5891f81c",
+    "artifacts/unity_demo/normalizer/tracker_mean.pt": "140b2b91846e15f326c0e6d1fcdfdf7217502cc2c830ff221b08576473e958e8",
+    "artifacts/unity_demo/normalizer/tracker_std.pt": "b8d1d34c4b0bdcd49afdc888d18e406ba29bd8c6dfee5a11bd1a138a31d85737",
+    "artifacts/unity_demo/normalizer/predictor_sparse_mean.pt": "7e9bfc992161d4326d89eaf032c6f98a188521cbd770c843856e503a7cf417fa",
+    "artifacts/unity_demo/normalizer/predictor_sparse_std.pt": "61beb9510a852a502c5ab819841fe43e3e800394501b919637621b0d217e482d",
+    "experiments/scene_guidance/inputs/chair_probe.json": "c13c86c3fe65e32ab43f71aa4f36bcb9c2cee65dfdd8af11a88b1026162b7543",
+    "artifacts/unity_demo/predictor/model_latest.pt": "775b3e471df2a9683a7f67a1e61c2c31bbcaacba121b018ed0dfc924a6cb3c0d",
+    "artifacts/unity_demo/predictor/args.json": "800b9efe8090f12307469780cdf7013c22d749b2f08a29747f1f0fbbd6f7221f"
+  }
+}
