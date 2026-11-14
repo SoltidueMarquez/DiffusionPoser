@@ -131,6 +131,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     group.add_argument("--output_json", required=True)
+    group.add_argument(
+        "--diagnostic_dir", type=Path, default=None,
+        help="可选：保存逐帧部署姿态、GT、源帧号和可用性，供掉线视觉质量分析。",
+    )
     return parser
 
 
@@ -354,6 +358,10 @@ def evaluate_hand_recovery_sequences(
         scored_raw_positions: list[np.ndarray] = []
         scored_deployed_positions: list[np.ndarray] = []
         scored_target_positions: list[np.ndarray] = []
+        # 诊断轨迹保留预热区间，视频才能展示首次掉线前的上下文。
+        diagnostic_positions = list(source["joints_world"][:11].copy())
+        diagnostic_rotations = list(world_rotations[:11].copy())
+        diagnostic_root_yaw = list(source["root_yaw"][:11].copy())
         for current in range(PREDICTOR_EVAL_FIRST_GENERATED_FRAME, last):
             scored = current >= REALTIME_POSE_EVAL_METRICS_START_FRAME
             previous_root_yaw = runtime.pose_history[-1].root_yaw_world
@@ -403,6 +411,10 @@ def evaluate_hand_recovery_sequences(
             generated_frame_count += 1
             previous_available = frame_available.copy()
             previous_result = result
+            if args.diagnostic_dir is not None:
+                diagnostic_positions.append(result.resolved_pose.joints_world.copy())
+                diagnostic_rotations.append(result.resolved_pose.joint_rotations_world.copy())
+                diagnostic_root_yaw.append(result.resolved_pose.root_yaw_world)
             if not scored:
                 continue
             if device.type == "cuda":
@@ -441,6 +453,25 @@ def evaluate_hand_recovery_sequences(
         raw_positions = np.stack(scored_raw_positions)
         deployed_positions = np.stack(scored_deployed_positions)
         target_positions = np.stack(scored_target_positions)
+        if args.diagnostic_dir is not None:
+            diagnostic_dir = Path(args.diagnostic_dir).expanduser().resolve()
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                diagnostic_dir / f"{sequence_index - 1:04d}.npz",
+                predicted_positions=np.stack(diagnostic_positions),
+                predicted_rotations=np.stack(diagnostic_rotations),
+                predicted_root_yaw=np.asarray(diagnostic_root_yaw),
+                target_positions=source["joints_world"][:last],
+                target_rotations=world_rotations[:last],
+                source_frames=np.arange(last, dtype=np.int64),
+                tracker_available=tracker_available[:last],
+                source_path=np.asarray(str(resolve_source_entry_path(entry))),
+                source_relative_path=np.asarray(str(entry["source_relative_path"])),
+                gap_key=np.asarray(gap_key),
+                fps=np.asarray(REALTIME_POSE_FPS),
+                generated_start_frame=np.asarray(PREDICTOR_EVAL_FIRST_GENERATED_FRAME),
+                metrics_start_frame=np.asarray(REALTIME_POSE_EVAL_METRICS_START_FRAME),
+            )
         common = {
             "target_global_rotations": target_rotations,
             "target_joint_positions": target_positions,

@@ -1,0 +1,33 @@
+table_name,method_and_configuration,mpjre_deg,mpjpe_cm,mpjve_cm_per_s,jitter_x1e2_m_per_s3
+tracker_count_metrics,Ours 3-point (Head+Hands),4.659,5.305,21.229,0.958
+tracker_count_metrics,Ours 4-point (Head+Hands+Hip),4.006,3.363,16.574,1.015
+tracker_count_metrics,Ours 4-point (Head+Hands+LeftFoot),4.488,3.656,16.700,1.040
+tracker_count_metrics,Ours 4-point (Head+Hands+RightFoot),4.473,3.669,16.511,1.049
+tracker_count_metrics,Ours 5-point (Head+Hands+BothFeet),4.256,2.220,12.517,1.119
+tracker_count_metrics,Ours 5-point (Head+Hands+Hip+LeftFoot),3.620,2.022,12.065,1.089
+tracker_count_metrics,Ours 5-point (Head+Hands+Hip+RightFoot),3.659,2.129,11.959,1.094
+tracker_count_metrics,Ours 6-point (Head+Hands+Hip+BothFeet),3.374,1.073,8.285,1.162
+dit_future_ablation,Ours 3-point without DiT future (F0),4.763,5.682,26.093,1.060
+dit_future_ablation,Ours 3-point with predicted future (F10),4.659,5.305,21.229,0.958
+dit_future_ablation,Ours 6-point without DiT future (F0),3.351,1.062,8.853,1.209
+dit_future_ablation,Ours 6-point with predicted future (F10),3.374,1.073,8.285,1.162
+predictor_dit_ablation,Predictor only 3-point,4.468,5.259,23.348,1.995
+predictor_dit_ablation,Ours 3-point (Predictor+DiT),4.659,5.305,21.229,0.958
+three_point_main,AvatarPoser,5.180,6.650,32.740,2.670
+three_point_main,AGRoL,5.210,6.600,50.110,9.650
+three_point_main,EgoPoser,5.490,6.880,34.190,3.520
+three_point_main,SAGE,5.360,6.170,34.620,3.680
+three_point_main,AvatarJLM,5.210,5.230,22.720,1.770
+three_point_main,HMD-Poser,5.170,5.580,24.510,2.150
+three_point_main,RPM-Reactive,5.150,6.560,27.160,1.550
+three_point_main,RPM-Smooth,5.400,7.140,30.360,1.390
+three_point_main,Ours,4.659,5.305,21.229,0.958
+six_point_main,FIK-Python,15.019,3.133,10.440,1.450
+six_point_main,SparsePoser Generator (0 future),3.943,2.791,22.761,2.179
+six_point_main,SparsePoser+Learned IK (0 future),3.728,2.121,17.806,2.169
+six_point_main,SparsePoser+Learned IK (7 future),3.531,1.824,11.510,1.809
+six_point_main,Ours,3.374,1.073,8.285,1.162
+dragposer_test_comparison,DragPoser 3-point,22.000,15.500,34.000,
+dragposer_test_comparison,Ours 3-point,6.194,7.613,20.518,
+dragposer_test_comparison,DragPoser 6-point,7.660,2.180,10.700,
+dragposer_test_comparison,Ours 6-point,4.339,1.599,9.116,

@@ -205,10 +205,19 @@ def test_hand_recovery_main_writes_ood_report(tmp_path, monkeypatch):
             "0.1",
             "--output_json",
             str(output),
+            "--diagnostic_dir",
+            str(tmp_path / "diagnostics"),
         ]
     )
 
     assert output.is_file()
+    with np.load(tmp_path / "diagnostics" / "0000.npz", allow_pickle=False) as diagnostic:
+        np.testing.assert_array_equal(diagnostic["source_frames"], np.arange(46))
+        assert diagnostic["predicted_positions"].shape == (46, 24, 3)
+        assert diagnostic["predicted_rotations"].shape == (46, 24, 3, 3)
+        assert diagnostic["predicted_root_yaw"].shape == (46,)
+        assert not diagnostic["tracker_available"][31:35, 1].any()
+        assert diagnostic["tracker_available"][35, 1]
     assert payload["experiment"] == "rpm_p2_hand_signal_loss_and_recovery"
     assert payload["source_sequence_count"] == 1
     assert "out_of_training_distribution" in payload["diagnostic_scope"]

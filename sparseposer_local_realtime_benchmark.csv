@@ -1,0 +1,15 @@
+方法,平均时延(ms),P95时延(ms),按平均时延换算FPS,计时范围
+SparsePoser Generator,1.12,1.74,889.3,Generator forward
+SparsePoser Learned IK,1.78,2.68,561.4,使用预生成姿态的Learned IK forward
+SparsePoser Generator+Learned IK (0 future),2.97,3.85,336.6,Generator与Learned IK连续forward
+SparsePoser Generator+Learned IK (7 future),2.97,3.86,336.7,Generator与Learned IK连续forward；不含未来帧等待
+
+测试条件,数值,,,
+GPU,NVIDIA GeForce RTX 5090,,,
+PyTorch,2.7.0+cu128,,,
+CUDA Runtime,12.8,,,
+Batch Size,1,,,
+输入窗口,64帧,,,
+预热与重复,每轮预热100次；计时500次；独立重复3轮,,,
+同步方式,每次forward后torch.cuda.synchronize,,,
+不计入范围,数据加载、Socket通信、Unity、指标计算、未来帧等待,,,
